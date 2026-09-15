@@ -133,7 +133,8 @@ float4 IconPS(VertexOutput input) : SV_Target
         ? smoothstep(0.075, 0.045, length(input.uv - float2(0.5, 0.96)))
         : 0.0;
     const float alpha = saturate(sampled.a + indicator * (1.0 - sampled.a));
-    const float3 color = sampled.rgb * sampled.a +
+    const float iconBrightness = icon.iconMeta.z > 0.5 ? 0.5 : 1.0;
+    const float3 color = sampled.rgb * sampled.a * iconBrightness +
         float3(0.24, 0.76, 1.0) * indicator * (1.0 - sampled.a);
     return float4(color, alpha);
 }

@@ -47,15 +47,21 @@ private:
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK InputWindowProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
+    static LRESULT CALLBACK HoverLabelWindowProcedure(HWND window, UINT message, WPARAM wParam,
+        LPARAM lParam);
     static LRESULT CALLBACK MouseHook(int code, WPARAM wParam, LPARAM lParam);
     static BOOL CALLBACK FindTaskbarWindow(HWND window, LPARAM data);
 
     LRESULT HandleRendererMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleInputMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     void CreateOverlayWindow();
+    void CreateHoverLabelWindow();
+    void DestroyHoverLabelWindow();
     void RebuildLayout(bool reloadIcons);
     void UpdateInputRegion();
     void PositionOverlayWindows();
+    void UpdateHoverLabel();
+    void HideHoverLabel() noexcept;
     void LoadIconTextures();
     void UpdatePrimaryMonitor();
     void BeginShow();
@@ -66,6 +72,7 @@ private:
     void HandleContextMenu(POINT screenPoint);
     void ActivatePressedApp();
     void CompleteDrag();
+    void ClearPressState() noexcept;
     void RefreshRunningWindows(bool force = false);
     bool RebuildDisplayApps();
     void HideTaskbar();
@@ -76,6 +83,7 @@ private:
     [[nodiscard]] bool IsCursorInBottomHotZone(POINT cursor) const noexcept;
     [[nodiscard]] int IconAtScreenPoint(POINT cursor) const noexcept;
     [[nodiscard]] int InsertionIndexFor(POINT cursor) const noexcept;
+    [[nodiscard]] bool HasCrossedDragThreshold(POINT cursor) const noexcept;
     [[nodiscard]] bool IsPersistentDisplayIcon(int icon) const noexcept;
     [[nodiscard]] LONG CurrentY() const noexcept;
     [[nodiscard]] bool IsAnimating() const noexcept;
@@ -85,6 +93,7 @@ private:
     HINSTANCE m_instance = nullptr;
     HWND m_window = nullptr;
     HWND m_inputWindow = nullptr;
+    HWND m_hoverLabelWindow = nullptr;
     HHOOK m_mouseHook = nullptr;
     HANDLE m_singleInstanceMutex = nullptr;
     RECT m_primaryBounds{};
