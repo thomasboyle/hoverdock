@@ -548,8 +548,8 @@ void Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene0[1] = static_cast<float>(state.height);
     frame.mappedConstants->scene0[2] = state.glassAlpha;
     frame.mappedConstants->scene0[3] = state.timeSeconds;
-    frame.mappedConstants->scene1[0] = static_cast<float>(GetDpiForWindow(m_window)) / 96.0F;
-    frame.mappedConstants->scene1[1] = state.slideProgress;
+    frame.mappedConstants->scene1[0] = state.slideProgress;
+    frame.mappedConstants->scene1[1] = static_cast<float>(GetDpiForWindow(m_window)) / 96.0F;
     frame.mappedConstants->scene1[2] = state.showDevBounds ? 1.0F : 0.0F;
     frame.mappedConstants->scene1[3] = m_backdropValid ? 1.0F : 0.0F;
 
@@ -1105,5 +1105,5 @@ void Renderer::UploadIconTexture(UINT textureIndex, const uint8_t* pixels, UINT 
 
 void Renderer::SignalFrame(FrameResource& frame) {
     frame.fenceValue = ++m_fenceValue;
-    Check(m_queue->Signal(m_fence.Get(), frame.fenceValue), "Signal frame fence");
+    Check(m_queue->Signal(m_fence.Get(), "Signal frame fence");
 }
