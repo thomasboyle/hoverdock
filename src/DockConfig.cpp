@@ -9,6 +9,8 @@
 #include <cstring>
 #include <cwctype>
 #include <fstream>
+#include <iterator>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string_view>
@@ -74,8 +76,12 @@ bool EndsWithInsensitive(std::wstring_view value, std::wstring_view suffix) {
         EqualInsensitive(value.substr(value.size() - suffix.size()), suffix);
 }
 
+bool StartsWithInsensitive(std::wstring_view value, std::wstring_view prefix) {
+    return value.size() >= prefix.size() && EqualInsensitive(value.substr(0, prefix.size()), prefix);
+}
+
 std::wstring Utf8ToWide(const std::string& text) {
-    if (text.empty()) {
+    if (text.empty() || text.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
         return {};
     }
 
@@ -92,7 +98,7 @@ std::wstring Utf8ToWide(const std::string& text) {
 }
 
 std::string WideToUtf8(const std::wstring& text) {
-    if (text.empty()) {
+    if (text.empty() || text.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
         return {};
     }
 
@@ -184,6 +190,11 @@ bool IsAumidCharacter(wchar_t character) {
         character == L'-' || character == L'!';
 }
 
+bool IsPrintableTextCharacter(wchar_t character) {
+    return character >= L' ' && character != 0x7f && (character < 0x80 || character > 0x9f) &&
+        character != 0xfffe && character != 0xffff;
+}
+
 bool IsAppsFolderTarget(const std::wstring& target) {
     return target.size() > std::size(kAppsFolderPrefix) - 1 &&
         EqualInsensitive(std::wstring_view(target).substr(0, std::size(kAppsFolderPrefix) - 1),
@@ -259,28 +270,6 @@ void ExtractAppsFolderTargets(const std::wstring& text, std::vector<std::wstring
             }
         }
         position = lower.find(prefix, end);
-    }
-}
-
-void ExtractAumidTargets(const std::wstring& text, std::vector<std::wstring>& targets) {
-    for (size_t bang = text.find(L'!'); bang != std::wstring::npos;
-         bang = text.find(L'!', bang + 1)) {
-        size_t start = bang;
-        while (start > 0 && IsAumidCharacter(text[start - 1])) {
-            --start;
-        }
-        size_t end = bang + 1;
-        while (end < text.size() && IsAumidCharacter(text[end])) {
-            ++end;
-        }
-        const std::wstring aumid = text.substr(start, end - start);
-        if (aumid.find(L'_') == std::wstring::npos) {
-            continue;
-        }
-        const std::wstring target = std::wstring(kAppsFolderPrefix) + aumid;
-        if (IsAppsFolderTarget(target)) {
-            targets.push_back(target);
-        }
     }
 }
 
@@ -429,7 +418,49 @@ bool HasExtensionAt(const std::wstring& text, size_t offset, std::wstring_view e
         EqualInsensitive(std::wstring_view(text).substr(offset, extension.size()), extension);
 }
 
-void ExtractPathsFromText(const std::wstring& text, std::vector<std::wstring>& paths) {
+void ExtractTargetsFromText(const std::wstring& text, std::vector<std::wstring>& targets) {
+    struct LocatedTarget {
+        size_t position = 0;
+        std::wstring target;
+    };
+
+    std::vector<LocatedTarget> locatedTargets;
+    const std::wstring lower = ToLower(text);
+    const std::wstring_view appsFolderPrefix(kAppsFolderPrefix, std::size(kAppsFolderPrefix) - 1);
+    for (size_t position = lower.find(appsFolderPrefix); position != std::wstring::npos;) {
+        const size_t start = position + appsFolderPrefix.size();
+        size_t end = start;
+        while (end < text.size() && IsAumidCharacter(text[end])) {
+            ++end;
+        }
+        if (end > start) {
+            const std::wstring target = std::wstring(kAppsFolderPrefix) + text.substr(start, end - start);
+            if (IsAppsFolderTarget(target)) {
+                locatedTargets.push_back({position, target});
+            }
+        }
+        position = lower.find(appsFolderPrefix, end);
+    }
+
+    for (size_t bang = text.find(L'!'); bang != std::wstring::npos;
+         bang = text.find(L'!', bang + 1U)) {
+        size_t start = bang;
+        while (start > 0 && IsAumidCharacter(text[start - 1U])) {
+            --start;
+        }
+        size_t end = bang + 1U;
+        while (end < text.size() && IsAumidCharacter(text[end])) {
+            ++end;
+        }
+        const std::wstring aumid = text.substr(start, end - start);
+        if (aumid.find(L'_') != std::wstring::npos) {
+            const std::wstring target = std::wstring(kAppsFolderPrefix) + aumid;
+            if (IsAppsFolderTarget(target)) {
+                locatedTargets.push_back({start, target});
+            }
+        }
+    }
+
     for (size_t start = 0; start < text.size(); ++start) {
         if (!IsTaskbandPathStart(text, start)) {
             continue;
@@ -442,44 +473,97 @@ void ExtractPathsFromText(const std::wstring& text, std::vector<std::wstring>& p
                 continue;
             }
 
-            const size_t end = extension + 4;
+            const size_t end = extension + 4U;
             if (end < text.size() && IsPathSeparator(text[end])) {
                 continue;
             }
-            paths.push_back(text.substr(start, end - start));
-            start = end - 1;
+            locatedTargets.push_back({start, text.substr(start, end - start)});
+            start = end - 1U;
             break;
         }
     }
+
+    std::stable_sort(locatedTargets.begin(), locatedTargets.end(), [](const LocatedTarget& left,
+        const LocatedTarget& right) {
+        return left.position < right.position;
+    });
+    for (LocatedTarget& target : locatedTargets) {
+        targets.push_back(std::move(target.target));
+    }
 }
 
-void ExtractTargetsFromText(const std::wstring& text, std::vector<std::wstring>& targets) {
-    ExtractAppsFolderTargets(text, targets);
-    ExtractAumidTargets(text, targets);
-    ExtractPathsFromText(text, targets);
+void ExtractUtf16Targets(const std::vector<BYTE>& value, size_t alignment,
+    std::vector<std::wstring>& targets) {
+    std::wstring text;
+    for (size_t offset = alignment; offset + sizeof(uint16_t) <= value.size();
+         offset += sizeof(uint16_t)) {
+        uint16_t codeUnit = 0;
+        std::memcpy(&codeUnit, value.data() + offset, sizeof(codeUnit));
+        if (IsPrintableTextCharacter(static_cast<wchar_t>(codeUnit))) {
+            text.push_back(static_cast<wchar_t>(codeUnit));
+            if (text.size() == kMaximumPathLength) {
+                ExtractTargetsFromText(text, targets);
+                text.clear();
+            }
+        } else if (!text.empty()) {
+            ExtractTargetsFromText(text, targets);
+            text.clear();
+        }
+    }
+    ExtractTargetsFromText(text, targets);
+}
+
+void ExtractAsciiTargets(const std::vector<BYTE>& value, std::vector<std::wstring>& targets) {
+    std::wstring text;
+    for (const BYTE byte : value) {
+        if (byte >= 0x20U && byte <= 0x7eU) {
+            text.push_back(static_cast<wchar_t>(byte));
+            if (text.size() == kMaximumPathLength) {
+                ExtractTargetsFromText(text, targets);
+                text.clear();
+            }
+        } else if (!text.empty()) {
+            ExtractTargetsFromText(text, targets);
+            text.clear();
+        }
+    }
+    ExtractTargetsFromText(text, targets);
+}
+
+void ExtractUtf8Targets(const std::vector<BYTE>& value, std::vector<std::wstring>& targets) {
+    constexpr size_t maximumUtf8TextLength = kMaximumPathLength * 4U;
+    std::string text;
+    for (const BYTE byte : value) {
+        if (byte >= 0x20U && byte != 0x7fU) {
+            text.push_back(static_cast<char>(byte));
+            if (text.size() == maximumUtf8TextLength) {
+                const std::wstring decoded = Utf8ToWide(text);
+                if (!decoded.empty() && std::ranges::all_of(decoded, IsPrintableTextCharacter)) {
+                    ExtractTargetsFromText(decoded, targets);
+                }
+                text.clear();
+            }
+        } else if (!text.empty()) {
+            const std::wstring decoded = Utf8ToWide(text);
+            if (!decoded.empty() && std::ranges::all_of(decoded, IsPrintableTextCharacter)) {
+                ExtractTargetsFromText(decoded, targets);
+            }
+            text.clear();
+        }
+    }
+    const std::wstring decoded = Utf8ToWide(text);
+    if (!decoded.empty() && std::ranges::all_of(decoded, IsPrintableTextCharacter)) {
+        ExtractTargetsFromText(decoded, targets);
+    }
 }
 
 std::vector<std::wstring> ExtractTaskbarTargets(const std::vector<BYTE>& value) {
     std::vector<std::wstring> targets;
     for (size_t alignment = 0; alignment < 2; ++alignment) {
-        std::wstring text;
-        for (size_t offset = alignment; offset + sizeof(uint16_t) <= value.size();
-             offset += sizeof(uint16_t)) {
-            uint16_t codeUnit = 0;
-            std::memcpy(&codeUnit, value.data() + offset, sizeof(codeUnit));
-            if (codeUnit >= 0x20U && codeUnit != 0xfffeU && codeUnit != 0xffffU) {
-                text.push_back(static_cast<wchar_t>(codeUnit));
-                if (text.size() == kMaximumPathLength) {
-                    ExtractTargetsFromText(text, targets);
-                    text.clear();
-                }
-            } else if (!text.empty()) {
-                ExtractTargetsFromText(text, targets);
-                text.clear();
-            }
-        }
-        ExtractTargetsFromText(text, targets);
+        ExtractUtf16Targets(value, alignment, targets);
     }
+    ExtractAsciiTargets(value, targets);
+    ExtractUtf8Targets(value, targets);
     return targets;
 }
 
@@ -552,9 +636,7 @@ void ImportCloudStoreTaskbarKey(HKEY key, bool isTaskbarKey, std::vector<PinnedA
             }
             value.resize(byteCount);
             for (const std::wstring& target : ExtractTaskbarTargets(value)) {
-                if (IsAppsFolderTarget(target)) {
-                    AppendAppsFolderPin(pins, target, canResolveShellLinks);
-                }
+                ImportTaskbarTarget(pins, target, canResolveShellLinks);
             }
         }
     }
@@ -589,37 +671,183 @@ void ImportCloudStoreTaskbarValues(std::vector<PinnedApp>& pins, bool canResolve
     RegCloseKey(cloudStore);
 }
 
+std::wstring ReadLayoutText(const std::wstring& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return {};
+    }
+
+    const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (bytes.size() >= 2U) {
+        const auto first = static_cast<unsigned char>(bytes[0]);
+        const auto second = static_cast<unsigned char>(bytes[1]);
+        const bool littleEndian = first == 0xffU && second == 0xfeU;
+        const bool bigEndian = first == 0xfeU && second == 0xffU;
+        if (littleEndian || bigEndian) {
+            if ((bytes.size() - 2U) % 2U != 0U) {
+                return {};
+            }
+
+            std::wstring text;
+            text.reserve((bytes.size() - 2U) / 2U);
+            for (size_t offset = 2U; offset < bytes.size(); offset += 2U) {
+                const auto low = static_cast<uint16_t>(static_cast<unsigned char>(bytes[offset]));
+                const auto high =
+                    static_cast<uint16_t>(static_cast<unsigned char>(bytes[offset + 1U]));
+                const uint16_t codeUnit = littleEndian
+                    ? static_cast<uint16_t>(low | static_cast<uint16_t>(high << 8U))
+                    : static_cast<uint16_t>(high | static_cast<uint16_t>(low << 8U));
+                text.push_back(static_cast<wchar_t>(codeUnit));
+            }
+            return text;
+        }
+    }
+
+    const size_t utf8BomLength = bytes.size() >= 3U &&
+            static_cast<unsigned char>(bytes[0]) == 0xefU &&
+            static_cast<unsigned char>(bytes[1]) == 0xbbU &&
+            static_cast<unsigned char>(bytes[2]) == 0xbfU
+        ? 3U
+        : 0U;
+    return Utf8ToWide(bytes.substr(utf8BomLength));
+}
+
+bool IsXmlAttributeStart(const std::wstring& text, size_t position) {
+    return position == 0 || std::iswspace(text[position - 1U]) != 0 || text[position - 1U] == L'<';
+}
+
+std::wstring DecodeXmlEntities(const std::wstring& value) {
+    std::wstring decoded;
+    decoded.reserve(value.size());
+    for (size_t index = 0; index < value.size(); ++index) {
+        const std::wstring_view remaining(value.data() + index, value.size() - index);
+        if (StartsWithInsensitive(remaining, L"&amp;")) {
+            decoded.push_back(L'&');
+            index += 4U;
+        } else if (StartsWithInsensitive(remaining, L"&quot;")) {
+            decoded.push_back(L'\"');
+            index += 5U;
+        } else if (StartsWithInsensitive(remaining, L"&apos;")) {
+            decoded.push_back(L'\'');
+            index += 5U;
+        } else if (StartsWithInsensitive(remaining, L"&lt;")) {
+            decoded.push_back(L'<');
+            index += 3U;
+        } else if (StartsWithInsensitive(remaining, L"&gt;")) {
+            decoded.push_back(L'>');
+            index += 3U;
+        } else {
+            decoded.push_back(value[index]);
+        }
+    }
+    return decoded;
+}
+
+void ImportLayoutTargets(const std::wstring& text, std::vector<PinnedApp>& pins,
+    bool canResolveShellLinks) {
+    constexpr std::wstring_view appUserModelIdAttribute = L"appusermodelid";
+    constexpr std::wstring_view desktopLinkPathAttribute = L"desktopapplicationlinkpath";
+
+    size_t cursor = 0;
+    while (cursor < text.size()) {
+        const std::wstring_view remaining(text.data() + cursor, text.size() - cursor);
+        const bool appUserModelId = IsXmlAttributeStart(text, cursor) &&
+            StartsWithInsensitive(remaining, appUserModelIdAttribute);
+        const bool desktopLinkPath = IsXmlAttributeStart(text, cursor) &&
+            StartsWithInsensitive(remaining, desktopLinkPathAttribute);
+        if (!appUserModelId && !desktopLinkPath) {
+            ++cursor;
+            continue;
+        }
+
+        const size_t attributeLength =
+            appUserModelId ? appUserModelIdAttribute.size() : desktopLinkPathAttribute.size();
+        size_t equals = cursor + attributeLength;
+        while (equals < text.size() && std::iswspace(text[equals]) != 0) {
+            ++equals;
+        }
+        if (equals == text.size() || text[equals] != L'=') {
+            cursor += attributeLength;
+            continue;
+        }
+
+        ++equals;
+        while (equals < text.size() && std::iswspace(text[equals]) != 0) {
+            ++equals;
+        }
+        if (equals == text.size()) {
+            return;
+        }
+
+        const wchar_t quote = text[equals];
+        const bool quoted = quote == L'\"' || quote == L'\'';
+        const size_t valueStart = quoted ? equals + 1U : equals;
+        size_t valueEnd = valueStart;
+        if (quoted) {
+            valueEnd = text.find(quote, valueStart);
+            if (valueEnd == std::wstring::npos) {
+                return;
+            }
+        } else {
+            while (valueEnd < text.size() && std::iswspace(text[valueEnd]) == 0 &&
+                text[valueEnd] != L'>' && text[valueEnd] != L'/') {
+                ++valueEnd;
+            }
+        }
+
+        const std::wstring value = DecodeXmlEntities(text.substr(valueStart, valueEnd - valueStart));
+        if (appUserModelId) {
+            const std::wstring target = IsAppsFolderTarget(value)
+                ? value
+                : std::wstring(kAppsFolderPrefix) + value;
+            ImportTaskbarTarget(pins, target, canResolveShellLinks);
+        } else if (EndsWithInsensitive(value, L".lnk")) {
+            ImportTaskbarTarget(pins, value, canResolveShellLinks);
+        }
+        cursor = quoted ? valueEnd + 1U : valueEnd;
+    }
+}
+
+void ImportTaskbarLayouts(std::vector<PinnedApp>& pins, bool canResolveShellLinks) {
+    const std::wstring appData = EnvironmentVariable(L"LOCALAPPDATA");
+    if (appData.empty()) {
+        return;
+    }
+
+    const std::wstring directory = appData + L"\\Microsoft\\Windows\\Shell\\";
+    constexpr std::array layoutFiles = {L"LayoutModification.xml", L"DefaultLayouts.xml"};
+    for (const wchar_t* file : layoutFiles) {
+        ImportLayoutTargets(ReadLayoutText(directory + file), pins, canResolveShellLinks);
+    }
+}
+
 std::vector<PinnedApp> ImportTaskbarPins() {
     std::vector<PinnedApp> pins;
     ComApartment apartment;
     const bool canResolveShellLinks = apartment.CanUseShellLinks();
 
-    // These stores preserve the taskbar's native serialized order. The shortcut folder is only
-    // a fallback, so it can fill missing pins without changing that order.
+    // CloudStore and Taskband preserve serialized taskbar order. Filesystem-based sources are
+    // fallbacks so directory enumeration never changes a successful serialized order.
     ImportCloudStoreTaskbarValues(pins, canResolveShellLinks);
-    ImportTaskbandValues(pins, canResolveShellLinks);
-    ImportShortcutFolder(pins, canResolveShellLinks);
+    if (pins.empty()) {
+        ImportTaskbandValues(pins, canResolveShellLinks);
+    }
+    if (pins.empty()) {
+        ImportShortcutFolder(pins, canResolveShellLinks);
+    }
+    if (pins.empty()) {
+        ImportTaskbarLayouts(pins, canResolveShellLinks);
+    }
     return pins;
 }
 
-bool IsLegacyDefaultPins(const std::vector<PinnedApp>& pins) {
-    if (pins.size() != 3) {
-        return false;
-    }
-
-    const std::array defaults = {
-        ExpandTarget(L"%SystemRoot%\\explorer.exe"),
-        ExpandTarget(L"%SystemRoot%\\System32\\notepad.exe"),
-        std::wstring(L"shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"),
-    };
-    for (size_t index = 0; index < defaults.size(); ++index) {
-        const PinnedApp& pin = pins[index];
-        if (!pin.arguments.empty() || !pin.workingDirectory.empty() ||
-            !EqualInsensitive(NormalizedTarget(pin.target), NormalizedTarget(defaults[index]))) {
-            return false;
-        }
-    }
-    return true;
+bool SamePins(const std::vector<PinnedApp>& left, const std::vector<PinnedApp>& right) {
+    return left.size() == right.size() &&
+        std::equal(left.begin(), left.end(), right.begin(), [](const PinnedApp& lhs,
+            const PinnedApp& rhs) {
+            return lhs.name == rhs.name && lhs.target == rhs.target &&
+                lhs.arguments == rhs.arguments && lhs.workingDirectory == rhs.workingDirectory;
+        });
 }
 
 }  // namespace
@@ -627,11 +855,17 @@ bool IsLegacyDefaultPins(const std::vector<PinnedApp>& pins) {
 bool DockConfig::LoadOrCreate() {
     m_path = AppDataConfigPath();
     if (m_path.empty()) {
-        SetDefaults();
+        m_followsTaskbarPins = true;
+        m_pins = ImportTaskbarPins();
+        m_showDevBounds = false;
+        if (m_pins.empty()) {
+            SetDefaults();
+        }
         return false;
     }
 
-    if (GetFileAttributesW(m_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributesW(m_path.c_str()) == INVALID_FILE_ATTRIBUTES || !Load()) {
+        m_followsTaskbarPins = true;
         m_pins = ImportTaskbarPins();
         m_showDevBounds = false;
         if (m_pins.empty()) {
@@ -640,19 +874,18 @@ bool DockConfig::LoadOrCreate() {
         return Save();
     }
 
-    if (!Load()) {
-        SetDefaults();
-        return Save();
+    if (!m_followsTaskbarPins) {
+        return true;
     }
 
-    if (IsLegacyDefaultPins(m_pins)) {
-        std::vector<PinnedApp> imported = ImportTaskbarPins();
-        if (!imported.empty()) {
-            m_pins = std::move(imported);
-            return Save();
-        }
+    std::vector<PinnedApp> imported = ImportTaskbarPins();
+    if (!imported.empty() && !SamePins(m_pins, imported)) {
+        m_pins = std::move(imported);
     }
-    return true;
+
+    // Rewriting configurations that follow taskbar pins also migrates configurations created
+    // before FollowTaskbarPins existed.
+    return Save();
 }
 
 bool DockConfig::Load() {
@@ -692,7 +925,19 @@ bool DockConfig::Load() {
     }
 
     m_pins.clear();
-    m_showDevBounds = ParseBoolean(sections[L"dock"][L"showdevbounds"]);
+    m_showDevBounds = false;
+    m_followsTaskbarPins = true;
+    const auto dockSection = sections.find(L"dock");
+    if (dockSection != sections.end()) {
+        const auto showDevBounds = dockSection->second.find(L"showdevbounds");
+        if (showDevBounds != dockSection->second.end()) {
+            m_showDevBounds = ParseBoolean(showDevBounds->second);
+        }
+        const auto followTaskbarPins = dockSection->second.find(L"followtaskbarpins");
+        if (followTaskbarPins != dockSection->second.end()) {
+            m_followsTaskbarPins = ParseBoolean(followTaskbarPins->second);
+        }
+    }
 
     for (size_t index = 0; index < kMaximumPins; ++index) {
         const std::wstring sectionName = L"pin" + std::to_wstring(index);
@@ -716,9 +961,6 @@ bool DockConfig::Load() {
         m_pins.push_back(std::move(app));
     }
 
-    if (m_pins.empty()) {
-        SetDefaults();
-    }
     return true;
 }
 
@@ -731,7 +973,8 @@ bool DockConfig::Save() const {
     contents << L"; Liquid Glass Dock v1 configuration\n";
     contents << L"; UTF-8 INI. Pins are ordered left to right.\n\n";
     contents << L"[Dock]\n";
-    contents << L"ShowDevBounds=" << (m_showDevBounds ? L"1" : L"0") << L"\n\n";
+    contents << L"ShowDevBounds=" << (m_showDevBounds ? L"1" : L"0") << L"\n";
+    contents << L"FollowTaskbarPins=" << (m_followsTaskbarPins ? L"1" : L"0") << L"\n\n";
 
     for (size_t index = 0; index < m_pins.size(); ++index) {
         const PinnedApp& app = m_pins[index];
@@ -762,6 +1005,14 @@ bool DockConfig::ShowDevBounds() const noexcept {
 
 void DockConfig::SetShowDevBounds(bool enabled) noexcept {
     m_showDevBounds = enabled;
+}
+
+bool DockConfig::FollowsTaskbarPins() const noexcept {
+    return m_followsTaskbarPins;
+}
+
+void DockConfig::StopFollowingTaskbarPins() noexcept {
+    m_followsTaskbarPins = false;
 }
 
 const std::wstring& DockConfig::Path() const noexcept {
