@@ -18,7 +18,7 @@ DockApp* DockApp::s_instance = nullptr;
 
 namespace {
 
-constexpr double kShowDurationSeconds = 0.100;
+constexpr double kShowDurationSeconds = 0.050;
 constexpr double kHideDurationSeconds = 0.200;
 constexpr int kBottomHotZonePixels = 2;
 constexpr int kDragThresholdPixels = 4;
