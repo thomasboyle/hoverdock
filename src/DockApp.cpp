@@ -1,6 +1,7 @@
 #include "DockApp.h"
 
 #include <ShellScalingApi.h>
+#include <windowsx.h>
 
 #include <algorithm>
 #include <cmath>
@@ -65,7 +66,7 @@ int DockApp::Run() {
     s_instance = this;
     m_config.LoadOrCreate();
     RestoreTaskbar();
-    CreateWindow();
+    CreateOverlayWindow();
     UpdatePrimaryMonitor();
     m_windows.Refresh();
     RebuildLayout(false);
@@ -273,7 +274,7 @@ LRESULT DockApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(m_window, message, wParam, lParam);
 }
 
-void DockApp::CreateWindow() {
+void DockApp::CreateOverlayWindow() {
     const wchar_t className[] = L"LiquidGlassDockWindow";
     WNDCLASSEXW windowClass{sizeof(windowClass)};
     windowClass.lpfnWndProc = &DockApp::WindowProcedure;
@@ -503,12 +504,13 @@ void DockApp::HandleContextMenu(POINT screenPoint) {
     }
 
     bool configChanged = false;
+    bool actionSucceeded = true;
     if (command == kContextOpen && icon >= 0) {
-        m_windows.ActivateOrLaunch(m_config.Pins()[static_cast<size_t>(icon)]);
+        actionSucceeded = m_windows.ActivateOrLaunch(m_config.Pins()[static_cast<size_t>(icon)]);
     } else if (command == kContextOpenLocation && icon >= 0) {
-        m_windows.OpenLocation(m_config.Pins()[static_cast<size_t>(icon)]);
+        actionSucceeded = m_windows.OpenLocation(m_config.Pins()[static_cast<size_t>(icon)]);
     } else if (command == kContextClose && icon >= 0) {
-        m_windows.Close(m_config.Pins()[static_cast<size_t>(icon)]);
+        actionSucceeded = m_windows.Close(m_config.Pins()[static_cast<size_t>(icon)]);
     } else if (command == kContextUnpin && icon >= 0) {
         m_config.Pins().erase(m_config.Pins().begin() + icon);
         configChanged = true;
@@ -519,6 +521,9 @@ void DockApp::HandleContextMenu(POINT screenPoint) {
         configChanged = true;
     }
 
+    if (!actionSucceeded) {
+        Log(L"Dock context action did not complete.");
+    }
     if (configChanged) {
         m_config.Save();
         m_windows.Refresh();
@@ -533,7 +538,9 @@ void DockApp::ActivatePressedApp() {
         return;
     }
     m_windows.Refresh();
-    m_windows.ActivateOrLaunch(m_config.Pins()[static_cast<size_t>(m_pressedIcon)]);
+    if (!m_windows.ActivateOrLaunch(m_config.Pins()[static_cast<size_t>(m_pressedIcon)])) {
+        Log(L"Pinned application did not launch or accept focus.");
+    }
     m_lastWindowRefresh = 0.0;
     RefreshRunningWindows();
 }
