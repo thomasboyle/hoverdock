@@ -42,7 +42,7 @@ private:
     static BOOL CALLBACK FindTaskbarWindow(HWND window, LPARAM data);
 
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
-    void CreateWindow();
+    void CreateOverlayWindow();
     void RebuildLayout(bool reloadIcons);
     void LoadIconTextures();
     void UpdatePrimaryMonitor();
