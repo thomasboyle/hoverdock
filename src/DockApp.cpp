@@ -21,6 +21,7 @@ constexpr double kShowDurationSeconds = 0.100;
 constexpr double kHideDurationSeconds = 0.200;
 constexpr int kBottomHotZonePixels = 2;
 constexpr int kDragThresholdPixels = 4;
+constexpr BYTE kInputWindowAlpha = 1;
 
 std::wstring ConfigDirectory(const std::wstring& path) {
     const size_t separator = path.find_last_of(L"\\/");
@@ -144,7 +145,22 @@ LRESULT CALLBACK DockApp::WindowProcedure(HWND window, UINT message, WPARAM wPar
         app = reinterpret_cast<DockApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     }
     return app == nullptr ? DefWindowProcW(window, message, wParam, lParam)
-                          : app->HandleMessage(message, wParam, lParam);
+                          : app->HandleRendererMessage(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK DockApp::InputWindowProcedure(HWND window, UINT message, WPARAM wParam,
+    LPARAM lParam) {
+    DockApp* app = nullptr;
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        app = static_cast<DockApp*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+        app->m_inputWindow = window;
+    } else {
+        app = reinterpret_cast<DockApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    }
+    return app == nullptr ? DefWindowProcW(window, message, wParam, lParam)
+                          : app->HandleInputMessage(window, message, wParam, lParam);
 }
 
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
@@ -172,69 +188,13 @@ BOOL CALLBACK DockApp::FindTaskbarWindow(HWND window, LPARAM data) {
     return TRUE;
 }
 
-LRESULT DockApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
+LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_NCHITTEST:
-        return m_visibility == VisibilityState::Hidden ? HTTRANSPARENT : HTCLIENT;
+        return HTTRANSPARENT;
 
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
-
-    case WM_SETCURSOR:
-        if (m_visibility != VisibilityState::Hidden) {
-            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-            return TRUE;
-        }
-        break;
-
-    case WM_LBUTTONDOWN: {
-        const POINT point = ScreenPointFromClient(m_window, lParam);
-        m_pressedIcon = IconAtScreenPoint(point);
-        if (m_pressedIcon >= 0) {
-            m_pressedAt = point;
-            SetCapture(m_window);
-        }
-        return 0;
-    }
-
-    case WM_MOUSEMOVE: {
-        const POINT point = ScreenPointFromClient(m_window, lParam);
-        HandlePointer(point);
-        if (m_pressedIcon >= 0 && IsPersistentDisplayIcon(m_pressedIcon) &&
-            (std::abs(point.x - m_pressedAt.x) >= kDragThresholdPixels ||
-                std::abs(point.y - m_pressedAt.y) >= kDragThresholdPixels)) {
-            m_draggedIcon = m_pressedIcon;
-            m_dragInsertion = InsertionIndexFor(point);
-            if (m_rendererInitialized) {
-                RenderFrame();
-            }
-        }
-        return 0;
-    }
-
-    case WM_LBUTTONUP:
-        if (GetCapture() == m_window) {
-            ReleaseCapture();
-        }
-        if (m_draggedIcon >= 0) {
-            CompleteDrag();
-        } else {
-            ActivatePressedApp();
-        }
-        m_pressedIcon = -1;
-        m_draggedIcon = -1;
-        m_dragInsertion = -1;
-        return 0;
-
-    case WM_CAPTURECHANGED:
-        m_pressedIcon = -1;
-        m_draggedIcon = -1;
-        m_dragInsertion = -1;
-        return 0;
-
-    case WM_RBUTTONUP:
-        HandleContextMenu(ScreenPointFromClient(m_window, lParam));
-        return 0;
 
     case WM_DPICHANGED:
     case WM_DISPLAYCHANGE:
@@ -276,35 +236,173 @@ LRESULT DockApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_CLOSE:
-        DestroyWindow(m_window);
+        if (DestroyWindow(window) == FALSE) {
+            Log(L"Could not destroy the renderer window.");
+        }
         return 0;
 
     case WM_DESTROY:
+        if (m_inputWindow != nullptr && DestroyWindow(m_inputWindow) == FALSE) {
+            Log(L"Could not destroy the dock input window.");
+        }
+        m_inputWindow = nullptr;
         PostQuitMessage(0);
         return 0;
 
     default:
         break;
     }
-    return DefWindowProcW(m_window, message, wParam, lParam);
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_NCHITTEST:
+        return m_visibility == VisibilityState::Hidden ? HTTRANSPARENT : HTCLIENT;
+
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_SETCURSOR:
+        if (m_visibility != VisibilityState::Hidden) {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+        break;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC paintDc = BeginPaint(window, &paint);
+        if (paintDc != nullptr) {
+            EndPaint(window, &paint);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        const POINT point = ScreenPointFromClient(window, lParam);
+        m_pressedIcon = IconAtScreenPoint(point);
+        LogInputMouse(message, point, m_pressedIcon);
+        if (m_pressedIcon >= 0) {
+            m_pressedAt = point;
+            SetCapture(window);
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        const POINT point = ScreenPointFromClient(window, lParam);
+        HandlePointer(point);
+        if (m_pressedIcon >= 0 && IsPersistentDisplayIcon(m_pressedIcon) &&
+            (std::abs(point.x - m_pressedAt.x) >= kDragThresholdPixels ||
+                std::abs(point.y - m_pressedAt.y) >= kDragThresholdPixels)) {
+            m_draggedIcon = m_pressedIcon;
+            m_dragInsertion = InsertionIndexFor(point);
+            if (m_rendererInitialized) {
+                RenderFrame();
+            }
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        const POINT point = ScreenPointFromClient(window, lParam);
+        LogInputMouse(message, point, IconAtScreenPoint(point));
+        if (m_draggedIcon >= 0) {
+            CompleteDrag();
+        } else {
+            ActivatePressedApp();
+        }
+        if (GetCapture() == window) {
+            ReleaseCapture();
+        }
+        m_pressedIcon = -1;
+        m_draggedIcon = -1;
+        m_dragInsertion = -1;
+        return 0;
+    }
+
+    case WM_CAPTURECHANGED:
+        m_pressedIcon = -1;
+        m_draggedIcon = -1;
+        m_dragInsertion = -1;
+        return 0;
+
+    case WM_RBUTTONUP: {
+        const POINT point = ScreenPointFromClient(window, lParam);
+        LogInputMouse(message, point, IconAtScreenPoint(point));
+        HandleContextMenu(point);
+        return 0;
+    }
+
+    case WM_DPICHANGED:
+        RebuildLayout(false);
+        return 0;
+
+    case WM_CLOSE:
+        if (DestroyWindow(m_window) == FALSE) {
+            Log(L"Could not destroy the renderer window from the input window.");
+        }
+        return 0;
+
+    case WM_DESTROY:
+        if (m_inputWindow == window) {
+            m_inputWindow = nullptr;
+        }
+        return 0;
+
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
 }
 
 void DockApp::CreateOverlayWindow() {
-    const wchar_t className[] = L"LiquidGlassDockWindow";
-    WNDCLASSEXW windowClass{sizeof(windowClass)};
-    windowClass.lpfnWndProc = &DockApp::WindowProcedure;
-    windowClass.hInstance = m_instance;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.lpszClassName = className;
-    windowClass.style = CS_HREDRAW | CS_VREDRAW;
-    RegisterClassExW(&windowClass);
+    const wchar_t rendererClassName[] = L"LiquidGlassDockWindow";
+    WNDCLASSEXW rendererClass{sizeof(rendererClass)};
+    rendererClass.lpfnWndProc = &DockApp::WindowProcedure;
+    rendererClass.hInstance = m_instance;
+    rendererClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    rendererClass.lpszClassName = rendererClassName;
+    rendererClass.style = CS_HREDRAW | CS_VREDRAW;
+    if (RegisterClassExW(&rendererClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        throw std::runtime_error("Register renderer window class failed.");
+    }
+
+    const wchar_t inputClassName[] = L"LiquidGlassDockInputWindow";
+    WNDCLASSEXW inputClass{sizeof(inputClass)};
+    inputClass.lpfnWndProc = &DockApp::InputWindowProcedure;
+    inputClass.hInstance = m_instance;
+    inputClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    inputClass.lpszClassName = inputClassName;
+    inputClass.style = CS_HREDRAW | CS_VREDRAW;
+    if (RegisterClassExW(&inputClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        throw std::runtime_error("Register dock input window class failed.");
+    }
 
     constexpr DWORD style = WS_POPUP;
-    constexpr DWORD extendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
-    m_window = CreateWindowExW(extendedStyle, className, L"Liquid Glass Dock", style, 0, 0, 1, 1,
-        nullptr, nullptr, m_instance, this);
+    constexpr DWORD rendererExtendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+    m_window = CreateWindowExW(rendererExtendedStyle, rendererClassName, L"Liquid Glass Dock", style,
+        0, 0, 1, 1, nullptr, nullptr, m_instance, this);
     if (m_window == nullptr) {
-        throw std::runtime_error("CreateWindowExW failed.");
+        throw std::runtime_error("Create renderer window failed.");
+    }
+
+    constexpr DWORD inputExtendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+    m_inputWindow = CreateWindowExW(inputExtendedStyle, inputClassName, L"", style, 0, 0, 1, 1,
+        nullptr, nullptr, m_instance, this);
+    if (m_inputWindow == nullptr) {
+        DestroyWindow(m_window);
+        throw std::runtime_error("Create dock input window failed.");
+    }
+    if (SetLayeredWindowAttributes(m_inputWindow, 0, kInputWindowAlpha, LWA_ALPHA) == FALSE) {
+        DestroyWindow(m_inputWindow);
+        m_inputWindow = nullptr;
+        DestroyWindow(m_window);
+        throw std::runtime_error("Set dock input window alpha failed.");
     }
 }
 
@@ -341,13 +439,44 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         m_iconRenderData.push_back(data);
     }
 
-    SetWindowPos(m_window, HWND_TOPMOST, m_windowX, m_currentY, static_cast<int>(m_dockWidth),
-        static_cast<int>(m_dockHeight), SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    UpdateInputRegion();
+    PositionOverlayWindows();
     if (m_rendererInitialized) {
         m_renderer.Resize(m_dockWidth, m_dockHeight);
     }
     if (reloadIcons && m_rendererInitialized) {
         LoadIconTextures();
+    }
+}
+
+void DockApp::UpdateInputRegion() {
+    if (m_inputWindow == nullptr) {
+        return;
+    }
+
+    const LONG radius = std::max(2L, std::lround(static_cast<float>(m_dockHeight) * 0.47F));
+    HRGN region = CreateRoundRectRgn(0, 0, static_cast<int>(m_dockWidth) + 1,
+        static_cast<int>(m_dockHeight) + 1, static_cast<int>(radius * 2),
+        static_cast<int>(radius * 2));
+    if (region == nullptr) {
+        Log(L"Could not create the dock input region.");
+        return;
+    }
+    if (SetWindowRgn(m_inputWindow, region, FALSE) == 0) {
+        DeleteObject(region);
+        Log(L"Could not apply the dock input region.");
+    }
+}
+
+void DockApp::PositionOverlayWindows() {
+    const UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    if (SetWindowPos(m_window, HWND_TOPMOST, m_windowX, m_currentY,
+            static_cast<int>(m_dockWidth), static_cast<int>(m_dockHeight), flags) == FALSE) {
+        Log(L"Could not position the renderer window.");
+    }
+    if (m_inputWindow != nullptr && SetWindowPos(m_inputWindow, m_window, m_windowX, m_currentY,
+            static_cast<int>(m_dockWidth), static_cast<int>(m_dockHeight), flags) == FALSE) {
+        Log(L"Could not position the dock input window.");
     }
 }
 
@@ -374,10 +503,22 @@ void DockApp::BeginShow() {
         return;
     }
 
+    const bool wasHidden = m_visibility == VisibilityState::Hidden;
     RefreshRunningWindows(true);
     RebuildLayout(false);
-    ShowWindow(m_window, SW_SHOWNOACTIVATE);
+    if (wasHidden) {
+        const RECT captureBounds{m_windowX, m_visibleY,
+            m_windowX + static_cast<LONG>(m_dockWidth),
+            m_visibleY + static_cast<LONG>(m_dockHeight)};
+        if (!m_renderer.CaptureBackdrop(captureBounds)) {
+            Log(L"Desktop backdrop capture failed; retaining the prior safe backdrop.");
+        }
+    }
+
     m_visibility = VisibilityState::Showing;
+    ShowWindow(m_window, SW_SHOWNOACTIVATE);
+    ShowWindow(m_inputWindow, SW_SHOWNOACTIVATE);
+    PositionOverlayWindows();
     m_animationFromY = m_currentY;
     m_animationToY = m_visibleY;
     m_animationStartedAt = QpcSeconds();
@@ -388,7 +529,7 @@ void DockApp::BeginHide() {
         return;
     }
 
-    if (GetCapture() == m_window) {
+    if (GetCapture() == m_inputWindow) {
         ReleaseCapture();
     }
     m_pressedIcon = -1;
@@ -408,8 +549,7 @@ void DockApp::AdvanceAnimation() {
     const double eased = linear * linear * (3.0 - 2.0 * linear);
     m_currentY = std::lround(static_cast<double>(m_animationFromY) +
         static_cast<double>(m_animationToY - m_animationFromY) * eased);
-    SetWindowPos(m_window, HWND_TOPMOST, m_windowX, m_currentY, static_cast<int>(m_dockWidth),
-        static_cast<int>(m_dockHeight), SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSIZE);
+    PositionOverlayWindows();
     RenderFrame();
 
     if (linear < 1.0) {
@@ -424,6 +564,7 @@ void DockApp::AdvanceAnimation() {
 
     m_visibility = VisibilityState::Hidden;
     m_currentY = m_hiddenY;
+    ShowWindow(m_inputWindow, SW_HIDE);
     ShowWindow(m_window, SW_HIDE);
 }
 
@@ -441,7 +582,7 @@ void DockApp::RenderFrame() {
     DockRenderState state;
     state.width = m_dockWidth;
     state.height = m_dockHeight;
-    state.glassAlpha = 0.90F;
+    state.glassAlpha = 0.60F;
     state.slideProgress = m_dockHeight == 0 ? 0.0F :
         static_cast<float>(m_visibleY - m_currentY) / static_cast<float>(m_dockHeight);
     state.timeSeconds = static_cast<float>(QpcSeconds());
@@ -508,8 +649,9 @@ void DockApp::HandleContextMenu(POINT screenPoint) {
     AppendMenuW(menu, MF_STRING, kContextToggleBounds,
         m_config.ShowDevBounds() ? L"Hide developer bounds" : L"Show developer bounds");
 
+    const HWND menuOwner = m_inputWindow == nullptr ? m_window : m_inputWindow;
     const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-        screenPoint.x, screenPoint.y, m_window, nullptr);
+        screenPoint.x, screenPoint.y, menuOwner, nullptr);
     DestroyMenu(menu);
 
     if (command == 0) {
@@ -635,6 +777,8 @@ bool DockApp::RebuildDisplayApps() {
         displayApps.push_back({pin, m_windows.FindWindowFor(pin), static_cast<int>(index)});
     }
 
+    std::vector<std::wstring> displayedUnpinnedTargets;
+    displayedUnpinnedTargets.reserve(m_windows.RunningWindows().size());
     for (const RunningWindow& window : m_windows.RunningWindows()) {
         const bool isPinned = std::ranges::any_of(m_config.Pins(), [&window](const PinnedApp& pin) {
             return WindowCatalog::TargetsMatch(pin.target, window.executablePath);
@@ -642,6 +786,15 @@ bool DockApp::RebuildDisplayApps() {
         if (isPinned) {
             continue;
         }
+
+        const bool alreadyDisplayed = std::ranges::any_of(displayedUnpinnedTargets,
+            [&window](const std::wstring& target) {
+                return WindowCatalog::TargetsMatch(target, window.executablePath);
+            });
+        if (alreadyDisplayed) {
+            continue;
+        }
+        displayedUnpinnedTargets.push_back(window.executablePath);
 
         PinnedApp app;
         app.name = window.title.empty() ? DisplayNameFromExecutable(window.executablePath) : window.title;
@@ -679,6 +832,25 @@ void DockApp::RestoreTaskbar() {
         Log(L"Native taskbar restored.");
     }
     m_taskbarHidden = false;
+}
+
+void DockApp::LogInputMouse(UINT message, POINT screenPoint, int icon) const {
+    std::wstring event;
+    switch (message) {
+    case WM_LBUTTONDOWN:
+        event = L"WM_LBUTTONDOWN";
+        break;
+    case WM_LBUTTONUP:
+        event = L"WM_LBUTTONUP";
+        break;
+    case WM_RBUTTONUP:
+        event = L"WM_RBUTTONUP";
+        break;
+    default:
+        return;
+    }
+    Log(L"Input " + event + L" at (" + std::to_wstring(screenPoint.x) + L", " +
+        std::to_wstring(screenPoint.y) + L"), icon " + std::to_wstring(icon));
 }
 
 void DockApp::Log(const std::wstring& message) const {
