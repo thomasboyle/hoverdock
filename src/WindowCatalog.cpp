@@ -21,11 +21,32 @@ std::wstring FileNameWithoutExtension(const std::wstring& path) {
     return file.stem().wstring();
 }
 
+bool ActivateWindow(HWND window) {
+    if (IsIconic(window) != FALSE) {
+        ShowWindowAsync(window, SW_RESTORE);
+    }
+    BringWindowToTop(window);
+    if (SetForegroundWindow(window) != FALSE) {
+        return true;
+    }
+
+    FLASHWINFO flash{sizeof(flash)};
+    flash.hwnd = window;
+    flash.dwFlags = FLASHW_TRAY;
+    flash.uCount = 3;
+    FlashWindowEx(&flash);
+    return false;
+}
+
 }  // namespace
 
 void WindowCatalog::Refresh() {
     m_windows.clear();
     EnumWindows(&WindowCatalog::EnumerateWindows, reinterpret_cast<LPARAM>(this));
+}
+
+const std::vector<RunningWindow>& WindowCatalog::RunningWindows() const noexcept {
+    return m_windows;
 }
 
 bool WindowCatalog::IsRunning(const PinnedApp& app) const {
@@ -37,31 +58,21 @@ HWND WindowCatalog::FindWindowFor(const PinnedApp& app) const {
         return nullptr;
     }
 
-    const std::wstring target = NormalizedPath(app.target);
     for (const RunningWindow& window : m_windows) {
-        if (EqualInsensitive(target, NormalizedPath(window.executablePath))) {
+        if (TargetsMatch(app.target, window.executablePath)) {
             return window.handle;
         }
     }
     return nullptr;
 }
 
-bool WindowCatalog::ActivateOrLaunch(const PinnedApp& app) const {
-    if (const HWND window = FindWindowFor(app)) {
-        if (IsIconic(window) != FALSE) {
-            ShowWindowAsync(window, SW_RESTORE);
-        }
-        BringWindowToTop(window);
-        if (SetForegroundWindow(window) != FALSE) {
-            return true;
-        }
-
-        FLASHWINFO flash{sizeof(flash)};
-        flash.hwnd = window;
-        flash.dwFlags = FLASHW_TRAY;
-        flash.uCount = 3;
-        FlashWindowEx(&flash);
-        return false;
+bool WindowCatalog::ActivateOrLaunch(const PinnedApp& app, HWND preferredWindow) const {
+    HWND window = preferredWindow;
+    if (window == nullptr || IsWindow(window) == FALSE) {
+        window = FindWindowFor(app);
+    }
+    if (window != nullptr) {
+        return ActivateWindow(window);
     }
 
     SHELLEXECUTEINFOW launch{sizeof(launch)};
@@ -74,8 +85,11 @@ bool WindowCatalog::ActivateOrLaunch(const PinnedApp& app) const {
     return ShellExecuteExW(&launch) != FALSE;
 }
 
-bool WindowCatalog::Close(const PinnedApp& app) const {
-    const HWND window = FindWindowFor(app);
+bool WindowCatalog::Close(const PinnedApp& app, HWND preferredWindow) const {
+    HWND window = preferredWindow;
+    if (window == nullptr || IsWindow(window) == FALSE) {
+        window = FindWindowFor(app);
+    }
     return window != nullptr && PostMessageW(window, WM_CLOSE, 0, 0) != FALSE;
 }
 
@@ -100,9 +114,8 @@ bool WindowCatalog::AddForegroundApplication(std::vector<PinnedApp>& pins) const
         return false;
     }
 
-    const std::wstring normalized = NormalizedPath(path);
-    const bool alreadyPinned = std::ranges::any_of(pins, [&normalized](const PinnedApp& app) {
-        return EqualInsensitive(WindowCatalog::NormalizedPath(app.target), normalized);
+    const bool alreadyPinned = std::ranges::any_of(pins, [&path](const PinnedApp& app) {
+        return WindowCatalog::TargetsMatch(app.target, path);
     });
     if (alreadyPinned) {
         return false;
@@ -116,6 +129,10 @@ bool WindowCatalog::AddForegroundApplication(std::vector<PinnedApp>& pins) const
     }
     pins.push_back(std::move(app));
     return true;
+}
+
+bool WindowCatalog::TargetsMatch(const std::wstring& left, const std::wstring& right) {
+    return EqualInsensitive(NormalizedPath(left), NormalizedPath(right));
 }
 
 BOOL CALLBACK WindowCatalog::EnumerateWindows(HWND window, LPARAM data) {

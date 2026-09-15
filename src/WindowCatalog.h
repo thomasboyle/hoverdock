@@ -16,12 +16,14 @@ struct RunningWindow {
 class WindowCatalog {
 public:
     void Refresh();
+    [[nodiscard]] const std::vector<RunningWindow>& RunningWindows() const noexcept;
     [[nodiscard]] bool IsRunning(const PinnedApp& app) const;
     [[nodiscard]] HWND FindWindowFor(const PinnedApp& app) const;
-    [[nodiscard]] bool ActivateOrLaunch(const PinnedApp& app) const;
-    [[nodiscard]] bool Close(const PinnedApp& app) const;
+    [[nodiscard]] bool ActivateOrLaunch(const PinnedApp& app, HWND preferredWindow = nullptr) const;
+    [[nodiscard]] bool Close(const PinnedApp& app, HWND preferredWindow = nullptr) const;
     [[nodiscard]] bool OpenLocation(const PinnedApp& app) const;
     [[nodiscard]] bool AddForegroundApplication(std::vector<PinnedApp>& pins) const;
+    [[nodiscard]] static bool TargetsMatch(const std::wstring& left, const std::wstring& right);
 
 private:
     static BOOL CALLBACK EnumerateWindows(HWND window, LPARAM data);

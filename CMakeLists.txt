@@ -59,6 +59,7 @@ target_link_libraries(Dock PRIVATE
     shcore
     shell32
     ole32
+    advapi32
     windowscodecs
 )
 

@@ -1,18 +1,46 @@
 #include "DockConfig.h"
 
 #include <Windows.h>
+#include <ShObjIdl.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include <cwctype>
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace {
 
 constexpr wchar_t kConfigDirectoryName[] = L"LiquidGlassDock";
 constexpr wchar_t kConfigFileName[] = L"dock.ini";
-constexpr size_t kMaximumPins = 16;
+constexpr size_t kMaximumPins = 32;
+constexpr size_t kMaximumPathLength = 32768;
+
+class ComApartment {
+public:
+    ComApartment()
+        : m_result(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)) {
+    }
+
+    ~ComApartment() {
+        if (SUCCEEDED(m_result)) {
+            CoUninitialize();
+        }
+    }
+
+    [[nodiscard]] bool CanUseShellLinks() const noexcept {
+        return SUCCEEDED(m_result) || m_result == RPC_E_CHANGED_MODE;
+    }
+
+private:
+    HRESULT m_result = E_FAIL;
+};
 
 std::wstring Trim(std::wstring value) {
     const auto first = std::find_if_not(value.begin(), value.end(), [](wchar_t value) {
@@ -29,6 +57,18 @@ std::wstring ToLower(std::wstring value) {
         return static_cast<wchar_t>(std::towlower(character));
     });
     return value;
+}
+
+bool EqualInsensitive(std::wstring_view left, std::wstring_view right) {
+    return left.size() == right.size() &&
+        std::equal(left.begin(), left.end(), right.begin(), [](wchar_t lhs, wchar_t rhs) {
+            return std::towlower(lhs) == std::towlower(rhs);
+        });
+}
+
+bool EndsWithInsensitive(std::wstring_view value, std::wstring_view suffix) {
+    return value.size() >= suffix.size() &&
+        EqualInsensitive(value.substr(value.size() - suffix.size()), suffix);
 }
 
 std::wstring Utf8ToWide(const std::string& text) {
@@ -65,14 +105,28 @@ std::string WideToUtf8(const std::wstring& text) {
     return result;
 }
 
-std::wstring AppDataConfigPath() {
-    wchar_t appData[MAX_PATH]{};
-    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", appData, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
+std::wstring EnvironmentVariable(const wchar_t* name) {
+    const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (required <= 1) {
         return {};
     }
 
-    std::wstring directory = std::wstring(appData) + L"\\" + kConfigDirectoryName;
+    std::wstring value(static_cast<size_t>(required), L'\0');
+    const DWORD copied = GetEnvironmentVariableW(name, value.data(), required);
+    if (copied == 0 || copied >= required) {
+        return {};
+    }
+    value.resize(copied);
+    return value;
+}
+
+std::wstring AppDataConfigPath() {
+    const std::wstring appData = EnvironmentVariable(L"LOCALAPPDATA");
+    if (appData.empty()) {
+        return {};
+    }
+
+    const std::wstring directory = appData + L"\\" + kConfigDirectoryName;
     CreateDirectoryW(directory.c_str(), nullptr);
     return directory + L"\\" + kConfigFileName;
 }
@@ -98,6 +152,274 @@ std::wstring ExpandTarget(const std::wstring& target) {
     return expanded;
 }
 
+std::wstring NormalizedTarget(const std::wstring& target) {
+    std::wstring normalized = ExpandTarget(target);
+    if (normalized.empty() || normalized.rfind(L"shell:", 0) == 0) {
+        return ToLower(std::move(normalized));
+    }
+
+    std::array<wchar_t, kMaximumPathLength> fullPath{};
+    const DWORD length = GetFullPathNameW(normalized.c_str(), static_cast<DWORD>(fullPath.size()),
+        fullPath.data(), nullptr);
+    if (length != 0 && length < fullPath.size()) {
+        normalized.assign(fullPath.data(), length);
+    }
+    return ToLower(std::move(normalized));
+}
+
+std::wstring FileNameWithoutExtension(const std::wstring& path) {
+    const size_t fileStart = path.find_last_of(L"\\/") + 1;
+    const size_t extension = path.find_last_of(L'.');
+    const size_t fileEnd = extension == std::wstring::npos || extension < fileStart
+        ? path.size()
+        : extension;
+    return path.substr(fileStart, fileEnd - fileStart);
+}
+
+void AppendUniquePin(std::vector<PinnedApp>& pins, PinnedApp app) {
+    app.target = ExpandTarget(app.target);
+    if (app.target.empty() || pins.size() >= kMaximumPins) {
+        return;
+    }
+
+    const std::wstring normalized = NormalizedTarget(app.target);
+    const bool duplicate = std::ranges::any_of(pins, [&normalized](const PinnedApp& existing) {
+        return EqualInsensitive(NormalizedTarget(existing.target), normalized);
+    });
+    if (duplicate) {
+        return;
+    }
+
+    if (app.name.empty()) {
+        app.name = FileNameWithoutExtension(app.target);
+    }
+    pins.push_back(std::move(app));
+}
+
+using ShellLinkTextMethod = HRESULT(STDMETHODCALLTYPE IShellLinkW::*)(LPWSTR, int);
+
+std::wstring ShellLinkText(IShellLinkW* link, ShellLinkTextMethod method) {
+    std::array<wchar_t, kMaximumPathLength> text{};
+    if (FAILED((link->*method)(text.data(), static_cast<int>(text.size())))) {
+        return {};
+    }
+    return text.data();
+}
+
+bool ResolveShortcut(const std::wstring& shortcut, PinnedApp& app) {
+    IShellLinkW* link = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&link)))) {
+        return false;
+    }
+
+    IPersistFile* persist = nullptr;
+    const HRESULT persistResult = link->QueryInterface(IID_PPV_ARGS(&persist));
+    if (FAILED(persistResult)) {
+        link->Release();
+        return false;
+    }
+
+    const bool loaded = SUCCEEDED(persist->Load(shortcut.c_str(), STGM_READ));
+    persist->Release();
+    if (!loaded) {
+        link->Release();
+        return false;
+    }
+
+    link->Resolve(nullptr, SLR_NO_UI | SLR_NOSEARCH | SLR_NOTRACK);
+    std::array<wchar_t, kMaximumPathLength> target{};
+    WIN32_FIND_DATAW findData{};
+    const bool hasTarget = SUCCEEDED(link->GetPath(target.data(), static_cast<int>(target.size()),
+        &findData, SLGP_RAWPATH));
+    const std::wstring arguments = ShellLinkText(link, &IShellLinkW::GetArguments);
+    const std::wstring workingDirectory = ShellLinkText(link, &IShellLinkW::GetWorkingDirectory);
+    const std::wstring description = ShellLinkText(link, &IShellLinkW::GetDescription);
+    link->Release();
+
+    if (!hasTarget || target.front() == L'\0') {
+        return false;
+    }
+
+    app.target = target.data();
+    app.arguments = arguments;
+    app.workingDirectory = workingDirectory;
+    app.name = description.empty() ? FileNameWithoutExtension(shortcut) : description;
+    if (app.name.empty()) {
+        app.name = FileNameWithoutExtension(app.target);
+    }
+    return true;
+}
+
+bool IsExistingFile(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+void ImportShortcutFolder(std::vector<PinnedApp>& pins, bool canResolveShellLinks) {
+    if (!canResolveShellLinks) {
+        return;
+    }
+
+    const std::wstring appData = EnvironmentVariable(L"APPDATA");
+    if (appData.empty()) {
+        return;
+    }
+
+    const std::wstring folder = appData +
+        L"\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar";
+    WIN32_FIND_DATAW entry{};
+    const HANDLE search = FindFirstFileW((folder + L"\\*.lnk").c_str(), &entry);
+    if (search == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            continue;
+        }
+
+        PinnedApp app;
+        if (ResolveShortcut(folder + L"\\" + entry.cFileName, app)) {
+            AppendUniquePin(pins, std::move(app));
+        }
+    } while (FindNextFileW(search, &entry) != FALSE);
+    FindClose(search);
+}
+
+std::vector<BYTE> ReadTaskbandValue(HKEY taskband, const wchar_t* name) {
+    DWORD type = 0;
+    DWORD byteCount = 0;
+    if (RegQueryValueExW(taskband, name, nullptr, &type, nullptr, &byteCount) != ERROR_SUCCESS ||
+        type != REG_BINARY || byteCount == 0) {
+        return {};
+    }
+
+    std::vector<BYTE> value(byteCount);
+    if (RegQueryValueExW(taskband, name, nullptr, &type, value.data(), &byteCount) != ERROR_SUCCESS ||
+        type != REG_BINARY) {
+        return {};
+    }
+    value.resize(byteCount);
+    return value;
+}
+
+bool IsPathSeparator(wchar_t character) {
+    return character == L'\\' || character == L'/';
+}
+
+bool IsTaskbandPathStart(const std::wstring& text, size_t index) {
+    if (index + 2 < text.size() && std::iswalpha(text[index]) != 0 && text[index + 1] == L':' &&
+        IsPathSeparator(text[index + 2])) {
+        return true;
+    }
+    if (index + 1 < text.size() && text[index] == L'\\' && text[index + 1] == L'\\') {
+        return true;
+    }
+    if (text[index] != L'%') {
+        return false;
+    }
+
+    const size_t variableEnd = text.find(L'%', index + 1);
+    return variableEnd != std::wstring::npos && variableEnd + 1 < text.size() &&
+        IsPathSeparator(text[variableEnd + 1]);
+}
+
+bool HasExtensionAt(const std::wstring& text, size_t offset, std::wstring_view extension) {
+    return offset + extension.size() <= text.size() &&
+        EqualInsensitive(std::wstring_view(text).substr(offset, extension.size()), extension);
+}
+
+void ExtractPathsFromText(const std::wstring& text, std::vector<std::wstring>& paths) {
+    for (size_t start = 0; start < text.size(); ++start) {
+        if (!IsTaskbandPathStart(text, start)) {
+            continue;
+        }
+
+        for (size_t extension = start; extension < text.size(); ++extension) {
+            const bool lnk = HasExtensionAt(text, extension, L".lnk");
+            const bool executable = HasExtensionAt(text, extension, L".exe");
+            if (!lnk && !executable) {
+                continue;
+            }
+
+            const size_t end = extension + 4;
+            if (end < text.size() && IsPathSeparator(text[end])) {
+                continue;
+            }
+            paths.push_back(text.substr(start, end - start));
+            start = end - 1;
+            break;
+        }
+    }
+}
+
+std::vector<std::wstring> ExtractTaskbandPaths(const std::vector<BYTE>& value) {
+    std::vector<std::wstring> paths;
+    for (size_t alignment = 0; alignment < 2; ++alignment) {
+        std::wstring text;
+        for (size_t offset = alignment; offset + sizeof(uint16_t) <= value.size();
+             offset += sizeof(uint16_t)) {
+            uint16_t codeUnit = 0;
+            std::memcpy(&codeUnit, value.data() + offset, sizeof(codeUnit));
+            if (codeUnit >= 0x20U && codeUnit != 0xfffeU && codeUnit != 0xffffU) {
+                text.push_back(static_cast<wchar_t>(codeUnit));
+                if (text.size() == kMaximumPathLength) {
+                    ExtractPathsFromText(text, paths);
+                    text.clear();
+                }
+            } else if (!text.empty()) {
+                ExtractPathsFromText(text, paths);
+                text.clear();
+            }
+        }
+        ExtractPathsFromText(text, paths);
+    }
+    return paths;
+}
+
+void ImportTaskbandPath(std::vector<PinnedApp>& pins, const std::wstring& candidate,
+    bool canResolveShellLinks) {
+    const std::wstring path = ExpandTarget(candidate);
+    if (EndsWithInsensitive(path, L".lnk")) {
+        PinnedApp app;
+        if (canResolveShellLinks && IsExistingFile(path) && ResolveShortcut(path, app)) {
+            AppendUniquePin(pins, std::move(app));
+        }
+        return;
+    }
+
+    if (EndsWithInsensitive(path, L".exe") && IsExistingFile(path)) {
+        AppendUniquePin(pins, {FileNameWithoutExtension(path), path, L"", L""});
+    }
+}
+
+void ImportTaskbandValues(std::vector<PinnedApp>& pins, bool canResolveShellLinks) {
+    HKEY taskband = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Taskband", 0,
+            KEY_QUERY_VALUE, &taskband) != ERROR_SUCCESS) {
+        return;
+    }
+
+    constexpr std::array valueNames = {L"Favorites", L"FavoritesResolve"};
+    for (const wchar_t* name : valueNames) {
+        for (const std::wstring& path : ExtractTaskbandPaths(ReadTaskbandValue(taskband, name))) {
+            ImportTaskbandPath(pins, path, canResolveShellLinks);
+        }
+    }
+    RegCloseKey(taskband);
+}
+
+std::vector<PinnedApp> ImportTaskbarPins() {
+    std::vector<PinnedApp> pins;
+    ComApartment apartment;
+    const bool canResolveShellLinks = apartment.CanUseShellLinks();
+    ImportShortcutFolder(pins, canResolveShellLinks);
+    ImportTaskbandValues(pins, canResolveShellLinks);
+    return pins;
+}
+
 }  // namespace
 
 bool DockConfig::LoadOrCreate() {
@@ -108,7 +430,11 @@ bool DockConfig::LoadOrCreate() {
     }
 
     if (GetFileAttributesW(m_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        SetDefaults();
+        m_pins = ImportTaskbarPins();
+        m_showDevBounds = false;
+        if (m_pins.empty()) {
+            SetDefaults();
+        }
         return Save();
     }
 
