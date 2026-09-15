@@ -1171,6 +1171,28 @@ bool DockApp::RebuildDisplayApps() {
         displayApps.push_back({pin, m_windows.FindWindowFor(pin), static_cast<int>(index)});
     }
 
+    for (const DisplayApp& existing : m_displayApps) {
+        if (IsSpecialDockTarget(existing.app.target) || existing.persistentPinIndex >= 0) {
+            continue;
+        }
+        const auto matchingWindow = std::ranges::find_if(m_windows.RunningWindows(),
+            [&existing](const RunningWindow& running) {
+                return WindowCatalog::TargetsMatch(existing.app.target, running.executablePath);
+            });
+        if (matchingWindow == m_windows.RunningWindows().end()) {
+            continue;
+        }
+        const bool alreadyDisplayed = std::ranges::any_of(displayedTargets,
+            [&existing](const std::wstring& target) {
+                return WindowCatalog::TargetsMatch(target, existing.app.target);
+            });
+        if (alreadyDisplayed) {
+            continue;
+        }
+        displayedTargets.push_back(existing.app.target);
+        displayApps.push_back({existing.app, matchingWindow->handle, -1});
+    }
+
     for (const RunningWindow& window : m_windows.RunningWindows()) {
         const bool alreadyDisplayed = std::ranges::any_of(displayedTargets,
             [&window](const std::wstring& target) {
