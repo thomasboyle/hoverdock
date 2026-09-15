@@ -557,7 +557,7 @@ void DockApp::UpdateInputRegion() {
         return;
     }
 
-    const LONG radius = std::max(2L, std::lround(static_cast<float>(m_dockHeight) * 0.47F));
+    const LONG radius = (std::max)(2L, static_cast<LONG>(std::lround(static_cast<float>(m_dockHeight) * 0.47F)));
     HRGN region = CreateRoundRectRgn(0, 0, static_cast<int>(m_dockWidth) + 1,
         static_cast<int>(m_dockHeight) + 1, static_cast<int>(radius * 2),
         static_cast<int>(radius * 2));
@@ -659,14 +659,14 @@ void DockApp::UpdateHoverLabel() {
 
     const UINT dpi = GetDpiForWindow(m_window);
     const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
-    const int horizontalPadding = std::max(8, std::lround(12.0F * scale));
-    const int verticalPadding = std::max(5, std::lround(6.0F * scale));
-    const int triangleWidth = std::max(10, std::lround(12.0F * scale));
-    const int triangleHeight = std::max(6, std::lround(7.0F * scale));
-    const int cornerRadius = std::max(5, std::lround(7.0F * scale));
-    const int gap = std::max(2, std::lround(4.0F * scale));
-    const int bubbleWidth = std::max(60, textSize.cx + horizontalPadding * 2);
-    const int bubbleHeight = std::max(24, textSize.cy + verticalPadding * 2);
+    const int horizontalPadding = (std::max)(8, static_cast<int>(std::lround(12.0F * scale)));
+    const int verticalPadding = (std::max)(5, static_cast<int>(std::lround(6.0F * scale)));
+    const int triangleWidth = (std::max)(10, static_cast<int>(std::lround(12.0F * scale)));
+    const int triangleHeight = (std::max)(6, static_cast<int>(std::lround(7.0F * scale)));
+    const int cornerRadius = (std::max)(5, static_cast<int>(std::lround(7.0F * scale)));
+    const int gap = (std::max)(2, static_cast<int>(std::lround(4.0F * scale)));
+    const int bubbleWidth = (std::max)(60, textSize.cx + horizontalPadding * 2);
+    const int bubbleHeight = (std::max)(24, textSize.cy + verticalPadding * 2);
     const SIZE labelSize{bubbleWidth, bubbleHeight + triangleHeight};
 
     BITMAPV5HEADER header{};
@@ -1117,7 +1117,7 @@ void DockApp::RefreshRunningWindows(bool force) {
         return;
     }
 
-    const size_t iconCount = std::min(m_iconRenderData.size(), m_displayApps.size());
+    const size_t iconCount = (std::min)(m_iconRenderData.size(), m_displayApps.size());
     for (size_t index = 0; index < iconCount; ++index) {
         m_iconRenderData[index].running = m_displayApps[index].runningWindow != nullptr;
     }
