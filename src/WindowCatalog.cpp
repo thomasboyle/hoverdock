@@ -1,6 +1,7 @@
 #include "WindowCatalog.h"
 
 #include <Shellapi.h>
+#include <dwmapi.h>
 
 #include <algorithm>
 #include <cwctype>
@@ -19,6 +20,48 @@ bool EqualInsensitive(const std::wstring& left, const std::wstring& right) {
 std::wstring FileNameWithoutExtension(const std::wstring& path) {
     const std::filesystem::path file(path);
     return file.stem().wstring();
+}
+
+bool IsTitleWordCharacter(wchar_t character) {
+    return std::iswalnum(character) != 0 || character == L'_';
+}
+
+bool IsPictureInPictureTitle(const std::wstring& title) {
+    std::wstring lowercase(title);
+    std::transform(lowercase.begin(), lowercase.end(), lowercase.begin(), [](wchar_t character) {
+        return static_cast<wchar_t>(std::towlower(character));
+    });
+    if (lowercase.find(L"picture-in-picture") != std::wstring::npos ||
+        lowercase.find(L"picture in picture") != std::wstring::npos) {
+        return true;
+    }
+
+    size_t position = lowercase.find(L"pip");
+    while (position != std::wstring::npos) {
+        const bool startsWord = position == 0 || !IsTitleWordCharacter(lowercase[position - 1]);
+        const size_t after = position + 3;
+        const bool endsWord = after == lowercase.size() || !IsTitleWordCharacter(lowercase[after]);
+        if (startsWord && endsWord) {
+            return true;
+        }
+        position = lowercase.find(L"pip", after);
+    }
+    return false;
+}
+
+bool IsSmallAuxiliaryWindow(HWND window, LONG_PTR style, LONG_PTR extendedStyle) {
+    if ((style & WS_OVERLAPPEDWINDOW) == WS_OVERLAPPEDWINDOW ||
+        (extendedStyle & WS_EX_APPWINDOW) != 0) {
+        return false;
+    }
+
+    RECT bounds{};
+    if (GetWindowRect(window, &bounds) == FALSE) {
+        return false;
+    }
+    const LONG width = bounds.right - bounds.left;
+    const LONG height = bounds.bottom - bounds.top;
+    return width < 240 || height < 180;
 }
 
 bool ActivateWindow(HWND window) {
@@ -141,12 +184,17 @@ BOOL CALLBACK WindowCatalog::EnumerateWindows(HWND window, LPARAM data) {
         return TRUE;
     }
 
+    const std::wstring title = WindowTitle(window);
+    if (IsPictureInPictureTitle(title)) {
+        return TRUE;
+    }
+
     const std::wstring path = ExecutablePath(window);
     if (path.empty()) {
         return TRUE;
     }
 
-    catalog->m_windows.push_back({window, path, WindowTitle(window)});
+    catalog->m_windows.push_back({window, path, title});
     return TRUE;
 }
 
@@ -157,7 +205,17 @@ bool WindowCatalog::IsApplicationWindow(HWND window) {
 
     const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
     const LONG_PTR extendedStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
-    return (style & WS_CHILD) == 0 && (extendedStyle & WS_EX_TOOLWINDOW) == 0;
+    if ((style & WS_CHILD) != 0 || (extendedStyle & WS_EX_TOOLWINDOW) != 0 ||
+        (extendedStyle & WS_EX_NOACTIVATE) != 0) {
+        return false;
+    }
+
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) &&
+        cloaked != 0) {
+        return false;
+    }
+    return !IsSmallAuxiliaryWindow(window, style, extendedStyle);
 }
 
 std::wstring WindowCatalog::ExecutablePath(HWND window) {

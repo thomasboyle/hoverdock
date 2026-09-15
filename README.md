@@ -1,6 +1,6 @@
 # Liquid Glass Dock
 
-Liquid Glass Dock is a single-process native Windows desktop overlay that hides the normal taskbar and replaces it with a centered macOS Dock-style launcher. It is written in C++ and Win32 with Direct3D 12, DXGI, DirectComposition, and HLSL only. The glass is a custom D3D12 pass; it does not use Acrylic, Mica, Fluent, WebView2, or third-party libraries.
+Liquid Glass Dock is a single-process native Windows desktop overlay that hides the normal taskbar and replaces it with a centered macOS Dock-style launcher. It is written in C++ and Win32 with Direct3D 12, DXGI, DirectComposition, GDI capture, and HLSL only. The glass is a custom D3D12 pass; it does not use Acrylic, Mica, Fluent, WebView2, or third-party libraries.
 
 `Dock.exe` is the only runtime artifact. HLSL is compiled to DXIL headers at build time and embedded into the executable.
 
@@ -14,7 +14,7 @@ Liquid Glass Dock is a single-process native Windows desktop overlay that hides 
 No vcpkg, NuGet, Conan, package manager, Agility SDK, or runtime redistribution is required. This build uses inbox D3D12 and links only Windows SDK system libraries:
 
 ```text
-d3d12 dxgi dcomp dwmapi shcore shell32 ole32 advapi32 windowscodecs
+d3d12 dxgi dcomp dwmapi shcore shell32 ole32 advapi32 windowscodecs gdi32
 ```
 
 The binary probes feature levels in this exact order: 12_2, 12_1, then 12_0. It never assumes a feature level. It uses Shader Model 6.6 when the driver reports it; otherwise it uses the separately compiled SM 6.0 shaders for devices such as a GTX 1070 Ti-class GPU.
@@ -74,17 +74,17 @@ On first run, the dock imports available user taskbar pins from the Windows 10 p
 - Drag a persistent icon and release it over another slot to persist a left-to-right reorder.
 - Right-click empty glass and select **Show developer bounds** to draw the capsule edge. `F12` toggles the same option when the window has keyboard input.
 
-The dock is always on top, owns no taskbar button, never activates itself on reveal or click, uses Per-Monitor V2 DPI, and handles 100%, 125%, and 150% scaling. It is primary-monitor only in v1.
+The D3D12/DirectComposition renderer is intentionally hit-transparent. A separate titleless, topmost, 1-alpha layered input window follows the DPI-scaled capsule region, never activates the process, and receives dock clicks while it is visible. The dock is always on top, owns no taskbar button, uses Per-Monitor V2 DPI, and handles 100%, 125%, and 150% scaling. It is primary-monitor only in v1.
 
 ## Rendering and timing
 
-The overlay is a transparent DirectComposition visual backed by a D3D12 `FLIP_DISCARD` composition swap chain with three buffers and `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`. It has one D3D12 device, one DIRECT queue, reusable frame allocators and command list, persistently mapped per-frame CBVs, a persistently mapped instanced-icon buffer, and a static shader-visible SRV heap for an icon texture array. No buffer, command allocator, descriptor layout, or icon texture is allocated during the 100 ms show or 200 ms hide path. Presentation is synchronized and does not opt into tearing: tearing is not appropriate for this transparent composition overlay.
+The overlay is a transparent DirectComposition visual backed by a D3D12 `FLIP_DISCARD` composition swap chain with three buffers and `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`. It has one D3D12 device, one DIRECT queue, reusable frame allocators and command list, persistently mapped per-frame CBVs, a persistently mapped instanced-icon buffer, and a static shader-visible SRV heap for an icon texture array and desktop backdrop. No buffer, command allocator, descriptor layout, icon texture, or backdrop resource is allocated during the 100 ms show or 200 ms hide path. Presentation is synchronized and does not opt into tearing: tearing is not appropriate for this transparent composition overlay.
 
 The render loop uses `QueryPerformanceCounter` for elapsed time and the DXGI frame-latency waitable object while the state machine is animating. It presents synchronized frames and targets the display cadence, up to 120 FPS on a 120 Hz display. A literal “120 unique frames in 100 ms at 120 Hz” cannot occur: 100 ms at 120 Hz contains 12 display intervals. This implementation produces one QPC-derived unique animation sample per available presentation interval, so the show interval has up to 12 unique visible positions and the 200 ms hide interval has up to 24 on a 120 Hz panel.
 
 The capsule’s slide distance is its current DPI-scaled height plus a 10-DIP margin. Its easing is cubic smoothstep (`t²(3−2t)`) for `t = elapsed / duration`, where duration is 0.1 seconds while showing and 0.2 seconds while hiding. The window is content-sized from display item count, icon size, gaps, and horizontal padding; it is centered rather than monitor-width.
 
-The glass pass renders a fullscreen triangle into the transparent capsule and combines procedural frosted refraction approximation, distortion, rim/specular fresnel, and subtle chromatic separation. Desktop duplication is deliberately not used in v1: capturing the primary monitor while an always-on-top composition overlay is visible can feed the dock’s previous frame back into the capture, and the approximation avoids this recursive artifact while keeping the app to one device and one queue. Instanced icon quads are sampled from icon pixels obtained from Windows shell icon extraction; their plates are lit by the glass pass.
+Before each hidden-to-show transition, a preallocated GDI DIB captures the dock rectangle with `BitBlt` and `CAPTUREBLT` while both dock windows are hidden. A precreated D3D12 command allocator and command list upload that snapshot into a reusable backdrop texture. The glass shader samples the real desktop with multi-tap frosted blur, edge-normal refraction, and Fresnel/specular rim highlights at a 0.6 alpha tint; capture failure keeps the prior snapshot or a transparent fallback. This remains one D3D12 device and one DIRECT queue, with no D3D11 desktop duplication. Instanced icon quads are sampled from icon pixels obtained from Windows shell icon extraction; their plates are lit by the glass pass.
 
 The native taskbar remains part of the primary monitor’s normal work area. The dock is deliberately positioned against the physical primary-monitor bottom edge after it hides the taskbar; it does not modify the system work area or replace Explorer.
 
@@ -98,7 +98,7 @@ src/
   DockApp.*           Overlay, input, state machine, taskbar safety, UI actions
   DockConfig.*        In-tree UTF-8 INI parser, taskbar import, and writer
   WindowCatalog.*     Window enumeration, launch, focus, close, pin actions
-  Renderer.*          D3D12/DXGI/DirectComposition renderer and icon uploads
+  Renderer.*          D3D12/DXGI/DirectComposition renderer, backdrop, and icon uploads
   Shaders.hlsl        Custom liquid-glass and icon HLSL
 ```
 

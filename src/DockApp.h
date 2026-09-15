@@ -45,12 +45,17 @@ private:
     static constexpr UINT kContextToggleBounds = 7;
 
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK InputWindowProcedure(HWND window, UINT message, WPARAM wParam,
+        LPARAM lParam);
     static LRESULT CALLBACK MouseHook(int code, WPARAM wParam, LPARAM lParam);
     static BOOL CALLBACK FindTaskbarWindow(HWND window, LPARAM data);
 
-    LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT HandleRendererMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT HandleInputMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     void CreateOverlayWindow();
     void RebuildLayout(bool reloadIcons);
+    void UpdateInputRegion();
+    void PositionOverlayWindows();
     void LoadIconTextures();
     void UpdatePrimaryMonitor();
     void BeginShow();
@@ -65,6 +70,7 @@ private:
     bool RebuildDisplayApps();
     void HideTaskbar();
     void RestoreTaskbar();
+    void LogInputMouse(UINT message, POINT screenPoint, int icon) const;
     void Log(const std::wstring& message) const;
 
     [[nodiscard]] bool IsCursorInBottomHotZone(POINT cursor) const noexcept;
@@ -78,6 +84,7 @@ private:
 
     HINSTANCE m_instance = nullptr;
     HWND m_window = nullptr;
+    HWND m_inputWindow = nullptr;
     HHOOK m_mouseHook = nullptr;
     HANDLE m_singleInstanceMutex = nullptr;
     RECT m_primaryBounds{};
