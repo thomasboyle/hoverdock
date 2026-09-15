@@ -14,7 +14,7 @@ Liquid Glass Dock is a single-process native Windows desktop overlay that hides 
 No vcpkg, NuGet, Conan, package manager, Agility SDK, or runtime redistribution is required. This build uses inbox D3D12 and links only Windows SDK system libraries:
 
 ```text
-d3d12 dxgi dcomp dwmapi shcore shell32 ole32 windowscodecs
+d3d12 dxgi dcomp dwmapi shcore shell32 ole32 advapi32 windowscodecs
 ```
 
 The binary probes feature levels in this exact order: 12_2, 12_1, then 12_0. It never assumes a feature level. It uses Shader Model 6.6 when the driver reports it; otherwise it uses the separately compiled SM 6.0 shaders for devices such as a GTX 1070 Ti-class GPU.
