@@ -69,6 +69,7 @@ D3D12_RESOURCE_DESC TextureDescription(UINT width, UINT height, UINT16 arraySize
     description.MipLevels = 1;
     description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     description.SampleDesc.Count = 1;
+    description.SampleDesc.Quality = 0;
     description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     description.Flags = D3D12_RESOURCE_FLAG_NONE;
     return description;
@@ -176,6 +177,7 @@ Renderer::~Renderer() {
         Flush();
     } catch (...) {
     }
+    ReleaseBackdropResources();
     if (m_frameLatencyWaitableObject != nullptr) {
         CloseHandle(m_frameLatencyWaitableObject);
     }
@@ -193,6 +195,7 @@ void Renderer::Initialize(HWND window, UINT width, UINT height) {
     CreateFrameResources();
     CreateRootSignatureAndPipelines();
     CreateRenderTargets();
+    CreateBackdropResources();
 }
 
 void Renderer::Resize(UINT width, UINT height) {
@@ -206,6 +209,7 @@ void Renderer::Resize(UINT width, UINT height) {
     for (ComPtr<ID3D12Resource>& backBuffer : m_backBuffers) {
         backBuffer.Reset();
     }
+    ReleaseBackdropResources();
 
     const UINT flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     Check(m_swapChain->ResizeBuffers(kBufferCount, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, flags),
@@ -213,6 +217,7 @@ void Renderer::Resize(UINT width, UINT height) {
     m_width = width;
     m_height = height;
     CreateRenderTargets();
+    CreateBackdropResources();
 }
 
 void Renderer::LoadIcons(const std::vector<std::wstring>& targets) {
@@ -245,8 +250,9 @@ void Renderer::LoadIcons(const std::vector<std::wstring>& targets) {
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
     view.Texture2DArray.MipLevels = 1;
     view.Texture2DArray.ArraySize = kMaximumIcons;
-    m_device->CreateShaderResourceView(m_iconAtlas.Get(), &view,
-        m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+    D3D12_CPU_DESCRIPTOR_HANDLE iconDescriptor = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    iconDescriptor.ptr += static_cast<SIZE_T>(kIconTextureDescriptor) * m_srvDescriptorSize;
+    m_device->CreateShaderResourceView(m_iconAtlas.Get(), &view, iconDescriptor);
 
     if (targets.empty()) {
         CreateFallbackIcon(0, commandList.Get());
@@ -271,6 +277,31 @@ void Renderer::LoadIcons(const std::vector<std::wstring>& targets) {
     m_pendingUploads.clear();
 }
 
+bool Renderer::CaptureBackdrop(const RECT& screenRectangle) {
+    const LONG width = screenRectangle.right - screenRectangle.left;
+    const LONG height = screenRectangle.bottom - screenRectangle.top;
+    if (m_backdropDc == nullptr || m_backdropDibPixels == nullptr || m_backdropTexture == nullptr ||
+        width != static_cast<LONG>(m_width) || height != static_cast<LONG>(m_height)) {
+        return false;
+    }
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return false;
+    }
+
+    const BOOL copied = BitBlt(m_backdropDc, 0, 0, width, height, screen, screenRectangle.left,
+        screenRectangle.top, SRCCOPY | CAPTUREBLT);
+    const int released = ReleaseDC(nullptr, screen);
+    if (copied == FALSE || released == 0) {
+        return false;
+    }
+
+    UploadBackdropPixels();
+    m_backdropValid = true;
+    return true;
+}
+
 void Renderer::Render(const DockRenderState& state) {
     if (state.width == 0 || state.height == 0) {
         return;
@@ -290,7 +321,7 @@ void Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene1[0] = state.slideProgress;
     frame.mappedConstants->scene1[1] = static_cast<float>(GetDpiForWindow(m_window)) / 96.0F;
     frame.mappedConstants->scene1[2] = state.showDevBounds ? 1.0F : 0.0F;
-    frame.mappedConstants->scene1[3] = 0.0F;
+    frame.mappedConstants->scene1[3] = m_backdropValid ? 1.0F : 0.0F;
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -314,16 +345,16 @@ void Renderer::Render(const DockRenderState& state) {
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
     m_commandList->SetGraphicsRootConstantBufferView(0, frame.constants->GetGPUVirtualAddress());
     m_commandList->SetGraphicsRootShaderResourceView(1, frame.iconInstances->GetGPUVirtualAddress());
+    ID3D12DescriptorHeap* heaps[] = {m_srvHeap.Get()};
+    m_commandList->SetDescriptorHeaps(1, heaps);
+    m_commandList->SetGraphicsRootDescriptorTable(2,
+        m_srvHeap->GetGPUDescriptorHandleForHeapStart());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     m_commandList->SetPipelineState(m_glassPipeline.Get());
     m_commandList->DrawInstanced(3, 1, 0, 0);
 
-    ID3D12DescriptorHeap* heaps[] = {m_srvHeap.Get()};
-    m_commandList->SetDescriptorHeaps(1, heaps);
     m_commandList->SetPipelineState(m_iconPipeline.Get());
-    m_commandList->SetGraphicsRootDescriptorTable(2,
-        m_srvHeap->GetGPUDescriptorHandleForHeapStart());
     const UINT iconCount = std::min(static_cast<UINT>(state.icons.size()), kMaximumIcons);
     for (UINT index = 0; index < iconCount; ++index) {
         const DockIconRenderData& icon = state.icons[index];
@@ -492,7 +523,7 @@ void Renderer::CreateFrameResources() {
 void Renderer::CreateRootSignatureAndPipelines() {
     D3D12_DESCRIPTOR_RANGE1 range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 1;
+    range.NumDescriptors = 2;
     range.BaseShaderRegister = 1;
     range.RegisterSpace = 0;
     range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
@@ -587,10 +618,11 @@ void Renderer::CreateRootSignatureAndPipelines() {
 
     D3D12_DESCRIPTOR_HEAP_DESC descriptors{};
     descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    descriptors.NumDescriptors = kMaximumIcons;
+    descriptors.NumDescriptors = 2;
     descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     Check(m_device->CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(&m_srvHeap)),
-        "Create icon descriptor heap");
+        "Create shader resource descriptor heap");
+    m_srvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(descriptors.Type);
 }
 
 void Renderer::CreateRenderTargets() {
@@ -611,6 +643,164 @@ void Renderer::CreateRenderTargets() {
         m_device->CreateRenderTargetView(m_backBuffers[index].Get(), nullptr, handle);
         handle.ptr += m_rtvDescriptorSize;
     }
+}
+
+void Renderer::CreateBackdropResources() {
+    ReleaseBackdropResources();
+
+    try {
+        HDC screen = GetDC(nullptr);
+        if (screen == nullptr) {
+            throw std::runtime_error("GetDC for desktop backdrop failed.");
+        }
+
+        m_backdropDc = CreateCompatibleDC(screen);
+        BITMAPINFO bitmapInfo{};
+        bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
+        bitmapInfo.bmiHeader.biWidth = static_cast<LONG>(m_width);
+        bitmapInfo.bmiHeader.biHeight = -static_cast<LONG>(m_height);
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        m_backdropBitmap = CreateDIBSection(screen, &bitmapInfo, DIB_RGB_COLORS, &bits, nullptr, 0);
+        const int released = ReleaseDC(nullptr, screen);
+        if (released == 0) {
+            throw std::runtime_error("ReleaseDC for desktop backdrop failed.");
+        }
+        if (m_backdropDc == nullptr || m_backdropBitmap == nullptr || bits == nullptr) {
+            throw std::runtime_error("Create desktop backdrop DIB failed.");
+        }
+
+        m_backdropDibPixels = static_cast<uint8_t*>(bits);
+        m_backdropPreviousBitmap = SelectObject(m_backdropDc, m_backdropBitmap);
+        if (m_backdropPreviousBitmap == nullptr || m_backdropPreviousBitmap == HGDI_ERROR) {
+            throw std::runtime_error("Select desktop backdrop DIB failed.");
+        }
+        std::memset(m_backdropDibPixels, 0,
+            static_cast<size_t>(m_width) * static_cast<size_t>(m_height) * 4U);
+
+        const D3D12_RESOURCE_DESC texture = TextureDescription(m_width, m_height);
+        const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+        Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &texture,
+                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_backdropTexture)),
+            "Create desktop backdrop texture");
+
+        UINT64 rowSize = 0;
+        UINT64 uploadSize = 0;
+        m_device->GetCopyableFootprints(&texture, 0, 1, 0, &m_backdropFootprint,
+            &m_backdropRowCount, &rowSize, &uploadSize);
+        const D3D12_RESOURCE_DESC upload = BufferDescription(uploadSize);
+        const D3D12_HEAP_PROPERTIES uploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        Check(m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &upload,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_backdropUpload)),
+            "Create desktop backdrop upload resource");
+        Check(m_backdropUpload->Map(0, nullptr,
+                  reinterpret_cast<void**>(&m_backdropUploadPixels)),
+            "Map desktop backdrop upload resource");
+
+        Check(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  IID_PPV_ARGS(&m_backdropCopyAllocator)),
+            "Create desktop backdrop command allocator");
+        Check(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  m_backdropCopyAllocator.Get(), nullptr,
+                  IID_PPV_ARGS(&m_backdropCopyCommandList)),
+            "Create desktop backdrop command list");
+        Check(m_backdropCopyCommandList->Close(), "Close initial desktop backdrop command list");
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE backdropDescriptor =
+            m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        backdropDescriptor.ptr += static_cast<SIZE_T>(kBackdropTextureDescriptor) *
+            m_srvDescriptorSize;
+        m_device->CreateShaderResourceView(m_backdropTexture.Get(), &view, backdropDescriptor);
+
+        UploadBackdropPixels();
+    } catch (...) {
+        ReleaseBackdropResources();
+        throw;
+    }
+}
+
+void Renderer::ReleaseBackdropResources() noexcept {
+    if (m_backdropUpload != nullptr && m_backdropUploadPixels != nullptr) {
+        m_backdropUpload->Unmap(0, nullptr);
+    }
+    m_backdropUploadPixels = nullptr;
+    m_backdropCopyCommandList.Reset();
+    m_backdropCopyAllocator.Reset();
+    m_backdropUpload.Reset();
+    m_backdropTexture.Reset();
+    m_backdropFootprint = {};
+    m_backdropRowCount = 0;
+    m_backdropInitialized = false;
+    m_backdropValid = false;
+
+    if (m_backdropDc != nullptr && m_backdropPreviousBitmap != nullptr &&
+        m_backdropPreviousBitmap != HGDI_ERROR) {
+        SelectObject(m_backdropDc, m_backdropPreviousBitmap);
+    }
+    m_backdropPreviousBitmap = nullptr;
+    if (m_backdropBitmap != nullptr) {
+        DeleteObject(m_backdropBitmap);
+    }
+    m_backdropBitmap = nullptr;
+    m_backdropDibPixels = nullptr;
+    if (m_backdropDc != nullptr) {
+        DeleteDC(m_backdropDc);
+    }
+    m_backdropDc = nullptr;
+}
+
+void Renderer::UploadBackdropPixels() {
+    const size_t rowBytes = static_cast<size_t>(m_width) * 4U;
+    for (UINT row = 0; row < m_backdropRowCount; ++row) {
+        std::memcpy(m_backdropUploadPixels + m_backdropFootprint.Offset +
+                static_cast<size_t>(row) * m_backdropFootprint.Footprint.RowPitch,
+            m_backdropDibPixels + static_cast<size_t>(row) * rowBytes, rowBytes);
+    }
+
+    Check(m_backdropCopyAllocator->Reset(), "Reset desktop backdrop command allocator");
+    Check(m_backdropCopyCommandList->Reset(m_backdropCopyAllocator.Get(), nullptr),
+        "Reset desktop backdrop command list");
+
+    if (m_backdropInitialized) {
+        D3D12_RESOURCE_BARRIER toCopy{};
+        toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy.Transition.pResource = m_backdropTexture.Get();
+        toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        m_backdropCopyCommandList->ResourceBarrier(1, &toCopy);
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = m_backdropUpload.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = m_backdropFootprint;
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = m_backdropTexture.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = 0;
+    m_backdropCopyCommandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+
+    D3D12_RESOURCE_BARRIER toShader{};
+    toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toShader.Transition.pResource = m_backdropTexture.Get();
+    toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_backdropCopyCommandList->ResourceBarrier(1, &toShader);
+
+    Check(m_backdropCopyCommandList->Close(), "Close desktop backdrop command list");
+    ID3D12CommandList* lists[] = {m_backdropCopyCommandList.Get()};
+    m_queue->ExecuteCommandLists(1, lists);
+    Flush();
+    m_backdropInitialized = true;
 }
 
 void Renderer::WaitForFrame(FrameResource& frame) {

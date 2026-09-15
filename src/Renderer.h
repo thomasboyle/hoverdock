@@ -25,7 +25,7 @@ struct DockIconRenderData {
 struct DockRenderState {
     UINT width = 1;
     UINT height = 1;
-    float glassAlpha = 0.92F;
+    float glassAlpha = 0.60F;
     float slideProgress = 0.0F;
     float timeSeconds = 0.0F;
     bool showDevBounds = false;
@@ -39,6 +39,7 @@ public:
     void Initialize(HWND window, UINT width, UINT height);
     void Resize(UINT width, UINT height);
     void LoadIcons(const std::vector<std::wstring>& targets);
+    [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle);
     void Render(const DockRenderState& state);
     void Flush();
 
@@ -49,6 +50,8 @@ public:
 private:
     static constexpr UINT kBufferCount = 3;
     static constexpr UINT kMaximumIcons = 32;
+    static constexpr UINT kIconTextureDescriptor = 0;
+    static constexpr UINT kBackdropTextureDescriptor = 1;
 
     struct alignas(256) FrameConstants {
         float scene0[4]{};
@@ -75,6 +78,9 @@ private:
     void CreateFrameResources();
     void CreateRootSignatureAndPipelines();
     void CreateRenderTargets();
+    void CreateBackdropResources();
+    void ReleaseBackdropResources() noexcept;
+    void UploadBackdropPixels();
     void WaitForFrame(FrameResource& frame);
     void UploadIcon(UINT textureIndex, const std::wstring& target,
         ID3D12GraphicsCommandList* commandList);
@@ -90,6 +96,7 @@ private:
     D3D_SHADER_MODEL m_shaderModel = D3D_SHADER_MODEL_6_0;
     UINT64 m_fenceValue = 0;
     UINT m_rtvDescriptorSize = 0;
+    UINT m_srvDescriptorSize = 0;
 
     Microsoft::WRL::ComPtr<IDXGIFactory6> m_factory;
     Microsoft::WRL::ComPtr<ID3D12Device> m_device;
@@ -108,8 +115,21 @@ private:
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kBufferCount> m_backBuffers;
     std::array<FrameResource, kBufferCount> m_frames;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_iconAtlas;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_backdropTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_backdropUpload;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_backdropCopyAllocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_backdropCopyCommandList;
     UINT m_iconCount = 0;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_pendingUploads;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_backdropFootprint{};
+    UINT m_backdropRowCount = 0;
+    uint8_t* m_backdropUploadPixels = nullptr;
+    HDC m_backdropDc = nullptr;
+    HBITMAP m_backdropBitmap = nullptr;
+    HGDIOBJ m_backdropPreviousBitmap = nullptr;
+    uint8_t* m_backdropDibPixels = nullptr;
+    bool m_backdropInitialized = false;
+    bool m_backdropValid = false;
     HANDLE m_fenceEvent = nullptr;
     HANDLE m_frameLatencyWaitableObject = nullptr;
 };

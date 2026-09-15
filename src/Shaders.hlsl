@@ -1,7 +1,7 @@
 cbuffer FrameData : register(b0)
 {
     float4 scene0; // output width, output height, glass alpha, time
-    float4 scene1; // slide progress, DPI scale, dev bounds, unused
+    float4 scene1; // slide progress, DPI scale, dev bounds, backdrop valid
 };
 
 struct IconInstance
@@ -12,6 +12,7 @@ struct IconInstance
 
 StructuredBuffer<IconInstance> iconInstances : register(t0);
 Texture2DArray iconTexture : register(t1);
+Texture2D backdropTexture : register(t2);
 SamplerState linearClamp : register(s0);
 
 struct VertexOutput
@@ -68,6 +69,24 @@ VertexOutput IconVS(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID
     return output;
 }
 
+float3 SampleFrostedBackdrop(float2 uv, float2 texel, float2 normal, float edge)
+{
+    const float2 refracted = normal * (1.2 + edge * 4.0) * texel;
+    const float2 centerUv = clamp(uv + refracted, texel * 0.5, 1.0 - texel * 0.5);
+    const float2 blur = texel * (1.25 + edge * 2.5);
+    const float3 center = backdropTexture.Sample(linearClamp, centerUv).rgb;
+    const float3 samples =
+        backdropTexture.Sample(linearClamp, centerUv + float2(blur.x, 0.0)).rgb +
+        backdropTexture.Sample(linearClamp, centerUv - float2(blur.x, 0.0)).rgb +
+        backdropTexture.Sample(linearClamp, centerUv + float2(0.0, blur.y)).rgb +
+        backdropTexture.Sample(linearClamp, centerUv - float2(0.0, blur.y)).rgb +
+        backdropTexture.Sample(linearClamp, centerUv + blur).rgb +
+        backdropTexture.Sample(linearClamp, centerUv - blur).rgb +
+        backdropTexture.Sample(linearClamp, centerUv + float2(blur.x, -blur.y)).rgb +
+        backdropTexture.Sample(linearClamp, centerUv + float2(-blur.x, blur.y)).rgb;
+    return center * 0.20 + samples * 0.10;
+}
+
 float4 GlassPS(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
@@ -75,19 +94,25 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float radius = min(outputSize.y * 0.47, 43.0 * scene1.y);
     const float distance = RoundedBoxSdf(pixel - outputSize * 0.5, outputSize * 0.5 - 1.5, radius);
     const float mask = 1.0 - smoothstep(-1.0, 1.5, distance);
+    const float2 texel = 1.0 / outputSize;
+    const float2 uv = pixel * texel;
 
-    const float2 uv = pixel / outputSize;
-    const float travel = scene0.w * 0.32 + scene1.x * 0.17;
-    const float ripple = sin((uv.x + uv.y * 1.9 + travel) * 18.0) * 0.004;
-    const float2 refracted = uv + float2(ripple, -ripple * 0.7);
-    const float3 background = lerp(float3(0.025, 0.04, 0.085), float3(0.15, 0.25, 0.36),
-        saturate(refracted.y + 0.2 * sin(refracted.x * 8.0 + travel)));
-    const float edge = saturate(1.0 - abs(distance) / max(radius, 1.0));
-    const float fresnel = pow(1.0 - edge, 3.0);
-    const float chromatic = sin((uv.x * 41.0 - uv.y * 23.0) + travel) * 0.012;
-    float3 color = background + float3(chromatic, 0.008, -chromatic);
-    color += float3(0.34, 0.48, 0.68) * (0.13 + fresnel * 0.28);
-    color += float3(0.7, 0.9, 1.0) * smoothstep(0.0, 0.9, edge) * 0.10;
+    const float2 gradient = float2(ddx(distance), ddy(distance));
+    const float2 normal = gradient / max(length(gradient), 0.0001);
+    const float insideDistance = max(-distance, 0.0);
+    const float edge = 1.0 - smoothstep(0.0, max(radius * 0.35, 1.0), insideDistance);
+    const float3 frostedBackground = SampleFrostedBackdrop(uv, texel, normal, edge);
+
+    const float3 coolTint = float3(0.72, 0.84, 1.0);
+    float3 color = lerp(frostedBackground, frostedBackground + coolTint * (0.10 + edge * 0.08),
+        0.26);
+    const float fresnel = pow(saturate(edge), 2.2);
+    const float3 lightDirection = normalize(float3(-0.45, -0.85, 0.55));
+    const float3 surfaceNormal = normalize(float3(normal, 0.55));
+    const float specular = pow(saturate(dot(surfaceNormal, lightDirection)), 18.0) *
+        (0.24 + fresnel * 0.76);
+    color += float3(0.34, 0.54, 0.82) * fresnel * 0.17;
+    color += float3(0.84, 0.94, 1.0) * specular * 0.24;
 
     if (scene1.z > 0.5)
     {
@@ -95,7 +120,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
         color = lerp(color, float3(1.0, 0.18, 0.58), outline);
     }
 
-    const float alpha = mask * scene0.z;
+    const float alpha = mask * scene0.z * scene1.w;
     return float4(color * alpha, alpha);
 }
 

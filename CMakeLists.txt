@@ -61,6 +61,7 @@ target_link_libraries(Dock PRIVATE
     ole32
     advapi32
     windowscodecs
+    gdi32
 )
 
 set(DOCK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.hlsl")
