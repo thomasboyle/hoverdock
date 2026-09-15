@@ -106,7 +106,7 @@ D3D12_RASTERIZER_DESC RasterizerDescription() {
     description.FrontCounterClockwise = FALSE;
     description.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
     description.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
-    description.SlopeScaledDepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+    description.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
     description.DepthClipEnable = TRUE;
     description.MultisampleEnable = FALSE;
     description.AntialiasedLineEnable = FALSE;
