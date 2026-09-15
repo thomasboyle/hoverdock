@@ -106,7 +106,7 @@ D3D12_RASTERIZER_DESC RasterizerDescription() {
     description.FrontCounterClockwise = FALSE;
     description.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
     description.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
-    description.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    description.SlopeScaledDepthBias = D3D12_DEFAULT_DEPTH_BIAS;
     description.DepthClipEnable = TRUE;
     description.MultisampleEnable = FALSE;
     description.AntialiasedLineEnable = FALSE;
@@ -805,7 +805,7 @@ void Renderer::CreateRootSignatureAndPipelines() {
     root.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{};
-    versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    versioned.Version = D3D12_ROOT_SIGNATURE_VERSION_1_1;
     versioned.Desc_1_1 = root;
 
     ComPtr<ID3DBlob> serialized;
