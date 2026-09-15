@@ -27,6 +27,10 @@ namespace {
 constexpr wchar_t kStartTarget[] = L"dock:start";
 constexpr wchar_t kSearchTarget[] = L"dock:search";
 
+UINT16 TextureArraySize(UINT arraySize) {
+    return static_cast<UINT16>(std::min(arraySize, static_cast<UINT>(UINT16_MAX)));
+}
+
 class ComApartment {
 public:
     ComApartment()
@@ -442,6 +446,9 @@ void Renderer::Resize(UINT width, UINT height) {
 }
 
 void Renderer::LoadIcons(const std::vector<std::wstring>& targets) {
+    static_assert(kMaximumIcons <= UINT16_MAX,
+        "The maximum icon count must fit in a D3D12 texture array.");
+
     if (targets.size() > kMaximumIcons) {
         throw std::runtime_error("The dock supports at most 512 visible icons.");
     }
@@ -461,8 +468,7 @@ void Renderer::LoadIcons(const std::vector<std::wstring>& targets) {
               IID_PPV_ARGS(&commandList)),
         "Create icon upload command list");
 
-    const D3D12_RESOURCE_DESC atlas = TextureDescription(extent, extent,
-        static_cast<UINT16>(m_iconCount));
+    const D3D12_RESOURCE_DESC atlas = TextureDescription(extent, extent, TextureArraySize(m_iconCount));
     const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
     Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &atlas,
               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_iconAtlas)),
@@ -542,8 +548,8 @@ void Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene0[1] = static_cast<float>(state.height);
     frame.mappedConstants->scene0[2] = state.glassAlpha;
     frame.mappedConstants->scene0[3] = state.timeSeconds;
-    frame.mappedConstants->scene1[0] = state.slideProgress;
-    frame.mappedConstants->scene1[1] = static_cast<float>(GetDpiForWindow(m_window)) / 96.0F;
+    frame.mappedConstants->scene1[0] = static_cast<float>(GetDpiForWindow(m_window)) / 96.0F;
+    frame.mappedConstants->scene1[1] = state.slideProgress;
     frame.mappedConstants->scene1[2] = state.showDevBounds ? 1.0F : 0.0F;
     frame.mappedConstants->scene1[3] = m_backdropValid ? 1.0F : 0.0F;
 
@@ -796,10 +802,10 @@ void Renderer::CreateRootSignatureAndPipelines() {
     root.pParameters = parameters.data();
     root.NumStaticSamplers = static_cast<UINT>(samplers.size());
     root.pStaticSamplers = samplers.data();
-    root.Flags = D3D_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    root.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{};
-    versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    versioned.Version = D3D12_ROOT_SIGNATURE_VERSION_1_1;
     versioned.Desc_1_1 = root;
 
     ComPtr<ID3DBlob> serialized;
@@ -1060,7 +1066,7 @@ void Renderer::CreateFallbackIcon(UINT textureIndex, ID3D12GraphicsCommandList* 
 
 void Renderer::UploadIconTexture(UINT textureIndex, const uint8_t* pixels, UINT width, UINT height,
     ID3D12GraphicsCommandList* commandList) {
-    const D3D12_RESOURCE_DESC texture = TextureDescription(width, height, m_iconCount);
+    const D3D12_RESOURCE_DESC texture = TextureDescription(width, height, TextureArraySize(m_iconCount));
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT rowCount = 0;
