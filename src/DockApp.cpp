@@ -451,7 +451,7 @@ void DockApp::CreateOverlayWindow() {
     inputClass.lpszClassName = inputClassName;
     inputClass.style = CS_HREDRAW | CS_VREDRAW;
     if (RegisterClassExW(&inputClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        throw std::runtime_error("Register dock input window failed.");
+        throw std::runtime_error("Register dock input window class failed.");
     }
 
     constexpr DWORD style = WS_POPUP;
