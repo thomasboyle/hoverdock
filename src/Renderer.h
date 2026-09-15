@@ -49,7 +49,7 @@ public:
 
 private:
     static constexpr UINT kBufferCount = 3;
-    static constexpr UINT kMaximumIcons = 32;
+    static constexpr UINT kMaximumIcons = 512;
     static constexpr UINT kIconTextureDescriptor = 0;
     static constexpr UINT kBackdropTextureDescriptor = 1;
 

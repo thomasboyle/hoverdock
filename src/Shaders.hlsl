@@ -14,6 +14,7 @@ StructuredBuffer<IconInstance> iconInstances : register(t0);
 Texture2DArray iconTexture : register(t1);
 Texture2D backdropTexture : register(t2);
 SamplerState linearClamp : register(s0);
+SamplerState iconPointClamp : register(s1);
 
 struct VertexOutput
 {
@@ -126,26 +127,13 @@ float4 GlassPS(VertexOutput input) : SV_Target
 
 float4 IconPS(VertexOutput input) : SV_Target
 {
-    const float2 centered = input.uv - 0.5;
-    const float plateDistance = RoundedBoxSdf(centered, float2(0.49, 0.49), 0.17);
-    const float plate = 1.0 - smoothstep(-0.012, 0.016, plateDistance);
-    const float2 lightVector = normalize(float2(-0.7, -1.0));
-    const float highlight = saturate(dot(normalize(centered + 0.001), -lightVector) * 0.5 + 0.5);
-    const float3 plateColor = lerp(float3(0.18, 0.28, 0.38), float3(0.48, 0.66, 0.82), highlight);
     const IconInstance icon = iconInstances[input.textureIndex];
-    const float4 sampled = iconTexture.Sample(linearClamp, float3(input.uv, input.textureIndex));
-    const float fallbackGlyph = 1.0 - smoothstep(0.17, 0.20, max(abs(centered.x), abs(centered.y)));
-    const float iconAlpha = max(sampled.a, fallbackGlyph * 0.30);
-    const float3 iconColor = sampled.a > 0.01 ? sampled.rgb : float3(0.9, 0.96, 1.0);
-    const float plateAlpha = plate * (0.30 + icon.iconMeta.y * 0.12);
-    const float alpha = saturate(plateAlpha + iconAlpha * (1.0 - plateAlpha));
-    float3 color = plateColor * plateAlpha * (1.0 - iconAlpha) + iconColor * iconAlpha;
-
-    if (icon.iconMeta.x > 0.5)
-    {
-        const float indicator = smoothstep(0.075, 0.045, length(input.uv - float2(0.5, 0.96)));
-        color += float3(0.24, 0.76, 1.0) * indicator;
-    }
-
+    const float4 sampled = iconTexture.Sample(iconPointClamp, float3(input.uv, input.textureIndex));
+    const float indicator = icon.iconMeta.x > 0.5
+        ? smoothstep(0.075, 0.045, length(input.uv - float2(0.5, 0.96)))
+        : 0.0;
+    const float alpha = saturate(sampled.a + indicator * (1.0 - sampled.a));
+    const float3 color = sampled.rgb * sampled.a +
+        float3(0.24, 0.76, 1.0) * indicator * (1.0 - sampled.a);
     return float4(color, alpha);
 }

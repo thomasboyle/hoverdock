@@ -60,17 +60,18 @@ Settings are written as UTF-8 to:
 %LOCALAPPDATA%\LiquidGlassDock\dock.ini
 ```
 
-On first run, the dock imports available user taskbar pins from the Windows 10 pinned-shortcut folder and, best effort, the Windows 11 Taskband `Favorites` and `FavoritesResolve` registry data. It resolves discovered shortcuts through Windows Shell COM and persists recovered pins. If no pin can be recovered, it falls back to File Explorer, Notepad, and Calculator. For UWP targets, launch is best effort through the AppsFolder shell target; running-window matching is intentionally limited to normal top-level desktop windows.
+On first run, the dock imports taskbar pins in native order from the Windows 11 CloudStore taskbar store or Windows Taskband data, then uses the Windows 10 pinned-shortcut folder only to fill pins absent from those stores. Shell shortcuts are resolved through Windows Shell COM, including wrappers around AppsFolder AUMIDs, and recovered pins are persisted. Existing custom `dock.ini` files are preserved; an older file containing only the Explorer, Notepad, and Calculator defaults is upgraded from available OS pins. If no pin can be recovered, it falls back to File Explorer, Notepad, and Calculator. For UWP targets, launch is best effort through the AppsFolder shell target; running-window matching is intentionally limited to normal top-level desktop windows.
 
 ## Interaction
 
 - Move the pointer into the full-width, 2-pixel bottom edge of the primary monitor to show the dock.
-- The dock slides from below the monitor to its resting position over exactly 100 ms of QPC time.
+- The dock slides from below the monitor to its resting position over exactly 50 ms of QPC time.
 - While the dock is showing or visible, moving the pointer above its resting top edge immediately starts the 200 ms hide animation. This also applies when the first post-hot-edge pointer sample is already above that edge.
 - Leaving through the left or right side does not hide the dock. The pointer remains unrestricted inside the resting dock bounds, which makes edge-to-edge icon targeting practical.
+- Start and Search are always the first two nonpersistent items. Their **Open** action sends the corresponding Windows keyboard shortcut; they cannot be pinned, closed, opened in Explorer, or reordered.
 - Click a running app to focus it; Windows foreground policy remains authoritative. If Windows rejects focus, the app is flashed instead of using an input-attachment foreground-stealing workaround.
 - Click a stopped app to launch it with `ShellExecuteEx`.
-- Right-click an icon for Focus/Open, Open location, Close, and Unpin. Transient running applications offer Pin instead. Right-click empty dock glass to pin the current foreground desktop application. UWP pinning and location are best effort.
+- Right-click an application icon for Focus/Open, Open location, Close, and Unpin. Transient running applications offer Pin instead. Right-click empty dock glass to pin the current foreground desktop application. UWP pinning and location are best effort.
 - Drag a persistent icon and release it over another slot to persist a left-to-right reorder.
 - Right-click empty glass and select **Show developer bounds** to draw the capsule edge. `F12` toggles the same option when the window has keyboard input.
 
@@ -78,13 +79,13 @@ The D3D12/DirectComposition renderer is intentionally hit-transparent. A separat
 
 ## Rendering and timing
 
-The overlay is a transparent DirectComposition visual backed by a D3D12 `FLIP_DISCARD` composition swap chain with three buffers and `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`. It has one D3D12 device, one DIRECT queue, reusable frame allocators and command list, persistently mapped per-frame CBVs, a persistently mapped instanced-icon buffer, and a static shader-visible SRV heap for an icon texture array and desktop backdrop. No buffer, command allocator, descriptor layout, icon texture, or backdrop resource is allocated during the 100 ms show or 200 ms hide path. Presentation is synchronized and does not opt into tearing: tearing is not appropriate for this transparent composition overlay.
+The overlay is a transparent DirectComposition visual backed by a D3D12 `FLIP_DISCARD` composition swap chain with three buffers and `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`. It has one D3D12 device, one DIRECT queue, reusable frame allocators and command list, persistently mapped per-frame CBVs, a persistently mapped instanced-icon buffer, and a static shader-visible SRV heap for an icon texture array and desktop backdrop. No buffer, command allocator, descriptor layout, icon texture, or backdrop resource is allocated during the 50 ms show or 200 ms hide path. Presentation is synchronized and does not opt into tearing: tearing is not appropriate for this transparent composition overlay.
 
-The render loop uses `QueryPerformanceCounter` for elapsed time and the DXGI frame-latency waitable object while the state machine is animating. It presents synchronized frames and targets the display cadence, up to 120 FPS on a 120 Hz display. A literal “120 unique frames in 100 ms at 120 Hz” cannot occur: 100 ms at 120 Hz contains 12 display intervals. This implementation produces one QPC-derived unique animation sample per available presentation interval, so the show interval has up to 12 unique visible positions and the 200 ms hide interval has up to 24 on a 120 Hz panel.
+The render loop uses `QueryPerformanceCounter` for elapsed time and the DXGI frame-latency waitable object while the state machine is animating. It presents synchronized frames and targets the display cadence, up to 120 FPS on a 120 Hz display. A literal “120 unique frames in 50 ms at 120 Hz” cannot occur: 50 ms at 120 Hz contains 6 display intervals. This implementation produces one QPC-derived unique animation sample per available presentation interval, so the show interval has up to 6 unique visible positions and the 200 ms hide interval has up to 24 on a 120 Hz panel.
 
-The capsule’s slide distance is its current DPI-scaled height plus a 10-DIP margin. Its easing is cubic smoothstep (`t²(3−2t)`) for `t = elapsed / duration`, where duration is 0.1 seconds while showing and 0.2 seconds while hiding. The window is content-sized from display item count, icon size, gaps, and horizontal padding; it is centered rather than monitor-width.
+The capsule’s slide distance is its current DPI-scaled height plus a 10-DIP margin. Its easing is cubic smoothstep (`t²(3−2t)`) for `t = elapsed / duration`, where duration is 0.05 seconds while showing and 0.2 seconds while hiding. The window is content-sized from display item count, icon size, gaps, and horizontal padding; it is centered rather than monitor-width.
 
-Before each hidden-to-show transition, a preallocated GDI DIB captures the dock rectangle with `BitBlt` and `CAPTUREBLT` while both dock windows are hidden. A precreated D3D12 command allocator and command list upload that snapshot into a reusable backdrop texture. The glass shader samples the real desktop with multi-tap frosted blur, edge-normal refraction, and Fresnel/specular rim highlights at a 0.6 alpha tint; capture failure keeps the prior snapshot or a transparent fallback. This remains one D3D12 device and one DIRECT queue, with no D3D11 desktop duplication. Instanced icon quads are sampled from icon pixels obtained from Windows shell icon extraction; their plates are lit by the glass pass.
+Before each hidden-to-show transition, a preallocated GDI DIB captures the dock rectangle with `BitBlt` and `CAPTUREBLT` while both dock windows are hidden. A precreated D3D12 command allocator and command list upload that snapshot into a reusable backdrop texture. The glass shader samples the real desktop with multi-tap frosted blur, edge-normal refraction, and Fresnel/specular rim highlights at a 0.6 alpha tint; capture failure keeps the prior snapshot or a transparent fallback. This remains one D3D12 device and one DIRECT queue, with no D3D11 desktop duplication. Instanced icon quads are sampled from high-resolution Windows shell images (or transparent Start/Search glyphs) with their native alpha; only the glass pass contributes a background behind app icons.
 
 The native taskbar remains part of the primary monitor’s normal work area. The dock is deliberately positioned against the physical primary-monitor bottom edge after it hides the taskbar; it does not modify the system work area or replace Explorer.
 
@@ -104,4 +105,4 @@ src/
 
 ## v1 non-goals
 
-Start/Win+X, a full system tray, Task View, Copilot, Widgets, Explorer replacement, Mission Control, and Stage Manager are intentionally outside this version.
+Win+X, a full system tray, Task View, Copilot, Widgets, Explorer replacement, Mission Control, and Stage Manager are intentionally outside this version.

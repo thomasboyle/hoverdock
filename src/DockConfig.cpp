@@ -19,8 +19,11 @@ namespace {
 
 constexpr wchar_t kConfigDirectoryName[] = L"LiquidGlassDock";
 constexpr wchar_t kConfigFileName[] = L"dock.ini";
-constexpr size_t kMaximumPins = 32;
+constexpr size_t kMaximumPins = 512;
 constexpr size_t kMaximumPathLength = 32768;
+constexpr wchar_t kAppsFolderPrefix[] = L"shell:AppsFolder\\";
+constexpr wchar_t kCloudStorePath[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\Cache\\DefaultAccount";
 
 class ComApartment {
 public:
@@ -176,6 +179,18 @@ std::wstring FileNameWithoutExtension(const std::wstring& path) {
     return path.substr(fileStart, fileEnd - fileStart);
 }
 
+bool IsAumidCharacter(wchar_t character) {
+    return std::iswalnum(character) != 0 || character == L'.' || character == L'_' ||
+        character == L'-' || character == L'!';
+}
+
+bool IsAppsFolderTarget(const std::wstring& target) {
+    return target.size() > std::size(kAppsFolderPrefix) - 1 &&
+        EqualInsensitive(std::wstring_view(target).substr(0, std::size(kAppsFolderPrefix) - 1),
+            std::wstring_view(kAppsFolderPrefix, std::size(kAppsFolderPrefix) - 1)) &&
+        target.find(L'!') != std::wstring::npos;
+}
+
 void AppendUniquePin(std::vector<PinnedApp>& pins, PinnedApp app) {
     app.target = ExpandTarget(app.target);
     if (app.target.empty() || pins.size() >= kMaximumPins) {
@@ -194,6 +209,79 @@ void AppendUniquePin(std::vector<PinnedApp>& pins, PinnedApp app) {
         app.name = FileNameWithoutExtension(app.target);
     }
     pins.push_back(std::move(app));
+}
+
+std::wstring ShellDisplayName(const std::wstring& target) {
+    IShellItem* item = nullptr;
+    if (FAILED(SHCreateItemFromParsingName(target.c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+        return {};
+    }
+
+    PWSTR name = nullptr;
+    const HRESULT result = item->GetDisplayName(SIGDN_NORMALDISPLAY, &name);
+    item->Release();
+    if (FAILED(result) || name == nullptr) {
+        return {};
+    }
+    std::wstring displayName(name);
+    CoTaskMemFree(name);
+    return displayName;
+}
+
+void AppendAppsFolderPin(std::vector<PinnedApp>& pins, const std::wstring& target,
+    bool canResolveShellLinks) {
+    if (!IsAppsFolderTarget(target)) {
+        return;
+    }
+
+    PinnedApp app;
+    app.target = target;
+    if (canResolveShellLinks) {
+        app.name = ShellDisplayName(target);
+    }
+    AppendUniquePin(pins, std::move(app));
+}
+
+void ExtractAppsFolderTargets(const std::wstring& text, std::vector<std::wstring>& targets) {
+    const std::wstring lower = ToLower(text);
+    const std::wstring_view prefix(kAppsFolderPrefix, std::size(kAppsFolderPrefix) - 1);
+    size_t position = lower.find(prefix);
+    while (position != std::wstring::npos) {
+        const size_t start = position + prefix.size();
+        size_t end = start;
+        while (end < text.size() && IsAumidCharacter(text[end])) {
+            ++end;
+        }
+        if (end > start) {
+            const std::wstring target = std::wstring(kAppsFolderPrefix) + text.substr(start, end - start);
+            if (IsAppsFolderTarget(target)) {
+                targets.push_back(target);
+            }
+        }
+        position = lower.find(prefix, end);
+    }
+}
+
+void ExtractAumidTargets(const std::wstring& text, std::vector<std::wstring>& targets) {
+    for (size_t bang = text.find(L'!'); bang != std::wstring::npos;
+         bang = text.find(L'!', bang + 1)) {
+        size_t start = bang;
+        while (start > 0 && IsAumidCharacter(text[start - 1])) {
+            --start;
+        }
+        size_t end = bang + 1;
+        while (end < text.size() && IsAumidCharacter(text[end])) {
+            ++end;
+        }
+        const std::wstring aumid = text.substr(start, end - start);
+        if (aumid.find(L'_') == std::wstring::npos) {
+            continue;
+        }
+        const std::wstring target = std::wstring(kAppsFolderPrefix) + aumid;
+        if (IsAppsFolderTarget(target)) {
+            targets.push_back(target);
+        }
+    }
 }
 
 using ShellLinkTextMethod = HRESULT(STDMETHODCALLTYPE IShellLinkW::*)(LPWSTR, int);
@@ -236,6 +324,17 @@ bool ResolveShortcut(const std::wstring& shortcut, PinnedApp& app) {
     const std::wstring workingDirectory = ShellLinkText(link, &IShellLinkW::GetWorkingDirectory);
     const std::wstring description = ShellLinkText(link, &IShellLinkW::GetDescription);
     link->Release();
+
+    std::vector<std::wstring> appsFolderTargets;
+    ExtractAppsFolderTargets(target.data(), appsFolderTargets);
+    ExtractAppsFolderTargets(arguments, appsFolderTargets);
+    if (!appsFolderTargets.empty()) {
+        app.target = std::move(appsFolderTargets.front());
+        app.arguments.clear();
+        app.workingDirectory.clear();
+        app.name = description.empty() ? FileNameWithoutExtension(shortcut) : description;
+        return true;
+    }
 
     if (!hasTarget || target.front() == L'\0') {
         return false;
@@ -287,16 +386,16 @@ void ImportShortcutFolder(std::vector<PinnedApp>& pins, bool canResolveShellLink
     FindClose(search);
 }
 
-std::vector<BYTE> ReadTaskbandValue(HKEY taskband, const wchar_t* name) {
+std::vector<BYTE> ReadRegistryBinaryValue(HKEY key, const wchar_t* name) {
     DWORD type = 0;
     DWORD byteCount = 0;
-    if (RegQueryValueExW(taskband, name, nullptr, &type, nullptr, &byteCount) != ERROR_SUCCESS ||
+    if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &byteCount) != ERROR_SUCCESS ||
         type != REG_BINARY || byteCount == 0) {
         return {};
     }
 
     std::vector<BYTE> value(byteCount);
-    if (RegQueryValueExW(taskband, name, nullptr, &type, value.data(), &byteCount) != ERROR_SUCCESS ||
+    if (RegQueryValueExW(key, name, nullptr, &type, value.data(), &byteCount) != ERROR_SUCCESS ||
         type != REG_BINARY) {
         return {};
     }
@@ -354,8 +453,14 @@ void ExtractPathsFromText(const std::wstring& text, std::vector<std::wstring>& p
     }
 }
 
-std::vector<std::wstring> ExtractTaskbandPaths(const std::vector<BYTE>& value) {
-    std::vector<std::wstring> paths;
+void ExtractTargetsFromText(const std::wstring& text, std::vector<std::wstring>& targets) {
+    ExtractAppsFolderTargets(text, targets);
+    ExtractAumidTargets(text, targets);
+    ExtractPathsFromText(text, targets);
+}
+
+std::vector<std::wstring> ExtractTaskbarTargets(const std::vector<BYTE>& value) {
+    std::vector<std::wstring> targets;
     for (size_t alignment = 0; alignment < 2; ++alignment) {
         std::wstring text;
         for (size_t offset = alignment; offset + sizeof(uint16_t) <= value.size();
@@ -365,21 +470,26 @@ std::vector<std::wstring> ExtractTaskbandPaths(const std::vector<BYTE>& value) {
             if (codeUnit >= 0x20U && codeUnit != 0xfffeU && codeUnit != 0xffffU) {
                 text.push_back(static_cast<wchar_t>(codeUnit));
                 if (text.size() == kMaximumPathLength) {
-                    ExtractPathsFromText(text, paths);
+                    ExtractTargetsFromText(text, targets);
                     text.clear();
                 }
             } else if (!text.empty()) {
-                ExtractPathsFromText(text, paths);
+                ExtractTargetsFromText(text, targets);
                 text.clear();
             }
         }
-        ExtractPathsFromText(text, paths);
+        ExtractTargetsFromText(text, targets);
     }
-    return paths;
+    return targets;
 }
 
-void ImportTaskbandPath(std::vector<PinnedApp>& pins, const std::wstring& candidate,
+void ImportTaskbarTarget(std::vector<PinnedApp>& pins, const std::wstring& candidate,
     bool canResolveShellLinks) {
+    if (IsAppsFolderTarget(candidate)) {
+        AppendAppsFolderPin(pins, candidate, canResolveShellLinks);
+        return;
+    }
+
     const std::wstring path = ExpandTarget(candidate);
     if (EndsWithInsensitive(path, L".lnk")) {
         PinnedApp app;
@@ -404,20 +514,112 @@ void ImportTaskbandValues(std::vector<PinnedApp>& pins, bool canResolveShellLink
 
     constexpr std::array valueNames = {L"Favorites", L"FavoritesResolve"};
     for (const wchar_t* name : valueNames) {
-        for (const std::wstring& path : ExtractTaskbandPaths(ReadTaskbandValue(taskband, name))) {
-            ImportTaskbandPath(pins, path, canResolveShellLinks);
+        for (const std::wstring& target : ExtractTaskbarTargets(ReadRegistryBinaryValue(taskband, name))) {
+            ImportTaskbarTarget(pins, target, canResolveShellLinks);
         }
     }
     RegCloseKey(taskband);
+}
+
+void ImportCloudStoreTaskbarKey(HKEY key, bool isTaskbarKey, std::vector<PinnedApp>& pins,
+    bool canResolveShellLinks) {
+    DWORD subkeyCount = 0;
+    DWORD longestSubkey = 0;
+    DWORD valueCount = 0;
+    DWORD longestValueName = 0;
+    if (RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &subkeyCount, &longestSubkey, nullptr,
+            &valueCount, &longestValueName, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+
+    if (isTaskbarKey) {
+        std::vector<wchar_t> valueName(static_cast<size_t>(longestValueName) + 1U, L'\0');
+        for (DWORD index = 0; index < valueCount; ++index) {
+            DWORD nameLength = static_cast<DWORD>(valueName.size());
+            DWORD type = 0;
+            DWORD byteCount = 0;
+            const LONG query = RegEnumValueW(key, index, valueName.data(), &nameLength, nullptr,
+                &type, nullptr, &byteCount);
+            if (query != ERROR_SUCCESS || type != REG_BINARY || byteCount == 0) {
+                continue;
+            }
+
+            std::vector<BYTE> value(byteCount);
+            nameLength = static_cast<DWORD>(valueName.size());
+            if (RegEnumValueW(key, index, valueName.data(), &nameLength, nullptr, &type,
+                    value.data(), &byteCount) != ERROR_SUCCESS || type != REG_BINARY) {
+                continue;
+            }
+            value.resize(byteCount);
+            for (const std::wstring& target : ExtractTaskbarTargets(value)) {
+                if (IsAppsFolderTarget(target)) {
+                    AppendAppsFolderPin(pins, target, canResolveShellLinks);
+                }
+            }
+        }
+    }
+
+    std::vector<wchar_t> subkeyName(static_cast<size_t>(longestSubkey) + 1U, L'\0');
+    for (DWORD index = 0; index < subkeyCount; ++index) {
+        DWORD nameLength = static_cast<DWORD>(subkeyName.size());
+        const LONG enumerated = RegEnumKeyExW(key, index, subkeyName.data(), &nameLength, nullptr,
+            nullptr, nullptr, nullptr);
+        if (enumerated != ERROR_SUCCESS) {
+            continue;
+        }
+
+        const std::wstring name(subkeyName.data(), nameLength);
+        HKEY child = nullptr;
+        if (RegOpenKeyExW(key, name.c_str(), 0, KEY_READ, &child) != ERROR_SUCCESS) {
+            continue;
+        }
+        const bool childIsTaskbarKey = isTaskbarKey ||
+            ToLower(name).find(L"taskbar") != std::wstring::npos;
+        ImportCloudStoreTaskbarKey(child, childIsTaskbarKey, pins, canResolveShellLinks);
+        RegCloseKey(child);
+    }
+}
+
+void ImportCloudStoreTaskbarValues(std::vector<PinnedApp>& pins, bool canResolveShellLinks) {
+    HKEY cloudStore = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kCloudStorePath, 0, KEY_READ, &cloudStore) != ERROR_SUCCESS) {
+        return;
+    }
+    ImportCloudStoreTaskbarKey(cloudStore, false, pins, canResolveShellLinks);
+    RegCloseKey(cloudStore);
 }
 
 std::vector<PinnedApp> ImportTaskbarPins() {
     std::vector<PinnedApp> pins;
     ComApartment apartment;
     const bool canResolveShellLinks = apartment.CanUseShellLinks();
-    ImportShortcutFolder(pins, canResolveShellLinks);
+
+    // These stores preserve the taskbar's native serialized order. The shortcut folder is only
+    // a fallback, so it can fill missing pins without changing that order.
+    ImportCloudStoreTaskbarValues(pins, canResolveShellLinks);
     ImportTaskbandValues(pins, canResolveShellLinks);
+    ImportShortcutFolder(pins, canResolveShellLinks);
     return pins;
+}
+
+bool IsLegacyDefaultPins(const std::vector<PinnedApp>& pins) {
+    if (pins.size() != 3) {
+        return false;
+    }
+
+    const std::array defaults = {
+        ExpandTarget(L"%SystemRoot%\\explorer.exe"),
+        ExpandTarget(L"%SystemRoot%\\System32\\notepad.exe"),
+        std::wstring(L"shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"),
+    };
+    for (size_t index = 0; index < defaults.size(); ++index) {
+        const PinnedApp& pin = pins[index];
+        if (!pin.arguments.empty() || !pin.workingDirectory.empty() ||
+            !EqualInsensitive(NormalizedTarget(pin.target), NormalizedTarget(defaults[index]))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -441,6 +643,14 @@ bool DockConfig::LoadOrCreate() {
     if (!Load()) {
         SetDefaults();
         return Save();
+    }
+
+    if (IsLegacyDefaultPins(m_pins)) {
+        std::vector<PinnedApp> imported = ImportTaskbarPins();
+        if (!imported.empty()) {
+            m_pins = std::move(imported);
+            return Save();
+        }
     }
     return true;
 }
