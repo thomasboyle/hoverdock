@@ -451,7 +451,7 @@ void DockApp::CreateOverlayWindow() {
     inputClass.lpszClassName = inputClassName;
     inputClass.style = CS_HREDRAW | CS_VREDRAW;
     if (RegisterClassExW(&inputClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        throw std::runtime_error("Register dock input window class failed.");
+        throw std::runtime_error("Register dock input window failed.");
     }
 
     constexpr DWORD style = WS_POPUP;
@@ -665,9 +665,11 @@ void DockApp::UpdateHoverLabel() {
     const int triangleHeight = (std::max)(6, static_cast<int>(std::lround(7.0F * scale)));
     const int cornerRadius = (std::max)(5, static_cast<int>(std::lround(7.0F * scale)));
     const int gap = (std::max)(2, static_cast<int>(std::lround(4.0F * scale)));
-    const int bubbleWidth = (std::max)(60, textSize.cx + horizontalPadding * 2);
-    const int bubbleHeight = (std::max)(24, textSize.cy + verticalPadding * 2);
-    const SIZE labelSize{bubbleWidth, bubbleHeight + triangleHeight};
+    const LONG bubbleWidth = (std::max)(static_cast<LONG>(60),
+        static_cast<LONG>(textSize.cx) + static_cast<LONG>(horizontalPadding) * 2L);
+    const LONG bubbleHeight = (std::max)(static_cast<LONG>(24),
+        static_cast<LONG>(textSize.cy) + static_cast<LONG>(verticalPadding) * 2L);
+    SIZE labelSize{bubbleWidth, bubbleHeight + triangleHeight};
 
     BITMAPV5HEADER header{};
     header.bV5Size = sizeof(header);
@@ -770,10 +772,10 @@ void DockApp::UpdateHoverLabel() {
         }
     }
 
-    const POINT destination{iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2 -
+    POINT destination{iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2 -
             labelSize.cx / 2,
         iconTopLeft.y - labelSize.cy - gap};
-    const POINT source{};
+    POINT source{};
     const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     const BOOL updated = UpdateLayeredWindow(m_hoverLabelWindow, nullptr, &destination, &labelSize,
         memory, &source, 0, &blend, ULW_ALPHA);
