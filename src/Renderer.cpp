@@ -805,7 +805,7 @@ void Renderer::CreateRootSignatureAndPipelines() {
     root.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{};
-    versioned.Version = D3D12_ROOT_SIGNATURE_VERSION_1_1;
+    versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
     versioned.Desc_1_1 = root;
 
     ComPtr<ID3DBlob> serialized;
@@ -1105,5 +1105,5 @@ void Renderer::UploadIconTexture(UINT textureIndex, const uint8_t* pixels, UINT 
 
 void Renderer::SignalFrame(FrameResource& frame) {
     frame.fenceValue = ++m_fenceValue;
-    Check(m_queue->Signal(m_fence.Get(), "Signal frame fence");
+    Check(m_queue->Signal(m_fence.Get(), frame.fenceValue), "Signal frame fence");
 }
