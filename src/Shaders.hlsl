@@ -21,9 +21,9 @@ struct VertexOutput
     nointerpolation uint textureIndex : TEXCOORD1;
 };
 
-float RoundedBoxSdf(float2 point, float2 halfSize, float radius)
+float RoundedBoxSdf(float2 boxPosition, float2 halfSize, float radius)
 {
-    const float2 distance = abs(point) - halfSize + radius;
+    const float2 distance = abs(boxPosition) - halfSize + radius;
     return length(max(distance, 0.0)) + min(max(distance.x, distance.y), 0.0) - radius;
 }
 
