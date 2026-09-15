@@ -1,0 +1,32 @@
+name: Build Dock
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Dock.exe
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure and build Release
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          cmake -S . -B out -G "Visual Studio 17 2022" -A x64
+          cmake --build out --config Release
+
+      - name: Upload Dock.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dock.exe
+          path: out\bin\Release\Dock.exe
+          if-no-files-found: error
