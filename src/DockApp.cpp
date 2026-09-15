@@ -28,6 +28,24 @@ constexpr BYTE kInputWindowAlpha = 1;
 constexpr wchar_t kStartTarget[] = L"dock:start";
 constexpr wchar_t kSearchTarget[] = L"dock:search";
 
+template <typename T>
+constexpr T LesserOf(T left, T right) noexcept {
+    return right < left ? right : left;
+}
+
+template <typename T>
+constexpr T GreaterOf(T left, T right) noexcept {
+    return left < right ? right : left;
+}
+
+constexpr int SaturatedInt(LONG value) noexcept {
+    return value > static_cast<LONG>(std::numeric_limits<int>::max())
+        ? std::numeric_limits<int>::max()
+        : value < static_cast<LONG>(std::numeric_limits<int>::min())
+        ? std::numeric_limits<int>::min()
+        : static_cast<int>(value);
+}
+
 std::wstring ConfigDirectory(const std::wstring& path) {
     const size_t separator = path.find_last_of(L"\\/");
     return separator == std::wstring::npos ? L"" : path.substr(0, separator);
@@ -557,7 +575,8 @@ void DockApp::UpdateInputRegion() {
         return;
     }
 
-    const LONG radius = (std::max)(2L, static_cast<LONG>(std::lround(static_cast<float>(m_dockHeight) * 0.47F)));
+    const LONG radius = GreaterOf(2L,
+        static_cast<LONG>(std::lround(static_cast<float>(m_dockHeight) * 0.47F)));
     HRGN region = CreateRoundRectRgn(0, 0, static_cast<int>(m_dockWidth) + 1,
         static_cast<int>(m_dockHeight) + 1, static_cast<int>(radius * 2),
         static_cast<int>(radius * 2));
@@ -659,16 +678,14 @@ void DockApp::UpdateHoverLabel() {
 
     const UINT dpi = GetDpiForWindow(m_window);
     const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
-    const int horizontalPadding = (std::max)(8, static_cast<int>(std::lround(12.0F * scale)));
-    const int verticalPadding = (std::max)(5, static_cast<int>(std::lround(6.0F * scale)));
-    const int triangleWidth = (std::max)(10, static_cast<int>(std::lround(12.0F * scale)));
-    const int triangleHeight = (std::max)(6, static_cast<int>(std::lround(7.0F * scale)));
-    const int cornerRadius = (std::max)(5, static_cast<int>(std::lround(7.0F * scale)));
-    const int gap = (std::max)(2, static_cast<int>(std::lround(4.0F * scale)));
-    const LONG bubbleWidth = (std::max)(static_cast<LONG>(60),
-        static_cast<LONG>(textSize.cx) + static_cast<LONG>(horizontalPadding) * 2L);
-    const LONG bubbleHeight = (std::max)(static_cast<LONG>(24),
-        static_cast<LONG>(textSize.cy) + static_cast<LONG>(verticalPadding) * 2L);
+    const LONG horizontalPadding = GreaterOf(8L, static_cast<LONG>(std::lround(12.0F * scale)));
+    const LONG verticalPadding = GreaterOf(5L, static_cast<LONG>(std::lround(6.0F * scale)));
+    const LONG triangleWidth = GreaterOf(10L, static_cast<LONG>(std::lround(12.0F * scale)));
+    const LONG triangleHeight = GreaterOf(6L, static_cast<LONG>(std::lround(7.0F * scale)));
+    const LONG cornerRadius = GreaterOf(5L, static_cast<LONG>(std::lround(7.0F * scale)));
+    const LONG gap = GreaterOf(2L, static_cast<LONG>(std::lround(4.0F * scale)));
+    const LONG bubbleWidth = GreaterOf(60L, textSize.cx + horizontalPadding * 2L);
+    const LONG bubbleHeight = GreaterOf(24L, textSize.cy + verticalPadding * 2L);
     SIZE labelSize{bubbleWidth, bubbleHeight + triangleHeight};
 
     BITMAPV5HEADER header{};
@@ -751,17 +768,18 @@ void DockApp::UpdateHoverLabel() {
         return;
     }
 
-    RoundRect(memory, 0, 0, bubbleWidth, bubbleHeight, cornerRadius * 2, cornerRadius * 2);
-    const int center = bubbleWidth / 2;
-    const POINT triangle[3] = {
-        {center - triangleWidth / 2, bubbleHeight - 1},
-        {center + triangleWidth / 2, bubbleHeight - 1},
-        {center, bubbleHeight + triangleHeight - 1},
+    RoundRect(memory, 0, 0, SaturatedInt(bubbleWidth), SaturatedInt(bubbleHeight),
+        SaturatedInt(cornerRadius * 2L), SaturatedInt(cornerRadius * 2L));
+    const LONG center = bubbleWidth / 2L;
+    POINT triangle[3] = {
+        {center - triangleWidth / 2L, bubbleHeight - 1L},
+        {center + triangleWidth / 2L, bubbleHeight - 1L},
+        {center, bubbleHeight + triangleHeight - 1L},
     };
-    Polygon(memory, triangle, static_cast<int>(std::size(triangle)));
+    Polygon(memory, triangle, SaturatedInt(static_cast<LONG>(std::size(triangle))));
     SetBkMode(memory, TRANSPARENT);
     SetTextColor(memory, RGB(245, 245, 247));
-    RECT textBounds{horizontalPadding, 0, bubbleWidth - horizontalPadding, bubbleHeight};
+    RECT textBounds{horizontalPadding, 0L, bubbleWidth - horizontalPadding, bubbleHeight};
     DrawTextW(memory, text.c_str(), textLength, &textBounds,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
@@ -772,11 +790,11 @@ void DockApp::UpdateHoverLabel() {
         }
     }
 
-    POINT destination{iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2 -
-            labelSize.cx / 2,
+    POINT destination{iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L -
+            labelSize.cx / 2L,
         iconTopLeft.y - labelSize.cy - gap};
-    POINT source{};
-    const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    POINT source{0L, 0L};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     const BOOL updated = UpdateLayeredWindow(m_hoverLabelWindow, nullptr, &destination, &labelSize,
         memory, &source, 0, &blend, ULW_ALPHA);
 
@@ -797,8 +815,9 @@ void DockApp::UpdateHoverLabel() {
         HideHoverLabel();
         return;
     }
-    if (SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, destination.x, destination.y, labelSize.cx,
-            labelSize.cy, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW) == FALSE) {
+    if (SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, SaturatedInt(destination.x),
+            SaturatedInt(destination.y), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy),
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW) == FALSE) {
         Log(L"Could not position the hover label window.");
     }
 }
@@ -1119,7 +1138,7 @@ void DockApp::RefreshRunningWindows(bool force) {
         return;
     }
 
-    const size_t iconCount = (std::min)(m_iconRenderData.size(), m_displayApps.size());
+    const size_t iconCount = LesserOf(m_iconRenderData.size(), m_displayApps.size());
     for (size_t index = 0; index < iconCount; ++index) {
         m_iconRenderData[index].running = m_displayApps[index].runningWindow != nullptr;
     }
