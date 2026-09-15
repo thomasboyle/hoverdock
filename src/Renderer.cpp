@@ -594,8 +594,8 @@ void Renderer::Render(const DockRenderState& state) {
         instance.iconRect[2] = static_cast<float>(icon.bounds.right - icon.bounds.left);
         instance.iconRect[3] = static_cast<float>(icon.bounds.bottom - icon.bounds.top);
         instance.iconMeta[0] = icon.running ? 1.0F : 0.0F;
-        instance.iconMeta[1] = icon.dragged ? 1.0F : 0.0F;
-        instance.iconMeta[2] = icon.hovered ? 1.0F : 0.0F;
+        instance.iconMeta[1] = icon.pressed ? 1.0F : 0.0F;
+        instance.iconMeta[2] = icon.dragged ? 1.0F : 0.0F;
         instance.iconMeta[3] = static_cast<float>(std::min(icon.textureIndex, m_iconCount - 1));
     }
     if (iconCount > 0) {

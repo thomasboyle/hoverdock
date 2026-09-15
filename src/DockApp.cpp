@@ -7,8 +7,10 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -20,8 +22,8 @@ namespace {
 
 constexpr double kShowDurationSeconds = 0.050;
 constexpr double kHideDurationSeconds = 0.200;
+constexpr double kDragThresholdLogicalPixels = 6.0;
 constexpr int kBottomHotZonePixels = 2;
-constexpr int kDragThresholdPixels = 4;
 constexpr BYTE kInputWindowAlpha = 1;
 constexpr wchar_t kStartTarget[] = L"dock:start";
 constexpr wchar_t kSearchTarget[] = L"dock:search";
@@ -101,6 +103,7 @@ DockApp::DockApp(HINSTANCE instance)
 }
 
 DockApp::~DockApp() {
+    DestroyHoverLabelWindow();
     if (m_mouseHook != nullptr) {
         UnhookWindowsHookEx(m_mouseHook);
     }
@@ -208,6 +211,23 @@ LRESULT CALLBACK DockApp::InputWindowProcedure(HWND window, UINT message, WPARAM
                           : app->HandleInputMessage(window, message, wParam, lParam);
 }
 
+LRESULT CALLBACK DockApp::HoverLabelWindowProcedure(HWND window, UINT message, WPARAM wParam,
+    LPARAM lParam) {
+    switch (message) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    default:
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+}
+
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && wParam == WM_MOUSEMOVE && s_instance != nullptr &&
         s_instance->m_window != nullptr) {
@@ -287,6 +307,9 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
 
     case WM_DESTROY:
+        HideHoverLabel();
+        DestroyHoverLabelWindow();
+        ClearPressState();
         if (m_inputWindow != nullptr && DestroyWindow(m_inputWindow) == FALSE) {
             Log(L"Could not destroy the dock input window.");
         }
@@ -331,11 +354,13 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
 
     case WM_LBUTTONDOWN: {
         const POINT point = ScreenPointFromClient(window, lParam);
+        ClearPressState();
         m_pressedIcon = IconAtScreenPoint(point);
         LogInputMouse(message, point, m_pressedIcon);
         if (m_pressedIcon >= 0) {
             m_pressedAt = point;
             SetCapture(window);
+            RenderFrame();
         }
         return 0;
     }
@@ -343,14 +368,14 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
     case WM_MOUSEMOVE: {
         const POINT point = ScreenPointFromClient(window, lParam);
         HandlePointer(point);
-        if (m_pressedIcon >= 0 && IsPersistentDisplayIcon(m_pressedIcon) &&
-            (std::abs(point.x - m_pressedAt.x) >= kDragThresholdPixels ||
-                std::abs(point.y - m_pressedAt.y) >= kDragThresholdPixels)) {
+        if (m_draggedIcon >= 0) {
+            m_dragInsertion = InsertionIndexFor(point);
+            RenderFrame();
+        } else if (m_pressedIcon >= 0 && IsPersistentDisplayIcon(m_pressedIcon) &&
+            HasCrossedDragThreshold(point)) {
             m_draggedIcon = m_pressedIcon;
             m_dragInsertion = InsertionIndexFor(point);
-            if (m_rendererInitialized) {
-                RenderFrame();
-            }
+            RenderFrame();
         }
         return 0;
     }
@@ -366,16 +391,14 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
         if (GetCapture() == window) {
             ReleaseCapture();
         }
-        m_pressedIcon = -1;
-        m_draggedIcon = -1;
-        m_dragInsertion = -1;
+        ClearPressState();
+        RenderFrame();
         return 0;
     }
 
     case WM_CAPTURECHANGED:
-        m_pressedIcon = -1;
-        m_draggedIcon = -1;
-        m_dragInsertion = -1;
+        ClearPressState();
+        RenderFrame();
         return 0;
 
     case WM_RBUTTONUP: {
@@ -396,6 +419,7 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
         return 0;
 
     case WM_DESTROY:
+        ClearPressState();
         if (m_inputWindow == window) {
             m_inputWindow = nullptr;
         }
@@ -451,6 +475,38 @@ void DockApp::CreateOverlayWindow() {
         DestroyWindow(m_window);
         throw std::runtime_error("Set dock input window alpha failed.");
     }
+    CreateHoverLabelWindow();
+}
+
+void DockApp::CreateHoverLabelWindow() {
+    const wchar_t hoverLabelClassName[] = L"LiquidGlassDockHoverLabel";
+    WNDCLASSEXW hoverLabelClass{sizeof(hoverLabelClass)};
+    hoverLabelClass.lpfnWndProc = &DockApp::HoverLabelWindowProcedure;
+    hoverLabelClass.hInstance = m_instance;
+    hoverLabelClass.lpszClassName = hoverLabelClassName;
+    if (RegisterClassExW(&hoverLabelClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        Log(L"Could not register the hover label window class.");
+        return;
+    }
+
+    constexpr DWORD extendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED |
+        WS_EX_TRANSPARENT;
+    m_hoverLabelWindow = CreateWindowExW(extendedStyle, hoverLabelClassName, L"", WS_POPUP,
+        0, 0, 1, 1, nullptr, nullptr, m_instance, nullptr);
+    if (m_hoverLabelWindow == nullptr) {
+        Log(L"Could not create the hover label window.");
+    }
+}
+
+void DockApp::DestroyHoverLabelWindow() {
+    if (m_hoverLabelWindow == nullptr) {
+        return;
+    }
+
+    if (DestroyWindow(m_hoverLabelWindow) == FALSE) {
+        Log(L"Could not destroy the hover label window.");
+    }
+    m_hoverLabelWindow = nullptr;
 }
 
 void DockApp::RebuildLayout(bool reloadIcons) {
@@ -525,6 +581,230 @@ void DockApp::PositionOverlayWindows() {
             static_cast<int>(m_dockWidth), static_cast<int>(m_dockHeight), flags) == FALSE) {
         Log(L"Could not position the dock input window.");
     }
+    UpdateHoverLabel();
+}
+
+void DockApp::UpdateHoverLabel() {
+    if (m_hoverLabelWindow == nullptr || m_visibility != VisibilityState::Visible ||
+        m_hoveredIcon < 0 || static_cast<size_t>(m_hoveredIcon) >= m_displayApps.size() ||
+        static_cast<size_t>(m_hoveredIcon) >= m_iconRenderData.size()) {
+        HideHoverLabel();
+        return;
+    }
+
+    std::wstring text = m_displayApps[static_cast<size_t>(m_hoveredIcon)].app.name;
+    if (text.empty()) {
+        text = DisplayNameFromExecutable(m_displayApps[static_cast<size_t>(m_hoveredIcon)].app.target);
+    }
+    if (text.empty() || text.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        HideHoverLabel();
+        return;
+    }
+
+    POINT iconTopLeft{m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].bounds.left,
+        m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].bounds.top};
+    POINT iconBottomRight{m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].bounds.right,
+        m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].bounds.bottom};
+    if (ClientToScreen(m_window, &iconTopLeft) == FALSE ||
+        ClientToScreen(m_window, &iconBottomRight) == FALSE) {
+        HideHoverLabel();
+        return;
+    }
+
+    NONCLIENTMETRICSW metrics{sizeof(metrics)};
+    HFONT font = SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0) != FALSE
+        ? CreateFontIndirectW(&metrics.lfMessageFont)
+        : nullptr;
+    HGDIOBJ fontObject = font == nullptr ? GetStockObject(DEFAULT_GUI_FONT) : font;
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        if (font != nullptr) {
+            DeleteObject(font);
+        }
+        HideHoverLabel();
+        return;
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    if (memory == nullptr) {
+        ReleaseDC(nullptr, screen);
+        if (font != nullptr) {
+            DeleteObject(font);
+        }
+        HideHoverLabel();
+        return;
+    }
+    HGDIOBJ previousFont = SelectObject(memory, fontObject);
+    if (previousFont == nullptr || previousFont == HGDI_ERROR) {
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        if (font != nullptr) {
+            DeleteObject(font);
+        }
+        HideHoverLabel();
+        return;
+    }
+
+    SIZE textSize{};
+    const int textLength = static_cast<int>(text.size());
+    if (GetTextExtentPoint32W(memory, text.c_str(), textLength, &textSize) == FALSE) {
+        SelectObject(memory, previousFont);
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        if (font != nullptr) {
+            DeleteObject(font);
+        }
+        HideHoverLabel();
+        return;
+    }
+
+    const UINT dpi = GetDpiForWindow(m_window);
+    const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
+    const int horizontalPadding = std::max(8, std::lround(12.0F * scale));
+    const int verticalPadding = std::max(5, std::lround(6.0F * scale));
+    const int triangleWidth = std::max(10, std::lround(12.0F * scale));
+    const int triangleHeight = std::max(6, std::lround(7.0F * scale));
+    const int cornerRadius = std::max(5, std::lround(7.0F * scale));
+    const int gap = std::max(2, std::lround(4.0F * scale));
+    const int bubbleWidth = std::max(60, textSize.cx + horizontalPadding * 2);
+    const int bubbleHeight = std::max(24, textSize.cy + verticalPadding * 2);
+    const SIZE labelSize{bubbleWidth, bubbleHeight + triangleHeight};
+
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = labelSize.cx;
+    header.bV5Height = -labelSize.cy;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (bitmap == nullptr || bits == nullptr) {
+        SelectObject(memory, previousFont);
+        DeleteDC(memory);
+        if (font != nullptr) {
+            DeleteObject(font);
+        }
+        HideHoverLabel();
+        return;
+    }
+    HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
+    if (previousBitmap == nullptr || previousBitmap == HGDI_ERROR) {
+        DeleteObject(bitmap);
+        SelectObject(memory, previousFont);
+        DeleteDC(memory);
+        if (font != nullptr) {
+            DeleteObject(font);
+        }
+        HideHoverLabel();
+        return;
+    }
+
+    const size_t pixelCount = static_cast<size_t>(labelSize.cx) * static_cast<size_t>(labelSize.cy);
+    std::memset(bits, 0, pixelCount * sizeof(DWORD));
+    HBRUSH bubbleBrush = CreateSolidBrush(RGB(42, 42, 46));
+    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(112, 112, 120));
+    if (bubbleBrush == nullptr || borderPen == nullptr) {
+        if (bubbleBrush != nullptr) {
+            DeleteObject(bubbleBrush);
+        }
+        if (borderPen != nullptr) {
+            DeleteObject(borderPen);
+        }
+        SelectObject(memory, previousBitmap);
+        DeleteObject(bitmap);
+        SelectObject(memory, previousFont);
+        DeleteDC(memory);
+        if (font != nullptr) {
+            DeleteObject(font);
+        }
+        HideHoverLabel();
+        return;
+    }
+    HGDIOBJ previousBrush = SelectObject(memory, bubbleBrush);
+    HGDIOBJ previousPen = SelectObject(memory, borderPen);
+    if (previousBrush == nullptr || previousBrush == HGDI_ERROR || previousPen == nullptr ||
+        previousPen == HGDI_ERROR) {
+        if (previousBrush != nullptr && previousBrush != HGDI_ERROR) {
+            SelectObject(memory, previousBrush);
+        }
+        if (previousPen != nullptr && previousPen != HGDI_ERROR) {
+            SelectObject(memory, previousPen);
+        }
+        DeleteObject(borderPen);
+        DeleteObject(bubbleBrush);
+        SelectObject(memory, previousBitmap);
+        DeleteObject(bitmap);
+        SelectObject(memory, previousFont);
+        DeleteDC(memory);
+        if (font != nullptr) {
+            DeleteObject(font);
+        }
+        HideHoverLabel();
+        return;
+    }
+
+    RoundRect(memory, 0, 0, bubbleWidth, bubbleHeight, cornerRadius * 2, cornerRadius * 2);
+    const int center = bubbleWidth / 2;
+    const POINT triangle[3] = {
+        {center - triangleWidth / 2, bubbleHeight - 1},
+        {center + triangleWidth / 2, bubbleHeight - 1},
+        {center, bubbleHeight + triangleHeight - 1},
+    };
+    Polygon(memory, triangle, static_cast<int>(std::size(triangle)));
+    SetBkMode(memory, TRANSPARENT);
+    SetTextColor(memory, RGB(245, 245, 247));
+    RECT textBounds{horizontalPadding, 0, bubbleWidth - horizontalPadding, bubbleHeight};
+    DrawTextW(memory, text.c_str(), textLength, &textBounds,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    DWORD* pixels = static_cast<DWORD*>(bits);
+    for (size_t index = 0; index < pixelCount; ++index) {
+        if ((pixels[index] & 0x00ffffffU) != 0) {
+            pixels[index] |= 0xff000000U;
+        }
+    }
+
+    const POINT destination{iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2 -
+            labelSize.cx / 2,
+        iconTopLeft.y - labelSize.cy - gap};
+    const POINT source{};
+    const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    const BOOL updated = UpdateLayeredWindow(m_hoverLabelWindow, nullptr, &destination, &labelSize,
+        memory, &source, 0, &blend, ULW_ALPHA);
+
+    SelectObject(memory, previousPen);
+    SelectObject(memory, previousBrush);
+    DeleteObject(borderPen);
+    DeleteObject(bubbleBrush);
+    SelectObject(memory, previousBitmap);
+    DeleteObject(bitmap);
+    SelectObject(memory, previousFont);
+    DeleteDC(memory);
+    if (font != nullptr) {
+        DeleteObject(font);
+    }
+
+    if (updated == FALSE) {
+        Log(L"Could not update the hover label window.");
+        HideHoverLabel();
+        return;
+    }
+    if (SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, destination.x, destination.y, labelSize.cx,
+            labelSize.cy, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW) == FALSE) {
+        Log(L"Could not position the hover label window.");
+    }
+}
+
+void DockApp::HideHoverLabel() noexcept {
+    if (m_hoverLabelWindow != nullptr) {
+        ShowWindow(m_hoverLabelWindow, SW_HIDE);
+    }
 }
 
 void DockApp::LoadIconTextures() {
@@ -550,6 +830,7 @@ void DockApp::BeginShow() {
         return;
     }
 
+    HideHoverLabel();
     const bool wasHidden = m_visibility == VisibilityState::Hidden;
     RefreshRunningWindows(true);
     RebuildLayout(false);
@@ -579,8 +860,8 @@ void DockApp::BeginHide() {
     if (GetCapture() == m_inputWindow) {
         ReleaseCapture();
     }
-    m_pressedIcon = -1;
-    m_draggedIcon = -1;
+    ClearPressState();
+    HideHoverLabel();
     m_visibility = VisibilityState::Hiding;
     ShowWindow(m_inputWindow, SW_HIDE);
     m_animationFromY = m_currentY;
@@ -607,11 +888,14 @@ void DockApp::AdvanceAnimation() {
     if (m_visibility == VisibilityState::Showing) {
         m_visibility = VisibilityState::Visible;
         m_currentY = m_visibleY;
+        UpdateHoverLabel();
         return;
     }
 
     m_visibility = VisibilityState::Hidden;
     m_currentY = m_hiddenY;
+    ClearPressState();
+    HideHoverLabel();
     ShowWindow(m_inputWindow, SW_HIDE);
     ShowWindow(m_window, SW_HIDE);
 }
@@ -625,6 +909,7 @@ void DockApp::RenderFrame() {
         DockIconRenderData& icon = m_iconRenderData[index];
         icon.hovered = static_cast<int>(index) == m_hoveredIcon;
         icon.dragged = static_cast<int>(index) == m_draggedIcon;
+        icon.pressed = static_cast<int>(index) == m_pressedIcon;
     }
 
     DockRenderState state;
@@ -642,6 +927,7 @@ void DockApp::RenderFrame() {
 void DockApp::HandlePointer(POINT cursor) {
     m_lastCursor = cursor;
     if (m_visibility == VisibilityState::Hidden) {
+        HideHoverLabel();
         if (IsCursorInBottomHotZone(cursor)) {
             BeginShow();
         }
@@ -666,6 +952,7 @@ void DockApp::HandlePointer(POINT cursor) {
             RenderFrame();
         }
     }
+    UpdateHoverLabel();
     RefreshRunningWindows();
 }
 
@@ -808,7 +1095,13 @@ void DockApp::CompleteDrag() {
     RebuildDisplayApps();
     RebuildLayout(true);
     m_lastWindowRefresh = QpcSeconds();
-    RenderFrame();
+}
+
+void DockApp::ClearPressState() noexcept {
+    m_pressedIcon = -1;
+    m_draggedIcon = -1;
+    m_dragInsertion = -1;
+    m_pressedAt = {};
 }
 
 void DockApp::RefreshRunningWindows(bool force) {
@@ -970,6 +1263,17 @@ int DockApp::InsertionIndexFor(POINT cursor) const noexcept {
         }
     }
     return static_cast<int>(m_iconRenderData.size());
+}
+
+bool DockApp::HasCrossedDragThreshold(POINT cursor) const noexcept {
+    UINT dpi = GetDpiForWindow(m_inputWindow == nullptr ? m_window : m_inputWindow);
+    if (dpi == 0) {
+        dpi = 96;
+    }
+    const double threshold = kDragThresholdLogicalPixels * static_cast<double>(dpi) / 96.0;
+    const double deltaX = static_cast<double>(cursor.x) - static_cast<double>(m_pressedAt.x);
+    const double deltaY = static_cast<double>(cursor.y) - static_cast<double>(m_pressedAt.y);
+    return deltaX * deltaX + deltaY * deltaY >= threshold * threshold;
 }
 
 bool DockApp::IsPersistentDisplayIcon(int icon) const noexcept {

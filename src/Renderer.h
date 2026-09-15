@@ -19,6 +19,7 @@ struct DockIconRenderData {
     bool running = false;
     bool dragged = false;
     bool hovered = false;
+    bool pressed = false;
     UINT textureIndex = 0;
 };
 
