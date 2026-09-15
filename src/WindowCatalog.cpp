@@ -7,7 +7,6 @@
 #include <cwctype>
 #include <filesystem>
 #include <iterator>
-#include <string_view>
 
 namespace {
 
@@ -50,8 +49,9 @@ bool IsPictureInPictureTitle(const std::wstring& title) {
     return false;
 }
 
-bool IsSmallAuxiliaryWindow(HWND window, LONG_PTR extendedStyle) {
-    if ((extendedStyle & WS_EX_APPWINDOW) != 0) {
+bool IsSmallAuxiliaryWindow(HWND window, LONG_PTR style, LONG_PTR extendedStyle) {
+    if ((style & WS_OVERLAPPEDWINDOW) == WS_OVERLAPPEDWINDOW ||
+        (extendedStyle & WS_EX_APPWINDOW) != 0) {
         return false;
     }
 
@@ -215,7 +215,7 @@ bool WindowCatalog::IsApplicationWindow(HWND window) {
         cloaked != 0) {
         return false;
     }
-    return !IsSmallAuxiliaryWindow(window, extendedStyle);
+    return !IsSmallAuxiliaryWindow(window, style, extendedStyle);
 }
 
 std::wstring WindowCatalog::ExecutablePath(HWND window) {

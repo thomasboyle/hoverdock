@@ -258,13 +258,15 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
 LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_NCHITTEST:
-        return m_visibility == VisibilityState::Hidden ? HTTRANSPARENT : HTCLIENT;
+        return m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible
+            ? HTCLIENT
+            : HTTRANSPARENT;
 
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
 
     case WM_SETCURSOR:
-        if (m_visibility != VisibilityState::Hidden) {
+        if (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) {
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             return TRUE;
         }
@@ -535,6 +537,7 @@ void DockApp::BeginHide() {
     m_pressedIcon = -1;
     m_draggedIcon = -1;
     m_visibility = VisibilityState::Hiding;
+    ShowWindow(m_inputWindow, SW_HIDE);
     m_animationFromY = m_currentY;
     m_animationToY = m_hiddenY;
     m_animationStartedAt = QpcSeconds();
@@ -771,30 +774,31 @@ void DockApp::RefreshRunningWindows(bool force) {
 bool DockApp::RebuildDisplayApps() {
     std::vector<DisplayApp> displayApps;
     displayApps.reserve(m_config.Pins().size() + m_windows.RunningWindows().size());
+    std::vector<std::wstring> displayedTargets;
+    displayedTargets.reserve(m_config.Pins().size() + m_windows.RunningWindows().size());
 
     for (size_t index = 0; index < m_config.Pins().size(); ++index) {
         const PinnedApp& pin = m_config.Pins()[index];
+        const bool alreadyDisplayed = std::ranges::any_of(displayedTargets,
+            [&pin](const std::wstring& target) {
+                return WindowCatalog::TargetsMatch(target, pin.target);
+            });
+        if (alreadyDisplayed) {
+            continue;
+        }
+        displayedTargets.push_back(pin.target);
         displayApps.push_back({pin, m_windows.FindWindowFor(pin), static_cast<int>(index)});
     }
 
-    std::vector<std::wstring> displayedUnpinnedTargets;
-    displayedUnpinnedTargets.reserve(m_windows.RunningWindows().size());
     for (const RunningWindow& window : m_windows.RunningWindows()) {
-        const bool isPinned = std::ranges::any_of(m_config.Pins(), [&window](const PinnedApp& pin) {
-            return WindowCatalog::TargetsMatch(pin.target, window.executablePath);
-        });
-        if (isPinned) {
-            continue;
-        }
-
-        const bool alreadyDisplayed = std::ranges::any_of(displayedUnpinnedTargets,
+        const bool alreadyDisplayed = std::ranges::any_of(displayedTargets,
             [&window](const std::wstring& target) {
                 return WindowCatalog::TargetsMatch(target, window.executablePath);
             });
         if (alreadyDisplayed) {
             continue;
         }
-        displayedUnpinnedTargets.push_back(window.executablePath);
+        displayedTargets.push_back(window.executablePath);
 
         PinnedApp app;
         app.name = window.title.empty() ? DisplayNameFromExecutable(window.executablePath) : window.title;
