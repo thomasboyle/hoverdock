@@ -28,14 +28,21 @@ private:
         Hiding,
     };
 
+    struct DisplayApp {
+        PinnedApp app;
+        HWND runningWindow = nullptr;
+        int persistentPinIndex = -1;
+    };
+
     static constexpr UINT kPointerMessage = WM_APP + 1;
     static constexpr UINT kRenderMessage = WM_APP + 2;
     static constexpr UINT kContextOpen = 1;
     static constexpr UINT kContextOpenLocation = 2;
     static constexpr UINT kContextClose = 3;
-    static constexpr UINT kContextUnpin = 4;
-    static constexpr UINT kContextPinForeground = 5;
-    static constexpr UINT kContextToggleBounds = 6;
+    static constexpr UINT kContextPin = 4;
+    static constexpr UINT kContextUnpin = 5;
+    static constexpr UINT kContextPinForeground = 6;
+    static constexpr UINT kContextToggleBounds = 7;
 
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK MouseHook(int code, WPARAM wParam, LPARAM lParam);
@@ -54,7 +61,8 @@ private:
     void HandleContextMenu(POINT screenPoint);
     void ActivatePressedApp();
     void CompleteDrag();
-    void RefreshRunningWindows();
+    void RefreshRunningWindows(bool force = false);
+    bool RebuildDisplayApps();
     void HideTaskbar();
     void RestoreTaskbar();
     void Log(const std::wstring& message) const;
@@ -62,6 +70,7 @@ private:
     [[nodiscard]] bool IsCursorInBottomHotZone(POINT cursor) const noexcept;
     [[nodiscard]] int IconAtScreenPoint(POINT cursor) const noexcept;
     [[nodiscard]] int InsertionIndexFor(POINT cursor) const noexcept;
+    [[nodiscard]] bool IsPersistentDisplayIcon(int icon) const noexcept;
     [[nodiscard]] LONG CurrentY() const noexcept;
     [[nodiscard]] bool IsAnimating() const noexcept;
     [[nodiscard]] double SecondsSinceAnimationStarted() const noexcept;
@@ -77,6 +86,7 @@ private:
     DockConfig m_config;
     WindowCatalog m_windows;
     Renderer m_renderer;
+    std::vector<DisplayApp> m_displayApps;
     std::vector<DockIconRenderData> m_iconRenderData;
     VisibilityState m_visibility = VisibilityState::Hidden;
     double m_animationStartedAt = 0.0;
@@ -96,7 +106,6 @@ private:
     bool m_taskbarHidden = false;
     bool m_rendererInitialized = false;
     bool m_renderQueued = false;
-    bool m_pointerInsideDock = false;
     double m_lastWindowRefresh = 0.0;
 
     static DockApp* s_instance;

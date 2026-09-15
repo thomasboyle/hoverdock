@@ -17,7 +17,8 @@ DockApp* DockApp::s_instance = nullptr;
 
 namespace {
 
-constexpr double kSlideDurationSeconds = 0.200;
+constexpr double kShowDurationSeconds = 0.100;
+constexpr double kHideDurationSeconds = 0.200;
 constexpr int kBottomHotZonePixels = 2;
 constexpr int kDragThresholdPixels = 4;
 
@@ -28,6 +29,23 @@ std::wstring ConfigDirectory(const std::wstring& path) {
 
 bool IsInside(const RECT& bounds, LONG x, LONG y) {
     return x >= bounds.left && x < bounds.right && y >= bounds.top && y < bounds.bottom;
+}
+
+POINT ScreenPointFromClient(HWND window, LPARAM lParam) {
+    POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+    if (ClientToScreen(window, &point) == FALSE) {
+        GetCursorPos(&point);
+    }
+    return point;
+}
+
+std::wstring DisplayNameFromExecutable(const std::wstring& path) {
+    const size_t fileStart = path.find_last_of(L"\\/") + 1;
+    const size_t extension = path.find_last_of(L'.');
+    const size_t fileEnd = extension == std::wstring::npos || extension < fileStart
+        ? path.size()
+        : extension;
+    return path.substr(fileStart, fileEnd - fileStart);
 }
 
 }  // namespace
@@ -69,6 +87,7 @@ int DockApp::Run() {
     CreateOverlayWindow();
     UpdatePrimaryMonitor();
     m_windows.Refresh();
+    RebuildDisplayApps();
     RebuildLayout(false);
 
     try {
@@ -169,7 +188,7 @@ LRESULT DockApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         break;
 
     case WM_LBUTTONDOWN: {
-        const POINT point{GET_X_LPARAM(lParam) + m_windowX, GET_Y_LPARAM(lParam) + m_currentY};
+        const POINT point = ScreenPointFromClient(m_window, lParam);
         m_pressedIcon = IconAtScreenPoint(point);
         if (m_pressedIcon >= 0) {
             m_pressedAt = point;
@@ -179,10 +198,9 @@ LRESULT DockApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_MOUSEMOVE: {
-        POINT point{};
-        GetCursorPos(&point);
+        const POINT point = ScreenPointFromClient(m_window, lParam);
         HandlePointer(point);
-        if (m_pressedIcon >= 0 &&
+        if (m_pressedIcon >= 0 && IsPersistentDisplayIcon(m_pressedIcon) &&
             (std::abs(point.x - m_pressedAt.x) >= kDragThresholdPixels ||
                 std::abs(point.y - m_pressedAt.y) >= kDragThresholdPixels)) {
             m_draggedIcon = m_pressedIcon;
@@ -214,12 +232,9 @@ LRESULT DockApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         m_dragInsertion = -1;
         return 0;
 
-    case WM_RBUTTONUP: {
-        POINT point{};
-        GetCursorPos(&point);
-        HandleContextMenu(point);
+    case WM_RBUTTONUP:
+        HandleContextMenu(ScreenPointFromClient(m_window, lParam));
         return 0;
-    }
 
     case WM_DPICHANGED:
     case WM_DISPLAYCHANGE:
@@ -285,8 +300,7 @@ void DockApp::CreateOverlayWindow() {
     RegisterClassExW(&windowClass);
 
     constexpr DWORD style = WS_POPUP;
-    constexpr DWORD extendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST |
-        WS_EX_NOREDIRECTIONBITMAP;
+    constexpr DWORD extendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
     m_window = CreateWindowExW(extendedStyle, className, L"Liquid Glass Dock", style, 0, 0, 1, 1,
         nullptr, nullptr, m_instance, this);
     if (m_window == nullptr) {
@@ -301,11 +315,11 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     const LONG padding = std::lround(20.0F * scale);
     const LONG gap = std::lround(10.0F * scale);
     const LONG margin = std::lround(10.0F * scale);
-    const size_t pinCount = m_config.Pins().size();
+    const size_t displayCount = m_displayApps.size();
 
     m_dockWidth = static_cast<UINT>(padding * 2 +
-        static_cast<LONG>(pinCount) * iconSize +
-        static_cast<LONG>(pinCount > 0 ? pinCount - 1 : 0) * gap);
+        static_cast<LONG>(displayCount) * iconSize +
+        static_cast<LONG>(displayCount > 0 ? displayCount - 1 : 0) * gap);
     m_dockHeight = static_cast<UINT>(std::lround(88.0F * scale));
     m_visibleY = m_primaryBounds.bottom - static_cast<LONG>(m_dockHeight);
     m_hiddenY = m_visibleY + static_cast<LONG>(m_dockHeight) + margin;
@@ -316,13 +330,13 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         ((m_primaryBounds.right - m_primaryBounds.left) - static_cast<LONG>(m_dockWidth)) / 2;
 
     m_iconRenderData.clear();
-    m_iconRenderData.reserve(pinCount);
+    m_iconRenderData.reserve(displayCount);
     const LONG top = (static_cast<LONG>(m_dockHeight) - iconSize) / 2;
-    for (size_t index = 0; index < pinCount; ++index) {
+    for (size_t index = 0; index < displayCount; ++index) {
         const LONG left = padding + static_cast<LONG>(index) * (iconSize + gap);
         DockIconRenderData data;
         data.bounds = {left, top, left + iconSize, top + iconSize};
-        data.running = m_windows.IsRunning(m_config.Pins()[index]);
+        data.running = m_displayApps[index].runningWindow != nullptr;
         data.textureIndex = static_cast<UINT>(index);
         m_iconRenderData.push_back(data);
     }
@@ -339,9 +353,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
 
 void DockApp::LoadIconTextures() {
     std::vector<std::wstring> targets;
-    targets.reserve(m_config.Pins().size());
-    for (const PinnedApp& app : m_config.Pins()) {
-        targets.push_back(app.target);
+    targets.reserve(m_displayApps.size());
+    for (const DisplayApp& app : m_displayApps) {
+        targets.push_back(app.app.target);
     }
     m_renderer.LoadIcons(targets);
 }
@@ -360,7 +374,7 @@ void DockApp::BeginShow() {
         return;
     }
 
-    RefreshRunningWindows();
+    RefreshRunningWindows(true);
     RebuildLayout(false);
     ShowWindow(m_window, SW_SHOWNOACTIVATE);
     m_visibility = VisibilityState::Showing;
@@ -386,8 +400,11 @@ void DockApp::BeginHide() {
 }
 
 void DockApp::AdvanceAnimation() {
+    const double duration = m_visibility == VisibilityState::Hiding
+        ? kHideDurationSeconds
+        : kShowDurationSeconds;
     const double elapsed = SecondsSinceAnimationStarted();
-    const double linear = std::clamp(elapsed / kSlideDurationSeconds, 0.0, 1.0);
+    const double linear = std::clamp(elapsed / duration, 0.0, 1.0);
     const double eased = linear * linear * (3.0 - 2.0 * linear);
     m_currentY = std::lround(static_cast<double>(m_animationFromY) +
         static_cast<double>(m_animationToY - m_animationFromY) * eased);
@@ -407,7 +424,6 @@ void DockApp::AdvanceAnimation() {
 
     m_visibility = VisibilityState::Hidden;
     m_currentY = m_hiddenY;
-    m_pointerInsideDock = false;
     ShowWindow(m_window, SW_HIDE);
 }
 
@@ -435,7 +451,6 @@ void DockApp::RenderFrame() {
 }
 
 void DockApp::HandlePointer(POINT cursor) {
-    const bool wasInsideDock = m_pointerInsideDock;
     m_lastCursor = cursor;
     if (m_visibility == VisibilityState::Hidden) {
         if (IsCursorInBottomHotZone(cursor)) {
@@ -449,16 +464,11 @@ void DockApp::HandlePointer(POINT cursor) {
         return;
     }
 
-    const bool isInsideDock = cursor.x >= m_windowX &&
-        cursor.x < m_windowX + static_cast<LONG>(m_dockWidth) &&
-        cursor.y >= m_currentY &&
-        cursor.y < m_currentY + static_cast<LONG>(m_dockHeight);
-    if (wasInsideDock && cursor.y < m_currentY) {
+    if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
+        cursor.y < m_visibleY) {
         BeginHide();
-        m_pointerInsideDock = false;
         return;
     }
-    m_pointerInsideDock = isInsideDock;
 
     const int hovered = IconAtScreenPoint(cursor);
     if (hovered != m_hoveredIcon) {
@@ -471,23 +481,26 @@ void DockApp::HandlePointer(POINT cursor) {
 }
 
 void DockApp::HandleContextMenu(POINT screenPoint) {
+    RefreshRunningWindows(true);
     const int icon = IconAtScreenPoint(screenPoint);
     HMENU menu = CreatePopupMenu();
     if (menu == nullptr) {
         return;
     }
 
-    m_windows.Refresh();
-    if (icon >= 0) {
-        const PinnedApp& app = m_config.Pins()[static_cast<size_t>(icon)];
-        const bool running = m_windows.IsRunning(app);
+    DisplayApp app;
+    if (icon >= 0 && static_cast<size_t>(icon) < m_displayApps.size()) {
+        app = m_displayApps[static_cast<size_t>(icon)];
+        const bool running = app.runningWindow != nullptr;
         AppendMenuW(menu, MF_STRING, kContextOpen, L"Open");
-        if (app.target.rfind(L"shell:", 0) != 0) {
+        if (app.app.target.rfind(L"shell:", 0) != 0) {
             AppendMenuW(menu, MF_STRING, kContextOpenLocation, L"Open location");
         }
         AppendMenuW(menu, MF_STRING | (running ? MF_ENABLED : MF_GRAYED), kContextClose, L"Close");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, kContextUnpin, L"Unpin");
+        AppendMenuW(menu, MF_STRING,
+            app.persistentPinIndex >= 0 ? kContextUnpin : kContextPin,
+            app.persistentPinIndex >= 0 ? L"Unpin" : L"Pin");
     } else {
         AppendMenuW(menu, MF_STRING, kContextPinForeground, L"Pin foreground application");
     }
@@ -506,14 +519,23 @@ void DockApp::HandleContextMenu(POINT screenPoint) {
     bool configChanged = false;
     bool actionSucceeded = true;
     if (command == kContextOpen && icon >= 0) {
-        actionSucceeded = m_windows.ActivateOrLaunch(m_config.Pins()[static_cast<size_t>(icon)]);
+        actionSucceeded = m_windows.ActivateOrLaunch(app.app, app.runningWindow);
     } else if (command == kContextOpenLocation && icon >= 0) {
-        actionSucceeded = m_windows.OpenLocation(m_config.Pins()[static_cast<size_t>(icon)]);
+        actionSucceeded = m_windows.OpenLocation(app.app);
     } else if (command == kContextClose && icon >= 0) {
-        actionSucceeded = m_windows.Close(m_config.Pins()[static_cast<size_t>(icon)]);
-    } else if (command == kContextUnpin && icon >= 0) {
-        m_config.Pins().erase(m_config.Pins().begin() + icon);
+        actionSucceeded = m_windows.Close(app.app, app.runningWindow);
+    } else if (command == kContextUnpin && app.persistentPinIndex >= 0 &&
+        static_cast<size_t>(app.persistentPinIndex) < m_config.Pins().size()) {
+        m_config.Pins().erase(m_config.Pins().begin() + app.persistentPinIndex);
         configChanged = true;
+    } else if (command == kContextPin && app.persistentPinIndex < 0) {
+        const bool alreadyPinned = std::ranges::any_of(m_config.Pins(), [&app](const PinnedApp& pin) {
+            return WindowCatalog::TargetsMatch(pin.target, app.app.target);
+        });
+        if (!alreadyPinned) {
+            m_config.Pins().push_back(app.app);
+            configChanged = true;
+        }
     } else if (command == kContextPinForeground) {
         configChanged = m_windows.AddForegroundApplication(m_config.Pins());
     } else if (command == kContextToggleBounds) {
@@ -526,55 +548,115 @@ void DockApp::HandleContextMenu(POINT screenPoint) {
     }
     if (configChanged) {
         m_config.Save();
-        m_windows.Refresh();
-        RebuildLayout(command == kContextUnpin || command == kContextPinForeground);
+        m_lastWindowRefresh = 0.0;
+        RefreshRunningWindows(true);
     }
     RefreshRunningWindows();
     RenderFrame();
 }
 
 void DockApp::ActivatePressedApp() {
-    if (m_pressedIcon < 0 || static_cast<size_t>(m_pressedIcon) >= m_config.Pins().size()) {
+    if (m_pressedIcon < 0 || static_cast<size_t>(m_pressedIcon) >= m_displayApps.size()) {
         return;
     }
+
+    const DisplayApp app = m_displayApps[static_cast<size_t>(m_pressedIcon)];
     m_windows.Refresh();
-    if (!m_windows.ActivateOrLaunch(m_config.Pins()[static_cast<size_t>(m_pressedIcon)])) {
-        Log(L"Pinned application did not launch or accept focus.");
+    if (!m_windows.ActivateOrLaunch(app.app, app.runningWindow)) {
+        Log(L"Application did not launch or accept focus.");
     }
     m_lastWindowRefresh = 0.0;
     RefreshRunningWindows();
 }
 
 void DockApp::CompleteDrag() {
-    if (m_draggedIcon < 0 || m_dragInsertion < 0 || m_draggedIcon == m_dragInsertion ||
-        static_cast<size_t>(m_draggedIcon) >= m_config.Pins().size()) {
+    if (m_draggedIcon < 0 || m_dragInsertion < 0 || !IsPersistentDisplayIcon(m_draggedIcon) ||
+        static_cast<size_t>(m_draggedIcon) >= m_displayApps.size()) {
+        return;
+    }
+
+    const int draggedPin = m_displayApps[static_cast<size_t>(m_draggedIcon)].persistentPinIndex;
+    if (draggedPin < 0 || static_cast<size_t>(draggedPin) >= m_config.Pins().size()) {
+        return;
+    }
+
+    const int insertion = std::clamp(m_dragInsertion, 0, static_cast<int>(m_displayApps.size()));
+    int target = 0;
+    for (int index = 0; index < insertion; ++index) {
+        if (m_displayApps[static_cast<size_t>(index)].persistentPinIndex >= 0) {
+            ++target;
+        }
+    }
+    if (target == draggedPin || target == draggedPin + 1) {
         return;
     }
 
     std::vector<PinnedApp>& pins = m_config.Pins();
-    PinnedApp app = std::move(pins[static_cast<size_t>(m_draggedIcon)]);
-    pins.erase(pins.begin() + m_draggedIcon);
-    int target = m_dragInsertion;
-    if (target > m_draggedIcon) {
+    PinnedApp app = std::move(pins[static_cast<size_t>(draggedPin)]);
+    pins.erase(pins.begin() + draggedPin);
+    if (target > draggedPin) {
         --target;
     }
     target = std::clamp(target, 0, static_cast<int>(pins.size()));
     pins.insert(pins.begin() + target, std::move(app));
     m_config.Save();
+    m_windows.Refresh();
+    RebuildDisplayApps();
     RebuildLayout(true);
+    m_lastWindowRefresh = QpcSeconds();
     RenderFrame();
 }
 
-void DockApp::RefreshRunningWindows() {
+void DockApp::RefreshRunningWindows(bool force) {
     const double now = QpcSeconds();
-    if (now - m_lastWindowRefresh < 0.5) {
+    if (!force && now - m_lastWindowRefresh < 0.5) {
         return;
     }
+
     m_lastWindowRefresh = now;
     m_windows.Refresh();
-    for (size_t index = 0; index < m_iconRenderData.size(); ++index) {
-        m_iconRenderData[index].running = m_windows.IsRunning(m_config.Pins()[index]);
+    if (RebuildDisplayApps()) {
+        RebuildLayout(true);
+        return;
     }
+
+    const size_t iconCount = std::min(m_iconRenderData.size(), m_displayApps.size());
+    for (size_t index = 0; index < iconCount; ++index) {
+        m_iconRenderData[index].running = m_displayApps[index].runningWindow != nullptr;
+    }
+}
+
+bool DockApp::RebuildDisplayApps() {
+    std::vector<DisplayApp> displayApps;
+    displayApps.reserve(m_config.Pins().size() + m_windows.RunningWindows().size());
+
+    for (size_t index = 0; index < m_config.Pins().size(); ++index) {
+        const PinnedApp& pin = m_config.Pins()[index];
+        displayApps.push_back({pin, m_windows.FindWindowFor(pin), static_cast<int>(index)});
+    }
+
+    for (const RunningWindow& window : m_windows.RunningWindows()) {
+        const bool isPinned = std::ranges::any_of(m_config.Pins(), [&window](const PinnedApp& pin) {
+            return WindowCatalog::TargetsMatch(pin.target, window.executablePath);
+        });
+        if (isPinned) {
+            continue;
+        }
+
+        PinnedApp app;
+        app.name = window.title.empty() ? DisplayNameFromExecutable(window.executablePath) : window.title;
+        app.target = window.executablePath;
+        displayApps.push_back({std::move(app), window.handle, -1});
+    }
+
+    const bool changed = displayApps.size() != m_displayApps.size() ||
+        !std::equal(displayApps.begin(), displayApps.end(), m_displayApps.begin(),
+            [](const DisplayApp& left, const DisplayApp& right) {
+                return left.persistentPinIndex == right.persistentPinIndex &&
+                    left.app.target == right.app.target;
+            });
+    m_displayApps = std::move(displayApps);
+    return changed;
 }
 
 void DockApp::HideTaskbar() {
@@ -620,10 +702,12 @@ bool DockApp::IsCursorInBottomHotZone(POINT cursor) const noexcept {
 }
 
 int DockApp::IconAtScreenPoint(POINT cursor) const noexcept {
-    const LONG localX = cursor.x - m_windowX;
-    const LONG localY = cursor.y - m_currentY;
+    if (ScreenToClient(m_window, &cursor) == FALSE) {
+        return -1;
+    }
+
     for (size_t index = 0; index < m_iconRenderData.size(); ++index) {
-        if (IsInside(m_iconRenderData[index].bounds, localX, localY)) {
+        if (IsInside(m_iconRenderData[index].bounds, cursor.x, cursor.y)) {
             return static_cast<int>(index);
         }
     }
@@ -631,15 +715,23 @@ int DockApp::IconAtScreenPoint(POINT cursor) const noexcept {
 }
 
 int DockApp::InsertionIndexFor(POINT cursor) const noexcept {
-    const LONG localX = cursor.x - m_windowX;
+    if (ScreenToClient(m_window, &cursor) == FALSE) {
+        return -1;
+    }
+
     for (size_t index = 0; index < m_iconRenderData.size(); ++index) {
         const RECT& bounds = m_iconRenderData[index].bounds;
         const LONG center = bounds.left + (bounds.right - bounds.left) / 2;
-        if (localX < center) {
+        if (cursor.x < center) {
             return static_cast<int>(index);
         }
     }
     return static_cast<int>(m_iconRenderData.size());
+}
+
+bool DockApp::IsPersistentDisplayIcon(int icon) const noexcept {
+    return icon >= 0 && static_cast<size_t>(icon) < m_displayApps.size() &&
+        m_displayApps[static_cast<size_t>(icon)].persistentPinIndex >= 0;
 }
 
 LONG DockApp::CurrentY() const noexcept {
