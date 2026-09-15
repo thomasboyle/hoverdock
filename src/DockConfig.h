@@ -19,6 +19,8 @@ public:
     [[nodiscard]] std::vector<PinnedApp>& Pins() noexcept;
     [[nodiscard]] bool ShowDevBounds() const noexcept;
     void SetShowDevBounds(bool enabled) noexcept;
+    [[nodiscard]] bool FollowsTaskbarPins() const noexcept;
+    void StopFollowingTaskbarPins() noexcept;
     [[nodiscard]] const std::wstring& Path() const noexcept;
 
 private:
@@ -28,4 +30,5 @@ private:
     std::wstring m_path;
     std::vector<PinnedApp> m_pins;
     bool m_showDevBounds = false;
+    bool m_followsTaskbarPins = true;
 };
