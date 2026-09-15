@@ -4,6 +4,7 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -22,6 +23,8 @@ constexpr double kHideDurationSeconds = 0.200;
 constexpr int kBottomHotZonePixels = 2;
 constexpr int kDragThresholdPixels = 4;
 constexpr BYTE kInputWindowAlpha = 1;
+constexpr wchar_t kStartTarget[] = L"dock:start";
+constexpr wchar_t kSearchTarget[] = L"dock:search";
 
 std::wstring ConfigDirectory(const std::wstring& path) {
     const size_t separator = path.find_last_of(L"\\/");
@@ -47,6 +50,48 @@ std::wstring DisplayNameFromExecutable(const std::wstring& path) {
         ? path.size()
         : extension;
     return path.substr(fileStart, fileEnd - fileStart);
+}
+
+bool IsSpecialDockTarget(const std::wstring& target) {
+    return target == kStartTarget || target == kSearchTarget;
+}
+
+INPUT KeyboardInput(WORD key, DWORD flags) {
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = key;
+    input.ki.dwFlags = flags;
+    return input;
+}
+
+bool OpenStartMenu() {
+    const std::array inputs = {
+        KeyboardInput(VK_LWIN, 0),
+        KeyboardInput(VK_LWIN, KEYEVENTF_KEYUP),
+    };
+    return SendInput(static_cast<UINT>(inputs.size()), const_cast<INPUT*>(inputs.data()),
+        sizeof(INPUT)) == static_cast<UINT>(inputs.size());
+}
+
+bool OpenSearch() {
+    const std::array inputs = {
+        KeyboardInput(VK_LWIN, 0),
+        KeyboardInput(L'S', 0),
+        KeyboardInput(L'S', KEYEVENTF_KEYUP),
+        KeyboardInput(VK_LWIN, KEYEVENTF_KEYUP),
+    };
+    return SendInput(static_cast<UINT>(inputs.size()), const_cast<INPUT*>(inputs.data()),
+        sizeof(INPUT)) == static_cast<UINT>(inputs.size());
+}
+
+bool OpenSpecialDockTarget(const std::wstring& target) {
+    if (target == kStartTarget) {
+        return OpenStartMenu();
+    }
+    if (target == kSearchTarget) {
+        return OpenSearch();
+    }
+    return false;
 }
 
 }  // namespace
@@ -199,7 +244,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
     case WM_DPICHANGED:
     case WM_DISPLAYCHANGE:
         UpdatePrimaryMonitor();
-        RebuildLayout(false);
+        RebuildLayout(true);
         return 0;
 
     case WM_ENDSESSION:
@@ -341,7 +386,7 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
     }
 
     case WM_DPICHANGED:
-        RebuildLayout(false);
+        RebuildLayout(true);
         return 0;
 
     case WM_CLOSE:
@@ -633,18 +678,24 @@ void DockApp::HandleContextMenu(POINT screenPoint) {
     }
 
     DisplayApp app;
-    if (icon >= 0 && static_cast<size_t>(icon) < m_displayApps.size()) {
+    const bool hasApp = icon >= 0 && static_cast<size_t>(icon) < m_displayApps.size();
+    const bool isSpecial = hasApp && IsSpecialDockTarget(m_displayApps[static_cast<size_t>(icon)].app.target);
+    if (hasApp) {
         app = m_displayApps[static_cast<size_t>(icon)];
-        const bool running = app.runningWindow != nullptr;
-        AppendMenuW(menu, MF_STRING, kContextOpen, L"Open");
-        if (app.app.target.rfind(L"shell:", 0) != 0) {
-            AppendMenuW(menu, MF_STRING, kContextOpenLocation, L"Open location");
+        if (isSpecial) {
+            AppendMenuW(menu, MF_STRING, kContextOpen, L"Open");
+        } else {
+            const bool running = app.runningWindow != nullptr;
+            AppendMenuW(menu, MF_STRING, kContextOpen, L"Open");
+            if (app.app.target.rfind(L"shell:", 0) != 0) {
+                AppendMenuW(menu, MF_STRING, kContextOpenLocation, L"Open location");
+            }
+            AppendMenuW(menu, MF_STRING | (running ? MF_ENABLED : MF_GRAYED), kContextClose, L"Close");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING,
+                app.persistentPinIndex >= 0 ? kContextUnpin : kContextPin,
+                app.persistentPinIndex >= 0 ? L"Unpin" : L"Pin");
         }
-        AppendMenuW(menu, MF_STRING | (running ? MF_ENABLED : MF_GRAYED), kContextClose, L"Close");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING,
-            app.persistentPinIndex >= 0 ? kContextUnpin : kContextPin,
-            app.persistentPinIndex >= 0 ? L"Unpin" : L"Pin");
     } else {
         AppendMenuW(menu, MF_STRING, kContextPinForeground, L"Pin foreground application");
     }
@@ -663,17 +714,18 @@ void DockApp::HandleContextMenu(POINT screenPoint) {
 
     bool configChanged = false;
     bool actionSucceeded = true;
-    if (command == kContextOpen && icon >= 0) {
-        actionSucceeded = m_windows.ActivateOrLaunch(app.app, app.runningWindow);
-    } else if (command == kContextOpenLocation && icon >= 0) {
+    if (command == kContextOpen && hasApp) {
+        actionSucceeded = isSpecial ? OpenSpecialDockTarget(app.app.target)
+                                    : m_windows.ActivateOrLaunch(app.app, app.runningWindow);
+    } else if (command == kContextOpenLocation && hasApp && !isSpecial) {
         actionSucceeded = m_windows.OpenLocation(app.app);
-    } else if (command == kContextClose && icon >= 0) {
+    } else if (command == kContextClose && hasApp && !isSpecial) {
         actionSucceeded = m_windows.Close(app.app, app.runningWindow);
-    } else if (command == kContextUnpin && app.persistentPinIndex >= 0 &&
+    } else if (command == kContextUnpin && !isSpecial && app.persistentPinIndex >= 0 &&
         static_cast<size_t>(app.persistentPinIndex) < m_config.Pins().size()) {
         m_config.Pins().erase(m_config.Pins().begin() + app.persistentPinIndex);
         configChanged = true;
-    } else if (command == kContextPin && app.persistentPinIndex < 0) {
+    } else if (command == kContextPin && !isSpecial && app.persistentPinIndex < 0) {
         const bool alreadyPinned = std::ranges::any_of(m_config.Pins(), [&app](const PinnedApp& pin) {
             return WindowCatalog::TargetsMatch(pin.target, app.app.target);
         });
@@ -706,6 +758,13 @@ void DockApp::ActivatePressedApp() {
     }
 
     const DisplayApp app = m_displayApps[static_cast<size_t>(m_pressedIcon)];
+    if (IsSpecialDockTarget(app.app.target)) {
+        if (!OpenSpecialDockTarget(app.app.target)) {
+            Log(L"Special dock target did not accept input.");
+        }
+        return;
+    }
+
     m_windows.Refresh();
     if (!m_windows.ActivateOrLaunch(app.app, app.runningWindow)) {
         Log(L"Application did not launch or accept focus.");
@@ -773,12 +832,20 @@ void DockApp::RefreshRunningWindows(bool force) {
 
 bool DockApp::RebuildDisplayApps() {
     std::vector<DisplayApp> displayApps;
-    displayApps.reserve(m_config.Pins().size() + m_windows.RunningWindows().size());
+    displayApps.reserve(m_config.Pins().size() + m_windows.RunningWindows().size() + 2U);
     std::vector<std::wstring> displayedTargets;
-    displayedTargets.reserve(m_config.Pins().size() + m_windows.RunningWindows().size());
+    displayedTargets.reserve(m_config.Pins().size() + m_windows.RunningWindows().size() + 2U);
+
+    displayApps.push_back({{L"Start", kStartTarget, L"", L""}, nullptr, -1});
+    displayApps.push_back({{L"Search", kSearchTarget, L"", L""}, nullptr, -1});
+    displayedTargets.push_back(kStartTarget);
+    displayedTargets.push_back(kSearchTarget);
 
     for (size_t index = 0; index < m_config.Pins().size(); ++index) {
         const PinnedApp& pin = m_config.Pins()[index];
+        if (IsSpecialDockTarget(pin.target)) {
+            continue;
+        }
         const bool alreadyDisplayed = std::ranges::any_of(displayedTargets,
             [&pin](const std::wstring& target) {
                 return WindowCatalog::TargetsMatch(target, pin.target);
@@ -907,6 +974,7 @@ int DockApp::InsertionIndexFor(POINT cursor) const noexcept {
 
 bool DockApp::IsPersistentDisplayIcon(int icon) const noexcept {
     return icon >= 0 && static_cast<size_t>(icon) < m_displayApps.size() &&
+        !IsSpecialDockTarget(m_displayApps[static_cast<size_t>(icon)].app.target) &&
         m_displayApps[static_cast<size_t>(icon)].persistentPinIndex >= 0;
 }
 

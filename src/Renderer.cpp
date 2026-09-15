@@ -1,6 +1,7 @@
 #include "Renderer.h"
 
 #include <Shellapi.h>
+#include <ShObjIdl.h>
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,25 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
+
+constexpr wchar_t kStartTarget[] = L"dock:start";
+constexpr wchar_t kSearchTarget[] = L"dock:search";
+
+class ComApartment {
+public:
+    ComApartment()
+        : m_result(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)) {
+    }
+
+    ~ComApartment() {
+        if (SUCCEEDED(m_result)) {
+            CoUninitialize();
+        }
+    }
+
+private:
+    HRESULT m_result = E_FAIL;
+};
 
 [[noreturn]] void ThrowFailure(HRESULT result, const char* operation) {
     throw std::runtime_error(std::string(operation) + " failed (HRESULT " +
@@ -109,24 +129,40 @@ D3D12_BLEND_DESC PremultipliedBlendDescription() {
     return description;
 }
 
-std::vector<uint8_t> ExtractIconPixels(const std::wstring& target) {
-    SHFILEINFOW information{};
-    if (SHGetFileInfoW(target.c_str(), FILE_ATTRIBUTE_NORMAL, &information, sizeof(information),
-            SHGFI_ICON | SHGFI_LARGEICON) == 0 ||
-        information.hIcon == nullptr) {
+UINT IconTextureExtent(HWND window) {
+    const UINT dpi = window == nullptr ? 96U : std::max(GetDpiForWindow(window), 96U);
+    return std::max(96U, static_cast<UINT>(std::lround(static_cast<float>(dpi))));
+}
+
+void NormalizeAlpha(std::vector<uint8_t>& pixels) {
+    bool hasAlpha = false;
+    for (size_t index = 3; index < pixels.size(); index += 4) {
+        hasAlpha = hasAlpha || pixels[index] != 0;
+    }
+    if (!hasAlpha) {
+        for (size_t index = 0; index < pixels.size(); index += 4) {
+            pixels[index + 3] = (pixels[index] | pixels[index + 1] | pixels[index + 2]) == 0 ? 0 : 255;
+        }
+    }
+}
+
+std::vector<uint8_t> RasterizeIcon(HICON icon, UINT extent) {
+    if (icon == nullptr) {
         return {};
     }
 
-    constexpr int iconSize = 64;
     BITMAPV5HEADER header{};
     header.bV5Size = sizeof(header);
-    header.bV5Width = iconSize;
-    header.bV5Height = -iconSize;
+    header.bV5Width = static_cast<LONG>(extent);
+    header.bV5Height = -static_cast<LONG>(extent);
     header.bV5Planes = 1;
     header.bV5BitCount = 32;
     header.bV5Compression = BI_RGB;
 
     HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return {};
+    }
     HDC memory = CreateCompatibleDC(screen);
     void* bitmapBits = nullptr;
     HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<BITMAPINFO*>(&header), DIB_RGB_COLORS,
@@ -139,31 +175,216 @@ std::vector<uint8_t> ExtractIconPixels(const std::wstring& target) {
         if (bitmap != nullptr) {
             DeleteObject(bitmap);
         }
-        DestroyIcon(information.hIcon);
         return {};
     }
 
     const HGDIOBJ previous = SelectObject(memory, bitmap);
-    std::memset(bitmapBits, 0, iconSize * iconSize * 4);
-    DrawIconEx(memory, 0, 0, information.hIcon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
-
-    std::vector<uint8_t> pixels(iconSize * iconSize * 4);
-    std::memcpy(pixels.data(), bitmapBits, pixels.size());
-    bool hasAlpha = false;
-    for (size_t index = 3; index < pixels.size(); index += 4) {
-        hasAlpha = hasAlpha || pixels[index] != 0;
+    if (previous == nullptr || previous == HGDI_ERROR) {
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+        return {};
     }
-    if (!hasAlpha) {
-        for (size_t index = 0; index < pixels.size(); index += 4) {
-            pixels[index + 3] = (pixels[index] | pixels[index + 1] | pixels[index + 2]) == 0 ? 0 : 255;
-        }
-    }
+    std::memset(bitmapBits, 0, static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U);
+    const BOOL drawn = DrawIconEx(memory, 0, 0, icon, static_cast<int>(extent), static_cast<int>(extent),
+        0, nullptr, DI_NORMAL);
 
+    std::vector<uint8_t> pixels;
+    if (drawn != FALSE) {
+        pixels.resize(static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U);
+        std::memcpy(pixels.data(), bitmapBits, pixels.size());
+        NormalizeAlpha(pixels);
+    }
     SelectObject(memory, previous);
     DeleteObject(bitmap);
     DeleteDC(memory);
+    return pixels;
+}
+
+std::vector<uint8_t> RasterizeBitmap(HBITMAP sourceBitmap, UINT extent) {
+    if (sourceBitmap == nullptr) {
+        return {};
+    }
+
+    BITMAP sourceInfo{};
+    if (GetObjectW(sourceBitmap, sizeof(sourceInfo), &sourceInfo) == 0 || sourceInfo.bmWidth <= 0 ||
+        sourceInfo.bmHeight == 0) {
+        return {};
+    }
+
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = static_cast<LONG>(extent);
+    header.bV5Height = -static_cast<LONG>(extent);
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_RGB;
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return {};
+    }
+    HDC source = CreateCompatibleDC(screen);
+    HDC destination = CreateCompatibleDC(screen);
+    void* destinationBits = nullptr;
+    HBITMAP destinationBitmap = CreateDIBSection(screen, reinterpret_cast<BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &destinationBits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (source == nullptr || destination == nullptr || destinationBitmap == nullptr ||
+        destinationBits == nullptr) {
+        if (source != nullptr) {
+            DeleteDC(source);
+        }
+        if (destination != nullptr) {
+            DeleteDC(destination);
+        }
+        if (destinationBitmap != nullptr) {
+            DeleteObject(destinationBitmap);
+        }
+        return {};
+    }
+
+    const HGDIOBJ previousSource = SelectObject(source, sourceBitmap);
+    const HGDIOBJ previousDestination = SelectObject(destination, destinationBitmap);
+    if (previousSource == nullptr || previousSource == HGDI_ERROR || previousDestination == nullptr ||
+        previousDestination == HGDI_ERROR) {
+        if (previousSource != nullptr && previousSource != HGDI_ERROR) {
+            SelectObject(source, previousSource);
+        }
+        if (previousDestination != nullptr && previousDestination != HGDI_ERROR) {
+            SelectObject(destination, previousDestination);
+        }
+        DeleteObject(destinationBitmap);
+        DeleteDC(destination);
+        DeleteDC(source);
+        return {};
+    }
+
+    const int sourceWidth = sourceInfo.bmWidth;
+    const int sourceHeight = std::abs(sourceInfo.bmHeight);
+    const int maximumDimension = std::max(sourceWidth, sourceHeight);
+    const int destinationWidth = std::max(1, static_cast<int>(extent) * sourceWidth / maximumDimension);
+    const int destinationHeight = std::max(1, static_cast<int>(extent) * sourceHeight / maximumDimension);
+    const int destinationX = (static_cast<int>(extent) - destinationWidth) / 2;
+    const int destinationY = (static_cast<int>(extent) - destinationHeight) / 2;
+    std::memset(destinationBits, 0, static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U);
+    SetStretchBltMode(destination, HALFTONE);
+    const BOOL copied = StretchBlt(destination, destinationX, destinationY, destinationWidth,
+        destinationHeight, source, 0, 0, sourceWidth, sourceHeight, SRCCOPY);
+
+    std::vector<uint8_t> pixels;
+    if (copied != FALSE) {
+        pixels.resize(static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U);
+        std::memcpy(pixels.data(), destinationBits, pixels.size());
+        NormalizeAlpha(pixels);
+    }
+    SelectObject(source, previousSource);
+    SelectObject(destination, previousDestination);
+    DeleteObject(destinationBitmap);
+    DeleteDC(destination);
+    DeleteDC(source);
+    return pixels;
+}
+
+void SetGlyphPixel(std::vector<uint8_t>& pixels, UINT extent, int x, int y) {
+    if (x < 0 || y < 0 || x >= static_cast<int>(extent) || y >= static_cast<int>(extent)) {
+        return;
+    }
+    const size_t offset = (static_cast<size_t>(y) * extent + static_cast<UINT>(x)) * 4U;
+    pixels[offset] = 255;
+    pixels[offset + 1] = 235;
+    pixels[offset + 2] = 220;
+    pixels[offset + 3] = 255;
+}
+
+void FillGlyphRectangle(std::vector<uint8_t>& pixels, UINT extent, int left, int top, int width,
+    int height) {
+    for (int y = top; y < top + height; ++y) {
+        for (int x = left; x < left + width; ++x) {
+            SetGlyphPixel(pixels, extent, x, y);
+        }
+    }
+}
+
+std::vector<uint8_t> CreateDockGlyph(const std::wstring& target, UINT extent) {
+    if (target != kStartTarget && target != kSearchTarget) {
+        return {};
+    }
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U, 0);
+    if (target == kStartTarget) {
+        const int cell = std::max(2, static_cast<int>(extent) * 20 / 100);
+        const int gap = std::max(1, static_cast<int>(extent) * 6 / 100);
+        const int total = cell * 2 + gap;
+        const int left = (static_cast<int>(extent) - total) / 2;
+        const int top = (static_cast<int>(extent) - total) / 2;
+        FillGlyphRectangle(pixels, extent, left, top, cell, cell);
+        FillGlyphRectangle(pixels, extent, left + cell + gap, top, cell, cell);
+        FillGlyphRectangle(pixels, extent, left, top + cell + gap, cell, cell);
+        FillGlyphRectangle(pixels, extent, left + cell + gap, top + cell + gap, cell, cell);
+        return pixels;
+    }
+
+    const float center = static_cast<float>(extent) * 0.42F;
+    const float radius = static_cast<float>(extent) * 0.20F;
+    const float ringWidth = std::max(1.0F, static_cast<float>(extent) * 0.045F);
+    const float handleStart = radius * 0.62F;
+    const float handleEnd = radius + static_cast<float>(extent) * 0.19F;
+    for (int y = 0; y < static_cast<int>(extent); ++y) {
+        for (int x = 0; x < static_cast<int>(extent); ++x) {
+            const float horizontal = static_cast<float>(x) - center;
+            const float vertical = static_cast<float>(y) - center;
+            const float distance = std::sqrt(horizontal * horizontal + vertical * vertical);
+            const float alongHandle = (horizontal + vertical) * 0.70710678F;
+            const float acrossHandle = std::abs(horizontal - vertical) * 0.70710678F;
+            if (std::abs(distance - radius) <= ringWidth ||
+                (alongHandle >= handleStart && alongHandle <= handleEnd && acrossHandle <= ringWidth)) {
+                SetGlyphPixel(pixels, extent, x, y);
+            }
+        }
+    }
+    return pixels;
+}
+
+std::vector<uint8_t> ExtractShellItemImage(const std::wstring& target, UINT extent) {
+    ComPtr<IShellItem> item;
+    if (FAILED(SHCreateItemFromParsingName(target.c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+        return {};
+    }
+
+    ComPtr<IShellItemImageFactory> factory;
+    if (FAILED(item.As(&factory))) {
+        return {};
+    }
+    SIZE size{static_cast<LONG>(extent), static_cast<LONG>(extent)};
+    HBITMAP bitmap = nullptr;
+    const HRESULT result = factory->GetImage(size,
+        static_cast<SIIGBF>(SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK), &bitmap);
+    if (FAILED(result) || bitmap == nullptr) {
+        return {};
+    }
+    const std::vector<uint8_t> pixels = RasterizeBitmap(bitmap, extent);
+    DeleteObject(bitmap);
+    return pixels;
+}
+
+std::vector<uint8_t> ExtractShellFallbackIcon(const std::wstring& target, UINT extent) {
+    SHFILEINFOW information{};
+    if (SHGetFileInfoW(target.c_str(), FILE_ATTRIBUTE_NORMAL, &information, sizeof(information),
+            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_ADDOVERLAYS) == 0 || information.hIcon == nullptr) {
+        return {};
+    }
+    const std::vector<uint8_t> pixels = RasterizeIcon(information.hIcon, extent);
     DestroyIcon(information.hIcon);
     return pixels;
+}
+
+std::vector<uint8_t> ExtractIconPixels(const std::wstring& target, UINT extent) {
+    std::vector<uint8_t> pixels = CreateDockGlyph(target, extent);
+    if (!pixels.empty()) {
+        return pixels;
+    }
+    pixels = ExtractShellItemImage(target, extent);
+    return pixels.empty() ? ExtractShellFallbackIcon(target, extent) : pixels;
 }
 
 const D3D12_SHADER_BYTECODE Shader(const unsigned char* bytes, size_t size) {
@@ -222,13 +443,15 @@ void Renderer::Resize(UINT width, UINT height) {
 
 void Renderer::LoadIcons(const std::vector<std::wstring>& targets) {
     if (targets.size() > kMaximumIcons) {
-        throw std::runtime_error("The dock supports at most 32 pinned icons.");
+        throw std::runtime_error("The dock supports at most 512 visible icons.");
     }
 
+    ComApartment apartment;
     Flush();
     m_iconAtlas.Reset();
     m_iconCount = static_cast<UINT>(std::max<size_t>(targets.size(), 1));
     m_pendingUploads.clear();
+    const UINT extent = IconTextureExtent(m_window);
 
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> commandList;
@@ -238,7 +461,8 @@ void Renderer::LoadIcons(const std::vector<std::wstring>& targets) {
               IID_PPV_ARGS(&commandList)),
         "Create icon upload command list");
 
-    const D3D12_RESOURCE_DESC atlas = TextureDescription(64, 64, kMaximumIcons);
+    const D3D12_RESOURCE_DESC atlas = TextureDescription(extent, extent,
+        static_cast<UINT16>(m_iconCount));
     const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
     Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &atlas,
               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_iconAtlas)),
@@ -249,7 +473,7 @@ void Renderer::LoadIcons(const std::vector<std::wstring>& targets) {
     view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
     view.Texture2DArray.MipLevels = 1;
-    view.Texture2DArray.ArraySize = kMaximumIcons;
+    view.Texture2DArray.ArraySize = m_iconCount;
     D3D12_CPU_DESCRIPTOR_HANDLE iconDescriptor = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
     iconDescriptor.ptr += static_cast<SIZE_T>(kIconTextureDescriptor) * m_srvDescriptorSize;
     m_device->CreateShaderResourceView(m_iconAtlas.Get(), &view, iconDescriptor);
@@ -547,27 +771,32 @@ void Renderer::CreateRootSignatureAndPipelines() {
     parameters[2].DescriptorTable.NumDescriptorRanges = 1;
     parameters[2].DescriptorTable.pDescriptorRanges = &range;
 
-    D3D12_STATIC_SAMPLER_DESC sampler{};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.MipLODBias = 0.0F;
-    sampler.MaxAnisotropy = 1;
-    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-    sampler.MinLOD = 0.0F;
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    sampler.ShaderRegister = 0;
-    sampler.RegisterSpace = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC linearSampler{};
+    linearSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    linearSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    linearSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    linearSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    linearSampler.MipLODBias = 0.0F;
+    linearSampler.MaxAnisotropy = 1;
+    linearSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    linearSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    linearSampler.MinLOD = 0.0F;
+    linearSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    linearSampler.ShaderRegister = 0;
+    linearSampler.RegisterSpace = 0;
+    linearSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC iconSampler = linearSampler;
+    iconSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    iconSampler.ShaderRegister = 1;
+    const std::array samplers = {linearSampler, iconSampler};
 
     D3D12_ROOT_SIGNATURE_DESC1 root{};
     root.NumParameters = static_cast<UINT>(parameters.size());
     root.pParameters = parameters.data();
-    root.NumStaticSamplers = 1;
-    root.pStaticSamplers = &sampler;
-    root.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    root.NumStaticSamplers = static_cast<UINT>(samplers.size());
+    root.pStaticSamplers = samplers.data();
+    root.Flags = D3D_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{};
     versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
@@ -814,22 +1043,24 @@ void Renderer::WaitForFrame(FrameResource& frame) {
 
 void Renderer::UploadIcon(UINT textureIndex, const std::wstring& target,
     ID3D12GraphicsCommandList* commandList) {
-    const std::vector<uint8_t> pixels = ExtractIconPixels(target);
+    const UINT extent = IconTextureExtent(m_window);
+    const std::vector<uint8_t> pixels = ExtractIconPixels(target, extent);
     if (pixels.empty()) {
         CreateFallbackIcon(textureIndex, commandList);
         return;
     }
-    UploadIconTexture(textureIndex, pixels.data(), 64, 64, commandList);
+    UploadIconTexture(textureIndex, pixels.data(), extent, extent, commandList);
 }
 
 void Renderer::CreateFallbackIcon(UINT textureIndex, ID3D12GraphicsCommandList* commandList) {
-    constexpr std::array<uint8_t, 64 * 64 * 4> pixels{};
-    UploadIconTexture(textureIndex, pixels.data(), 64, 64, commandList);
+    const UINT extent = IconTextureExtent(m_window);
+    const std::vector<uint8_t> pixels(static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U, 0);
+    UploadIconTexture(textureIndex, pixels.data(), extent, extent, commandList);
 }
 
 void Renderer::UploadIconTexture(UINT textureIndex, const uint8_t* pixels, UINT width, UINT height,
     ID3D12GraphicsCommandList* commandList) {
-    const D3D12_RESOURCE_DESC texture = TextureDescription(width, height, kMaximumIcons);
+    const D3D12_RESOURCE_DESC texture = TextureDescription(width, height, m_iconCount);
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT rowCount = 0;
@@ -850,7 +1081,7 @@ void Renderer::UploadIconTexture(UINT textureIndex, const uint8_t* pixels, UINT 
     Check(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map icon upload buffer");
     for (UINT row = 0; row < rowCount; ++row) {
         std::memcpy(mapped + footprint.Offset + static_cast<size_t>(row) * footprint.Footprint.RowPitch,
-            pixels + static_cast<size_t>(row) * width * 4, static_cast<size_t>(rowSize));
+            pixels + static_cast<size_t>(row) * width * 4U, static_cast<size_t>(rowSize));
     }
     upload->Unmap(0, nullptr);
 
