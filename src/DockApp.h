@@ -49,6 +49,8 @@ private:
         LPARAM lParam);
     static LRESULT CALLBACK HoverLabelWindowProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
+    static LRESULT CALLBACK DragGhostWindowProcedure(HWND window, UINT message, WPARAM wParam,
+        LPARAM lParam);
     static LRESULT CALLBACK MouseHook(int code, WPARAM wParam, LPARAM lParam);
     static BOOL CALLBACK FindTaskbarWindow(HWND window, LPARAM data);
 
@@ -71,7 +73,19 @@ private:
     void HandlePointer(POINT cursor);
     void HandleContextMenu(POINT screenPoint);
     void ActivatePressedApp();
+    void BeginDrag(POINT screenCursor);
+    void UpdateDrag(POINT screenCursor);
+    void FinishDrag(POINT screenCursor);
+    void CancelDragWithSnapBack(POINT releaseCursor);
+    void AdvanceDragSnapBack();
     void CompleteDrag();
+    void ApplyDragPreviewLayout();
+    void CacheLayoutSlotBounds();
+    void EnsureDragGhostWindow();
+    void UpdateDragGhostContent();
+    void UpdateDragGhostPosition(POINT screenCursor);
+    void HideDragGhost() noexcept;
+    void DestroyDragGhostWindow();
     void ClearPressState() noexcept;
     void RefreshRunningWindows(bool force = false);
     bool RebuildDisplayApps();
@@ -83,7 +97,10 @@ private:
     [[nodiscard]] bool IsCursorInBottomHotZone(POINT cursor) const noexcept;
     [[nodiscard]] int IconAtScreenPoint(POINT cursor) const noexcept;
     [[nodiscard]] int InsertionIndexFor(POINT cursor) const noexcept;
+    [[nodiscard]] int InsertionIndexForDrag(POINT cursor) const noexcept;
     [[nodiscard]] bool HasCrossedDragThreshold(POINT cursor) const noexcept;
+    [[nodiscard]] bool IsCursorOverDock(POINT cursor) const noexcept;
+    [[nodiscard]] bool IsDragActive() const noexcept;
     [[nodiscard]] bool IsPersistentDisplayIcon(int icon) const noexcept;
     [[nodiscard]] LONG CurrentY() const noexcept;
     [[nodiscard]] bool IsAnimating() const noexcept;
@@ -94,7 +111,10 @@ private:
     HWND m_window = nullptr;
     HWND m_inputWindow = nullptr;
     HWND m_hoverLabelWindow = nullptr;
+    HWND m_dragGhostWindow = nullptr;
     HHOOK m_mouseHook = nullptr;
+    HBITMAP m_dragGhostBitmap = nullptr;
+    SIZE m_dragGhostSize{};
     HANDLE m_singleInstanceMutex = nullptr;
     RECT m_primaryBounds{};
     POINT m_lastCursor{};
@@ -118,6 +138,14 @@ private:
     int m_pressedIcon = -1;
     int m_draggedIcon = -1;
     int m_dragInsertion = -1;
+    int m_dragOriginIndex = -1;
+    RECT m_dragOriginBounds{};
+    POINT m_dragGrabOffset{};
+    POINT m_dragSnapFrom{};
+    POINT m_dragSnapTo{};
+    double m_dragSnapStartedAt = 0.0;
+    bool m_dragSnapAnimating = false;
+    std::vector<RECT> m_layoutSlotBounds;
     POINT m_pressedAt{};
     bool m_taskbarHidden = false;
     bool m_rendererInitialized = false;
