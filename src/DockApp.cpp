@@ -1,6 +1,7 @@
 #include "DockApp.h"
 
 #include <ShellScalingApi.h>
+#include <Shellapi.h>
 #include <ShlObj.h>
 #include <ShObjIdl.h>
 #include <windowsx.h>
