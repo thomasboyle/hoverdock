@@ -1,11 +1,14 @@
 #include "DockApp.h"
 
 #include <ShellScalingApi.h>
+#include <ShlObj.h>
+#include <ShObjIdl.h>
 #include <windowsx.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -22,6 +25,7 @@ namespace {
 
 constexpr double kShowDurationSeconds = 0.050;
 constexpr double kHideDurationSeconds = 0.050;
+constexpr double kDragSnapDurationSeconds = 0.050;
 constexpr double kDragThresholdLogicalPixels = 6.0;
 constexpr int kBottomHotZonePixels = 2;
 constexpr BYTE kInputWindowAlpha = 1;
@@ -114,6 +118,251 @@ bool OpenSpecialDockTarget(const std::wstring& target) {
     return false;
 }
 
+class ComApartment {
+public:
+    ComApartment()
+        : m_result(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)) {
+    }
+
+    ~ComApartment() {
+        if (SUCCEEDED(m_result)) {
+            CoUninitialize();
+        }
+    }
+
+private:
+    HRESULT m_result = E_FAIL;
+};
+
+std::vector<uint8_t> RasterizeIconHandle(HICON icon, UINT extent) {
+    if (icon == nullptr) {
+        return {};
+    }
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return {};
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    if (memory == nullptr) {
+        return {};
+    }
+
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = static_cast<LONG>(extent);
+    header.bV5Height = -static_cast<LONG>(extent);
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(memory, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        DeleteDC(memory);
+        return {};
+    }
+    HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
+    if (previousBitmap == nullptr || previousBitmap == HGDI_ERROR) {
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+        return {};
+    }
+
+    std::memset(bits, 0, static_cast<size_t>(extent) * static_cast<size_t>(extent) * sizeof(DWORD));
+    DrawIconEx(memory, 0, 0, icon, static_cast<int>(extent), static_cast<int>(extent), 0, nullptr,
+        DI_NORMAL);
+    const size_t pixelCount = static_cast<size_t>(extent) * static_cast<size_t>(extent);
+    const auto* pixels = static_cast<const DWORD*>(bits);
+    std::vector<uint8_t> result(pixelCount * 4U);
+    for (size_t index = 0; index < pixelCount; ++index) {
+        const DWORD pixel = pixels[index];
+        result[index * 4U + 0U] = static_cast<uint8_t>((pixel >> 16) & 0xffU);
+        result[index * 4U + 1U] = static_cast<uint8_t>((pixel >> 8) & 0xffU);
+        result[index * 4U + 2U] = static_cast<uint8_t>(pixel & 0xffU);
+        result[index * 4U + 3U] = static_cast<uint8_t>((pixel >> 24) & 0xffU);
+    }
+
+    SelectObject(memory, previousBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    return result;
+}
+
+std::vector<uint8_t> RasterizeBitmapHandle(HBITMAP bitmap, UINT extent) {
+    if (bitmap == nullptr) {
+        return {};
+    }
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return {};
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    if (memory == nullptr) {
+        return {};
+    }
+
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = static_cast<LONG>(extent);
+    header.bV5Height = -static_cast<LONG>(extent);
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* bits = nullptr;
+    HBITMAP target = CreateDIBSection(memory, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (target == nullptr || bits == nullptr) {
+        DeleteDC(memory);
+        return {};
+    }
+    HGDIOBJ previousTarget = SelectObject(memory, target);
+    HDC source = CreateCompatibleDC(screen);
+    if (source == nullptr) {
+        SelectObject(memory, previousTarget);
+        DeleteObject(target);
+        DeleteDC(memory);
+        return {};
+    }
+    HGDIOBJ previousSource = SelectObject(source, bitmap);
+    if (previousTarget == nullptr || previousTarget == HGDI_ERROR || previousSource == nullptr ||
+        previousSource == HGDI_ERROR) {
+        if (previousSource != nullptr && previousSource != HGDI_ERROR) {
+            SelectObject(source, previousSource);
+        }
+        DeleteDC(source);
+        if (previousTarget != nullptr && previousTarget != HGDI_ERROR) {
+            SelectObject(memory, previousTarget);
+        }
+        DeleteObject(target);
+        DeleteDC(memory);
+        return {};
+    }
+
+    std::memset(bits, 0, static_cast<size_t>(extent) * static_cast<size_t>(extent) * sizeof(DWORD));
+    BitBlt(memory, 0, 0, static_cast<int>(extent), static_cast<int>(extent), source, 0, 0,
+        SRCCOPY);
+    const size_t pixelCount = static_cast<size_t>(extent) * static_cast<size_t>(extent);
+    const auto* pixels = static_cast<const DWORD*>(bits);
+    std::vector<uint8_t> result(pixelCount * 4U);
+    for (size_t index = 0; index < pixelCount; ++index) {
+        const DWORD pixel = pixels[index];
+        result[index * 4U + 0U] = static_cast<uint8_t>((pixel >> 16) & 0xffU);
+        result[index * 4U + 1U] = static_cast<uint8_t>((pixel >> 8) & 0xffU);
+        result[index * 4U + 2U] = static_cast<uint8_t>(pixel & 0xffU);
+        result[index * 4U + 3U] = static_cast<uint8_t>((pixel >> 24) & 0xffU);
+    }
+
+    SelectObject(source, previousSource);
+    DeleteDC(source);
+    SelectObject(memory, previousTarget);
+    DeleteObject(target);
+    DeleteDC(memory);
+    return result;
+}
+
+std::vector<uint8_t> ExtractDragIconPixels(const std::wstring& target, UINT extent) {
+    ComApartment apartment;
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName(target.c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+        IShellItemImageFactory* factory = nullptr;
+        if (SUCCEEDED(item->QueryInterface(IID_PPV_ARGS(&factory)))) {
+            SIZE size{static_cast<LONG>(extent), static_cast<LONG>(extent)};
+            HBITMAP bitmap = nullptr;
+            if (SUCCEEDED(factory->GetImage(size,
+                    static_cast<SIIGBF>(SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK), &bitmap)) &&
+                bitmap != nullptr) {
+                const std::vector<uint8_t> pixels = RasterizeBitmapHandle(bitmap, extent);
+                DeleteObject(bitmap);
+                factory->Release();
+                item->Release();
+                if (!pixels.empty()) {
+                    return pixels;
+                }
+            } else {
+                factory->Release();
+            }
+        }
+        item->Release();
+    }
+
+    SHFILEINFOW information{};
+    if (SHGetFileInfoW(target.c_str(), FILE_ATTRIBUTE_NORMAL, &information, sizeof(information),
+            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_ADDOVERLAYS) != 0 &&
+        information.hIcon != nullptr) {
+        const std::vector<uint8_t> pixels = RasterizeIconHandle(information.hIcon, extent);
+        DestroyIcon(information.hIcon);
+        return pixels;
+    }
+    return {};
+}
+
+HBITMAP CreateDragGhostBitmap(const std::wstring& target, UINT extent) {
+    const std::vector<uint8_t> pixels = ExtractDragIconPixels(target, extent);
+    if (pixels.empty()) {
+        return nullptr;
+    }
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return nullptr;
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    if (memory == nullptr) {
+        return nullptr;
+    }
+
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = static_cast<LONG>(extent);
+    header.bV5Height = -static_cast<LONG>(extent);
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(memory, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        DeleteDC(memory);
+        return nullptr;
+    }
+    HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
+    if (previousBitmap == nullptr || previousBitmap == HGDI_ERROR) {
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+        return nullptr;
+    }
+
+    std::memcpy(bits, pixels.data(), pixels.size());
+    const size_t pixelCount = static_cast<size_t>(extent) * static_cast<size_t>(extent);
+    auto* pixelData = static_cast<DWORD*>(bits);
+    for (size_t index = 0; index < pixelCount; ++index) {
+        const BYTE alpha = static_cast<BYTE>((pixelData[index] >> 24) & 0xffU);
+        pixelData[index] = (pixelData[index] & 0x00ffffffU) |
+            (static_cast<DWORD>(alpha / 2U) << 24);
+    }
+
+    SelectObject(memory, previousBitmap);
+    DeleteDC(memory);
+    return bitmap;
+}
+
 }  // namespace
 
 DockApp::DockApp(HINSTANCE instance)
@@ -122,6 +371,7 @@ DockApp::DockApp(HINSTANCE instance)
 
 DockApp::~DockApp() {
     DestroyHoverLabelWindow();
+    DestroyDragGhostWindow();
     if (m_mouseHook != nullptr) {
         UnhookWindowsHookEx(m_mouseHook);
     }
@@ -183,8 +433,13 @@ int DockApp::Run() {
         const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, QS_ALLINPUT,
             MWMO_INPUTAVAILABLE);
 
-        if (IsAnimating() && (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT)) {
-            AdvanceAnimation();
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT) {
+            if (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Hiding) {
+                AdvanceAnimation();
+            }
+            if (m_dragSnapAnimating) {
+                AdvanceDragSnapBack();
+            }
         }
 
         if (wait == WAIT_OBJECT_0 + count || wait == WAIT_FAILED) {
@@ -246,13 +501,35 @@ LRESULT CALLBACK DockApp::HoverLabelWindowProcedure(HWND window, UINT message, W
     }
 }
 
+LRESULT CALLBACK DockApp::DragGhostWindowProcedure(HWND window, UINT message, WPARAM wParam,
+    LPARAM lParam) {
+    switch (message) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    default:
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+}
+
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
-    if (code == HC_ACTION && wParam == WM_MOUSEMOVE && s_instance != nullptr &&
-        s_instance->m_window != nullptr) {
+    if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-        PostMessageW(s_instance->m_window, kPointerMessage,
-            static_cast<WPARAM>(static_cast<INT_PTR>(mouse->pt.x)),
-            static_cast<LPARAM>(mouse->pt.y));
+        if (wParam == WM_MOUSEMOVE) {
+            PostMessageW(s_instance->m_window, kPointerMessage,
+                static_cast<WPARAM>(static_cast<INT_PTR>(mouse->pt.x)),
+                static_cast<LPARAM>(mouse->pt.y));
+        } else if (wParam == WM_LBUTTONUP && s_instance->IsDragActive() &&
+            s_instance->m_inputWindow != nullptr) {
+            PostMessageW(s_instance->m_inputWindow, WM_LBUTTONUP, 0,
+                MAKELPARAM(mouse->pt.x, mouse->pt.y));
+        }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
@@ -385,38 +662,48 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
 
     case WM_MOUSEMOVE: {
         const POINT point = ScreenPointFromClient(window, lParam);
-        HandlePointer(point);
+        if (m_dragSnapAnimating) {
+            return 0;
+        }
         if (m_draggedIcon >= 0) {
-            m_dragInsertion = InsertionIndexFor(point);
-            RenderFrame();
-        } else if (m_pressedIcon >= 0 && IsPersistentDisplayIcon(m_pressedIcon) &&
+            UpdateDrag(point);
+            return 0;
+        }
+        HandlePointer(point);
+        if (m_pressedIcon >= 0 && IsPersistentDisplayIcon(m_pressedIcon) &&
             HasCrossedDragThreshold(point)) {
-            m_draggedIcon = m_pressedIcon;
-            m_dragInsertion = InsertionIndexFor(point);
-            RenderFrame();
+            BeginDrag(point);
         }
         return 0;
     }
 
     case WM_LBUTTONUP: {
-        const POINT point = ScreenPointFromClient(window, lParam);
+        POINT point{};
+        GetCursorPos(&point);
         LogInputMouse(message, point, IconAtScreenPoint(point));
+        if (m_dragSnapAnimating) {
+            return 0;
+        }
         if (m_draggedIcon >= 0) {
-            CompleteDrag();
+            FinishDrag(point);
         } else {
             ActivatePressedApp();
         }
         if (GetCapture() == window) {
             ReleaseCapture();
         }
-        ClearPressState();
+        if (!m_dragSnapAnimating) {
+            ClearPressState();
+        }
         RenderFrame();
         return 0;
     }
 
     case WM_CAPTURECHANGED:
-        ClearPressState();
-        RenderFrame();
+        if (!IsDragActive()) {
+            ClearPressState();
+            RenderFrame();
+        }
         return 0;
 
     case WM_RBUTTONUP: {
@@ -560,6 +847,8 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         m_iconRenderData.push_back(data);
     }
 
+    CacheLayoutSlotBounds();
+
     UpdateInputRegion();
     PositionOverlayWindows();
     if (m_rendererInitialized) {
@@ -604,6 +893,11 @@ void DockApp::PositionOverlayWindows() {
 }
 
 void DockApp::UpdateHoverLabel() {
+    if (IsDragActive() || m_draggedIcon >= 0) {
+        HideHoverLabel();
+        return;
+    }
+
     if (m_hoverLabelWindow == nullptr || m_visibility != VisibilityState::Visible ||
         m_hoveredIcon < 0 || static_cast<size_t>(m_hoveredIcon) >= m_displayApps.size() ||
         static_cast<size_t>(m_hoveredIcon) >= m_iconRenderData.size()) {
@@ -928,9 +1222,9 @@ void DockApp::RenderFrame() {
 
     for (size_t index = 0; index < m_iconRenderData.size(); ++index) {
         DockIconRenderData& icon = m_iconRenderData[index];
-        icon.hovered = static_cast<int>(index) == m_hoveredIcon;
+        icon.hovered = m_draggedIcon < 0 && static_cast<int>(index) == m_hoveredIcon;
         icon.dragged = static_cast<int>(index) == m_draggedIcon;
-        icon.pressed = static_cast<int>(index) == m_pressedIcon;
+        icon.pressed = m_draggedIcon < 0 && static_cast<int>(index) == m_pressedIcon;
     }
 
     DockRenderState state;
@@ -947,6 +1241,13 @@ void DockApp::RenderFrame() {
 
 void DockApp::HandlePointer(POINT cursor) {
     m_lastCursor = cursor;
+    if (IsDragActive()) {
+        if (m_draggedIcon >= 0) {
+            UpdateDrag(cursor);
+        }
+        return;
+    }
+
     if (m_visibility == VisibilityState::Hidden) {
         HideHoverLabel();
         if (IsCursorInBottomHotZone(cursor)) {
@@ -1081,6 +1382,276 @@ void DockApp::ActivatePressedApp() {
     RefreshRunningWindows();
 }
 
+void DockApp::CacheLayoutSlotBounds() {
+    m_layoutSlotBounds.clear();
+    m_layoutSlotBounds.reserve(m_iconRenderData.size());
+    for (const DockIconRenderData& icon : m_iconRenderData) {
+        m_layoutSlotBounds.push_back(icon.bounds);
+    }
+}
+
+void DockApp::EnsureDragGhostWindow() {
+    if (m_dragGhostWindow != nullptr) {
+        return;
+    }
+
+    const wchar_t dragGhostClassName[] = L"LiquidGlassDockDragGhost";
+    WNDCLASSEXW dragGhostClass{sizeof(dragGhostClass)};
+    dragGhostClass.lpfnWndProc = &DockApp::DragGhostWindowProcedure;
+    dragGhostClass.hInstance = m_instance;
+    dragGhostClass.lpszClassName = dragGhostClassName;
+    if (RegisterClassExW(&dragGhostClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        Log(L"Could not register the drag ghost window class.");
+        return;
+    }
+
+    constexpr DWORD extendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED |
+        WS_EX_TRANSPARENT | WS_EX_TOPMOST;
+    m_dragGhostWindow = CreateWindowExW(extendedStyle, dragGhostClassName, L"", WS_POPUP, 0, 0, 1,
+        1, nullptr, nullptr, m_instance, nullptr);
+    if (m_dragGhostWindow == nullptr) {
+        Log(L"Could not create the drag ghost window.");
+    }
+}
+
+void DockApp::UpdateDragGhostContent() {
+    if (m_dragGhostWindow == nullptr || m_draggedIcon < 0 ||
+        static_cast<size_t>(m_draggedIcon) >= m_displayApps.size()) {
+        return;
+    }
+
+    if (m_dragGhostBitmap != nullptr) {
+        DeleteObject(m_dragGhostBitmap);
+        m_dragGhostBitmap = nullptr;
+        m_dragGhostSize = {};
+    }
+
+    const UINT dpi = GetDpiForWindow(m_window);
+    const UINT extent = static_cast<UINT>(std::lround(56.0F * static_cast<float>(dpi) / 96.0F));
+    m_dragGhostBitmap = CreateDragGhostBitmap(
+        m_displayApps[static_cast<size_t>(m_draggedIcon)].app.target, extent);
+    if (m_dragGhostBitmap == nullptr) {
+        return;
+    }
+
+    m_dragGhostSize.cx = static_cast<LONG>(extent);
+    m_dragGhostSize.cy = static_cast<LONG>(extent);
+}
+
+void DockApp::UpdateDragGhostPosition(POINT screenCursor) {
+    if (m_dragGhostWindow == nullptr || m_dragGhostBitmap == nullptr ||
+        m_dragGhostSize.cx <= 0 || m_dragGhostSize.cy <= 0) {
+        return;
+    }
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return;
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    if (memory == nullptr) {
+        return;
+    }
+    HGDIOBJ previousBitmap = SelectObject(memory, m_dragGhostBitmap);
+    if (previousBitmap == nullptr || previousBitmap == HGDI_ERROR) {
+        DeleteDC(memory);
+        return;
+    }
+
+    POINT destination{screenCursor.x - m_dragGrabOffset.x, screenCursor.y - m_dragGrabOffset.y};
+    POINT source{0L, 0L};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    const BOOL updated = UpdateLayeredWindow(m_dragGhostWindow, nullptr, &destination,
+        &m_dragGhostSize, memory, &source, 0, &blend, ULW_ALPHA);
+    SelectObject(memory, previousBitmap);
+    DeleteDC(memory);
+    if (updated == FALSE) {
+        Log(L"Could not update the drag ghost window.");
+        return;
+    }
+    ShowWindow(m_dragGhostWindow, SW_SHOWNOACTIVATE);
+}
+
+void DockApp::HideDragGhost() noexcept {
+    if (m_dragGhostWindow != nullptr) {
+        ShowWindow(m_dragGhostWindow, SW_HIDE);
+    }
+}
+
+void DockApp::DestroyDragGhostWindow() {
+    HideDragGhost();
+    if (m_dragGhostBitmap != nullptr) {
+        DeleteObject(m_dragGhostBitmap);
+        m_dragGhostBitmap = nullptr;
+        m_dragGhostSize = {};
+    }
+    if (m_dragGhostWindow != nullptr) {
+        if (DestroyWindow(m_dragGhostWindow) == FALSE) {
+            Log(L"Could not destroy the drag ghost window.");
+        }
+        m_dragGhostWindow = nullptr;
+    }
+}
+
+void DockApp::ApplyDragPreviewLayout() {
+    if (m_draggedIcon < 0 || m_layoutSlotBounds.size() != m_iconRenderData.size()) {
+        return;
+    }
+
+    const int iconCount = static_cast<int>(m_iconRenderData.size());
+    const LONG iconWidth = m_layoutSlotBounds[0].right - m_layoutSlotBounds[0].left;
+    const LONG iconHeight = m_layoutSlotBounds[0].bottom - m_layoutSlotBounds[0].top;
+    const RECT offscreen = {-32000L, -32000L, -32000L + iconWidth, -32000L + iconHeight};
+    m_iconRenderData[static_cast<size_t>(m_draggedIcon)].bounds = offscreen;
+
+    const bool overDock = IsCursorOverDock(m_lastCursor) && m_dragInsertion >= 0;
+    if (!overDock) {
+        for (int displayIndex = 0; displayIndex < iconCount; ++displayIndex) {
+            if (displayIndex == m_draggedIcon) {
+                continue;
+            }
+            m_iconRenderData[static_cast<size_t>(displayIndex)].bounds =
+                m_layoutSlotBounds[static_cast<size_t>(displayIndex)];
+        }
+        return;
+    }
+
+    const int insertion = std::clamp(m_dragInsertion, 2, iconCount);
+    int slot = 0;
+    for (int displayIndex = 0; displayIndex < iconCount; ++displayIndex) {
+        if (displayIndex == m_draggedIcon) {
+            continue;
+        }
+        if (displayIndex == insertion) {
+            ++slot;
+        }
+        m_iconRenderData[static_cast<size_t>(displayIndex)].bounds =
+            m_layoutSlotBounds[static_cast<size_t>(slot)];
+        ++slot;
+    }
+}
+
+void DockApp::BeginDrag(POINT screenCursor) {
+    if (m_pressedIcon < 0 || !IsPersistentDisplayIcon(m_pressedIcon)) {
+        return;
+    }
+
+    CacheLayoutSlotBounds();
+    m_draggedIcon = m_pressedIcon;
+    m_dragOriginIndex = m_pressedIcon;
+    m_dragOriginBounds = m_iconRenderData[static_cast<size_t>(m_draggedIcon)].bounds;
+    m_dragInsertion = InsertionIndexForDrag(screenCursor);
+
+    POINT iconTopLeft{m_dragOriginBounds.left, m_dragOriginBounds.top};
+    if (ClientToScreen(m_window, &iconTopLeft) == FALSE) {
+        iconTopLeft = screenCursor;
+    }
+    m_dragGrabOffset = {screenCursor.x - iconTopLeft.x, screenCursor.y - iconTopLeft.y};
+
+    HideHoverLabel();
+    EnsureDragGhostWindow();
+    UpdateDragGhostContent();
+    UpdateDragGhostPosition(screenCursor);
+    ApplyDragPreviewLayout();
+    RenderFrame();
+}
+
+void DockApp::UpdateDrag(POINT screenCursor) {
+    if (m_draggedIcon < 0) {
+        return;
+    }
+
+    m_lastCursor = screenCursor;
+    if (IsCursorOverDock(screenCursor)) {
+        m_dragInsertion = InsertionIndexForDrag(screenCursor);
+    } else {
+        m_dragInsertion = -1;
+    }
+    UpdateDragGhostPosition(screenCursor);
+    ApplyDragPreviewLayout();
+    RenderFrame();
+}
+
+void DockApp::CancelDragWithSnapBack(POINT releaseCursor) {
+    if (m_draggedIcon < 0) {
+        return;
+    }
+
+    POINT originTopLeft{m_dragOriginBounds.left, m_dragOriginBounds.top};
+    if (ClientToScreen(m_window, &originTopLeft) == FALSE) {
+        originTopLeft = releaseCursor;
+    }
+
+    m_dragSnapFrom = {releaseCursor.x - m_dragGrabOffset.x, releaseCursor.y - m_dragGrabOffset.y};
+    m_dragSnapTo = originTopLeft;
+    m_dragSnapStartedAt = QpcSeconds();
+    m_dragSnapAnimating = true;
+    m_dragInsertion = -1;
+    ApplyDragPreviewLayout();
+    RenderFrame();
+}
+
+void DockApp::AdvanceDragSnapBack() {
+    if (!m_dragSnapAnimating) {
+        return;
+    }
+
+    const double elapsed = QpcSeconds() - m_dragSnapStartedAt;
+    const double linear = std::clamp(elapsed / kDragSnapDurationSeconds, 0.0, 1.0);
+    const double eased = linear * linear * (3.0 - 2.0 * linear);
+    const POINT current{
+        std::lround(static_cast<double>(m_dragSnapFrom.x) +
+            static_cast<double>(m_dragSnapTo.x - m_dragSnapFrom.x) * eased),
+        std::lround(static_cast<double>(m_dragSnapFrom.y) +
+            static_cast<double>(m_dragSnapTo.y - m_dragSnapFrom.y) * eased),
+    };
+    UpdateDragGhostPosition({current.x + m_dragGrabOffset.x, current.y + m_dragGrabOffset.y});
+
+    if (linear < 1.0) {
+        return;
+    }
+
+    HideDragGhost();
+    m_dragSnapAnimating = false;
+    ClearPressState();
+    for (size_t index = 0; index < m_iconRenderData.size() && index < m_layoutSlotBounds.size();
+        ++index) {
+        m_iconRenderData[index].bounds = m_layoutSlotBounds[index];
+    }
+    RenderFrame();
+}
+
+void DockApp::FinishDrag(POINT screenCursor) {
+    if (m_draggedIcon < 0) {
+        return;
+    }
+
+    if (!IsCursorOverDock(screenCursor) || m_dragInsertion < 0) {
+        CancelDragWithSnapBack(screenCursor);
+        return;
+    }
+
+    const int draggedPin = m_displayApps[static_cast<size_t>(m_draggedIcon)].persistentPinIndex;
+    const int insertion = std::clamp(m_dragInsertion, 0, static_cast<int>(m_displayApps.size()));
+    int target = 0;
+    for (int index = 0; index < insertion; ++index) {
+        if (m_displayApps[static_cast<size_t>(index)].persistentPinIndex >= 0) {
+            ++target;
+        }
+    }
+    if (target == draggedPin || target == draggedPin + 1) {
+        CancelDragWithSnapBack(screenCursor);
+        return;
+    }
+
+    CompleteDrag();
+    HideDragGhost();
+    ClearPressState();
+    CacheLayoutSlotBounds();
+    RenderFrame();
+}
+
 void DockApp::CompleteDrag() {
     if (m_draggedIcon < 0 || m_dragInsertion < 0 || !IsPersistentDisplayIcon(m_draggedIcon) ||
         static_cast<size_t>(m_draggedIcon) >= m_displayApps.size()) {
@@ -1122,6 +1693,9 @@ void DockApp::ClearPressState() noexcept {
     m_pressedIcon = -1;
     m_draggedIcon = -1;
     m_dragInsertion = -1;
+    m_dragOriginIndex = -1;
+    m_dragOriginBounds = {};
+    m_dragGrabOffset = {};
     m_pressedAt = {};
 }
 
@@ -1308,6 +1882,44 @@ int DockApp::InsertionIndexFor(POINT cursor) const noexcept {
     return static_cast<int>(m_iconRenderData.size());
 }
 
+int DockApp::InsertionIndexForDrag(POINT cursor) const noexcept {
+    if (!IsCursorOverDock(cursor) || m_layoutSlotBounds.size() != m_iconRenderData.size() ||
+        m_draggedIcon < 0) {
+        return -1;
+    }
+    if (ScreenToClient(m_window, &cursor) == FALSE) {
+        return -1;
+    }
+
+    constexpr int kFixedIconCount = 2;
+    const int iconCount = static_cast<int>(m_iconRenderData.size());
+    int slot = 0;
+    for (int displayIndex = 0; displayIndex < iconCount; ++displayIndex) {
+        if (displayIndex == m_draggedIcon) {
+            continue;
+        }
+        if (slot >= static_cast<int>(m_layoutSlotBounds.size())) {
+            break;
+        }
+        const RECT& bounds = m_layoutSlotBounds[static_cast<size_t>(slot)];
+        const LONG center = bounds.left + (bounds.right - bounds.left) / 2;
+        if (displayIndex >= kFixedIconCount && cursor.x < center) {
+            return displayIndex;
+        }
+        ++slot;
+    }
+    return iconCount;
+}
+
+bool DockApp::IsCursorOverDock(POINT cursor) const noexcept {
+    return cursor.x >= m_windowX && cursor.x < m_windowX + static_cast<LONG>(m_dockWidth) &&
+        cursor.y >= m_currentY && cursor.y < m_currentY + static_cast<LONG>(m_dockHeight);
+}
+
+bool DockApp::IsDragActive() const noexcept {
+    return m_draggedIcon >= 0 || m_dragSnapAnimating;
+}
+
 bool DockApp::HasCrossedDragThreshold(POINT cursor) const noexcept {
     UINT dpi = GetDpiForWindow(m_inputWindow == nullptr ? m_window : m_inputWindow);
     if (dpi == 0) {
@@ -1330,7 +1942,8 @@ LONG DockApp::CurrentY() const noexcept {
 }
 
 bool DockApp::IsAnimating() const noexcept {
-    return m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Hiding;
+    return m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Hiding ||
+        m_dragSnapAnimating;
 }
 
 double DockApp::SecondsSinceAnimationStarted() const noexcept {
