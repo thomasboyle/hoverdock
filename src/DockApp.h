@@ -138,7 +138,6 @@ private:
     int m_pressedIcon = -1;
     int m_draggedIcon = -1;
     int m_dragInsertion = -1;
-    int m_dragOriginIndex = -1;
     RECT m_dragOriginBounds{};
     POINT m_dragGrabOffset{};
     POINT m_dragSnapFrom{};
