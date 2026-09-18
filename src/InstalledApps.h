@@ -24,6 +24,9 @@ struct InstalledApp {
 class InstalledAppCatalog {
 public:
     void EnsureLoaded();
+    // Drop the catalogue when search UI closes so idle dock does not keep every
+    // Start Menu shortcut string resident.
+    void Clear() noexcept;
     [[nodiscard]] std::vector<InstalledApp> Snapshot() const;
 
 private:

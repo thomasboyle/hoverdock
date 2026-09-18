@@ -73,6 +73,14 @@ public:
         const std::vector<std::wstring>& candidates, UINT iconPixelExtent);
     [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle, bool* changed = nullptr);
     [[nodiscard]] bool BackdropValid() const noexcept;
+    void EnsureBackdropResources();
+    void ReleaseBackdropForIdle() noexcept;
+    void DiscardIconPixelCache() noexcept;
+    void SuspendGpuOutput();
+    void RestoreGpuOutput(UINT width, UINT height);
+    // Full device teardown for idle RAM (NVIDIA UMD dominates private bytes).
+    void Shutdown() noexcept;
+    [[nodiscard]] bool IsInitialized() const noexcept;
     [[nodiscard]] bool Render(const DockRenderState& state);
     void Flush();
 
@@ -81,7 +89,7 @@ public:
     [[nodiscard]] D3D_SHADER_MODEL ShaderModel() const noexcept;
 
 private:
-    static constexpr UINT kBufferCount = 3;
+    static constexpr UINT kBufferCount = 2;
     static constexpr UINT kMaximumIcons = 512;
     static constexpr UINT kIconTextureDescriptor = 0;
     static constexpr UINT kBackdropTextureDescriptor = 1;

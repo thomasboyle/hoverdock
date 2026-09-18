@@ -81,7 +81,14 @@ target_link_options(Dock PRIVATE
 
 set_property(TARGET Dock PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
+# Delay-load GPU stack so cold-hidden dock does not map NVIDIA UMD (~tens of MB).
+target_link_options(Dock PRIVATE
+    "/DELAYLOAD:d3d12.dll"
+    "/DELAYLOAD:dxgi.dll"
+    "/DELAYLOAD:dcomp.dll"
+)
 target_link_libraries(Dock PRIVATE
+    delayimp
     d3d12
     dxgi
     dcomp
