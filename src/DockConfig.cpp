@@ -949,6 +949,7 @@ bool DockConfig::Load() {
     m_checkForUpdates = true;
     m_lastInstalledVersion.clear();
     m_lastInstalledTime = 0;
+    m_lastInstalledAttempts = 0;
     const auto dockSection = sections.find(L"dock");
     if (dockSection != sections.end()) {
         const auto showDevBounds = dockSection->second.find(L"showdevbounds");
@@ -989,6 +990,16 @@ bool DockConfig::Load() {
             }
             if (m_lastInstalledTime < 0) {
                 m_lastInstalledTime = 0;
+            }
+        }
+        const auto lastInstalledAttempts =
+            dockSection->second.find(L"lastinstalledattempts");
+        if (lastInstalledAttempts != dockSection->second.end()) {
+            try {
+                m_lastInstalledAttempts =
+                    std::clamp(std::stoi(lastInstalledAttempts->second), 0, 1000);
+            } catch (...) {
+                m_lastInstalledAttempts = 0;
             }
         }
     }
@@ -1035,6 +1046,7 @@ bool DockConfig::Save() const {
     if (!m_lastInstalledVersion.empty()) {
         contents << L"LastInstalledVersion=" << m_lastInstalledVersion << L"\n";
         contents << L"LastInstalledTime=" << m_lastInstalledTime << L"\n";
+        contents << L"LastInstalledAttempts=" << m_lastInstalledAttempts << L"\n";
     }
     if (!m_typeSafeApiKey.empty()) {
         contents << L"TypeSafeApiKey=" << m_typeSafeApiKey << L"\n";
@@ -1115,6 +1127,14 @@ long long DockConfig::LastInstalledTime() const noexcept {
 void DockConfig::SetLastInstalledVersion(const std::wstring& version, long long unixTime) {
     m_lastInstalledVersion = version;
     m_lastInstalledTime = unixTime < 0 ? 0 : unixTime;
+}
+
+int DockConfig::LastInstalledAttempts() const noexcept {
+    return m_lastInstalledAttempts;
+}
+
+void DockConfig::SetLastInstalledAttempts(int attempts) noexcept {
+    m_lastInstalledAttempts = std::clamp(attempts, 0, 1000);
 }
 
 const std::wstring& DockConfig::Path() const noexcept {

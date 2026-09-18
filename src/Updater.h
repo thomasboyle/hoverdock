@@ -38,6 +38,17 @@ public:
 
     [[nodiscard]] static std::wstring DefaultDownloadPath(const std::string& version,
         bool isSetup);
+    // Registered install record written by the NSIS installer
+    // (HKCU\Software\Hoverdock: InstallDir + Version, falling back to the
+    // per-user Uninstall entry). Empty version = no install on record.
+    struct InstalledCopy {
+        std::string version;      // Normalized, no leading 'v'.
+        std::wstring exePath;     // InstallDir\Dock.exe, may not exist.
+    };
+    [[nodiscard]] static InstalledCopy InstalledCopyInfo();
+    [[nodiscard]] static std::wstring CurrentExecutablePath();
+    // Case-insensitive path equality tolerating '/' vs '\\' separators.
+    [[nodiscard]] static bool IsSamePath(const std::wstring& left, const std::wstring& right);
     // Installed = running from a per-user or per-machine install directory
     // (LocalAppData\Programs\Hoverdock or Program Files). Portable builds
     // self-replace instead of expecting an installer.

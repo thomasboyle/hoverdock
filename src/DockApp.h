@@ -226,6 +226,15 @@ private:
     void SetUpdateStatus(const std::wstring& status);
     void CheckForUpdatesAsync(bool manual);
     void ApplyUpdateResult(const UpdateReply& reply);
+    // Hands off to the registered install when it is newer than this running
+    // copy ("installed X but the app still reports Y"). Returns an exit code
+    // when startup must not continue.
+    [[nodiscard]] std::optional<int> HandOffToNewerInstalledCopy();
+    // Reconciles the last launched install with the running version: clears
+    // the record once the update took effect, or spends one retry from a
+    // small budget so a silent failed replace is re-offered promptly instead
+    // of hitting the 24 h reinstall-guard silence.
+    void ReconcileLastUpdate();
     void StartUpdateTimer(UINT delayMs) noexcept;
     void StopUpdateTimer() noexcept;
     [[nodiscard]] bool IsDockSettingsOpen() const noexcept;

@@ -1113,6 +1113,12 @@ int DockApp::Run() {
     s_instance = this;
     m_config.LoadOrCreate();
     m_dockScale = m_config.DockScale();
+    // A registered install newer than this binary means this copy is stale
+    // (Setup updated the install dir while an older copy kept launching).
+    // Hand off before touching taskbar/startup state; the new copy owns it.
+    if (const std::optional<int> handOff = HandOffToNewerInstalledCopy()) {
+        return *handOff;
+    }
     // The Run key is authoritative for startup, but the toggle owns it: repair
     // a stale path (portable copy moved) or clear a leftover entry so the
     // persisted setting and the registry never disagree after restart.
@@ -1124,6 +1130,9 @@ int DockApp::Run() {
             ? L"Version " + wide + L" — checking for updates..."
             : L"Version " + wide + L" — automatic updates off.";
     }
+    // Clear a fulfilled install record, or reclaim one retry when the last
+    // launched install never took effect on this copy.
+    ReconcileLastUpdate();
     RestoreTaskbar();
     CreateOverlayWindow();
     UpdatePrimaryMonitor();
@@ -2948,6 +2957,103 @@ void DockApp::SetUpdateStatus(const std::wstring& status) {
     }
 }
 
+std::optional<int> DockApp::HandOffToNewerInstalledCopy() {
+    // Local/dev builds report the CMake project version and would otherwise
+    // hand off to the installed release on every launch. Set
+    // HOVERDOCK_NO_HANDOFF=1 to run them in place.
+    wchar_t noHandoff[8]{};
+    if (GetEnvironmentVariableW(L"HOVERDOCK_NO_HANDOFF", noHandoff,
+            static_cast<DWORD>(std::size(noHandoff))) != 0) {
+        return std::nullopt;
+    }
+    const std::string current = Updater::CurrentVersion();
+    const Updater::InstalledCopy installed = Updater::InstalledCopyInfo();
+    if (installed.version.empty() || installed.exePath.empty()) {
+        return std::nullopt;
+    }
+    if (!Updater::IsNewerVersion(installed.version, current)) {
+        return std::nullopt;
+    }
+    const std::wstring currentExe = Updater::CurrentExecutablePath();
+    if (currentExe.empty() || Updater::IsSamePath(currentExe, installed.exePath)) {
+        return std::nullopt;
+    }
+    if (GetFileAttributesW(installed.exePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return std::nullopt;
+    }
+    const std::wstring wideCurrent(current.begin(), current.end());
+    const std::wstring wideInstalled(installed.version.begin(), installed.version.end());
+    Log(L"Installed v" + wideInstalled + L" is newer than running v" + wideCurrent +
+        L"; handing off to " + installed.exePath);
+    // Release the single-instance lock first so the new copy does not quit on
+    // startup; this process exits right after launching it.
+    if (m_singleInstanceMutex != nullptr) {
+        CloseHandle(m_singleInstanceMutex);
+        m_singleInstanceMutex = nullptr;
+    }
+    const HINSTANCE launched = ShellExecuteW(nullptr, nullptr, installed.exePath.c_str(),
+        nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(launched) > 32) {
+        return 0;
+    }
+    Log(L"Hand-off to the installed copy failed; continuing with this copy.");
+    m_singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\LiquidGlassDock.SingleInstance");
+    if (m_singleInstanceMutex == nullptr) {
+        MessageBoxW(nullptr, L"Liquid Glass Dock could not create its single-instance lock.",
+            L"Liquid Glass Dock", MB_ICONERROR | MB_OK);
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(m_singleInstanceMutex);
+        m_singleInstanceMutex = nullptr;
+        return 0;
+    }
+    return std::nullopt;
+}
+
+void DockApp::ReconcileLastUpdate() {
+    const std::string current = Updater::CurrentVersion();
+    const std::wstring record = m_config.LastInstalledVersion();
+    if (record.empty()) {
+        return;
+    }
+    // Version strings are ASCII (digits, dots, 'v', pre-release tags).
+    std::string narrow;
+    narrow.reserve(record.size());
+    for (const wchar_t c : record) {
+        narrow.push_back(static_cast<char>(c));
+    }
+    if (!Updater::IsNewerVersion(narrow, current)) {
+        // The recorded install took effect (or is stale history): clear it so
+        // a future mismatch is judged on its own retry budget.
+        m_config.SetLastInstalledVersion(L"", 0);
+        m_config.SetLastInstalledAttempts(0);
+        static_cast<void>(m_config.Save());
+        return;
+    }
+    // The recorded install is newer than this binary: the replace did not
+    // take effect on this copy. Without a reclaim the 24 h reinstall guard
+    // stays silent about it; spend one retry from a small budget so the next
+    // check re-offers promptly. The budget (not the cooldown) is what still
+    // protects against a systematically stale asset looping forever.
+    constexpr int kMaxUpdateRetries = 2;
+    const std::wstring wideCurrent(current.begin(), current.end());
+    const int attempts = m_config.LastInstalledAttempts();
+    if (attempts < kMaxUpdateRetries) {
+        m_config.SetLastInstalledAttempts(attempts + 1);
+        m_config.SetLastInstalledVersion(record, 0);
+        static_cast<void>(m_config.Save());
+        m_updateStatus = L"Update v" + record + L" didn't take effect (still v" + wideCurrent +
+            L") — retrying...";
+        Log(L"Last update to v" + record + L" did not take effect; retry " +
+            std::to_wstring(attempts + 1));
+        return;
+    }
+    m_updateStatus = L"Update v" + record + L" was installed but this app still reports v" +
+        wideCurrent + L". Run the installer from the release page manually.";
+    Log(L"Update to v" + record + L" did not take effect after retries; manual install needed.");
+}
+
 void DockApp::CheckForUpdatesAsync(bool manual) {
     if (m_updateInFlight.exchange(true)) {
         if (manual) {
@@ -3117,6 +3223,11 @@ void DockApp::ApplyUpdateResult(const UpdateReply& reply) {
             // config-save timer, which would not fire before WM_CLOSE exits):
             // if the new process still reports the old version, the next
             // check skips this version for a cooldown instead of looping.
+            // A different version restarts the retry budget; re-launching the
+            // same one keeps the attempts spent so far.
+            if (m_config.LastInstalledVersion() != wide) {
+                m_config.SetLastInstalledAttempts(0);
+            }
             m_config.SetLastInstalledVersion(
                 wide, static_cast<long long>(std::time(nullptr)));
             static_cast<void>(m_config.Save());

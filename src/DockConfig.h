@@ -37,6 +37,11 @@ public:
     [[nodiscard]] std::wstring LastInstalledVersion() const;
     [[nodiscard]] long long LastInstalledTime() const noexcept;
     void SetLastInstalledVersion(const std::wstring& version, long long unixTime);
+    // Bounded auto-retry budget for an install that did not take effect
+    // (running version still older than LastInstalledVersion at startup).
+    // Reset to 0 whenever a different version is recorded.
+    [[nodiscard]] int LastInstalledAttempts() const noexcept;
+    void SetLastInstalledAttempts(int attempts) noexcept;
 
 private:
     bool Load();
@@ -52,4 +57,5 @@ private:
     bool m_checkForUpdates = true;
     std::wstring m_lastInstalledVersion;
     long long m_lastInstalledTime = 0;
+    int m_lastInstalledAttempts = 0;
 };

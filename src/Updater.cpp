@@ -675,6 +675,34 @@ bool ToLowerContains(const std::string& haystack, const char* needle) {
     return ToLowerAscii(haystack).find(needle) != std::string::npos;
 }
 
+bool EqualInsensitivePath(const std::wstring& left, const std::wstring& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < left.size(); ++i) {
+        wchar_t x = left[i] == L'/' ? L'\\' : left[i];
+        wchar_t y = right[i] == L'/' ? L'\\' : right[i];
+        if (std::towlower(x) != std::towlower(y)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::wstring ReadRegString(HKEY root, const wchar_t* subkey, const wchar_t* valueName) {
+    DWORD type = 0;
+    wchar_t buffer[32768]{};
+    DWORD size = sizeof(buffer);
+    if (RegGetValueW(root, subkey, valueName, RRF_RT_REG_SZ, &type, buffer, &size) !=
+            ERROR_SUCCESS ||
+        type != REG_SZ) {
+        return {};
+    }
+    // size includes the nul terminator; guard against a missing one.
+    const size_t chars = size >= sizeof(wchar_t) ? (size / sizeof(wchar_t)) - 1U : 0U;
+    return std::wstring(buffer, (std::min)(chars, std::size(buffer) - 1U));
+}
+
 }  // namespace
 
 std::string Updater::CurrentVersion() {
@@ -866,21 +894,62 @@ std::wstring Updater::DefaultDownloadPath(const std::string& version, bool isSet
     return TempDirectory() + L"\\" + name;
 }
 
-bool Updater::IsInstalledCopy() {
+bool Updater::IsSamePath(const std::wstring& left, const std::wstring& right) {
+    return EqualInsensitivePath(left, right);
+}
+
+std::wstring Updater::CurrentExecutablePath() {
     wchar_t buffer[32768]{};
     const DWORD length =
         GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
     if (length == 0) {
+        return {};
+    }
+    return std::wstring(buffer, length);
+}
+
+Updater::InstalledCopy Updater::InstalledCopyInfo() {
+    InstalledCopy info;
+    std::wstring dir = ReadRegString(HKEY_CURRENT_USER, L"Software\\Hoverdock", L"InstallDir");
+    std::wstring version = ReadRegString(HKEY_CURRENT_USER, L"Software\\Hoverdock", L"Version");
+    if (dir.empty()) {
+        dir = ReadRegString(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Hoverdock",
+            L"InstallLocation");
+    }
+    if (version.empty()) {
+        version = ReadRegString(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Hoverdock",
+            L"DisplayVersion");
+    }
+    while (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/')) {
+        dir.pop_back();
+    }
+    if (!dir.empty()) {
+        info.exePath = dir + L"\\Dock.exe";
+    }
+    info.version = TrimVersion(WideToUtf8Simple(version));
+    return info;
+}
+
+bool Updater::IsInstalledCopy() {
+    const std::wstring path = CurrentExecutablePath();
+    if (path.empty()) {
         return false;
     }
-    std::wstring path(buffer, length);
     std::wstring lower = path;
     std::transform(lower.begin(), lower.end(), lower.begin(), [](wchar_t c) {
         return static_cast<wchar_t>(std::towlower(c));
     });
-    return lower.find(L"\\programs\\hoverdock\\") != std::wstring::npos ||
+    if (lower.find(L"\\programs\\hoverdock\\") != std::wstring::npos ||
         lower.find(L"\\program files\\") != std::wstring::npos ||
-        lower.find(L"\\program files (x86)\\") != std::wstring::npos;
+        lower.find(L"\\program files (x86)\\") != std::wstring::npos) {
+        return true;
+    }
+    // Custom install directories miss the path heuristic: the registry record
+    // written by the installer is authoritative instead.
+    const InstalledCopy installed = InstalledCopyInfo();
+    return !installed.exePath.empty() && EqualInsensitivePath(path, installed.exePath);
 }
 
 bool Updater::LaunchInstallerAndExit(const std::wstring& installerPath) {
@@ -923,21 +992,21 @@ bool Updater::StagePortableUpdateAndRestart(const std::wstring& downloadedExe) {
     }
     const std::wstring batch = TempDirectory() + L"\\hoverdock-update.bat";
     // Wait for the dock to exit (PID gate), replace the binary, relaunch, and
-    // delete the helper. /F fallback covers a hung exit.
+    // delete the helper. The wait loops (~20 s) instead of a fixed short sleep:
+    // replacing Dock.exe while the old process still holds it silently keeps
+    // the old version in place, and the relaunch then reports the stale
+    // version as if the update had succeeded.
     const DWORD pid = GetCurrentProcessId();
     std::wstring script =
         L"@echo off\r\n"
-        L"tasklist /FI \"PID eq " +
-        std::to_wstring(pid) +
-        L"\" | find \"" + std::to_wstring(pid) +
-        L"\" >nul\r\n"
-        L"if not errorlevel 1 (\r\n"
-        L"  timeout /t 1 /nobreak >nul\r\n"
+        L"for /L %%i in (1,1,20) do (\r\n"
         L"  tasklist /FI \"PID eq " +
         std::to_wstring(pid) + L"\" | find \"" + std::to_wstring(pid) +
         L"\" >nul\r\n"
-        L"  if not errorlevel 1 timeout /t 2 /nobreak >nul\r\n"
+        L"  if errorlevel 1 goto replaced\r\n"
+        L"  timeout /t 1 /nobreak >nul\r\n"
         L")\r\n"
+        L":replaced\r\n"
         L"move /y \"" +
         downloadedExe + L"\" \"" + currentPath +
         L"\" >nul\r\n"
