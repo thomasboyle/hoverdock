@@ -13,7 +13,6 @@
 #include <WtsApi32.h>
 #include <CommCtrl.h>
 #include <dwmapi.h>
-#include <psapi.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -1187,9 +1186,9 @@ int DockApp::Run() {
     RebuildLayout(false);
 
     try {
-        // Defer D3D12 until first BeginShow so a never-shown / idle-hidden dock
-        // does not pay the NVIDIA UMD private-bytes floor at startup.
-        m_rendererInitialized = false;
+        m_renderer.Initialize(m_window, m_dockWidth, m_dockHeight);
+        m_rendererInitialized = true;
+        LoadIconTextures();
         AssignIconTextureIndices();
     } catch (...) {
         DestroyWindow(m_window);
@@ -1216,8 +1215,9 @@ int DockApp::Run() {
     // Prime the DDC brightness level off-thread (monitor round-trips stall far
     // too long for the UI thread); the tile updates on arrival when it moved.
     RefreshBrightnessAsync();
-    // Installed-app catalogue loads lazily when search/launch needs it (and is
-    // cleared when the prompt closes) so idle memory stays lower.
+    std::thread([this] {
+        m_installedApps.EnsureLoaded();
+    }).detach();
     // Delayed first update check (lets the dock settle), then every 6 h while
     // running. The worker skips itself when auto-checks are disabled.
     StartUpdateTimer(kUpdateInitialDelayMs);
@@ -2184,7 +2184,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     const LONG trayLeadGap = std::lround(10.0F * layoutScale);
     const LONG trayClockGap = std::lround(16.0F * layoutScale);
     const SIZE clockSize = m_tray.MeasureClock(layoutScale);
-    const LONG atlasExtent = std::min(256L, std::max(1L, static_cast<LONG>(IconPixelExtent())));
+    const LONG atlasExtent = std::min(256L, std::max(1L, static_cast<LONG>(IconPixelExtent()) * 2L));
     const LONG clockWidth = std::min(atlasExtent,
         std::max(clockSize.cx, std::lround(72.0F * layoutScale)));
     const LONG clockHeight = std::min(atlasExtent,
@@ -4817,15 +4817,6 @@ void DockApp::BeginShow() {
     HideHoverLabel();
     ++m_showSessionId;
 
-    if (!m_rendererInitialized) {
-        m_renderer.Initialize(m_window, m_dockWidth, m_dockHeight);
-        m_rendererInitialized = true;
-        LoadIconTextures();
-        AssignIconTextureIndices();
-    } else {
-        m_renderer.RestoreGpuOutput(m_dockWidth, m_dockHeight);
-    }
-
     // Elevated foreground (Task Manager, etc.) can make BitBlt/UIPI desktop reads
     // stall for hundreds of ms on the same thread that owns WH_MOUSE_LL. Prefer a
     // cached backdrop and start the slide immediately; live capture resumes on the
@@ -4919,16 +4910,6 @@ void DockApp::AdvanceAnimation() {
     ShowWindow(m_inputWindow, SW_HIDE);
     ShowWindow(m_window, SW_HIDE);
     SyncCursorWatchInterval();
-    if (m_rendererInitialized) {
-        // NVIDIA's D3D12 UMD alone maps tens of MB; tear down while hidden so
-        // Task Manager private bytes can sit under 100 MB. Recreated in BeginShow.
-        m_renderer.Shutdown();
-        m_rendererInitialized = false;
-        m_loadedIconExtent = 0;
-    }
-    // Return unused committed pages to the OS while idle (allocations kept).
-    static_cast<void>(_heapmin());
-    static_cast<void>(EmptyWorkingSet(GetCurrentProcess()));
 }
 
 void DockApp::QueueRenderFrame(bool allowBlockingGpuWait) {
@@ -5319,8 +5300,6 @@ void DockApp::CloseLaunchPrompt(bool hideDockIfAway) {
     ++m_launchGeneration;
     m_launchInFlight = false;
     m_launchTargets.clear();
-    m_launchTargets.shrink_to_fit();
-    m_installedApps.Clear();
 
     if (m_launchEdit != nullptr && m_launchEditPrevious != nullptr) {
         SetWindowLongPtrW(m_launchEdit, GWLP_WNDPROC,

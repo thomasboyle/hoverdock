@@ -438,14 +438,6 @@ void InstalledAppCatalog::EnsureLoaded() {
     m_loaded = true;
 }
 
-void InstalledAppCatalog::Clear() noexcept {
-    std::lock_guard lock(m_mutex);
-    m_apps.clear();
-    m_apps.shrink_to_fit();
-    m_loaded = false;
-}
-
-
 std::vector<InstalledApp> InstalledAppCatalog::Snapshot() const {
     std::lock_guard lock(m_mutex);
     return m_apps;

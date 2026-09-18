@@ -17,7 +17,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <delayimp.h>
 
 #include "glass_ps_60.h"
 #include "glass_ps_66.h"
@@ -142,13 +141,11 @@ D3D12_BLEND_DESC PremultipliedBlendDescription() {
 }
 
 UINT IconAtlasExtent(UINT displayExtent) {
-    // 1x display size: halves linear resolution vs prior 2x atlas (about 75% fewer texels).
-    return std::min(256U, std::max(1U, displayExtent));
+    return std::min(256U, std::max(1U, displayExtent * 2U));
 }
 
 UINT IconSourceExtent(UINT displayExtent) {
-    const UINT atlas = IconAtlasExtent(displayExtent);
-    return std::min(256U, std::max(atlas, displayExtent));
+    return std::min(256U, std::max(128U, IconAtlasExtent(displayExtent)));
 }
 
 BITMAPV5HEADER IconBitmapHeader(UINT width, UINT height) {
@@ -736,76 +733,6 @@ Renderer::~Renderer() {
     }
 }
 
-bool Renderer::IsInitialized() const noexcept {
-    return m_device != nullptr;
-}
-
-void Renderer::Shutdown() noexcept {
-    try {
-        Flush();
-    } catch (...) {
-    }
-    ReleaseBackdropResources();
-    DiscardIconPixelCache();
-    m_iconTextureByTarget.clear();
-    m_iconCount = 0;
-    m_pendingUploads.clear();
-    m_iconAtlas.Reset();
-    for (FrameResource& frame : m_frames) {
-        if (frame.constants != nullptr && frame.mappedConstants != nullptr) {
-            frame.constants->Unmap(0, nullptr);
-            frame.mappedConstants = nullptr;
-        }
-        if (frame.iconInstances != nullptr && frame.mappedIcons != nullptr) {
-            frame.iconInstances->Unmap(0, nullptr);
-            frame.mappedIcons = nullptr;
-        }
-        frame.constants.Reset();
-        frame.iconInstances.Reset();
-        frame.allocator.Reset();
-        frame.fenceValue = 0;
-    }
-    for (auto& backBuffer : m_backBuffers) {
-        backBuffer.Reset();
-    }
-    m_commandList.Reset();
-    m_glassPipeline.Reset();
-    m_iconPipeline.Reset();
-    m_rootSignature.Reset();
-    m_rtvHeap.Reset();
-    m_srvHeap.Reset();
-    if (m_frameLatencyWaitableObject != nullptr) {
-        CloseHandle(m_frameLatencyWaitableObject);
-        m_frameLatencyWaitableObject = nullptr;
-    }
-    m_compositionVisual.Reset();
-    m_compositionTarget.Reset();
-    m_compositionDevice.Reset();
-    m_swapChain.Reset();
-    m_queue.Reset();
-    if (m_fenceEvent != nullptr) {
-        CloseHandle(m_fenceEvent);
-        m_fenceEvent = nullptr;
-    }
-    m_fence.Reset();
-    m_device.Reset();
-    m_factory.Reset();
-    m_window = nullptr;
-    m_width = 1;
-    m_height = 1;
-    m_fenceValue = 0;
-    m_backdropCopyFenceValue = 0;
-    m_backdropInitialized = false;
-    m_backdropValid = false;
-    m_backdropDwmFrameValid = false;
-
-    // Drop delay-loaded GPU DLLs so the NVIDIA UMD can unmap while hidden.
-    (void)__FUnloadDelayLoadedDLL2("d3d12.dll");
-    (void)__FUnloadDelayLoadedDLL2("dxgi.dll");
-    (void)__FUnloadDelayLoadedDLL2("dcomp.dll");
-}
-
-
 void Renderer::Initialize(HWND window, UINT width, UINT height) {
     m_window = window;
     m_width = std::max(width, 1U);
@@ -816,7 +743,7 @@ void Renderer::Initialize(HWND window, UINT width, UINT height) {
     CreateFrameResources();
     CreateRootSignatureAndPipelines();
     CreateRenderTargets();
-    // Backdrop DIB/texture created on first capture / show (saves idle RAM).
+    CreateBackdropResources();
 }
 
 void Renderer::Resize(UINT width, UINT height) {
@@ -883,9 +810,7 @@ void Renderer::UploadIcons(const std::vector<std::wstring>& targets,
     for (UINT index = 0; index < targets.size(); ++index) {
         m_iconTextureByTarget[targets[index]] = index;
         if (!pixelBuffers[index].empty()) {
-            auto& cached = m_iconPixelCache[targets[index]];
-            cached = pixelBuffers[index];
-            cached.shrink_to_fit();
+            m_iconPixelCache[targets[index]] = pixelBuffers[index];
         }
     }
     RebuildIconAtlasFromCache();
@@ -941,7 +866,7 @@ void Renderer::RebuildIconAtlasFromCache() {
             if (cached != m_iconPixelCache.end() && !cached->second.empty()) {
                 UploadIconTexture(slot, cached->second.data(), displayExtent, displayExtent, commandList.Get());
             } else {
-                UploadIcon(slot, target, commandList.Get());
+                CreateFallbackIcon(slot, commandList.Get());
             }
         }
     }
@@ -959,7 +884,6 @@ void Renderer::RebuildIconAtlasFromCache() {
     m_queue->ExecuteCommandLists(1, lists);
     Flush();
     m_pendingUploads.clear();
-    DiscardIconPixelCache();
 }
 
 void Renderer::AppendMissingIcons(const std::vector<std::wstring>& targets,
@@ -1100,56 +1024,8 @@ std::vector<uint8_t> Renderer::ExtractIconPixels(const std::vector<std::wstring>
         IconAtlasExtent(displayExtent));
 }
 
-
-
-void Renderer::SuspendGpuOutput() {
-    if (m_swapChain == nullptr || m_width <= 1 && m_height <= 1) {
-        ReleaseBackdropForIdle();
-        return;
-    }
-    Flush();
-    ReleaseBackdropForIdle();
-    for (auto& backBuffer : m_backBuffers) {
-        backBuffer.Reset();
-    }
-    const UINT flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-    Check(m_swapChain->ResizeBuffers(kBufferCount, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, flags),
-        "Suspend swap chain to 1x1");
-    m_width = 1;
-    m_height = 1;
-    CreateRenderTargets();
-}
-
-void Renderer::RestoreGpuOutput(UINT width, UINT height) {
-    width = std::max(width, 1U);
-    height = std::max(height, 1U);
-    if (m_swapChain == nullptr) {
-        return;
-    }
-    if (m_width == width && m_height == height && m_backdropTexture != nullptr) {
-        return;
-    }
-    Resize(width, height);
-}
-
-void Renderer::EnsureBackdropResources() {
-    if (m_backdropDc != nullptr && m_backdropTexture != nullptr) {
-        return;
-    }
-    CreateBackdropResources();
-}
-
-void Renderer::ReleaseBackdropForIdle() noexcept {
-    ReleaseBackdropResources();
-}
-
-void Renderer::DiscardIconPixelCache() noexcept {
-    m_iconPixelCache.clear();
-}
-
 bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     ProfileScope scope("Renderer::CaptureBackdrop");
-    EnsureBackdropResources();
     const LONG width = screenRectangle.right - screenRectangle.left;
     const LONG height = screenRectangle.bottom - screenRectangle.top;
     if (m_backdropDc == nullptr || m_backdropDibPixels == nullptr || m_backdropTexture == nullptr ||
