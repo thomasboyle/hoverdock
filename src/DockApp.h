@@ -108,6 +108,7 @@ private:
     static constexpr UINT kPinIconMessage = WM_APP + 10;
     static constexpr UINT kUpdateResultMessage = WM_APP + 12;
     static constexpr UINT kSettingsPaintMessage = WM_APP + 13;
+    static constexpr UINT kCursorWatchSyncMessage = WM_APP + 14;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
     static constexpr UINT_PTR kConfigSaveTimerId = 3;
@@ -120,12 +121,17 @@ private:
     static constexpr UINT kUpdateIntervalMs = 6U * 60U * 60U * 1000U;
     static constexpr UINT kUpdateInitialDelayMs = 15000;
     static constexpr UINT kCursorWatchIntervalMs = 33;
+    // 0 = no timer while Hidden with a healthy LL hook (event-driven via hook + FG WinEvent).
+    static constexpr UINT kCursorWatchHiddenIntervalMs = 0;
     static constexpr UINT kDeferredRefreshDelayMs = 400;
     static constexpr UINT kBackdropIntervalMs = 8;
     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
-    static constexpr UINT kTaskbarMonitorSlowIntervalMs = 1000;
+    static constexpr UINT kTaskbarMonitorSlowIntervalMs = 5000;
     static constexpr int kTaskbarMonitorCalmPasses = 5;
     static constexpr UINT kTrayIntervalMs = 1000;
+    // Dock face clock uses TIME_NOSECONDS; idle ticks only need minute/battery granularity.
+    static constexpr UINT kTrayIdleIntervalMs = 30000;
+    static constexpr UINT kCursorWatchCalmIntervalMs = 100;
     static constexpr UINT kContextOpen = 1;
     static constexpr UINT kContextOpenLocation = 2;
     static constexpr UINT kContextClose = 3;
@@ -347,6 +353,12 @@ private:
     void StopCursorWatch() noexcept;
     void EnsureMouseHook() noexcept;
     void PumpCursorWatch();
+    [[nodiscard]] UINT DesiredCursorWatchIntervalMs() const noexcept;
+    void SyncCursorWatchInterval() noexcept;
+    void RegisterForegroundWatch() noexcept;
+    void UnregisterForegroundWatch() noexcept;
+    static void CALLBACK ForegroundWinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+        LONG idObject, LONG idChild, DWORD idEventThread, DWORD dwmsEventTime);
     [[nodiscard]] bool IsElevatedForeground() const noexcept;
     void ApplyPinUnpinLayoutChange();
     void RemapInteractionAfterLayoutChange(const std::wstring& pressedTarget,
@@ -443,6 +455,12 @@ private:
     bool m_taskbarHidden = false;
     int m_taskbarMonitorQuietPasses = 0;
     bool m_taskbarMonitorFast = true;
+    bool m_cursorWatchArmed = false;
+    bool m_cursorWatchTimerRunning = false;
+    bool m_cursorWatchCalm = false;
+    UINT m_cursorWatchAppliedMs = 0;
+    UINT m_cursorWatchStationaryPumps = 0;
+    HWINEVENTHOOK m_foregroundHook = nullptr;
     bool m_taskbarStateSaved = false;
     UINT m_savedTaskbarState = 0;
     RECT m_savedWorkArea{};

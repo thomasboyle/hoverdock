@@ -51,7 +51,7 @@ constexpr size_t kMaxMissingIconsPerRefresh = 2;
 constexpr float kMinDockScale = 0.75F;
 constexpr float kMaxDockScale = 1.5F;
 constexpr int kBottomHotZonePixels = 8;
-constexpr UINT kRefreshIntervalMs = 5000;
+constexpr UINT kRefreshIntervalMs = 15000;
 constexpr BYTE kInputWindowAlpha = 1;
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
@@ -1111,6 +1111,7 @@ DockApp::~DockApp() {
     DestroyHoverLabelFont();
     DestroyDragGhostWindow();
     StopCursorWatch();
+    UnregisterForegroundWatch();
     if (m_mouseHook != nullptr) {
         UnhookWindowsHookEx(m_mouseHook);
     }
@@ -1195,6 +1196,7 @@ int DockApp::Run() {
     if (m_mouseHook == nullptr) {
         Log(L"Low-level mouse hook unavailable; the dock can still be shown by moving over its window.");
     }
+    RegisterForegroundWatch();
     StartCursorWatch();
 
     GetCursorPos(&m_lastCursor);
@@ -1613,6 +1615,19 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         }
         break;
 
+    case kCursorWatchSyncMessage: {
+        EnsureMouseHook();
+        SyncCursorWatchInterval();
+        // If we just promoted to the fast poll (elevated FG / hook loss), sample once
+        // so a hot-zone show is not delayed until the first timer tick.
+        if (DesiredCursorWatchIntervalMs() == kCursorWatchIntervalMs && !IsDragActive()) {
+            POINT cursor{};
+            if (GetCursorPos(&cursor) != FALSE) {
+                HandlePointer(cursor);
+            }
+        }
+        return 0;
+    }
     case kPointerMessage: {
         POINT point{static_cast<LONG>(static_cast<INT_PTR>(wParam)),
             static_cast<LONG>(lParam)};
@@ -1802,12 +1817,16 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 m_taskbarMonitorFast = false;
                 SetTimer(window, kTaskbarMonitorTimerId, kTaskbarMonitorSlowIntervalMs, nullptr);
             }
-            // Hook reinstall only here. Show/hide cursor sampling is owned by
-            // kCursorWatchTimerId (33 ms) so elevated foreground apps (Task
-            // Manager) cannot force a ~1 s calm-timer lag via UIPI-blocked LL hooks.
+            // Hook reinstall + cursor-watch cadence sync. When Hidden with a healthy
+            // hook the cursor timer is off (0 Hz); elevated FG / missing hook re-arms
+            // 33 ms. Foreground WinEvent also posts kCursorWatchSyncMessage for lag-free
+            // promote (Task Manager UIPI case) without a standing poll.
             EnsureMouseHook();
+            SyncCursorWatchInterval();
         } else if (wParam == kTrayTimerId) {
             RefreshTray(false);
+            // Re-arm: overflow wants 1 Hz IPC; dock-face clock has no seconds.
+            StartTrayTimer();
         } else if (wParam == kUpdateTimerId) {
             // First tick is the delayed startup check; re-arm for the steady
             // 6 h cadence afterwards.
@@ -2714,6 +2733,9 @@ void DockApp::ToggleOverflowPopup() {
         ShowWindow(m_overflowWindow, SW_SHOWNA);
         PositionOverflowPopup();
     }
+    if (m_visibility == VisibilityState::Visible) {
+        StartTrayTimer();
+    }
 }
 
 void DockApp::QueueOverflowPaint() {
@@ -2958,6 +2980,9 @@ void DockApp::CloseOverflowPopup() noexcept {
     }
     m_overflowHover = -1;
     InvalidateOverflowGlass();
+    if (m_visibility == VisibilityState::Visible) {
+        StartTrayTimer();
+    }
 }
 
 void DockApp::DestroyOverflowPopup() noexcept {
@@ -4642,7 +4667,8 @@ void DockApp::PaintOverflowPopup() {
 
 void DockApp::StartTrayTimer() noexcept {
     if (m_window != nullptr) {
-        SetTimer(m_window, kTrayTimerId, kTrayIntervalMs, nullptr);
+        const UINT interval = IsOverflowOpen() ? kTrayIntervalMs : kTrayIdleIntervalMs;
+        SetTimer(m_window, kTrayTimerId, interval, nullptr);
     }
 }
 
@@ -4877,6 +4903,7 @@ void DockApp::AdvanceAnimation() {
     HideHoverLabel();
     ShowWindow(m_inputWindow, SW_HIDE);
     ShowWindow(m_window, SW_HIDE);
+    SyncCursorWatchInterval();
 }
 
 void DockApp::QueueRenderFrame(bool allowBlockingGpuWait) {
@@ -7084,10 +7111,12 @@ bool DockApp::MaintainNativeTaskbarSuppression() {
 }
 
 void DockApp::StartTaskbarMonitor() noexcept {
-    m_taskbarMonitorQuietPasses = 0;
-    m_taskbarMonitorFast = true;
+    // HideTaskbar() already applied suppression synchronously; start calm and
+    // promote to 100 ms only while MaintainNativeTaskbarSuppression fights Explorer.
+    m_taskbarMonitorQuietPasses = kTaskbarMonitorCalmPasses;
+    m_taskbarMonitorFast = false;
     if (m_window != nullptr) {
-        SetTimer(m_window, kTaskbarMonitorTimerId, kTaskbarMonitorIntervalMs, nullptr);
+        SetTimer(m_window, kTaskbarMonitorTimerId, kTaskbarMonitorSlowIntervalMs, nullptr);
     }
 }
 
@@ -7098,12 +7127,15 @@ void DockApp::StopTaskbarMonitor() noexcept {
 }
 
 void DockApp::StartCursorWatch() noexcept {
-    if (m_window != nullptr) {
-        SetTimer(m_window, kCursorWatchTimerId, kCursorWatchIntervalMs, nullptr);
-    }
+    m_cursorWatchArmed = true;
+    m_cursorWatchAppliedMs = 0;
+    SyncCursorWatchInterval();
 }
 
 void DockApp::StopCursorWatch() noexcept {
+    m_cursorWatchArmed = false;
+    m_cursorWatchAppliedMs = 0;
+    m_cursorWatchTimerRunning = false;
     if (m_window != nullptr) {
         KillTimer(m_window, kCursorWatchTimerId);
     }
@@ -7119,12 +7151,78 @@ void DockApp::EnsureMouseHook() noexcept {
     }
 }
 
+UINT DockApp::DesiredCursorWatchIntervalMs() const noexcept {
+    // Fast poll while interacting, when the LL hook is missing, or when an elevated
+    // foreground window may UIPI-block WH_MOUSE_LL. When Hidden with a healthy hook,
+    // return 0: no timer — hot-zone entry arrives via the hook; FG changes arrive via
+    // WinEvent. Visible + stationary pointer uses a calmer poll (hover still works;
+    // leave/hide remains hook-assisted). Does not change kBackdropIntervalMs.
+    if (m_visibility == VisibilityState::Hidden) {
+        if (m_mouseHook == nullptr || IsElevatedForeground()) {
+            return kCursorWatchIntervalMs;
+        }
+        return kCursorWatchHiddenIntervalMs;
+    }
+    if (m_visibility == VisibilityState::Visible && m_cursorWatchCalm && !IsDragActive()) {
+        return kCursorWatchCalmIntervalMs;
+    }
+    return kCursorWatchIntervalMs;
+}
+
+void DockApp::SyncCursorWatchInterval() noexcept {
+    if (m_window == nullptr || !m_cursorWatchArmed) {
+        return;
+    }
+    const UINT interval = DesiredCursorWatchIntervalMs();
+    if (interval == 0) {
+        if (m_cursorWatchTimerRunning) {
+            KillTimer(m_window, kCursorWatchTimerId);
+            m_cursorWatchTimerRunning = false;
+            m_cursorWatchAppliedMs = 0;
+        }
+        return;
+    }
+    if (m_cursorWatchTimerRunning && interval == m_cursorWatchAppliedMs) {
+        return;
+    }
+    m_cursorWatchAppliedMs = interval;
+    m_cursorWatchTimerRunning = true;
+    SetTimer(m_window, kCursorWatchTimerId, interval, nullptr);
+}
+
+void DockApp::RegisterForegroundWatch() noexcept {
+    if (m_foregroundHook != nullptr) {
+        return;
+    }
+    m_foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+        &DockApp::ForegroundWinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (m_foregroundHook == nullptr) {
+        Log(L"Foreground WinEvent hook unavailable; elevated FG uses timer/taskbar sync only.");
+    }
+}
+
+void DockApp::UnregisterForegroundWatch() noexcept {
+    if (m_foregroundHook != nullptr) {
+        UnhookWinEvent(m_foregroundHook);
+        m_foregroundHook = nullptr;
+    }
+}
+
+void CALLBACK DockApp::ForegroundWinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    if (s_instance == nullptr || s_instance->m_window == nullptr) {
+        return;
+    }
+    PostMessageW(s_instance->m_window, kCursorWatchSyncMessage, 0, 0);
+}
+
 bool DockApp::IsElevatedForeground() const noexcept {
     return IsWindowProcessElevated(GetForegroundWindow());
 }
 
 void DockApp::PumpCursorWatch() {
     EnsureMouseHook();
+    SyncCursorWatchInterval();
     if (IsDragActive()) {
         return;
     }
@@ -7142,7 +7240,22 @@ void DockApp::PumpCursorWatch() {
     }
     m_lastPointerSampleAt = now;
     if (cursor.x == m_lastCursor.x && cursor.y == m_lastCursor.y) {
+        if (m_visibility == VisibilityState::Visible && !IsDragActive()) {
+            if (m_cursorWatchStationaryPumps < 0xFFFFu) {
+                ++m_cursorWatchStationaryPumps;
+            }
+            // ~330 ms of stillness at 33 ms before calming (reduces visible idle wakes).
+            if (!m_cursorWatchCalm && m_cursorWatchStationaryPumps >= 10) {
+                m_cursorWatchCalm = true;
+                SyncCursorWatchInterval();
+            }
+        }
         return;
+    }
+    if (m_cursorWatchCalm || m_cursorWatchStationaryPumps != 0) {
+        m_cursorWatchCalm = false;
+        m_cursorWatchStationaryPumps = 0;
+        SyncCursorWatchInterval();
     }
     HandlePointer(cursor);
 }
