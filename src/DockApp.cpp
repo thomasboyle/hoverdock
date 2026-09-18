@@ -1948,8 +1948,9 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
         } else {
             m_lastPointerSampleAt = nowMove;
         }
-        if (!m_suppressDragUntilRelease && m_pressedIcon >= 0 &&
+        if (!m_suppressDragUntilRelease && !m_launchClickInProgress && m_pressedIcon >= 0 &&
             IsPersistentDisplayIcon(m_pressedIcon) &&
+            (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 &&
             (nowMove - m_pressedAtTime) >= kMinDragPressSeconds &&
             HasCrossedDragThreshold(point)) {
             BeginDrag(point);
@@ -5113,7 +5114,10 @@ void DockApp::ActivatePressedApp() {
         return;
     }
     if (IsTrayRenderIndex(m_pressedIcon)) {
-        OpenTraySlot(m_iconRenderData[static_cast<size_t>(m_pressedIcon)].traySlot);
+        const TraySlot slot = m_iconRenderData[static_cast<size_t>(m_pressedIcon)].traySlot;
+        m_suppressDragUntilRelease = true;
+        ClearPressState();
+        OpenTraySlot(slot);
         return;
     }
     if (static_cast<size_t>(m_pressedIcon) >= m_displayApps.size()) {
@@ -5121,6 +5125,17 @@ void DockApp::ActivatePressedApp() {
     }
 
     const DisplayApp app = m_displayApps[static_cast<size_t>(m_pressedIcon)];
+    // Clear press/drag BEFORE ActivateOrLaunch. Heavy apps (Settings) make
+    // ShellExecuteEx pump WM_MOUSEMOVE on this thread; with press still armed that
+    // falsely begins a drag and ApplyDragPreviewLayout hides the icon off-screen.
+    m_suppressDragUntilRelease = true;
+    m_launchClickInProgress = true;
+    ClearPressState();
+    struct LaunchClickGuard {
+        DockApp* app;
+        ~LaunchClickGuard() { app->m_launchClickInProgress = false; }
+    } launchGuard{this};
+
     if (app.app.target == kSearchTarget) {
         if (IsLaunchPromptOpen()) {
             CloseLaunchPrompt();
@@ -5141,7 +5156,8 @@ void DockApp::ActivatePressedApp() {
         Log(L"Application did not launch or accept focus.");
     }
     m_lastWindowRefresh = 0.0;
-    RefreshRunningWindows();
+    // Defer refresh so Settings' window storm does not rebuild the dock mid-click.
+    ScheduleDeferredRefresh();
 }
 
 LaunchCandidate DockApp::MakeLaunchCandidate(const LaunchTarget& target) const {
@@ -5843,8 +5859,16 @@ void DockApp::ApplyDragPreviewLayout() {
 
 void DockApp::BeginDrag(POINT screenCursor) {
     ProfileScope scope("BeginDrag");
-    if (m_suppressDragUntilRelease || m_pressedIcon < 0 ||
+    if (m_suppressDragUntilRelease || m_launchClickInProgress || m_pressedIcon < 0 ||
         !IsPersistentDisplayIcon(m_pressedIcon)) {
+        return;
+    }
+    // ShellExecute / Settings activation pumps messages on this thread. A nested
+    // move must not start a drag after the user already released (or while a click
+    // activate is in progress) — that parked the icon at -32000 until a layout rebuild.
+    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+        ClearPressState();
+        m_suppressDragUntilRelease = true;
         return;
     }
     if (QpcSeconds() - m_pressedAtTime < kMinDragPressSeconds) {
@@ -6055,6 +6079,7 @@ void DockApp::CompleteDrag() {
 }
 
 void DockApp::ClearPressState() noexcept {
+    const bool restoreSlots = m_draggedIcon >= 0 || m_dragSnapAnimating;
     m_pressedIcon = -1;
     m_draggedIcon = -1;
     m_dragInsertion = -1;
@@ -6067,6 +6092,14 @@ void DockApp::ClearPressState() noexcept {
     m_draggedTarget.clear();
     m_scalingDivider = false;
     m_hoveredDivider = -1;
+    if (restoreSlots) {
+        HideDragGhost();
+        m_dragSnapAnimating = false;
+        for (size_t index = 0; index < m_iconRenderData.size() && index < m_layoutSlotBounds.size();
+            ++index) {
+            m_iconRenderData[index].bounds = m_layoutSlotBounds[index];
+        }
+    }
 }
 
 void DockApp::StartRefreshTimer() noexcept {

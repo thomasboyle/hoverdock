@@ -437,6 +437,7 @@ private:
     double m_pressedAtTime = 0.0;
     double m_lastPointerSampleAt = 0.0;
     bool m_suppressDragUntilRelease = false;
+    bool m_launchClickInProgress = false;
     std::wstring m_pressedTarget;
     std::wstring m_draggedTarget;
     bool m_taskbarHidden = false;
