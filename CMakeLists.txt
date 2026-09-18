@@ -155,13 +155,23 @@ set_property(TARGET Dock PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_D
 find_program(MAKENSIS_EXECUTABLE NAMES makensis makensis.exe)
 if(MAKENSIS_EXECUTABLE)
     set(DOCK_INSTALLER_OUTPUT "${CMAKE_BINARY_DIR}/Hoverdock-Setup-${DOCK_EFFECTIVE_VERSION}.exe")
+    # NSIS File does not match forward-slash paths, but CMake paths always use
+    # them: stage the exe via cmake -E (which accepts either form) and hand
+    # makensis native backslash paths only.
+    file(TO_NATIVE_PATH "${CMAKE_BINARY_DIR}/staging/Dock.exe" DOCK_STAGED_EXE_NATIVE)
+    file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}" DOCK_SRC_DIR_NATIVE)
+    file(TO_NATIVE_PATH "${DOCK_INSTALLER_OUTPUT}" DOCK_INSTALLER_OUTPUT_NATIVE)
+    file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/installer/hoverdock.nsi" DOCK_NSI_NATIVE)
     add_custom_target(installer
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/staging"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:Dock>"
+            "${CMAKE_BINARY_DIR}/staging/Dock.exe"
         COMMAND "${MAKENSIS_EXECUTABLE}"
             /DVERSION=${DOCK_EFFECTIVE_VERSION}
-            /DSRCBIN=$<TARGET_FILE:Dock>
-            /DSRCDIR=${CMAKE_CURRENT_SOURCE_DIR}
-            /DOUTFILE=${DOCK_INSTALLER_OUTPUT}
-            ${CMAKE_CURRENT_SOURCE_DIR}/installer/hoverdock.nsi
+            "/DSRCBIN=${DOCK_STAGED_EXE_NATIVE}"
+            "/DSRCDIR=${DOCK_SRC_DIR_NATIVE}"
+            "/DOUTFILE=${DOCK_INSTALLER_OUTPUT_NATIVE}"
+            "${DOCK_NSI_NATIVE}"
         DEPENDS Dock
         COMMENT "Building NSIS installer ${DOCK_INSTALLER_OUTPUT}"
         VERBATIM
