@@ -3020,8 +3020,8 @@ void DockApp::BeginOverflowHide(bool animate) noexcept {
         m_overflowCurrentY = origin.y;
     }
     m_overflowAnimFromY = m_overflowCurrentY;
-    // Slide down toward the dock (same bottom-edge reveal semantics as dock hide).
-    m_overflowAnimToY = origin.y + m_overflowSize.cy;
+    // Tuck back to the dock's top edge.
+    m_overflowAnimToY = m_currentY;
     m_overflowAnimStartedAt = QpcSeconds();
     m_overflowVisibility = VisibilityState::Hiding;
 }
@@ -3049,8 +3049,10 @@ void DockApp::BeginOverflowShow() {
         return;
     }
     m_overflowCaretX = caret;
+    // Emerge from the dock's top edge (not origin.y + height, which becomes
+    // screen-bottom when the rest Y is clamped to the monitor top).
     m_overflowAnimToY = origin.y;
-    m_overflowAnimFromY = origin.y + m_overflowSize.cy;
+    m_overflowAnimFromY = m_currentY;
     m_overflowCurrentY = m_overflowAnimFromY;
     m_overflowAnimStartedAt = QpcSeconds();
     m_overflowVisibility = VisibilityState::Showing;
@@ -3085,7 +3087,7 @@ void DockApp::AdvanceOverflowAnimation() {
         if (m_overflowVisibility == VisibilityState::Showing) {
             m_overflowAnimToY = origin.y;
         } else if (m_overflowVisibility == VisibilityState::Hiding) {
-            m_overflowAnimToY = origin.y + m_overflowSize.cy;
+            m_overflowAnimToY = m_currentY;
         }
         SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x),
             SaturatedInt(m_overflowCurrentY), SaturatedInt(m_overflowSize.cx),
