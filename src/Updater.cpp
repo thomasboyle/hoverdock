@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <ctime>
 #include <cwctype>
 #include <fstream>
 #include <shellapi.h>
@@ -16,10 +17,13 @@
 namespace {
 
 constexpr wchar_t kApiHost[] = L"api.github.com";
+constexpr wchar_t kWebHost[] = L"github.com";
 constexpr DWORD kConnectTimeoutMs = 8000;
 constexpr DWORD kSendTimeoutMs = 15000;
 constexpr DWORD kReceiveTimeoutMs = 30000;
 constexpr DWORD kMaxDownloadBytes = 256U * 1024U * 1024U;  // 256 MB sanity cap.
+constexpr DWORD kMaxApiBytes = 1024U * 1024U;
+constexpr DWORD kMaxErrorBodyBytes = 64U * 1024U;
 
 std::string WideToUtf8Simple(const std::wstring& text) {
     if (text.empty()) {
@@ -102,6 +106,8 @@ std::string ToLowerAscii(std::string value) {
     });
     return value;
 }
+
+bool ToLowerContains(const std::string& haystack, const char* needle);
 
 // Minimal JSON string-field scan: finds "key" : "value" without a full parser.
 // GitHub release payloads are flat enough for this; values never contain
@@ -241,9 +247,143 @@ bool CrackUrl(const std::string& url, std::wstring& host, std::wstring& path, IN
     return !host.empty();
 }
 
-bool HttpGet(const std::wstring& host, INTERNET_PORT port, bool secure, const std::wstring& path,
-    const std::wstring& extraHeaders, std::string& body, DWORD maxBytes, std::wstring& error) {
-    WinHttpHandle session(WinHttpOpen(L"Hoverdock/1.0 (auto-update)", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+std::wstring UserAgent() {
+    std::string version = TrimVersion(DockVersion::kVersion);
+    if (version.empty()) {
+        version = "1.0";
+    }
+    return Utf8ToWideSimple("Hoverdock/" + version + " (auto-update)");
+}
+
+bool QueryCustomHeader(HINTERNET request, const wchar_t* name, std::wstring& value) {
+    value.clear();
+    DWORD size = 0;
+    WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, name, WINHTTP_NO_OUTPUT_BUFFER, &size,
+        WINHTTP_NO_HEADER_INDEX);
+    if (size == 0 || size > 16U * 1024U) {
+        return false;
+    }
+    std::wstring buffer(size / sizeof(wchar_t), L'\0');
+    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, name, buffer.data(), &size,
+            WINHTTP_NO_HEADER_INDEX) == FALSE) {
+        return false;
+    }
+    while (!buffer.empty() && buffer.back() == L'\0') {
+        buffer.pop_back();
+    }
+    value = buffer;
+    return !value.empty();
+}
+
+bool QueryLocationHeader(HINTERNET request, std::wstring& location) {
+    location.clear();
+    wchar_t buffer[4096]{};
+    DWORD size = sizeof(buffer);
+    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
+            buffer, &size, WINHTTP_NO_HEADER_INDEX) == FALSE) {
+        return false;
+    }
+    location.assign(buffer);
+    return !location.empty();
+}
+
+std::wstring TruncateWide(std::wstring text, size_t maxChars) {
+    if (text.size() > maxChars) {
+        text.resize(maxChars);
+    }
+    for (wchar_t& c : text) {
+        if (c < 0x20 && c != L'\n' && c != L'\r' && c != L'\t') {
+            c = L' ';
+        }
+    }
+    return text;
+}
+
+// Builds a user-facing HTTP error that surfaces GitHub's JSON "message" and,
+// for rate limiting, the reset time. `contextNoun` is "check" or "download".
+std::wstring FormatHttpError(DWORD status, const std::string& body, HINTERNET request,
+    const std::wstring& contextNoun) {
+    std::wstring prefix =
+        contextNoun == L"download" ? L"Update download failed " : L"Update check failed ";
+    const std::wstring statusText = L"(" + std::to_wstring(status) + L")";
+
+    std::string serverMessage;
+    if (!body.empty()) {
+        size_t cursor = 0;
+        FindJsonStringField(body, cursor, "message", serverMessage);
+    }
+
+    const std::string lowerMessage = ToLowerAscii(serverMessage);
+    const bool messageSaysRateLimit = lowerMessage.find("rate limit") != std::string::npos ||
+        lowerMessage.find("abuse") != std::string::npos;
+
+    std::wstring remaining;
+    std::wstring reset;
+    std::wstring retryAfter;
+    if (request != nullptr) {
+        QueryCustomHeader(request, L"X-RateLimit-Remaining", remaining);
+        QueryCustomHeader(request, L"X-RateLimit-Reset", reset);
+        QueryCustomHeader(request, L"Retry-After", retryAfter);
+    }
+    const bool rateLimited = status == 429 || messageSaysRateLimit ||
+        (status == 403 && (remaining == L"0" || messageSaysRateLimit));
+    if (rateLimited) {
+        // X-RateLimit-Reset is unix seconds; Retry-After is seconds to wait.
+        long waitMinutes = -1;
+        try {
+            if (!retryAfter.empty()) {
+                const long seconds = std::stol(retryAfter);
+                if (seconds >= 0) {
+                    waitMinutes = (seconds + 59) / 60;
+                }
+            } else if (!reset.empty()) {
+                const long long resetUnix = std::stoll(reset);
+                const long long nowUnix = static_cast<long long>(std::time(nullptr));
+                const long long delta = resetUnix - nowUnix;
+                if (delta > 0 && delta < 24LL * 3600LL) {
+                    waitMinutes = static_cast<long>((delta + 59) / 60);
+                }
+            }
+        } catch (...) {
+            waitMinutes = -1;
+        }
+        if (waitMinutes >= 0) {
+            return prefix + statusText +
+                L": GitHub update rate limit exceeded, try again in " +
+                std::to_wstring(waitMinutes + 1) + L" min.";
+        }
+        return prefix + statusText + L": GitHub update rate limit exceeded, try again later.";
+    }
+
+    if (!serverMessage.empty()) {
+        std::wstring wide = Utf8ToWideSimple(serverMessage);
+        if (!wide.empty()) {
+            wide = TruncateWide(wide, 160);
+            return prefix + statusText + L": " + wide;
+        }
+    }
+    if (status == 404) {
+        return prefix + statusText + L": no releases published yet.";
+    }
+    return prefix + statusText + L".";
+}
+
+struct HttpResult {
+    DWORD status = 0;
+    std::string body;
+    std::wstring location;  // Set when the final response is a redirect.
+};
+
+// Core HTTPS GET. When `followRedirects` is false the first 3xx response is
+// returned (with `location`) instead of being followed; this is how the
+// rate-limit-free github.com/releases/latest probe resolves the tag.
+bool HttpGetEx(const std::wstring& host, INTERNET_PORT port, bool secure,
+    const std::wstring& path, const std::wstring& extraHeaders, DWORD maxBytes,
+    bool followRedirects, HttpResult& result, std::wstring& error,
+    const std::wstring& contextNoun) {
+    result = HttpResult{};
+    const std::wstring agent = UserAgent();
+    WinHttpHandle session(WinHttpOpen(agent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session) {
         error = L"Could not open an HTTPS session.";
@@ -251,31 +391,47 @@ bool HttpGet(const std::wstring& host, INTERNET_PORT port, bool secure, const st
     }
     WinHttpSetTimeouts(session.Get(), kConnectTimeoutMs, kConnectTimeoutMs, kSendTimeoutMs,
         kReceiveTimeoutMs);
-    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    // GitHub requires TLS 1.2+; pin the floor explicitly so older OS defaults
+    // cannot negotiate TLS 1.0/1.1 and fail the handshake.
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+    protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#endif
+    WinHttpSetOption(
+        session.Get(), WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+    // Follow redirects manually so host changes (api.github.com ->
+    // objects.githubusercontent.com, github.com -> release assets) are
+    // honored and so the version probe can observe Location without fetching
+    // HTML. Disable WinHTTP's automatic handling to avoid double-follows.
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     WinHttpSetOption(session.Get(), WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy,
         sizeof(redirectPolicy));
 
-    WinHttpHandle connection(WinHttpConnect(session.Get(), host.c_str(), port, 0));
-    if (!connection) {
-        error = L"Could not reach the update server.";
-        return false;
-    }
-    const DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
-    WinHttpHandle request(WinHttpOpenRequest(connection.Get(), L"GET", path.c_str(), nullptr,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
-    if (!request) {
-        error = L"Could not create the update request.";
-        return false;
-    }
+    std::wstring curHost = host;
+    INTERNET_PORT curPort = port;
+    bool curSecure = secure;
+    std::wstring curPath = path;
+
     DWORD redirectCount = 0;
     constexpr DWORD kMaxRedirects = 5;
     for (;;) {
-        std::wstring headers = L"User-Agent: Hoverdock/1.0\r\nAccept: */*";
-        if (!extraHeaders.empty()) {
-            headers += L"\r\n" + extraHeaders;
+        WinHttpHandle connection(WinHttpConnect(session.Get(), curHost.c_str(), curPort, 0));
+        if (!connection) {
+            error = L"Could not reach the update server.";
+            return false;
         }
-        if (WinHttpSendRequest(request.Get(), headers.c_str(), static_cast<DWORD>(-1L),
-                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) == FALSE) {
+        const DWORD flags = curSecure ? WINHTTP_FLAG_SECURE : 0;
+        WinHttpHandle request(WinHttpOpenRequest(connection.Get(), L"GET", curPath.c_str(),
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
+        if (!request) {
+            error = L"Could not create the update request.";
+            return false;
+        }
+        const wchar_t* headersPtr = extraHeaders.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS
+                                                         : extraHeaders.c_str();
+        DWORD headersLen = extraHeaders.empty() ? 0 : static_cast<DWORD>(-1L);
+        if (WinHttpSendRequest(request.Get(), headersPtr, headersLen, WINHTTP_NO_REQUEST_DATA,
+                0, 0, 0) == FALSE) {
             error = L"Could not send the update request.";
             return false;
         }
@@ -292,54 +448,214 @@ bool HttpGet(const std::wstring& host, INTERNET_PORT port, bool secure, const st
             error = L"Update server returned an unreadable status.";
             return false;
         }
-        if ((status == 301 || status == 302 || status == 303 || status == 307 ||
-                status == 308) &&
-            redirectCount < kMaxRedirects) {
-            wchar_t location[4096]{};
-            DWORD locationSize = sizeof(location);
-            if (WinHttpQueryHeaders(request.Get(), WINHTTP_QUERY_LOCATION,
-                    WINHTTP_HEADER_NAME_BY_INDEX, location, &locationSize,
-                    WINHTTP_NO_HEADER_INDEX) == FALSE) {
+        result.status = status;
+        const bool isRedirect =
+            status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+        if (isRedirect) {
+            std::wstring location;
+            if (!QueryLocationHeader(request.Get(), location)) {
                 error = L"Update redirect had no location.";
                 return false;
             }
-            std::wstring nextHost;
-            std::wstring nextPath;
-            INTERNET_PORT nextPort = INTERNET_DEFAULT_HTTPS_PORT;
-            bool nextSecure = true;
-            if (!CrackUrl(WideToUtf8Simple(location), nextHost, nextPath, nextPort,
-                    nextSecure)) {
-                error = L"Update redirect URL was invalid.";
-                return false;
+            if (!followRedirects || redirectCount >= kMaxRedirects) {
+                result.location = location;
+                return true;
             }
-            // Follow manually so host changes (api.github.com ->
-            // objects.githubusercontent.com) are honored.
-            WinHttpHandle nextConnection(
-                WinHttpConnect(session.Get(), nextHost.c_str(), nextPort, 0));
-            if (!nextConnection) {
-                error = L"Could not follow the update redirect.";
-                return false;
+            // Resolve relative redirects ("/owner/repo/...") against the
+            // current host; absolute URLs may change host/port/scheme.
+            if (!location.empty() && location.front() == L'/') {
+                curPath = location;
+            } else {
+                std::wstring nextHost;
+                std::wstring nextPath;
+                INTERNET_PORT nextPort = INTERNET_DEFAULT_HTTPS_PORT;
+                bool nextSecure = true;
+                if (!CrackUrl(WideToUtf8Simple(location), nextHost, nextPath, nextPort,
+                        nextSecure)) {
+                    error = L"Update redirect URL was invalid.";
+                    return false;
+                }
+                curHost = nextHost;
+                curPath = nextPath;
+                curPort = nextPort;
+                curSecure = nextSecure;
             }
-            const DWORD nextFlags = nextSecure ? WINHTTP_FLAG_SECURE : 0;
-            WinHttpHandle nextRequest(WinHttpOpenRequest(nextConnection.Get(), L"GET",
-                nextPath.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                nextFlags));
-            if (!nextRequest) {
-                error = L"Could not follow the update redirect.";
-                return false;
-            }
-            // Transfer ownership for the next loop iteration.
-            connection = std::move(nextConnection);
-            request = std::move(nextRequest);
             ++redirectCount;
             continue;
         }
         if (status < 200 || status > 299) {
-            error = L"Update check failed (" + std::to_wstring(status) + L").";
+            // Capture GitHub's JSON error body (rate-limit message, abuse
+            // notice, ...) so the user sees more than a bare status code.
+            std::string errorBody;
+            std::wstring ignored;
+            if (ReadResponseBody(request.Get(), errorBody, kMaxErrorBodyBytes, ignored)) {
+                result.body = errorBody;
+            }
+            error = FormatHttpError(status, result.body, request.Get(), contextNoun);
             return false;
         }
-        return ReadResponseBody(request.Get(), body, maxBytes, error);
+        return ReadResponseBody(request.Get(), result.body, maxBytes, error);
     }
+}
+
+bool HttpGet(const std::wstring& host, INTERNET_PORT port, bool secure, const std::wstring& path,
+    const std::wstring& extraHeaders, std::string& body, DWORD maxBytes, std::wstring& error) {
+    HttpResult result;
+    // Only the JSON API is a "check"; release-asset downloads (which also live
+    // under /releases/download/...) must report as downloads.
+    const bool isApi = ToLowerContains(WideToUtf8Simple(host), "api.github.com");
+    if (!HttpGetEx(host, port, secure, path, extraHeaders, maxBytes, true, result, error,
+            isApi ? L"check" : L"download")) {
+        return false;
+    }
+    body = result.body;
+    return true;
+}
+
+std::wstring ApiHeaders() {
+    // Single Accept header (a duplicated "Accept: */*" + json line confuses
+    // content negotiation) plus the pinned API version GitHub recommends.
+    return L"Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28";
+}
+
+// Resolves the latest tag without touching the rate-limited JSON API:
+// GET https://github.com/<owner>/<repo>/releases/latest returns
+// 302 Location: .../releases/tag/<tag>. No auth, no API quota.
+bool ResolveLatestViaWebRedirect(
+    std::string& tagOut, std::string& versionOut, std::string& pageUrlOut, std::wstring& error) {
+    tagOut.clear();
+    versionOut.clear();
+    pageUrlOut.clear();
+    std::wstring path = L"/";
+    path += Utf8ToWideSimple(DockVersion::kRepoOwner);
+    path += L"/";
+    path += Utf8ToWideSimple(DockVersion::kRepoName);
+    path += L"/releases/latest";
+
+    HttpResult result;
+    if (!HttpGetEx(kWebHost, INTERNET_DEFAULT_HTTPS_PORT, true, path,
+            L"Accept: text/html,*/*;q=0.8", kMaxErrorBodyBytes, false, result, error,
+            L"check")) {
+        return false;
+    }
+    if (result.status == 404) {
+        error = L"Update check failed (404): no releases published yet.";
+        return false;
+    }
+    const bool isRedirect = result.status == 301 || result.status == 302 ||
+        result.status == 303 || result.status == 307 || result.status == 308;
+    if (!isRedirect) {
+        error = L"Update check failed (" + std::to_wstring(result.status) + L").";
+        return false;
+    }
+    if (result.location.empty()) {
+        error = L"Update redirect had no location.";
+        return false;
+    }
+    const std::string location = WideToUtf8Simple(result.location);
+    std::string clean = location;
+    const size_t hash = clean.find('#');
+    if (hash != std::string::npos) {
+        clean.resize(hash);
+    }
+    const size_t query = clean.find('?');
+    if (query != std::string::npos) {
+        clean.resize(query);
+    }
+    const std::string marker = "/tag/";
+    const size_t markerPos = clean.rfind(marker);
+    if (markerPos == std::string::npos) {
+        error = L"Update redirect URL was invalid.";
+        return false;
+    }
+    std::string tag = clean.substr(markerPos + marker.size());
+    while (!tag.empty() && tag.back() == '/') {
+        tag.pop_back();
+    }
+    if (tag.empty()) {
+        error = L"Update redirect URL was invalid.";
+        return false;
+    }
+    tagOut = tag;
+    versionOut = TrimVersion(tag);
+    pageUrlOut = location;
+    if (versionOut.empty()) {
+        error = L"Release had no version.";
+        return false;
+    }
+    return true;
+}
+
+// Synthesizes release-asset URLs from the known release.yml naming
+// (Hoverdock-Setup-<version>.exe + Dock.exe). Used when the JSON API is
+// rate-limited: github.com download URLs carry no API quota.
+void BuildFallbackRelease(
+    const std::string& tag, const std::string& version, const std::string& pageUrl,
+    Updater::ReleaseInfo& out) {
+    out = Updater::ReleaseInfo{};
+    out.version = version;
+    out.pageUrl = pageUrl.empty()
+        ? std::string("https://github.com/") + DockVersion::kRepoOwner + "/" +
+            DockVersion::kRepoName + "/releases/tag/" + tag
+        : pageUrl;
+    const std::string base = std::string("https://github.com/") + DockVersion::kRepoOwner +
+        "/" + DockVersion::kRepoName + "/releases/download/" + tag + "/";
+    out.setupUrl = base + "Hoverdock-Setup-" + version + ".exe";
+    out.exeUrl = base + "Dock.exe";
+}
+
+bool ParseApiReleaseBody(const std::string& body, Updater::ReleaseInfo& out) {
+    out = Updater::ReleaseInfo{};
+    size_t cursor = 0;
+    std::string tag;
+    if (FindJsonStringField(body, cursor, "tag_name", tag)) {
+        out.version = TrimVersion(tag);
+    }
+    std::string page;
+    size_t pageCursor = 0;
+    if (FindJsonStringField(body, pageCursor, "html_url", page)) {
+        out.pageUrl = page;
+    }
+
+    // Collect every asset URL, then prefer a Setup installer.
+    size_t assetCursor = 0;
+    std::string url;
+    std::vector<std::string> urls;
+    while (FindJsonStringField(body, assetCursor, "browser_download_url", url)) {
+        urls.push_back(url);
+    }
+    for (const std::string& candidate : urls) {
+        if (ToLowerContains(candidate, ".exe") && ToLowerContains(candidate, "setup")) {
+            if (out.setupUrl.empty()) {
+                out.setupUrl = candidate;
+            }
+        }
+    }
+    for (const std::string& candidate : urls) {
+        const std::string lower = ToLowerAscii(candidate);
+        const bool isExe = lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".exe") == 0;
+        if (!isExe) {
+            continue;
+        }
+        if (!out.setupUrl.empty()) {
+            break;
+        }
+        // No Setup asset: accept Dock.exe / Hoverdock.exe as portable payload.
+        if (ToLowerContains(candidate, "dock")) {
+            out.exeUrl = candidate;
+            break;
+        }
+    }
+    if (out.setupUrl.empty() && out.exeUrl.empty()) {
+        // Last resort: any .exe asset so a renamed uploader still updates.
+        for (const std::string& candidate : urls) {
+            if (ToLowerContains(candidate, ".exe")) {
+                out.exeUrl = candidate;
+                break;
+            }
+        }
+    }
+    return !out.version.empty() && (!out.setupUrl.empty() || !out.exeUrl.empty());
 }
 
 std::wstring TempDirectory() {
@@ -390,82 +706,117 @@ bool Updater::IsNewerVersion(const std::string& latest, const std::string& curre
 
 bool Updater::FetchLatestRelease(ReleaseInfo& out, std::wstring& error) {
     out = ReleaseInfo{};
-    std::wstring path = L"/repos/";
-    path += Utf8ToWideSimple(DockVersion::kRepoOwner);
-    path += L"/";
-    path += Utf8ToWideSimple(DockVersion::kRepoName);
-    path += L"/releases/latest";
+    const std::string current = CurrentVersion();
 
-    std::string body;
-    if (!HttpGet(kApiHost, INTERNET_DEFAULT_HTTPS_PORT, true, path,
-            L"Accept: application/vnd.github+json", body, 1024U * 1024U, error)) {
-        return false;
-    }
-    if (body.empty()) {
-        error = L"Update server returned an empty release.";
-        return false;
-    }
+    // Prefer the rate-limit-free github.com redirect for version resolution:
+    // unauthenticated api.github.com calls are capped at 60/hour per IP and
+    // shared NATs exhaust that quota, surfacing as HTTP 403.
+    std::string webTag;
+    std::string webVersion;
+    std::string webPage;
+    std::wstring webError;
+    const bool webOk = ResolveLatestViaWebRedirect(webTag, webVersion, webPage, webError);
 
-    size_t cursor = 0;
-    std::string tag;
-    if (FindJsonStringField(body, cursor, "tag_name", tag)) {
-        out.version = TrimVersion(tag);
-    }
-    std::string page;
-    size_t pageCursor = 0;
-    if (FindJsonStringField(body, pageCursor, "html_url", page)) {
-        out.pageUrl = page;
-    }
+    auto fetchViaApi = [&](ReleaseInfo& apiOut, std::wstring& apiError) -> bool {
+        apiOut = ReleaseInfo{};
+        std::wstring apiPath = L"/repos/";
+        apiPath += Utf8ToWideSimple(DockVersion::kRepoOwner);
+        apiPath += L"/";
+        apiPath += Utf8ToWideSimple(DockVersion::kRepoName);
+        apiPath += L"/releases/latest";
 
-    // Collect every asset URL, then prefer a Setup installer.
-    size_t assetCursor = 0;
-    std::string url;
-    std::vector<std::string> urls;
-    while (FindJsonStringField(body, assetCursor, "browser_download_url", url)) {
-        urls.push_back(url);
-    }
-    for (const std::string& candidate : urls) {
-        if (ToLowerContains(candidate, ".exe") && ToLowerContains(candidate, "setup")) {
-            if (out.setupUrl.empty()) {
-                out.setupUrl = candidate;
+        std::string body;
+        if (!HttpGet(kApiHost, INTERNET_DEFAULT_HTTPS_PORT, true, apiPath, ApiHeaders(), body,
+                kMaxApiBytes, apiError)) {
+            return false;
+        }
+        if (body.empty()) {
+            apiError = L"Update server returned an empty release.";
+            return false;
+        }
+        if (!ParseApiReleaseBody(body, apiOut)) {
+            if (apiOut.version.empty()) {
+                apiError = L"Release had no version.";
+            } else {
+                apiError = L"Release has no downloadable .exe asset.";
             }
+            return false;
         }
-    }
-    for (const std::string& candidate : urls) {
-        const std::string lower = ToLowerAscii(candidate);
-        const bool isExe = lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".exe") == 0;
-        if (!isExe) {
-            continue;
+        apiOut.hasUpdate = IsNewerVersion(apiOut.version, current);
+        return true;
+    };
+
+    if (webOk) {
+        if (!IsNewerVersion(webVersion, current)) {
+            // Up to date: no JSON API call needed, so routine checks never
+            // consume the 60/hour quota.
+            BuildFallbackRelease(webTag, webVersion, webPage, out);
+            out.hasUpdate = false;
+            return true;
         }
-        if (!out.setupUrl.empty()) {
-            break;
+        // A newer tag exists: prefer exact API asset URLs, but fall back to
+        // the conventional github.com download URLs when the API is
+        // rate-limited (403/429) or unreachable.
+        ReleaseInfo apiOut;
+        std::wstring apiError;
+        if (fetchViaApi(apiOut, apiError)) {
+            out = apiOut;
+            return true;
         }
-        // No Setup asset: accept Dock.exe / Hoverdock.exe as portable payload.
-        if (ToLowerContains(candidate, "dock")) {
-            out.exeUrl = candidate;
-            break;
-        }
-    }
-    if (out.setupUrl.empty() && out.exeUrl.empty()) {
-        // Last resort: any .exe asset so a renamed uploader still updates.
-        for (const std::string& candidate : urls) {
-            if (ToLowerContains(candidate, ".exe")) {
-                out.exeUrl = candidate;
-                break;
-            }
-        }
+        BuildFallbackRelease(webTag, webVersion, webPage, out);
+        out.hasUpdate = true;
+        return true;
     }
 
-    if (out.version.empty()) {
-        error = L"Release had no version.";
-        return false;
+    // Web redirect failed (offline, no releases, unexpected HTML): try the
+    // JSON API so proxied setups still have a path.
+    ReleaseInfo apiOut;
+    std::wstring apiError;
+    if (fetchViaApi(apiOut, apiError)) {
+        out = apiOut;
+        return true;
     }
-    if (out.setupUrl.empty() && out.exeUrl.empty()) {
-        error = L"Release has no downloadable .exe asset.";
-        return false;
+    // Prefer the more actionable error. A 404 "no releases" from the web
+    // probe beats a 403 rate-limit from the API, and vice versa.
+    if (!webError.empty() &&
+        (webError.find(L"no releases") != std::wstring::npos || apiError.empty())) {
+        error = webError;
+    } else {
+        error = apiError.empty() ? webError : apiError;
     }
-    out.hasUpdate = IsNewerVersion(out.version, CurrentVersion());
-    return true;
+    if (error.empty()) {
+        error = L"Update check failed.";
+    }
+    return false;
+}
+
+// Picks the download asset for THIS copy. Installed copies (LocalAppData\
+// Programs\Hoverdock, Program Files) update via the NSIS installer, which
+// replaces the install dir and relaunches it. Portable copies must
+// self-replace in place: running the installer would plant a second copy in
+// the install dir while the running portable binary stays old, so the next
+// check re-offers the same version forever.
+void Updater::SelectAssetUrls(const ReleaseInfo& release, std::string& urlOut, bool& isSetupOut) {
+    urlOut.clear();
+    isSetupOut = false;
+    const bool installed = IsInstalledCopy();
+    if (installed) {
+        if (!release.setupUrl.empty()) {
+            urlOut = release.setupUrl;
+            isSetupOut = true;
+            return;
+        }
+        urlOut = release.exeUrl;
+        isSetupOut = false;
+        return;
+    }
+    if (!release.exeUrl.empty()) {
+        urlOut = release.exeUrl;
+        isSetupOut = false;
+        return;
+    }
+    urlOut = release.setupUrl;
+    isSetupOut = !release.setupUrl.empty();
 }
 
 bool Updater::DownloadFile(const std::string& url, const std::wstring& destPath,
@@ -479,7 +830,7 @@ bool Updater::DownloadFile(const std::string& url, const std::wstring& destPath,
         return false;
     }
     std::string body;
-    if (!HttpGet(host, port, secure, path, L"", body, kMaxDownloadBytes, error)) {
+    if (!HttpGet(host, port, secure, path, L"Accept: */*", body, kMaxDownloadBytes, error)) {
         return false;
     }
     if (body.empty()) {
@@ -553,6 +904,21 @@ bool Updater::StagePortableUpdateAndRestart(const std::wstring& downloadedExe) {
     }
     const std::wstring currentPath(current, length);
     if (GetFileAttributesW(downloadedExe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    // The helper below is a batch file, which cmd.exe reads in the ANSI code
+    // page: non-ASCII bytes in either path would be mojibake and the move
+    // would silently target the wrong file (relaunching the old build =
+    // an update loop that reports success). Refuse honestly instead.
+    auto isAscii = [](const std::wstring& text) {
+        for (wchar_t c : text) {
+            if (c > 127) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!isAscii(downloadedExe) || !isAscii(currentPath)) {
         return false;
     }
     const std::wstring batch = TempDirectory() + L"\\hoverdock-update.bat";

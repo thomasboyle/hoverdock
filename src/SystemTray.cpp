@@ -974,6 +974,22 @@ bool SystemTray::Refresh() {
     return changed;
 }
 
+bool SystemTray::RefreshForDock() {
+    TrayStatus next = m_status;
+    QueryClock(next);
+    QueryBattery(next);
+    const bool changed = next.hasBattery != m_status.hasBattery ||
+        next.batteryCharging != m_status.batteryCharging ||
+        next.batteryPercent != m_status.batteryPercent || next.timeText != m_status.timeText ||
+        next.dateText != m_status.dateText;
+    m_status.timeText = std::move(next.timeText);
+    m_status.dateText = std::move(next.dateText);
+    m_status.hasBattery = next.hasBattery;
+    m_status.batteryCharging = next.batteryCharging;
+    m_status.batteryPercent = next.batteryPercent;
+    return changed;
+}
+
 const TrayStatus& SystemTray::Status() const noexcept {
     return m_status;
 }

@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <malloc.h>
 #include <cstring>
 #include <cwctype>
@@ -1754,10 +1755,15 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             // drop LL hooks (e.g. after a timeout), which would otherwise leave
             // the dock permanently hidden with no show/hide updates. Sampling
             // the cursor here keeps the same HandlePointer rules working.
-            // Skipped while dragging, mirroring the hook's own gating.
+            // Skipped while dragging, mirroring the hook's own gating. Skipped
+            // when the cursor hasn't moved since the last handled sample: with a
+            // stationary cursor HandlePointer is idempotent (hover/show state
+            // already settled via the hook path), so this avoids MonitorRect +
+            // hit-test work on every steady 1 s tick while visible.
             if (!IsDragActive()) {
                 POINT cursor{};
-                if (GetCursorPos(&cursor) != FALSE) {
+                if (GetCursorPos(&cursor) != FALSE &&
+                    (cursor.x != m_lastCursor.x || cursor.y != m_lastCursor.y)) {
                     HandlePointer(cursor);
                 }
             }
@@ -2574,7 +2580,13 @@ void DockApp::EnsureTrayIcons() {
 }
 
 void DockApp::RefreshTray(bool forceLayout) {
-    if (!m_tray.Refresh() && !forceLayout) {
+    // Steady visible-idle fast path: the dock face only shows clock/battery, so
+    // the 1 Hz tick skips WLAN/COM-audio/power-scheme IPC unless Quick Settings
+    // is open (its tiles need volume/network/brightness). Interval unchanged.
+    const bool popupOpen = IsOverflowOpen();
+    const bool changed =
+        (popupOpen || forceLayout ? m_tray.Refresh() : m_tray.RefreshForDock()) || forceLayout;
+    if (!changed) {
         return;
     }
     RebuildLayout(false);
@@ -2633,6 +2645,10 @@ void DockApp::ToggleOverflowPopup() {
     }
     // The hover label would otherwise linger under the popup; dismiss it.
     HideHoverLabel();
+    // The 1 Hz tick uses the cheap dock-only poll while closed, so take one
+    // synchronous full refresh on open for fresh volume/network/brightness tiles.
+    // The 1 Hz timer then keeps them live while open; cost is one click, not idle.
+    static_cast<void>(m_tray.Refresh());
     // Refresh the DDC level off-thread; repaints on arrival when it moved.
     RefreshBrightnessAsync();
     RebuildOverflowPopup();
@@ -2943,8 +2959,14 @@ void DockApp::CheckForUpdatesAsync(bool manual) {
         SetUpdateStatus(L"Checking for updates...");
     }
     m_lastUpdateCheck = QpcSeconds();
+    // Snapshot the reinstall-loop guard on the UI thread (DockConfig is not
+    // thread-safe): version + time of the last launched install.
+    const std::wstring lastInstalledVersion = m_config.LastInstalledVersion();
+    const long long lastInstalledTime = m_config.LastInstalledTime();
+    const long long checkTime = static_cast<long long>(std::time(nullptr));
     const HWND replyWindow = m_window;
-    std::thread([this, replyWindow, manual] {
+    std::thread([this, replyWindow, manual, lastInstalledVersion, lastInstalledTime,
+        checkTime] {
         auto postReply = [replyWindow](UpdateReply reply) {
             auto* owned = new UpdateReply(std::move(reply));
             if (replyWindow == nullptr ||
@@ -2983,10 +3005,36 @@ void DockApp::CheckForUpdatesAsync(bool manual) {
             return;
         }
 
+        // Reinstall-loop guard: this exact version already had its
+        // installer/mover launched recently but the running build still
+        // reports an older version, so the install did not take effect
+        // (portable vs installed location, locked file, ...). Do not
+        // download + reinstall it again; that is the observed infinite loop.
+        constexpr long long kReinstallCooldownSeconds = 24LL * 60LL * 60LL;
+        const std::string version = release.version;
+        const std::wstring wideVersion(version.begin(), version.end());
+        if (!wideVersion.empty() && wideVersion == lastInstalledVersion &&
+            lastInstalledTime > 0 && checkTime >= lastInstalledTime &&
+            checkTime - lastInstalledTime < kReinstallCooldownSeconds) {
+            if (manual) {
+                UpdateReply reply;
+                reply.finished = true;
+                std::string current = Updater::CurrentVersion();
+                std::wstring wideCurrent(current.begin(), current.end());
+                reply.status = L"Update v" + wideVersion +
+                    L" was already installed but this app still reports v" + wideCurrent +
+                    L". Run the installer from the release page manually.";
+                postReply(std::move(reply));
+            } else {
+                Log(L"Background update check skipped: v" + wideVersion +
+                    L" was installed recently but did not take effect.");
+                m_updateInFlight.store(false);
+            }
+            return;
+        }
+
         // An update is available: automatically download and stage the install.
         // The UI thread performs the final launch + exit so file locks are clean.
-        std::string version = release.version;
-        std::wstring wideVersion(version.begin(), version.end());
         {
             UpdateReply downloading;
             downloading.finished = false;
@@ -2994,10 +3042,31 @@ void DockApp::CheckForUpdatesAsync(bool manual) {
             postReply(downloading);
         }
 
-        std::string url = !release.setupUrl.empty() ? release.setupUrl : release.exeUrl;
-        const bool isSetup = !release.setupUrl.empty();
+        // Installed copies update via the Setup installer; portable copies
+        // self-replace in place (see Updater::SelectAssetUrls).
+        std::string url;
+        bool isSetup = true;
+        Updater::SelectAssetUrls(release, url, isSetup);
+        if (url.empty()) {
+            UpdateReply reply;
+            reply.finished = true;
+            reply.status = L"Release has no downloadable .exe asset.";
+            postReply(std::move(reply));
+            return;
+        }
         std::wstring dest = Updater::DefaultDownloadPath(version, isSetup);
-        if (!Updater::DownloadFile(url, dest, error)) {
+        bool downloaded = Updater::DownloadFile(url, dest, error);
+        if (!downloaded && isSetup && !release.exeUrl.empty()) {
+            // The fallback feed synthesizes conventional asset names; if the
+            // Setup name drifts (or the installer asset is missing), retry the
+            // portable Dock.exe before surfacing a download failure.
+            error.clear();
+            url = release.exeUrl;
+            isSetup = false;
+            dest = Updater::DefaultDownloadPath(version, isSetup);
+            downloaded = Updater::DownloadFile(url, dest, error);
+        }
+        if (!downloaded) {
             UpdateReply reply;
             reply.finished = true;
             reply.status = error.empty() ? L"Update download failed."
@@ -3026,6 +3095,16 @@ void DockApp::ApplyUpdateResult(const UpdateReply& reply) {
             m_updateInFlight.store(false);
             return;
         }
+        // Defensive: a stale queued reply must never reinstall the running
+        // (or an older) version over a newer build.
+        if (!Updater::IsNewerVersion(reply.version, Updater::CurrentVersion())) {
+            m_updateInstalling.store(false);
+            m_updateInFlight.store(false);
+            std::string current = Updater::CurrentVersion();
+            std::wstring wide(current.begin(), current.end());
+            SetUpdateStatus(L"You are up to date (v" + wide + L").");
+            return;
+        }
         bool launched = false;
         if (reply.isSetup) {
             launched = Updater::LaunchInstallerAndExit(reply.path);
@@ -3034,6 +3113,13 @@ void DockApp::ApplyUpdateResult(const UpdateReply& reply) {
         }
         if (launched) {
             std::wstring wide(reply.version.begin(), reply.version.end());
+            // Record the launched install synchronously (not via the deferred
+            // config-save timer, which would not fire before WM_CLOSE exits):
+            // if the new process still reports the old version, the next
+            // check skips this version for a cooldown instead of looping.
+            m_config.SetLastInstalledVersion(
+                wide, static_cast<long long>(std::time(nullptr)));
+            static_cast<void>(m_config.Save());
             SetUpdateStatus(L"Restarting into v" + wide + L"...");
             Log(L"Update installer launched; exiting for replace.");
             // Give the status paint a beat, then exit cleanly so the

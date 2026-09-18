@@ -947,6 +947,8 @@ bool DockConfig::Load() {
     m_typeSafeApiKey.clear();
     m_launchAtStartup = false;
     m_checkForUpdates = true;
+    m_lastInstalledVersion.clear();
+    m_lastInstalledTime = 0;
     const auto dockSection = sections.find(L"dock");
     if (dockSection != sections.end()) {
         const auto showDevBounds = dockSection->second.find(L"showdevbounds");
@@ -972,6 +974,22 @@ bool DockConfig::Load() {
         const auto checkForUpdates = dockSection->second.find(L"checkforupdates");
         if (checkForUpdates != dockSection->second.end()) {
             m_checkForUpdates = ParseBoolean(checkForUpdates->second);
+        }
+        const auto lastInstalledVersion =
+            dockSection->second.find(L"lastinstalledversion");
+        if (lastInstalledVersion != dockSection->second.end()) {
+            m_lastInstalledVersion = lastInstalledVersion->second;
+        }
+        const auto lastInstalledTime = dockSection->second.find(L"lastinstalledtime");
+        if (lastInstalledTime != dockSection->second.end()) {
+            try {
+                m_lastInstalledTime = std::stoll(lastInstalledTime->second);
+            } catch (...) {
+                m_lastInstalledTime = 0;
+            }
+            if (m_lastInstalledTime < 0) {
+                m_lastInstalledTime = 0;
+            }
         }
     }
 
@@ -1014,6 +1032,10 @@ bool DockConfig::Save() const {
     contents << L"Scale=" << m_dockScale << L"\n";
     contents << L"LaunchAtStartup=" << (m_launchAtStartup ? L"1" : L"0") << L"\n";
     contents << L"CheckForUpdates=" << (m_checkForUpdates ? L"1" : L"0") << L"\n";
+    if (!m_lastInstalledVersion.empty()) {
+        contents << L"LastInstalledVersion=" << m_lastInstalledVersion << L"\n";
+        contents << L"LastInstalledTime=" << m_lastInstalledTime << L"\n";
+    }
     if (!m_typeSafeApiKey.empty()) {
         contents << L"TypeSafeApiKey=" << m_typeSafeApiKey << L"\n";
     }
@@ -1080,6 +1102,19 @@ bool DockConfig::CheckForUpdates() const noexcept {
 
 void DockConfig::SetCheckForUpdates(bool enabled) noexcept {
     m_checkForUpdates = enabled;
+}
+
+std::wstring DockConfig::LastInstalledVersion() const {
+    return m_lastInstalledVersion;
+}
+
+long long DockConfig::LastInstalledTime() const noexcept {
+    return m_lastInstalledTime;
+}
+
+void DockConfig::SetLastInstalledVersion(const std::wstring& version, long long unixTime) {
+    m_lastInstalledVersion = version;
+    m_lastInstalledTime = unixTime < 0 ? 0 : unixTime;
 }
 
 const std::wstring& DockConfig::Path() const noexcept {

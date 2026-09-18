@@ -4,11 +4,16 @@
 
 // GitHub-Releases based auto updater.
 //
-// Feed: https://api.github.com/repos/<owner>/<repo>/releases/latest
-// Asset preference: "*Setup*.exe" (the NSIS installer) first, then the
-// portable "Dock.exe". Installer downloads are launched silent ("/S") so the
-// update installs without prompts; portable builds self-replace via a helper
-// batch file. In both cases the new build is reopened after install.
+// Version feed: https://github.com/<owner>/<repo>/releases/latest (302 to the
+// latest tag; carries no API quota). Asset URLs come from the JSON API
+// (https://api.github.com/repos/<owner>/<repo>/releases/latest) when
+// available, with conventional github.com download URLs as fallback when the
+// unauthenticated API quota (60/hour per IP -> HTTP 403) is exhausted.
+// Installed copies update via the "*Setup*.exe" NSIS installer, launched
+// silent ("/S"); portable copies self-replace the running "Dock.exe" via a
+// helper batch file (running the installer from a portable copy would leave
+// the running binary stale and re-offer the same version forever). In both
+// cases the new build is reopened after install.
 class Updater {
 public:
     struct ReleaseInfo {
@@ -37,6 +42,10 @@ public:
     // (LocalAppData\Programs\Hoverdock or Program Files). Portable builds
     // self-replace instead of expecting an installer.
     [[nodiscard]] static bool IsInstalledCopy();
+    // Chooses the asset matching this copy: installed -> Setup installer
+    // first, portable -> Dock.exe first, each falling back to the other.
+    static void SelectAssetUrls(const ReleaseInfo& release, std::string& urlOut,
+        bool& isSetupOut);
     // Launches the downloaded installer silently and returns true if the
     // caller should now exit so files can be replaced. The installer
     // relaunches the dock when finished.

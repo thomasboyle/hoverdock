@@ -172,6 +172,11 @@ private:
     bool m_backdropInitialized = false;
     bool m_backdropValid = false;
     uint64_t m_backdropHash = 0;
+    // Last DWM composed-frame count seen by CaptureBackdrop. Used for the idle
+    // fast path: when DWM hasn't composed since the last capture, the backdrop
+    // pixels cannot have changed and the BitBlt is skipped (timer still fires).
+    uint64_t m_backdropDwmFrame = 0;
+    bool m_backdropDwmFrameValid = false;
     UINT64 m_backdropCopyFenceValue = 0;
     HANDLE m_fenceEvent = nullptr;
     HANDLE m_frameLatencyWaitableObject = nullptr;

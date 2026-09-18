@@ -57,6 +57,12 @@ struct TrayNotifyIcon {
 class SystemTray {
 public:
     [[nodiscard]] bool Refresh();
+    // Cheap 1 Hz poll for the visible dock: clock + battery only. The dock face
+    // shows Overflow, Power, and Clock; volume/network/brightness tiles live in
+    // Quick Settings and are refreshed by the full Refresh() while the popup is
+    // open (plus once synchronously on open). This keeps the steady visible-idle
+    // tick to two cheap syscalls instead of WLAN/COM audio/power IPC every second.
+    [[nodiscard]] bool RefreshForDock();
     [[nodiscard]] const TrayStatus& Status() const noexcept;
 
     [[nodiscard]] static const wchar_t* TargetForSlot(TraySlot slot) noexcept;
