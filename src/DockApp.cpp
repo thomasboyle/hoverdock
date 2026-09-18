@@ -1225,15 +1225,20 @@ int DockApp::Run() {
     for (;;) {
         const bool slideAnimating = m_visibility == VisibilityState::Showing ||
             m_visibility == VisibilityState::Hiding;
+        const bool overflowAnimating = IsOverflowAnimating();
         HANDLE frameWaitable = slideAnimating ? m_renderer.FrameLatencyWaitableObject() : nullptr;
         const DWORD count = frameWaitable == nullptr ? 0 : 1;
-        const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
+        const DWORD timeout =
+            (slideAnimating || overflowAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
         const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, QS_ALLINPUT,
             MWMO_INPUTAVAILABLE);
 
         if (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT) {
             if (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Hiding) {
                 AdvanceAnimation();
+            }
+            if (overflowAnimating) {
+                AdvanceOverflowAnimation();
             }
             if (m_dragSnapAnimating) {
                 AdvanceDragSnapBack();
@@ -1860,7 +1865,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         StopShellFlyoutWatch();
         CloseLaunchPrompt(false);
         DestroyDockSettings();
-        CloseOverflowPopup();
+        BeginOverflowHide(false);
         DestroyOverflowPopup();
         HideHoverLabel();
         DestroyHoverLabelWindow();
@@ -2722,26 +2727,28 @@ void DockApp::OpenTraySlot(TraySlot slot) {
 }
 
 void DockApp::ToggleOverflowPopup() {
-    if (IsOverflowOpen()) {
-        CloseOverflowPopup();
+    if (m_overflowVisibility == VisibilityState::Visible ||
+        m_overflowVisibility == VisibilityState::Showing) {
+        BeginOverflowHide(true);
         return;
     }
-    // The hover label would otherwise linger under the popup; dismiss it.
-    HideHoverLabel();
-    // The 1 Hz tick uses the cheap dock-only poll while closed, so take one
-    // synchronous full refresh on open for fresh volume/network/brightness tiles.
-    // The 1 Hz timer then keeps them live while open; cost is one click, not idle.
-    static_cast<void>(m_tray.Refresh());
-    // Refresh the DDC level off-thread; repaints on arrival when it moved.
-    RefreshBrightnessAsync();
-    RebuildOverflowPopup();
-    if (m_overflowWindow != nullptr) {
-        ShowWindow(m_overflowWindow, SW_SHOWNA);
-        PositionOverflowPopup();
+    if (m_overflowVisibility == VisibilityState::Hiding) {
+        // Reverse an in-flight hide into a show from the current Y.
+        POINT origin{};
+        LONG caret = m_overflowCaretX;
+        if (OverflowScreenOrigin(origin, caret)) {
+            m_overflowCaretX = caret;
+            m_overflowAnimFromY = m_overflowCurrentY;
+            m_overflowAnimToY = origin.y;
+            m_overflowAnimStartedAt = QpcSeconds();
+            m_overflowVisibility = VisibilityState::Showing;
+            if (m_visibility == VisibilityState::Visible) {
+                StartTrayTimer();
+            }
+        }
+        return;
     }
-    if (m_visibility == VisibilityState::Visible) {
-        StartTrayTimer();
-    }
+    BeginOverflowShow();
 }
 
 void DockApp::QueueOverflowPaint() {
@@ -2978,12 +2985,12 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notify
     m_overflowGlyphBoost = m_tray.RasterizeSymbol(L'\uE945', tileExtent);
 }
 
-void DockApp::CloseOverflowPopup() noexcept {
-    // The settings panel is attached to Quick Settings: dismiss both together.
+void DockApp::FinishOverflowHide() noexcept {
     CloseDockSettings();
     if (m_overflowWindow != nullptr) {
         ShowWindow(m_overflowWindow, SW_HIDE);
     }
+    m_overflowVisibility = VisibilityState::Hidden;
     m_overflowHover = -1;
     InvalidateOverflowGlass();
     if (m_visibility == VisibilityState::Visible) {
@@ -2991,8 +2998,117 @@ void DockApp::CloseOverflowPopup() noexcept {
     }
 }
 
+void DockApp::BeginOverflowHide(bool animate) noexcept {
+    if (m_overflowVisibility == VisibilityState::Hidden) {
+        return;
+    }
+    // Settings rides with Quick Settings; drop it as soon as dismiss starts.
+    CloseDockSettings();
+    if (!animate || m_overflowWindow == nullptr || m_overflowSize.cy <= 0) {
+        FinishOverflowHide();
+        return;
+    }
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (!OverflowScreenOrigin(origin, caret)) {
+        FinishOverflowHide();
+        return;
+    }
+    m_overflowCaretX = caret;
+    if (m_overflowVisibility != VisibilityState::Showing &&
+        m_overflowVisibility != VisibilityState::Hiding) {
+        m_overflowCurrentY = origin.y;
+    }
+    m_overflowAnimFromY = m_overflowCurrentY;
+    // Slide down toward the dock (same bottom-edge reveal semantics as dock hide).
+    m_overflowAnimToY = origin.y + m_overflowSize.cy;
+    m_overflowAnimStartedAt = QpcSeconds();
+    m_overflowVisibility = VisibilityState::Hiding;
+}
+
+void DockApp::CloseOverflowPopup() noexcept {
+    // User dismiss (toggle, outside click, tray actions): same 50 ms slide as dock hide.
+    BeginOverflowHide(true);
+}
+
+void DockApp::BeginOverflowShow() {
+    if (m_overflowVisibility == VisibilityState::Visible ||
+        m_overflowVisibility == VisibilityState::Showing) {
+        return;
+    }
+    HideHoverLabel();
+    static_cast<void>(m_tray.Refresh());
+    RefreshBrightnessAsync();
+    RebuildOverflowPopup();
+    if (m_overflowWindow == nullptr || m_overflowSize.cy <= 0) {
+        return;
+    }
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (!OverflowScreenOrigin(origin, caret)) {
+        return;
+    }
+    m_overflowCaretX = caret;
+    m_overflowAnimToY = origin.y;
+    m_overflowAnimFromY = origin.y + m_overflowSize.cy;
+    m_overflowCurrentY = m_overflowAnimFromY;
+    m_overflowAnimStartedAt = QpcSeconds();
+    m_overflowVisibility = VisibilityState::Showing;
+    ShowWindow(m_overflowWindow, SW_SHOWNA);
+    SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x),
+        SaturatedInt(m_overflowCurrentY), SaturatedInt(m_overflowSize.cx),
+        SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
+    PositionDockSettings();
+    if (m_visibility == VisibilityState::Visible) {
+        StartTrayTimer();
+    }
+}
+
+void DockApp::AdvanceOverflowAnimation() {
+    if (!IsOverflowAnimating()) {
+        return;
+    }
+    const double duration = m_overflowVisibility == VisibilityState::Hiding
+        ? kHideDurationSeconds
+        : kShowDurationSeconds;
+    const double elapsed = std::max(0.0, QpcSeconds() - m_overflowAnimStartedAt);
+    const double linear = std::clamp(elapsed / duration, 0.0, 1.0);
+    const double eased = linear * linear * (3.0 - 2.0 * linear);
+    m_overflowCurrentY = std::lround(static_cast<double>(m_overflowAnimFromY) +
+        static_cast<double>(m_overflowAnimToY - m_overflowAnimFromY) * eased);
+
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (OverflowScreenOrigin(origin, caret)) {
+        m_overflowCaretX = caret;
+        // Keep X locked to the chevron while Y follows the slide.
+        if (m_overflowVisibility == VisibilityState::Showing) {
+            m_overflowAnimToY = origin.y;
+        } else if (m_overflowVisibility == VisibilityState::Hiding) {
+            m_overflowAnimToY = origin.y + m_overflowSize.cy;
+        }
+        SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x),
+            SaturatedInt(m_overflowCurrentY), SaturatedInt(m_overflowSize.cx),
+            SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
+        PositionDockSettings();
+    }
+
+    if (linear < 1.0) {
+        return;
+    }
+
+    if (m_overflowVisibility == VisibilityState::Showing) {
+        m_overflowVisibility = VisibilityState::Visible;
+        m_overflowCurrentY = m_overflowAnimToY;
+        PositionOverflowPopup();
+        return;
+    }
+
+    FinishOverflowHide();
+}
+
 void DockApp::DestroyOverflowPopup() noexcept {
-    CloseOverflowPopup();
+    BeginOverflowHide(false);
     m_overflowPaintQueued = false;
     m_overflowIcons.clear();
     m_overflowHits.clear();
@@ -3932,7 +4048,12 @@ void DockApp::PaintSettingsPopup() {
 }
 
 bool DockApp::IsOverflowOpen() const noexcept {
-    return m_overflowWindow != nullptr && IsWindowVisible(m_overflowWindow) != FALSE;
+    return m_overflowWindow != nullptr && m_overflowVisibility != VisibilityState::Hidden;
+}
+
+bool DockApp::IsOverflowAnimating() const noexcept {
+    return m_overflowVisibility == VisibilityState::Showing ||
+        m_overflowVisibility == VisibilityState::Hiding;
 }
 
 bool DockApp::IsCursorOverOverflow(POINT cursor) const noexcept {
@@ -4117,7 +4238,13 @@ void DockApp::PositionOverflowPopup() {
         return;
     }
     m_overflowCaretX = caret;
-    SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(origin.y),
+    LONG y = origin.y;
+    if (IsOverflowAnimating()) {
+        y = m_overflowCurrentY;
+    } else {
+        m_overflowCurrentY = origin.y;
+    }
+    SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(y),
         SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
     // The settings panel is anchored beside Quick Settings; follow its moves.
     PositionDockSettings();
@@ -4875,7 +5002,7 @@ void DockApp::BeginHide() {
     m_dropPresentPending = false;
     HideDragGhost();
     HideHoverLabel();
-    CloseOverflowPopup();
+    BeginOverflowHide(false);
     StopRefreshTimer();
     StopTrayTimer();
     StopBackdropTimer();
@@ -4919,7 +5046,7 @@ void DockApp::AdvanceAnimation() {
     StopBackdropTimer();
     StopRefreshTimer();
     StopTrayTimer();
-    CloseOverflowPopup();
+    BeginOverflowHide(false);
     ClearPressState();
     HideHoverLabel();
     ShowWindow(m_inputWindow, SW_HIDE);

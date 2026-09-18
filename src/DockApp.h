@@ -253,6 +253,11 @@ private:
     void DestroyOverflowFonts() noexcept;
     [[nodiscard]] bool OverflowGlassValid(POINT origin) const noexcept;
     void PositionOverflowPopup();
+    void BeginOverflowShow();
+    void BeginOverflowHide(bool animate) noexcept;
+    void FinishOverflowHide() noexcept;
+    void AdvanceOverflowAnimation();
+    [[nodiscard]] bool IsOverflowAnimating() const noexcept;
     void DestroyOverflowPopup() noexcept;
     void HandleOverflowClick(const TrayFlyoutHit& hit, UINT message);
     [[nodiscard]] int OverflowHitIndex(POINT point) const noexcept;
@@ -509,6 +514,11 @@ private:
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;
     HWND m_overflowWindow = nullptr;
+    VisibilityState m_overflowVisibility = VisibilityState::Hidden;
+    double m_overflowAnimStartedAt = 0.0;
+    LONG m_overflowAnimFromY = 0;
+    LONG m_overflowAnimToY = 0;
+    LONG m_overflowCurrentY = 0;
     std::vector<TrayNotifyIcon> m_overflowIcons;
     std::vector<TrayFlyoutHit> m_overflowHits;
     int m_overflowHover = -1;
