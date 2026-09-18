@@ -4671,10 +4671,23 @@ void DockApp::PaintOverflowPopup() {
     PositionOverflowPopup();
 }
 
+UINT DockApp::DesiredTrayIntervalMs() const noexcept {
+    if (IsOverflowOpen()) {
+        return kTrayIntervalMs;
+    }
+    // No-seconds clock: wake just after the next minute instead of a fixed idle poll.
+    SYSTEMTIME localTime{};
+    GetLocalTime(&localTime);
+    const UINT msIntoMinute =
+        static_cast<UINT>(localTime.wSecond) * 1000U + static_cast<UINT>(localTime.wMilliseconds);
+    const UINT msToBoundary = (msIntoMinute >= 60000U) ? 1000U : (60000U - msIntoMinute);
+    // Small pad so GetTimeFormatEx sees the new minute; clamp away from 0.
+    return std::clamp(msToBoundary + 75U, 200U, 60000U);
+}
+
 void DockApp::StartTrayTimer() noexcept {
     if (m_window != nullptr) {
-        const UINT interval = IsOverflowOpen() ? kTrayIntervalMs : kTrayIdleIntervalMs;
-        SetTimer(m_window, kTrayTimerId, interval, nullptr);
+        SetTimer(m_window, kTrayTimerId, DesiredTrayIntervalMs(), nullptr);
     }
 }
 
@@ -4838,6 +4851,8 @@ void DockApp::BeginShow() {
     m_animationFromY = m_currentY;
     m_animationToY = m_visibleY;
     m_animationStartedAt = QpcSeconds();
+    // Tray timer is stopped while hidden; pull a fresh clock/battery before first paint.
+    RefreshTray(true);
     StartCursorWatch();
     QueueRenderFrame(false);
 }

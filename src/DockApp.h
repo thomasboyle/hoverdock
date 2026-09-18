@@ -129,8 +129,8 @@ private:
     static constexpr UINT kTaskbarMonitorSlowIntervalMs = 5000;
     static constexpr int kTaskbarMonitorCalmPasses = 5;
     static constexpr UINT kTrayIntervalMs = 1000;
-    // Dock face clock uses TIME_NOSECONDS; idle ticks only need minute/battery granularity.
-    static constexpr UINT kTrayIdleIntervalMs = 30000;
+    // Dock face clock uses TIME_NOSECONDS. While Quick Settings is closed, StartTrayTimer
+    // arms for the next minute boundary (not a fixed 30 s idle) so the face clock moves.
     static constexpr UINT kCursorWatchCalmIntervalMs = 100;
     static constexpr UINT kContextOpen = 1;
     static constexpr UINT kContextOpenLocation = 2;
@@ -316,6 +316,7 @@ private:
     void ApplyPinIcons(UINT generation);
     void StartRefreshTimer() noexcept;
     void StopRefreshTimer() noexcept;
+    [[nodiscard]] UINT DesiredTrayIntervalMs() const noexcept;
     void StartTrayTimer() noexcept;
     void StopTrayTimer() noexcept;
     void ScheduleConfigSave() noexcept;
