@@ -2712,7 +2712,9 @@ void DockApp::RunPerformanceBoost() {
         };
 
         // Profiling (enumeration + CPU sample) runs here, off the UI thread.
-        const std::vector<BoostProcess> candidates = PerfBoost::EnumerateClosableCandidates();
+        // Guarded: an uncaught throw in a detached thread terminates the dock.
+        try {
+            const std::vector<BoostProcess> candidates = PerfBoost::EnumerateClosableCandidates();
         if (candidates.empty()) {
             postStatus(L"All clear", true);
             return;
@@ -2790,6 +2792,9 @@ void DockApp::RunPerformanceBoost() {
         Log(L"Boost closed " + std::to_wstring(closed.closed) + L", freed " +
             PerfBoost::FormatMegabytes(closed.freedBytes));
         postStatus(L"Freed " + PerfBoost::FormatMegabytes(closed.freedBytes), true);
+        } catch (...) {
+            postStatus(L"Unavailable", true);
+        }
     }).detach();
 }
 
@@ -5082,24 +5087,40 @@ void DockApp::SubmitLaunchPrompt() {
     const std::vector<DisplayApp> displayApps = m_displayApps;
     const std::vector<RunningWindow> runningWindows = m_windows.RunningWindows();
     std::thread([this, generation, apiKey, request, replyWindow, displayApps, runningWindows]() {
-        m_installedApps.EnsureLoaded();
-        std::vector<LaunchTarget> targets = CollectLaunchTargets(displayApps, runningWindows);
+        // Never let an exception escape: an uncaught throw in a detached
+        // thread calls std::terminate and the dock vanishes with no log.
+        std::vector<LaunchTarget> targets;
         LaunchJudgment judgment;
-        const std::string exactId = ExactLaunchId(request, targets);
-        if (!exactId.empty()) {
-            judgment.action = LaunchJudgment::Action::Launch;
-            judgment.chosenId = exactId;
-            judgment.exists = 1.0;
-            judgment.confidence = 1.0;
-        } else {
-            std::vector<LaunchCandidate> candidates;
-            candidates.reserve(targets.size());
-            for (const LaunchTarget& target : targets) {
-                candidates.push_back(MakeLaunchCandidate(target));
+        try {
+            m_installedApps.EnsureLoaded();
+            targets = CollectLaunchTargets(displayApps, runningWindows);
+            const std::string exactId = ExactLaunchId(request, targets);
+            if (!exactId.empty()) {
+                judgment.action = LaunchJudgment::Action::Launch;
+                judgment.chosenId = exactId;
+                judgment.exists = 1.0;
+                judgment.confidence = 1.0;
+            } else {
+                std::vector<LaunchCandidate> candidates;
+                candidates.reserve(targets.size());
+                for (const LaunchTarget& target : targets) {
+                    candidates.push_back(MakeLaunchCandidate(target));
+                }
+                judgment = TypeSafeClient::ResolveApp(apiKey, request, candidates);
             }
-            judgment = TypeSafeClient::ResolveApp(apiKey, request, candidates);
+        } catch (const std::exception&) {
+            judgment.action = LaunchJudgment::Action::Error;
+            judgment.error = L"Launch failed before a match could be picked.";
+        } catch (...) {
+            judgment.action = LaunchJudgment::Action::Error;
+            judgment.error = L"Launch failed unexpectedly.";
         }
-        auto* reply = new LaunchReply{generation, std::move(judgment), std::move(targets)};
+        LaunchReply* reply = nullptr;
+        try {
+            reply = new LaunchReply{generation, std::move(judgment), std::move(targets)};
+        } catch (...) {
+            return;
+        }
         if (replyWindow == nullptr ||
             PostMessageW(replyWindow, kLaunchResultMessage, 0,
                 reinterpret_cast<LPARAM>(reply)) == FALSE) {

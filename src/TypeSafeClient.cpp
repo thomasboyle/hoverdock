@@ -981,6 +981,7 @@ bool PostRawSystemOne(const std::wstring& apiKey, const std::string& body,
     }
 
     response.clear();
+    constexpr size_t kMaxResponseBytes = 4U * 1024U * 1024U;
     while (true) {
         DWORD available = 0;
         if (WinHttpQueryDataAvailable(request.Get(), &available) == FALSE) {
@@ -989,6 +990,13 @@ bool PostRawSystemOne(const std::wstring& apiKey, const std::string& body,
         }
         if (available == 0) {
             break;
+        }
+        // `available` is server-driven: cap growth so a hostile or broken
+        // response cannot force a huge allocation and terminate the caller.
+        if (static_cast<size_t>(available) > kMaxResponseBytes ||
+            response.size() > kMaxResponseBytes - static_cast<size_t>(available)) {
+            error = L"TypeSafe response was too large.";
+            return false;
         }
         const size_t offset = response.size();
         response.resize(offset + available);
