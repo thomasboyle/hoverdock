@@ -10,9 +10,21 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <wrl/client.h>
+
+#include "SystemTray.h"
+#include "DockTheme.hlsli"
+
+enum class DockIconKind : uint8_t {
+    App = 0,
+    Divider = 1,
+    TrayDivider = 2,
+    Tray = 3,
+    Clock = 4,
+};
 
 struct DockIconRenderData {
     RECT bounds{};
@@ -20,16 +32,20 @@ struct DockIconRenderData {
     bool dragged = false;
     bool hovered = false;
     bool pressed = false;
+    DockIconKind kind = DockIconKind::App;
+    TraySlot traySlot = TraySlot::Overflow;
     UINT textureIndex = 0;
 };
 
 struct DockRenderState {
     UINT width = 1;
     UINT height = 1;
-    float glassAlpha = 0.60F;
+    float glassAlpha = DOCK_GLASS_ALPHA;
     float slideProgress = 0.0F;
     float timeSeconds = 0.0F;
     bool showDevBounds = false;
+    bool allowBlockingGpuWait = true;
+    bool skipIfGpuBusy = false;
     std::span<const DockIconRenderData> icons;
 };
 
@@ -39,9 +55,25 @@ public:
 
     void Initialize(HWND window, UINT width, UINT height);
     void Resize(UINT width, UINT height);
-    void LoadIcons(const std::vector<std::wstring>& targets);
-    [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle);
-    void Render(const DockRenderState& state);
+    void LoadIcons(const std::vector<std::wstring>& cacheKeys,
+        const std::vector<std::vector<std::wstring>>& iconCandidates, UINT iconPixelExtent);
+    void UploadIcons(const std::vector<std::wstring>& targets,
+        const std::vector<std::vector<uint8_t>>& pixelBuffers);
+    [[nodiscard]] UINT TextureIndexForTarget(const std::wstring& target) const noexcept;
+    [[nodiscard]] bool HasIconForTarget(const std::wstring& target) const noexcept;
+    [[nodiscard]] bool HasCachedIconPixels(const std::wstring& target) const noexcept;
+    [[nodiscard]] const std::vector<uint8_t>* CachedIconPixels(const std::wstring& target) const noexcept;
+    [[nodiscard]] std::vector<std::wstring> IconTargetKeys() const;
+    void AppendMissingIcons(const std::vector<std::wstring>& targets,
+        const std::vector<std::vector<uint8_t>>& pixelBuffers);
+    void UpdateCachedIcons(const std::vector<std::wstring>& targets,
+        const std::vector<std::vector<uint8_t>>& pixelBuffers);
+    [[nodiscard]] UINT IconAtlasPixelExtent() const noexcept;
+    [[nodiscard]] static std::vector<uint8_t> ExtractIconPixels(
+        const std::vector<std::wstring>& candidates, UINT iconPixelExtent);
+    [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle, bool* changed = nullptr);
+    [[nodiscard]] bool BackdropValid() const noexcept;
+    [[nodiscard]] bool Render(const DockRenderState& state);
     void Flush();
 
     [[nodiscard]] HANDLE FrameLatencyWaitableObject() const noexcept;
@@ -81,8 +113,12 @@ private:
     void CreateRenderTargets();
     void CreateBackdropResources();
     void ReleaseBackdropResources() noexcept;
-    void UploadBackdropPixels();
-    void WaitForFrame(FrameResource& frame);
+    [[nodiscard]] bool UploadBackdropPixels();
+    [[nodiscard]] uint64_t HashBackdropPixels() const noexcept;
+    [[nodiscard]] bool WaitForBackdropCopy(DWORD timeoutMs = INFINITE);
+    [[nodiscard]] bool WaitForFrame(FrameResource& frame, DWORD timeoutMs = INFINITE);
+    void WaitForAllFrames();
+    void RebuildIconAtlasFromCache();
     void UploadIcon(UINT textureIndex, const std::wstring& target,
         ID3D12GraphicsCommandList* commandList);
     void CreateFallbackIcon(UINT textureIndex, ID3D12GraphicsCommandList* commandList);
@@ -121,6 +157,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_backdropCopyAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_backdropCopyCommandList;
     UINT m_iconCount = 0;
+    UINT m_iconPixelExtent = 56;
+    float m_dpiScale = 1.0F;
+    std::unordered_map<std::wstring, UINT> m_iconTextureByTarget;
+    std::unordered_map<std::wstring, std::vector<uint8_t>> m_iconPixelCache;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_pendingUploads;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_backdropFootprint{};
     UINT m_backdropRowCount = 0;
@@ -131,6 +171,8 @@ private:
     uint8_t* m_backdropDibPixels = nullptr;
     bool m_backdropInitialized = false;
     bool m_backdropValid = false;
+    uint64_t m_backdropHash = 0;
+    UINT64 m_backdropCopyFenceValue = 0;
     HANDLE m_fenceEvent = nullptr;
     HANDLE m_frameLatencyWaitableObject = nullptr;
 };

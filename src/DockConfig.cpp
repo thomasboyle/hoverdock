@@ -145,6 +145,18 @@ bool ParseBoolean(const std::wstring& value) {
     return lower == L"1" || lower == L"true" || lower == L"yes";
 }
 
+float ParseFloat(const std::wstring& value, float fallback) {
+    const std::wstring trimmed = Trim(value);
+    if (trimmed.empty()) {
+        return fallback;
+    }
+    try {
+        return std::stof(trimmed);
+    } catch (...) {
+        return fallback;
+    }
+}
+
 std::wstring ExpandTarget(const std::wstring& target) {
     if (target.empty()) {
         return {};
@@ -858,6 +870,8 @@ bool DockConfig::LoadOrCreate() {
         m_followsTaskbarPins = true;
         m_pins = ImportTaskbarPins();
         m_showDevBounds = false;
+        m_launchAtStartup = false;
+        m_checkForUpdates = true;
         if (m_pins.empty()) {
             SetDefaults();
         }
@@ -868,6 +882,8 @@ bool DockConfig::LoadOrCreate() {
         m_followsTaskbarPins = true;
         m_pins = ImportTaskbarPins();
         m_showDevBounds = false;
+        m_launchAtStartup = false;
+        m_checkForUpdates = true;
         if (m_pins.empty()) {
             SetDefaults();
         }
@@ -927,6 +943,10 @@ bool DockConfig::Load() {
     m_pins.clear();
     m_showDevBounds = false;
     m_followsTaskbarPins = true;
+    m_dockScale = 1.0F;
+    m_typeSafeApiKey.clear();
+    m_launchAtStartup = false;
+    m_checkForUpdates = true;
     const auto dockSection = sections.find(L"dock");
     if (dockSection != sections.end()) {
         const auto showDevBounds = dockSection->second.find(L"showdevbounds");
@@ -936,6 +956,22 @@ bool DockConfig::Load() {
         const auto followTaskbarPins = dockSection->second.find(L"followtaskbarpins");
         if (followTaskbarPins != dockSection->second.end()) {
             m_followsTaskbarPins = ParseBoolean(followTaskbarPins->second);
+        }
+        const auto dockScale = dockSection->second.find(L"scale");
+        if (dockScale != dockSection->second.end()) {
+            m_dockScale = std::clamp(ParseFloat(dockScale->second, 1.0F), 0.75F, 1.5F);
+        }
+        const auto typeSafeApiKey = dockSection->second.find(L"typesafeapikey");
+        if (typeSafeApiKey != dockSection->second.end()) {
+            m_typeSafeApiKey = typeSafeApiKey->second;
+        }
+        const auto launchAtStartup = dockSection->second.find(L"launchatstartup");
+        if (launchAtStartup != dockSection->second.end()) {
+            m_launchAtStartup = ParseBoolean(launchAtStartup->second);
+        }
+        const auto checkForUpdates = dockSection->second.find(L"checkforupdates");
+        if (checkForUpdates != dockSection->second.end()) {
+            m_checkForUpdates = ParseBoolean(checkForUpdates->second);
         }
     }
 
@@ -974,7 +1010,14 @@ bool DockConfig::Save() const {
     contents << L"; UTF-8 INI. Pins are ordered left to right.\n\n";
     contents << L"[Dock]\n";
     contents << L"ShowDevBounds=" << (m_showDevBounds ? L"1" : L"0") << L"\n";
-    contents << L"FollowTaskbarPins=" << (m_followsTaskbarPins ? L"1" : L"0") << L"\n\n";
+    contents << L"FollowTaskbarPins=" << (m_followsTaskbarPins ? L"1" : L"0") << L"\n";
+    contents << L"Scale=" << m_dockScale << L"\n";
+    contents << L"LaunchAtStartup=" << (m_launchAtStartup ? L"1" : L"0") << L"\n";
+    contents << L"CheckForUpdates=" << (m_checkForUpdates ? L"1" : L"0") << L"\n";
+    if (!m_typeSafeApiKey.empty()) {
+        contents << L"TypeSafeApiKey=" << m_typeSafeApiKey << L"\n";
+    }
+    contents << L"\n";
 
     for (size_t index = 0; index < m_pins.size(); ++index) {
         const PinnedApp& app = m_pins[index];
@@ -1015,8 +1058,37 @@ void DockConfig::StopFollowingTaskbarPins() noexcept {
     m_followsTaskbarPins = false;
 }
 
+float DockConfig::DockScale() const noexcept {
+    return m_dockScale;
+}
+
+void DockConfig::SetDockScale(float scale) noexcept {
+    m_dockScale = std::clamp(scale, 0.75F, 1.5F);
+}
+
+bool DockConfig::LaunchAtStartup() const noexcept {
+    return m_launchAtStartup;
+}
+
+void DockConfig::SetLaunchAtStartup(bool enabled) noexcept {
+    m_launchAtStartup = enabled;
+}
+
+bool DockConfig::CheckForUpdates() const noexcept {
+    return m_checkForUpdates;
+}
+
+void DockConfig::SetCheckForUpdates(bool enabled) noexcept {
+    m_checkForUpdates = enabled;
+}
+
 const std::wstring& DockConfig::Path() const noexcept {
     return m_path;
+}
+
+std::wstring DockConfig::TypeSafeApiKey() const {
+    const std::wstring fromEnvironment = EnvironmentVariable(L"TYPESAFE_API_KEY");
+    return fromEnvironment.empty() ? m_typeSafeApiKey : fromEnvironment;
 }
 
 void DockConfig::SetDefaults() {
@@ -1026,4 +1098,7 @@ void DockConfig::SetDefaults() {
         {L"Calculator", L"shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", L"", L""},
     };
     m_showDevBounds = false;
+    m_dockScale = 1.0F;
+    m_launchAtStartup = false;
+    m_checkForUpdates = true;
 }

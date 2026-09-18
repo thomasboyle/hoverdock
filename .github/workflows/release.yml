@@ -1,0 +1,112 @@
+name: Release
+
+# Every merge to main ships a new release automatically:
+#   1. The version is the latest v* tag with the patch bumped
+#      (v1.1.3 -> v1.1.4; falls back to the CMake project version when no
+#      tag exists yet). Manual `v*` tags still work and take precedence.
+#   2. Dock.exe and the NSIS installer are both stamped with that version
+#      (-DDOCK_VERSION drives the in-app version string and the
+#      Hoverdock-Setup-<version>.exe file name).
+#   3. Both assets are published to a new GitHub Release, which is the feed
+#      the in-app auto-updater polls
+#      (https://api.github.com/repos/<owner>/<repo>/releases/latest,
+#      preferring the *Setup*.exe asset).
+#
+# No infinite loop: tags/releases created through GITHUB_TOKEN do not
+# re-trigger workflow runs. The concurrency group serializes merges so two
+# runs can never compute the same next version.
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hoverdock-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Version, build + publish release
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source with tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine release version
+        id: version
+        shell: powershell
+        run: |
+          $ref = "${{ github.ref }}"
+          if ($ref -like "refs/tags/v*") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+            Write-Host "Manual tag push, using version: $version"
+          } else {
+            $tags = git tag --list "v*" | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
+            $latest = $tags | ForEach-Object {
+              $parts = $_.TrimStart("v").Split(".") | ForEach-Object { [int]$_ }
+              [pscustomobject]@{ Parts = $parts }
+            } | Sort-Object `
+              { $_.Parts[0] }, `
+              { $_.Parts[1] }, `
+              { $_.Parts[2] } | Select-Object -Last 1
+            if ($latest) {
+              $version = "$($latest.Parts[0]).$($latest.Parts[1]).$($latest.Parts[2] + 1)"
+            } else {
+              $match = Select-String -Path CMakeLists.txt `
+                -Pattern 'project\(LiquidGlassDock VERSION ([0-9.]+)'
+              $version = if ($match) { $match.Matches[0].Groups[1].Value } else { "1.1.0" }
+            }
+            Write-Host "Auto-incremented version: $version"
+          }
+          # Safety net: never reuse an existing tag (e.g. the fallback version
+          # already shipped) — keep bumping the patch until it is fresh.
+          while ($version -match '^\d+\.\d+\.\d+$' -and
+              (git rev-parse --verify --quiet "refs/tags/v$version")) {
+            $parts = $version.Split(".") | ForEach-Object { [int]$_ }
+            $version = "$($parts[0]).$($parts[1]).$($parts[2] + 1)"
+            Write-Host "Tag exists, trying: $version"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Configure and build Release
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          cmake -S . -B out -G "Visual Studio 17 2022" -A x64 -DDOCK_VERSION=${{ steps.version.outputs.version }}
+          cmake --build out --config Release
+
+      - name: Install NSIS
+        shell: powershell
+        run: choco install nsis -y --no-progress
+
+      - name: Build NSIS installer
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          cmake --build out --config Release --target installer
+          dir out\Hoverdock-Setup-*.exe
+
+      - name: Stage release assets
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          Copy-Item "out\bin\Release\Dock.exe" "release-assets\Dock.exe"
+          Copy-Item "out\Hoverdock-Setup-*.exe" "release-assets\"
+          Get-ChildItem release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: release-assets/*

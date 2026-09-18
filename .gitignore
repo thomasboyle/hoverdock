@@ -1,0 +1,9 @@
+# Build outputs
+out/
+*.obj
+*.pdb
+*.ilk
+*.log
+
+# Local profiling / analysis scratch
+.system-analysis/

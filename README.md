@@ -46,6 +46,31 @@ cmake --build out --config Release
 
 DXC emits `vs_6_0`, `ps_6_0`, `vs_6_6`, and `ps_6_6` blobs into the build directory as generated C++ headers. The headers are compiled into `Dock.exe`; do not copy any generated shader files beside the EXE.
 
+## Installer (NSIS)
+
+Per-user install, no elevation required (so silent auto-updates work without UAC):
+
+```bat
+cmake -S . -B out -G "Visual Studio 17 2022" -A x64
+cmake --build out --config Release --target installer
+```
+
+Output:
+
+```text
+out\Hoverdock-Setup-<version>.exe
+```
+
+The installer closes a running dock (which restores the taskbar on exit),
+installs to `%LOCALAPPDATA%\Programs\Hoverdock`, registers Add/Remove Programs,
+creates Start Menu shortcuts, enables launch-at-startup on fresh installs only
+(existing Run-key choices are never clobbered), and relaunches the dock. Silent
+mode (`Hoverdock-Setup-<version>.exe /S`) is what the auto-updater runs: it
+installs without prompts and always reopens the new build. Every merge to
+`main` auto-publishes a GitHub Release with `Dock.exe` +
+`Hoverdock-Setup-*.exe`, bumping the patch version off the latest `v*` tag
+(`release.yml`; manual `v*` tags still work and take precedence).
+
 ## Run
 
 ```bat
@@ -74,6 +99,7 @@ On first run, the dock imports taskbar pins in native order from the Windows 11 
 - Right-click an application icon for Focus/Open, Open location, Close, and Unpin. Transient running applications offer Pin instead. Right-click empty dock glass to pin the current foreground desktop application. UWP pinning and location are best effort.
 - Drag a persistent icon and release it over another slot to persist a left-to-right reorder.
 - Right-click empty glass and select **Show developer bounds** to draw the capsule edge. `F12` toggles the same option when the window has keyboard input.
+- The gear in Quick Settings pops a **Hoverdock Settings** glass panel out beside Quick Settings (not Windows Settings): **Launch at startup** and **Check for updates** toggle switches, a **Check for updates now** button, and the current version + update status. Quick Settings stays open behind it; the dock stays visible while either is open, `Esc` closes Settings first, and clicking away dismisses both.
 
 The D3D12/DirectComposition renderer is intentionally hit-transparent. A separate titleless, topmost, 1-alpha layered input window follows the DPI-scaled capsule region, never activates the process, and receives dock clicks while it is visible. The dock is always on top, owns no taskbar button, uses Per-Monitor V2 DPI, and handles 100%, 125%, and 150% scaling. It is primary-monitor only in v1.
 
@@ -89,15 +115,34 @@ Before each hidden-to-show transition, a preallocated GDI DIB captures the dock 
 
 The native taskbar remains part of the primary monitor’s normal work area. The dock is deliberately positioned against the physical primary-monitor bottom edge after it hides the taskbar; it does not modify the system work area or replace Explorer.
 
+## Updates
+
+When **Check for updates automatically** is on (default), the dock checks
+`https://api.github.com/repos/<owner>/<repo>/releases/latest` ~15 s after
+startup and every 6 h after. When a newer tag is found, the update is
+**automatically downloaded and installed and the new build is reopened**: the
+`*Setup*.exe` installer asset is preferred (run `/S` silent, which closes the
+dock, replaces files, and relaunches), with the portable `Dock.exe` asset as
+fallback (staged over the running binary via a helper batch file, then
+relaunched). `dock.ini` sets `CheckForUpdates=1/0` and `LaunchAtStartup=1/0`
+(the latter owns `HKCU\...\Run\Hoverdock`). Forks can point the feed at their
+own releases with `-DDOCK_REPO_OWNER=... -DDOCK_REPO_NAME=...`; tag builds pass
+`-DDOCK_VERSION=<tag>` so the compiled version matches the release.
+
 ## Project layout
 
 ```text
 CMakeLists.txt        MSVC/DXC build definition
 dock.default.ini      Default persisted pin order and settings
+installer/
+  hoverdock.nsi       Per-user NSIS installer (silent /S for auto-update)
 src/
   main.cpp            Win32 entry point
   DockApp.*           Overlay, input, state machine, taskbar safety, UI actions
   DockConfig.*        In-tree UTF-8 INI parser, taskbar import, and writer
+  Startup.*           HKCU Run-key launch-at-startup helper
+  Updater.*           GitHub Releases check/download/install/restart
+  Version.h           Compiled version + update-feed identity
   WindowCatalog.*     Window enumeration, launch, focus, close, pin actions
   Renderer.*          D3D12/DXGI/DirectComposition renderer, backdrop, and icon uploads
   Shaders.hlsl        Custom liquid-glass and icon HLSL

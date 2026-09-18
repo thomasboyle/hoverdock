@@ -1,16 +1,18 @@
 name: Build Dock
 
+# PR / manual validation only. Merges to main are built + released by
+# release.yml (which bumps the version and publishes Dock.exe and the
+# installer), so main pushes are excluded here to avoid a duplicate build.
 on:
-  push:
-    branches:
-      - main
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Dock.exe
+    name: Build Dock.exe + installer
     runs-on: windows-2022
 
     steps:
@@ -24,9 +26,27 @@ jobs:
           cmake -S . -B out -G "Visual Studio 17 2022" -A x64
           cmake --build out --config Release
 
+      - name: Install NSIS
+        shell: powershell
+        run: choco install nsis -y --no-progress
+
+      - name: Build NSIS installer
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          cmake --build out --config Release --target installer
+          dir out\Hoverdock-Setup-*.exe
+
       - name: Upload Dock.exe
         uses: actions/upload-artifact@v4
         with:
           name: Dock.exe
           path: out\bin\Release\Dock.exe
+          if-no-files-found: error
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hoverdock-Setup
+          path: out\Hoverdock-Setup-*.exe
           if-no-files-found: error
