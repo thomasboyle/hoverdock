@@ -44,7 +44,10 @@ namespace {
 constexpr double kShowDurationSeconds = 0.050;
 constexpr double kHideDurationSeconds = 0.050;
 constexpr double kDragSnapDurationSeconds = 0.050;
-constexpr double kDragThresholdLogicalPixels = 6.0;
+constexpr double kDragThresholdLogicalPixels = 14.0;
+constexpr double kMinDragPressSeconds = 0.080;
+constexpr double kMaxPointerStallSeconds = 0.220;
+constexpr size_t kMaxMissingIconsPerRefresh = 3;
 constexpr float kMinDockScale = 0.75F;
 constexpr float kMaxDockScale = 1.5F;
 constexpr int kBottomHotZonePixels = 8;
@@ -684,6 +687,36 @@ bool SendWinKey() {
         sizeof(INPUT)) == static_cast<UINT>(inputs.size());
 }
 
+
+bool IsWindowProcessElevated(HWND window) noexcept {
+    if (window == nullptr) {
+        return false;
+    }
+    DWORD processId = 0;
+    GetWindowThreadProcessId(window, &processId);
+    if (processId == 0) {
+        return false;
+    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == nullptr) {
+        // Access denied often means a higher-integrity process when we are not elevated.
+        return GetLastError() == ERROR_ACCESS_DENIED;
+    }
+    HANDLE token = nullptr;
+    bool elevated = false;
+    if (OpenProcessToken(process, TOKEN_QUERY, &token) != FALSE) {
+        TOKEN_ELEVATION elevation{};
+        DWORD returned = 0;
+        if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation),
+                &returned) != FALSE) {
+            elevated = elevation.TokenIsElevated != 0;
+        }
+        CloseHandle(token);
+    }
+    CloseHandle(process);
+    return elevated;
+}
+
 bool GrantExplorerForeground() {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     DWORD processId = 0;
@@ -1077,6 +1110,7 @@ DockApp::~DockApp() {
     DestroyHoverLabelWindow();
     DestroyHoverLabelFont();
     DestroyDragGhostWindow();
+    StopCursorWatch();
     if (m_mouseHook != nullptr) {
         UnhookWindowsHookEx(m_mouseHook);
     }
@@ -1161,8 +1195,10 @@ int DockApp::Run() {
     if (m_mouseHook == nullptr) {
         Log(L"Low-level mouse hook unavailable; the dock can still be shown by moving over its window.");
     }
+    StartCursorWatch();
 
     GetCursorPos(&m_lastCursor);
+    m_lastPointerSampleAt = QpcSeconds();
     HandlePointer(m_lastCursor);
     Log(L"Dock initialized.");
     // Startup transient allocations (icon extraction temps, shell queries) stay
@@ -1735,7 +1771,13 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             }
         } else if (wParam == kConfigSaveTimerId) {
             KillTimer(window, kConfigSaveTimerId);
-            static_cast<void>(m_config.Save());
+            // Disk write off the UI/hook thread so pin/unpin never stalls the cursor.
+            const DockConfig snapshot = m_config;
+            std::thread([snapshot]() {
+                static_cast<void>(snapshot.Save());
+            }).detach();
+        } else if (wParam == kCursorWatchTimerId) {
+            PumpCursorWatch();
         } else if (wParam == kBackdropTimerId) {
             // Paused while Quick Settings is open: the 8ms capture + upload budget
             // stays available for input and hover paints instead. The blur refreshes
@@ -1760,22 +1802,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 m_taskbarMonitorFast = false;
                 SetTimer(window, kTaskbarMonitorTimerId, kTaskbarMonitorSlowIntervalMs, nullptr);
             }
-            // Watchdog for the low-level mouse hook: the system can silently
-            // drop LL hooks (e.g. after a timeout), which would otherwise leave
-            // the dock permanently hidden with no show/hide updates. Sampling
-            // the cursor here keeps the same HandlePointer rules working.
-            // Skipped while dragging, mirroring the hook's own gating. Skipped
-            // when the cursor hasn't moved since the last handled sample: with a
-            // stationary cursor HandlePointer is idempotent (hover/show state
-            // already settled via the hook path), so this avoids MonitorRect +
-            // hit-test work on every steady 1 s tick while visible.
-            if (!IsDragActive()) {
-                POINT cursor{};
-                if (GetCursorPos(&cursor) != FALSE &&
-                    (cursor.x != m_lastCursor.x || cursor.y != m_lastCursor.y)) {
-                    HandlePointer(cursor);
-                }
-            }
+            // Hook reinstall only here. Show/hide cursor sampling is owned by
+            // kCursorWatchTimerId (33 ms) so elevated foreground apps (Task
+            // Manager) cannot force a ~1 s calm-timer lag via UIPI-blocked LL hooks.
+            EnsureMouseHook();
         } else if (wParam == kTrayTimerId) {
             RefreshTray(false);
         } else if (wParam == kUpdateTimerId) {
@@ -1879,6 +1909,9 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
         LogInputMouse(message, point, m_pressedIcon);
         if (m_pressedIcon >= 0) {
             m_pressedAt = point;
+            m_pressedAtTime = QpcSeconds();
+            m_lastPointerSampleAt = m_pressedAtTime;
+            m_suppressDragUntilRelease = false;
             SetCapture(window);
             RenderFrame();
         }
@@ -1902,7 +1935,17 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
             return 0;
         }
         HandlePointer(point);
-        if (m_pressedIcon >= 0 && IsPersistentDisplayIcon(m_pressedIcon) &&
+        const double nowMove = QpcSeconds();
+        if (m_pressedIcon >= 0 && m_lastPointerSampleAt > 0.0 &&
+            nowMove - m_lastPointerSampleAt > kMaxPointerStallSeconds) {
+            ClearPressState();
+            m_suppressDragUntilRelease = true;
+        } else {
+            m_lastPointerSampleAt = nowMove;
+        }
+        if (!m_suppressDragUntilRelease && m_pressedIcon >= 0 &&
+            IsPersistentDisplayIcon(m_pressedIcon) &&
+            (nowMove - m_pressedAtTime) >= kMinDragPressSeconds &&
             HasCrossedDragThreshold(point)) {
             BeginDrag(point);
         }
@@ -4673,6 +4716,10 @@ bool DockApp::CaptureLiveBackdrop() {
     if (m_shellFlyoutHold || !m_rendererInitialized || m_visibility == VisibilityState::Hidden) {
         return false;
     }
+    // Elevated FG can make desktop BitBlt / DwmFlush stall the hook thread.
+    if (IsElevatedForeground()) {
+        return false;
+    }
 
     const RECT captureBounds{m_windowX, m_currentY,
         m_windowX + static_cast<LONG>(m_dockWidth),
@@ -4732,11 +4779,18 @@ void DockApp::BeginShow() {
     HideHoverLabel();
     ++m_showSessionId;
 
-    const RECT captureBounds{m_windowX, m_visibleY,
-        m_windowX + static_cast<LONG>(m_dockWidth),
-        m_visibleY + static_cast<LONG>(m_dockHeight)};
-    if (!m_renderer.CaptureBackdrop(captureBounds)) {
-        Log(L"Desktop backdrop capture failed; using fallback glass.");
+    // Elevated foreground (Task Manager, etc.) can make BitBlt/UIPI desktop reads
+    // stall for hundreds of ms on the same thread that owns WH_MOUSE_LL. Prefer a
+    // cached backdrop and start the slide immediately; live capture resumes on the
+    // backdrop timer once visible.
+    const bool elevatedFg = IsElevatedForeground();
+    if (!elevatedFg) {
+        const RECT captureBounds{m_windowX, m_visibleY,
+            m_windowX + static_cast<LONG>(m_dockWidth),
+            m_visibleY + static_cast<LONG>(m_dockHeight)};
+        if (!m_renderer.CaptureBackdrop(captureBounds)) {
+            Log(L"Desktop backdrop capture failed; using fallback glass.");
+        }
     }
 
     m_visibility = VisibilityState::Showing;
@@ -4746,7 +4800,8 @@ void DockApp::BeginShow() {
     m_animationFromY = m_currentY;
     m_animationToY = m_visibleY;
     m_animationStartedAt = QpcSeconds();
-    QueueRenderFrame();
+    StartCursorWatch();
+    QueueRenderFrame(false);
 }
 
 void DockApp::BeginHide() {
@@ -4873,6 +4928,7 @@ void DockApp::StopBackdropTimer() noexcept {
 
 void DockApp::HandlePointer(POINT cursor) {
     m_lastCursor = cursor;
+    m_lastPointerSampleAt = QpcSeconds();
     if (IsDragActive()) {
         if (m_draggedIcon >= 0) {
             UpdateDrag(cursor);
@@ -5032,24 +5088,15 @@ void DockApp::HandleContextMenu(POINT screenPoint) {
         Log(L"Dock context action did not complete.");
     }
     if (configChanged) {
+        // Keep WH_MOUSE_LL responsive: never run COM/shortcut RebuildPinProfiles,
+        // full icon atlas extraction, Save, or a forced window enum on this thread.
+        // Optimistic geometry + async icons; deferred refresh rebuilds profiles off-thread.
         m_config.StopFollowingTaskbarPins();
         ScheduleConfigSave();
         ++m_refreshGeneration;
-        m_windows.RebuildPinProfiles(m_config.Pins());
-        RebuildDisplayApps();
-        // Pin/unpin must stay responsive: RebuildLayout(false) updates geometry
-        // immediately without the synchronous full-atlas icon extraction that
-        // LoadIconTextures performs on this thread (shell queries + GPU flush).
-        // Any icon not yet cached (the newly pinned app) is extracted off-thread
-        // and applied incrementally; unpin needs no extraction at all.
-        if (IconPixelExtent() != m_loadedIconExtent) {
-            RebuildLayout(true);
-        } else {
-            RebuildLayout(false);
-            EnsureMissingPinIconsAsync();
-        }
+        ApplyPinUnpinLayoutChange();
         m_lastWindowRefresh = QpcSeconds();
-        RefreshRunningWindows(true);
+        ScheduleDeferredRefresh();
     } else {
         RefreshRunningWindows();
     }
@@ -5791,7 +5838,11 @@ void DockApp::ApplyDragPreviewLayout() {
 
 void DockApp::BeginDrag(POINT screenCursor) {
     ProfileScope scope("BeginDrag");
-    if (m_pressedIcon < 0 || !IsPersistentDisplayIcon(m_pressedIcon)) {
+    if (m_suppressDragUntilRelease || m_pressedIcon < 0 ||
+        !IsPersistentDisplayIcon(m_pressedIcon)) {
+        return;
+    }
+    if (QpcSeconds() - m_pressedAtTime < kMinDragPressSeconds) {
         return;
     }
 
@@ -6002,6 +6053,7 @@ void DockApp::ClearPressState() noexcept {
     m_dragOriginBounds = {};
     m_dragGrabOffset = {};
     m_pressedAt = {};
+    m_pressedAtTime = 0.0;
     m_scalingDivider = false;
     m_hoveredDivider = -1;
 }
@@ -6030,6 +6082,21 @@ void DockApp::StopRefreshTimer() noexcept {
         KillTimer(m_window, kRefreshTimerId);
     }
     CancelDeferredRefresh();
+}
+
+
+void DockApp::ApplyPinUnpinLayoutChange() {
+    ProfileScope scope("ApplyPinUnpinLayoutChange");
+    RebuildDisplayApps();
+    // Prefer geometry-only rebuild. Extent changes still need a full reload, but
+    // that path is rare during pin/unpin and is deferred to the next idle tick.
+    if (IconPixelExtent() != m_loadedIconExtent) {
+        ScheduleDeferredRefresh();
+        RebuildLayout(false);
+        return;
+    }
+    RebuildLayout(false);
+    EnsureMissingPinIconsAsync();
 }
 
 void DockApp::ScheduleConfigSave() noexcept {
@@ -6231,6 +6298,7 @@ void DockApp::BeginBackgroundRefresh(bool force) {
         if (snapshot.layoutChanged || snapshot.runningChanged) {
             snapshot.missingIconTargets.clear();
             snapshot.missingIconPixels.clear();
+            size_t extracted = 0;
             for (const DisplayApp& app : snapshot.displayApps) {
                 if (app.app.target == kDividerTarget) {
                     continue;
@@ -6246,9 +6314,13 @@ void DockApp::BeginBackgroundRefresh(bool force) {
                 if (alreadyCached) {
                     continue;
                 }
+                if (extracted >= kMaxMissingIconsPerRefresh) {
+                    break;
+                }
                 snapshot.missingIconTargets.push_back(key);
                 snapshot.missingIconPixels.push_back(Renderer::ExtractIconPixels(
                     WindowCatalog::IconResolutionCandidates(app.app, app.runningWindow), iconPixelExtent));
+                ++extracted;
             }
         }
 
@@ -6287,6 +6359,16 @@ void DockApp::ApplyBackgroundRefresh(UINT generation) {
     m_dividerIndex = DividerIndexFromDisplayApps(m_displayApps);
 
     if (snapshot.layoutChanged) {
+        // Icon slots jump under a held press during first-launch refresh storms;
+        // cancel the press so a Settings tile cannot follow the cursor.
+        if (m_pressedIcon >= 0 || m_draggedIcon >= 0) {
+            if (GetCapture() == m_inputWindow) {
+                ReleaseCapture();
+            }
+            ClearPressState();
+            m_suppressDragUntilRelease = true;
+            HideDragGhost();
+        }
         RebuildLayout(false);
     }
 
@@ -6299,11 +6381,15 @@ void DockApp::ApplyBackgroundRefresh(UINT generation) {
         }
         AssignIconTextureIndices();
         QueueRenderFrame();
+        // Refresh worker only extracts a few icons per wave; finish the rest
+        // on the dedicated pin-icon worker so first-open storms stay frame-budgeted.
+        EnsureMissingPinIconsAsync();
         if (!snapshot.runningChanged) {
             return;
         }
     } else if (snapshot.layoutChanged) {
         AssignIconTextureIndices();
+        EnsureMissingPinIconsAsync();
         QueueRenderFrame();
         return;
     }
@@ -6866,6 +6952,57 @@ void DockApp::StopTaskbarMonitor() noexcept {
         KillTimer(m_window, kTaskbarMonitorTimerId);
     }
 }
+
+void DockApp::StartCursorWatch() noexcept {
+    if (m_window != nullptr) {
+        SetTimer(m_window, kCursorWatchTimerId, kCursorWatchIntervalMs, nullptr);
+    }
+}
+
+void DockApp::StopCursorWatch() noexcept {
+    if (m_window != nullptr) {
+        KillTimer(m_window, kCursorWatchTimerId);
+    }
+}
+
+void DockApp::EnsureMouseHook() noexcept {
+    if (m_mouseHook != nullptr || m_instance == nullptr) {
+        return;
+    }
+    m_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, &DockApp::MouseHook, m_instance, 0);
+    if (m_mouseHook == nullptr) {
+        Log(L"Low-level mouse hook reinstall failed.");
+    }
+}
+
+bool DockApp::IsElevatedForeground() const noexcept {
+    return IsWindowProcessElevated(GetForegroundWindow());
+}
+
+void DockApp::PumpCursorWatch() {
+    EnsureMouseHook();
+    if (IsDragActive()) {
+        return;
+    }
+    POINT cursor{};
+    if (GetCursorPos(&cursor) == FALSE) {
+        return;
+    }
+    const double now = QpcSeconds();
+    // Large dt between samples means the UI thread hitch'd; drop any in-progress
+    // press so a post-stall jitter cannot begin an accidental reorder drag.
+    if (m_pressedIcon >= 0 && m_lastPointerSampleAt > 0.0 &&
+        now - m_lastPointerSampleAt > kMaxPointerStallSeconds) {
+        ClearPressState();
+        m_suppressDragUntilRelease = true;
+    }
+    m_lastPointerSampleAt = now;
+    if (cursor.x == m_lastCursor.x && cursor.y == m_lastCursor.y) {
+        return;
+    }
+    HandlePointer(cursor);
+}
+
 
 void DockApp::RegisterSystemResumeNotifications() {
     if (m_window == nullptr) {

@@ -116,8 +116,10 @@ private:
     static constexpr UINT_PTR kTaskbarMonitorTimerId = 6;
     static constexpr UINT_PTR kTrayTimerId = 7;
     static constexpr UINT_PTR kUpdateTimerId = 8;
+    static constexpr UINT_PTR kCursorWatchTimerId = 9;
     static constexpr UINT kUpdateIntervalMs = 6U * 60U * 60U * 1000U;
     static constexpr UINT kUpdateInitialDelayMs = 15000;
+    static constexpr UINT kCursorWatchIntervalMs = 33;
     static constexpr UINT kDeferredRefreshDelayMs = 400;
     static constexpr UINT kBackdropIntervalMs = 8;
     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
@@ -341,6 +343,12 @@ private:
     [[nodiscard]] bool CollapseNativeTaskbarAppBar();
     void StartTaskbarMonitor() noexcept;
     void StopTaskbarMonitor() noexcept;
+    void StartCursorWatch() noexcept;
+    void StopCursorWatch() noexcept;
+    void EnsureMouseHook() noexcept;
+    void PumpCursorWatch();
+    [[nodiscard]] bool IsElevatedForeground() const noexcept;
+    void ApplyPinUnpinLayoutChange();
     void RegisterSystemResumeNotifications();
     void UnregisterSystemResumeNotifications() noexcept;
     LRESULT HandlePowerBroadcast(WPARAM wParam, LPARAM lParam);
@@ -424,6 +432,9 @@ private:
     LONG m_scaleDragStartY = 0;
     std::vector<RECT> m_layoutSlotBounds;
     POINT m_pressedAt{};
+    double m_pressedAtTime = 0.0;
+    double m_lastPointerSampleAt = 0.0;
+    bool m_suppressDragUntilRelease = false;
     bool m_taskbarHidden = false;
     int m_taskbarMonitorQuietPasses = 0;
     bool m_taskbarMonitorFast = true;
