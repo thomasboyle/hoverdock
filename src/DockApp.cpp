@@ -43,10 +43,6 @@ namespace {
 
 constexpr double kShowDurationSeconds = 0.050;
 constexpr double kHideDurationSeconds = 0.050;
-// Overflow grow/shrink needs longer than the dock's tiny Y travel or it reads as a pop,
-// especially after PaintOverflowPopup itself can cost tens of ms.
-constexpr double kOverflowShowDurationSeconds = 0.160;
-constexpr double kOverflowHideDurationSeconds = 0.140;
 constexpr double kDragSnapDurationSeconds = 0.050;
 constexpr double kDragThresholdLogicalPixels = 20.0;
 constexpr double kMinDragPressSeconds = 0.100;
@@ -3122,8 +3118,8 @@ void DockApp::AdvanceOverflowAnimation() {
         return;
     }
     const double duration = m_overflowVisibility == VisibilityState::Hiding
-        ? kOverflowHideDurationSeconds
-        : kOverflowShowDurationSeconds;
+        ? kHideDurationSeconds
+        : kShowDurationSeconds;
     const double elapsed = std::max(0.0, QpcSeconds() - m_overflowAnimStartedAt);
     const double linear = std::clamp(elapsed / duration, 0.0, 1.0);
     const double eased = linear * linear * (3.0 - 2.0 * linear);
