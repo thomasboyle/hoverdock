@@ -1087,8 +1087,11 @@ const std::wstring& DockConfig::Path() const noexcept {
 }
 
 std::wstring DockConfig::TypeSafeApiKey() const {
-    const std::wstring fromEnvironment = EnvironmentVariable(L"TYPESAFE_API_KEY");
-    return fromEnvironment.empty() ? m_typeSafeApiKey : fromEnvironment;
+    const std::wstring fromEnvironment = Trim(EnvironmentVariable(L"TYPESAFE_API_KEY"));
+    if (!fromEnvironment.empty()) {
+        return fromEnvironment;
+    }
+    return Trim(m_typeSafeApiKey);
 }
 
 void DockConfig::SetDefaults() {

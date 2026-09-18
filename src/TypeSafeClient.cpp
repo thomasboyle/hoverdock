@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cwctype>
 #include <limits>
 #include <map>
 #include <optional>
@@ -23,8 +24,15 @@ constexpr DWORD kConnectTimeoutMs = 8000;
 constexpr DWORD kSendTimeoutMs = 15000;
 constexpr DWORD kReceiveTimeoutMs = 30000;
 constexpr double kExistsLaunch = 0.35;
-constexpr size_t kMaxAppsPerChoice = 254;
-constexpr size_t kGroupSize = 180;
+// Capped to stay under server choice-option / payload limits that previously
+// surfaced as generic HTTP 400. Local pre-ranking keeps the most relevant
+// candidates when the catalog is larger than this.
+constexpr size_t kMaxAppsPerChoice = 100;
+constexpr size_t kGroupSize = 80;
+constexpr size_t kMaxRequestChars = 200;
+constexpr size_t kMaxCriteriaChars = 220;
+constexpr size_t kMaxStateFieldChars = 120;
+constexpr size_t kMaxErrorSnippetChars = 300;
 
 std::wstring Utf8ToWide(const std::string& text) {
     if (text.empty() || text.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
@@ -58,6 +66,92 @@ std::string WideToUtf8(const std::wstring& text) {
     WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
         static_cast<int>(text.size()), result.data(), count, nullptr, nullptr);
     return result;
+}
+
+std::wstring TrimKey(std::wstring value) {
+    const auto first = std::find_if_not(value.begin(), value.end(),
+        [](wchar_t character) { return std::iswspace(character) != 0; });
+    const auto last = std::find_if_not(value.rbegin(), value.rend(),
+        [](wchar_t character) { return std::iswspace(character) != 0; })
+                          .base();
+    return first >= last ? L"" : std::wstring(first, last);
+}
+
+std::wstring ToLowerWide(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](wchar_t character) { return static_cast<wchar_t>(std::towlower(character)); });
+    return value;
+}
+
+// Defensive: copy-pasted keys often arrive with quotes, whitespace, or a
+// duplicated "Bearer " prefix, which the server reports as generic 400
+// instead of 401. Normalizing here keeps header construction valid.
+std::wstring SanitizeApiKey(const std::wstring& raw) {
+    std::wstring key = TrimKey(raw);
+    if (key.size() >= 2 &&
+        ((key.front() == L'"' && key.back() == L'"') ||
+            (key.front() == L'\'' && key.back() == L'\''))) {
+        key = TrimKey(key.substr(1, key.size() - 2));
+    }
+    constexpr std::wstring_view kBearerPrefix = L"Bearer ";
+    if (key.size() > kBearerPrefix.size() &&
+        ToLowerWide(key.substr(0, kBearerPrefix.size())) == kBearerPrefix) {
+        key = TrimKey(key.substr(kBearerPrefix.size()));
+    }
+    // Embedded whitespace/newlines can never be part of a bearer token.
+    key.erase(std::remove_if(key.begin(), key.end(),
+                  [](wchar_t character) { return std::iswspace(character) != 0; }),
+        key.end());
+    return key;
+}
+
+std::wstring TruncateWide(const std::wstring& value, size_t maxChars) {
+    if (value.size() <= maxChars) {
+        return value;
+    }
+    if (maxChars <= 1) {
+        return L"…";
+    }
+    return value.substr(0, maxChars - 1) + L"…";
+}
+
+std::wstring NormalizeRequest(const std::wstring& raw) {
+    return TruncateWide(TrimKey(raw), kMaxRequestChars);
+}
+
+// Server error bodies (e.g. {"error":...,"field":...}) name the offending
+// field. Previously PostRawSystemOne discarded them and only showed the
+// status code, making 400s undebuggable. Keep a short single-line snippet.
+std::wstring ErrorSnippetFromBody(const std::string& body) {
+    if (body.empty()) {
+        return {};
+    }
+    std::string clipped = body.substr(0, 1024);
+    for (char& character : clipped) {
+        if (character == '\r' || character == '\n' || character == '\t') {
+            character = ' ';
+        } else if (static_cast<unsigned char>(character) < 0x20) {
+            character = '?';
+        }
+    }
+    std::wstring wide = Utf8ToWide(clipped);
+    if (wide.empty()) {
+        return {};
+    }
+    wide = TrimKey(wide);
+    return TruncateWide(wide, kMaxErrorSnippetChars);
+}
+
+std::wstring StatusErrorWithBody(
+    const wchar_t* prefix, DWORD status, const std::string& response) {
+    std::wstring message = std::wstring(prefix) + L" (" + std::to_wstring(status) + L")";
+    const std::wstring snippet = ErrorSnippetFromBody(response);
+    if (!snippet.empty()) {
+        message += L": " + snippet;
+    } else {
+        message += L".";
+    }
+    return message;
 }
 
 void AppendEscaped(std::string& out, std::string_view text) {
@@ -135,6 +229,10 @@ void AppendAlias(std::vector<std::wstring>& aliases, const std::wstring& name,
 }
 
 void AppendCandidateObject(std::string& out, const LaunchCandidate& candidate) {
+    // Compact: the same facts are repeated in questions.criteria, so the
+    // structured copy keeps only discriminative fields. Long filesystem
+    // paths, Start Menu folders, comments, and volatile window titles are
+    // dropped here (they remain summarized in the criteria text when useful).
     out += '{';
     AppendEscaped(out, "id");
     out += ':';
@@ -143,7 +241,7 @@ void AppendCandidateObject(std::string& out, const LaunchCandidate& candidate) {
     auto field = [&out, &first](std::string_view key, const std::wstring& value) {
         AppendOptionalField(out, first, key, value);
     };
-    field("name", candidate.name);
+    field("name", TruncateWide(candidate.name, kMaxStateFieldChars));
 
     std::vector<std::wstring> aliases;
     AppendAlias(aliases, candidate.name, candidate.pinName);
@@ -155,59 +253,165 @@ void AppendCandidateObject(std::string& out, const LaunchCandidate& candidate) {
             if (index > 0) {
                 out += ',';
             }
-            AppendEscaped(out, WideToUtf8(aliases[index]));
+            AppendEscaped(out, WideToUtf8(TruncateWide(aliases[index], kMaxStateFieldChars)));
         }
         out += ']';
     }
 
-    field("exe", candidate.executable);
-    field("path", candidate.executablePath);
-    field("aumid", candidate.aumid);
-    field("target", candidate.target);
-    field("description", candidate.description);
-    field("product", candidate.productName);
-    field("publisher", candidate.publisher);
-    field("start_menu_folder", candidate.startMenuFolder);
-    field("comment", candidate.comment);
-    field("window_title", candidate.windowTitle);
+    field("exe", TruncateWide(candidate.executable, kMaxStateFieldChars));
+    field("aumid", TruncateWide(candidate.aumid, kMaxStateFieldChars));
+    field("description", TruncateWide(candidate.description, kMaxStateFieldChars));
+    field("product", TruncateWide(candidate.productName, kMaxStateFieldChars));
+    field("publisher", TruncateWide(candidate.publisher, kMaxStateFieldChars));
     out += ",\"running\":";
     out += candidate.running ? "true" : "false";
     out += '}';
 }
 
 std::string CandidateDescription(const LaunchCandidate& candidate) {
-    std::wstring text = candidate.name;
-    auto append = [&text](std::wstring_view label, const std::wstring& value) {
+    // Compact single-line rubric text for the choice criteria. Previously this
+    // duplicated every verbose field (paths, targets, folders, comments,
+    // full window titles), doubling payload size and token cost. Keep only
+    // identity + kind signals, capped so one noisy app cannot blow the budget.
+    std::wstring base = candidate.name;
+    if (base.empty()) {
+        base = candidate.executable;
+    }
+    if (base.empty()) {
+        base = Utf8ToWide(candidate.id);
+    }
+    std::wstring text = TruncateWide(base, 80);
+    auto append = [&text](std::wstring_view label, const std::wstring& value, size_t maxChars) {
         if (value.empty() || value == text) {
+            return;
+        }
+        std::wstring clipped = TruncateWide(value, maxChars);
+        if (clipped.empty() || text.find(clipped) != std::wstring::npos) {
             return;
         }
         text += L"; ";
         text += label;
-        text += value;
+        text += clipped;
     };
-    append(L"also called ", candidate.shortcutName);
-    append(L"also called ", candidate.pinName);
-    append(L"product ", candidate.productName);
-    append(L"exe ", candidate.executable);
-    append(L"AUMID ", candidate.aumid);
-    append(L"", candidate.description);
-    append(L"by ", candidate.publisher);
-    append(L"Start Menu ", candidate.startMenuFolder);
-    append(L"", candidate.comment);
-    append(L"window ", candidate.windowTitle);
-    if (!candidate.executablePath.empty() && candidate.executablePath != candidate.target) {
-        append(L"path ", candidate.executablePath);
+    if (candidate.shortcutName != candidate.name) {
+        append(L"aka ", candidate.shortcutName, 40);
     }
-    append(L"target ", candidate.target);
+    if (candidate.pinName != candidate.name && candidate.pinName != candidate.shortcutName) {
+        append(L"aka ", candidate.pinName, 40);
+    }
+    append(L"exe ", candidate.executable, 40);
+    append(L"", candidate.description, 100);
+    append(L"product ", candidate.productName, 60);
+    append(L"by ", candidate.publisher, 60);
+    if (text.empty()) {
+        text = Utf8ToWide(candidate.id);
+    }
     text += candidate.running ? L"; currently running" : L"";
-    return WideToUtf8(text);
+    return WideToUtf8(TruncateWide(text, kMaxCriteriaChars));
 }
 
 std::wstring LauncherSurface() {
     return L"The user typed this into an application launcher over every installed app, not only "
         L"dock pins. Interpret `request` as the app they want to open. A single noun naming a "
-        L"product or a kind of app is a valid launch query. Use names, aliases, executable, path, "
-        L"AUMID, description, publisher, product, Start Menu folder, comment, and window titles.";
+        L"product or a kind of app is a valid launch query. Use names, aliases, executable, "
+        L"AUMID, description, publisher, and product.";
+}
+
+// Local pre-ranking: sending the full catalog (200+ apps x2 copies) caused
+// huge payloads and generic HTTP 400s. Score cheaply on lexical overlap and
+// keep the top-N so truncation drops irrelevant apps, not arbitrary ones.
+// Semantic kind queries ("browser") still work when descriptions mention the
+// kind ("Web browser"); zero-score fallbacks keep diverse coverage.
+double CandidateRelevance(const LaunchCandidate& candidate, const std::wstring& queryLower,
+    const std::vector<std::wstring>& tokens) {
+    if (tokens.empty()) {
+        return candidate.running ? 1.0 : 0.0;
+    }
+    const std::wstring name = ToLowerWide(candidate.name);
+    const std::wstring exe = ToLowerWide(candidate.executable);
+    const std::wstring shortcut = ToLowerWide(candidate.shortcutName);
+    const std::wstring pin = ToLowerWide(candidate.pinName);
+    const std::wstring product = ToLowerWide(candidate.productName);
+    const std::wstring publisher = ToLowerWide(candidate.publisher);
+    const std::wstring description = ToLowerWide(candidate.description);
+    double score = 0.0;
+    for (const std::wstring& token : tokens) {
+        if (token.empty()) {
+            continue;
+        }
+        if (name == token) {
+            score += 100.0;
+        } else if (!name.empty() && name.starts_with(token)) {
+            score += 80.0;
+        } else if (name.find(token) != std::wstring::npos) {
+            score += 50.0;
+        }
+        if (!exe.empty()) {
+            if (exe == token || exe == token + L".exe") {
+                score += 70.0;
+            } else if (exe.find(token) != std::wstring::npos) {
+                score += 40.0;
+            }
+        }
+        if (!shortcut.empty() && shortcut.find(token) != std::wstring::npos) {
+            score += 45.0;
+        }
+        if (!pin.empty() && pin.find(token) != std::wstring::npos) {
+            score += 45.0;
+        }
+        if (!product.empty() && product.find(token) != std::wstring::npos) {
+            score += 30.0;
+        }
+        if (!description.empty() && description.find(token) != std::wstring::npos) {
+            score += 12.0;
+        }
+        if (!publisher.empty() && publisher.find(token) != std::wstring::npos) {
+            score += 8.0;
+        }
+    }
+    if (!queryLower.empty() && !name.empty() && name.find(queryLower) != std::wstring::npos) {
+        score += 25.0;
+    }
+    if (candidate.running) {
+        score += 2.0;
+    }
+    return score;
+}
+
+std::vector<LaunchCandidate> SelectTopCandidates(
+    const std::vector<LaunchCandidate>& candidates, const std::wstring& request, size_t limit) {
+    if (candidates.size() <= limit) {
+        return candidates;
+    }
+    const std::wstring queryLower = ToLowerWide(TrimKey(request));
+    std::vector<std::wstring> tokens;
+    size_t start = 0;
+    while (start < queryLower.size()) {
+        while (start < queryLower.size() && std::iswspace(queryLower[start]) != 0) {
+            ++start;
+        }
+        size_t end = start;
+        while (end < queryLower.size() && std::iswspace(queryLower[end]) == 0) {
+            ++end;
+        }
+        if (end > start) {
+            tokens.push_back(queryLower.substr(start, end - start));
+        }
+        start = end;
+    }
+    std::vector<std::pair<double, size_t>> ranked;
+    ranked.reserve(candidates.size());
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        ranked.emplace_back(CandidateRelevance(candidates[index], queryLower, tokens), index);
+    }
+    std::stable_sort(ranked.begin(), ranked.end(),
+        [](const auto& left, const auto& right) { return left.first > right.first; });
+    std::vector<LaunchCandidate> top;
+    top.reserve(limit);
+    for (size_t rank = 0; rank < limit && rank < ranked.size(); ++rank) {
+        top.push_back(candidates[ranked[rank].second]);
+    }
+    return top;
 }
 
 std::string BuildAppQuestions(const std::vector<LaunchCandidate>& candidates) {
@@ -252,7 +456,7 @@ std::string BuildAppQuestions(const std::vector<LaunchCandidate>& candidates) {
 std::string BuildRequestBody(const std::wstring& request,
     const std::vector<LaunchCandidate>& candidates) {
     std::string body;
-    body.reserve(4096 + candidates.size() * 384);
+    body.reserve(4096 + candidates.size() * 256);
     body += "{\"model\":\"jev-latest\",\"state\":{";
     AppendUtf8Field(body, "surface", LauncherSurface());
     body += ',';
@@ -743,7 +947,7 @@ bool PostRawSystemOne(const std::wstring& apiKey, const std::string& body,
     }
 
     std::wstring headers = L"Authorization: Bearer ";
-    headers += apiKey;
+    headers += SanitizeApiKey(apiKey);
     headers += L"\r\nContent-Type: application/json";
     if (WinHttpAddRequestHeaders(request.Get(), headers.c_str(), static_cast<DWORD>(-1L),
             WINHTTP_ADDREQ_FLAG_ADD) == FALSE) {
@@ -751,6 +955,10 @@ bool PostRawSystemOne(const std::wstring& apiKey, const std::string& body,
         return false;
     }
 
+    if (body.size() > static_cast<size_t>((std::numeric_limits<DWORD>::max)())) {
+        error = L"TypeSafe request is too large to send.";
+        return false;
+    }
     const DWORD bodySize = static_cast<DWORD>(body.size());
     if (WinHttpSendRequest(request.Get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             body.empty() ? nullptr : const_cast<char*>(body.data()), bodySize, bodySize, 0) ==
@@ -804,11 +1012,15 @@ bool PostRawSystemOne(const std::wstring& apiKey, const std::string& body,
         return false;
     }
     if (status == 422) {
-        error = L"TypeSafe rejected the request.";
+        error = StatusErrorWithBody(L"TypeSafe rejected the request", status, response);
+        return false;
+    }
+    if (status == 400) {
+        error = StatusErrorWithBody(L"TypeSafe rejected the request", status, response);
         return false;
     }
     if (status < 200 || status > 299) {
-        error = L"TypeSafe request failed (" + std::to_wstring(status) + L").";
+        error = StatusErrorWithBody(L"TypeSafe request failed", status, response);
         return false;
     }
     return true;
@@ -1033,28 +1245,32 @@ NoulBatchResult PostNoulBatch(const std::wstring& apiKey, const std::string& bod
 
 LaunchJudgment TypeSafeClient::ResolveApp(const std::wstring& apiKey, const std::wstring& request,
     const std::vector<LaunchCandidate>& candidates) {
-    if (apiKey.empty()) {
+    const std::wstring cleanKey = SanitizeApiKey(apiKey);
+    if (cleanKey.empty()) {
         return HttpError(
             L"Set TYPESAFE_API_KEY or TypeSafeApiKey in dock.ini.");
     }
-    if (request.empty() || candidates.empty()) {
+    const std::wstring cleanRequest = NormalizeRequest(request);
+    if (cleanRequest.empty() || candidates.empty()) {
         LaunchJudgment judgment;
         judgment.action = LaunchJudgment::Action::None;
         return judgment;
     }
 
-    if (candidates.size() <= kMaxAppsPerChoice) {
-        return PostSystemOne(apiKey, BuildRequestBody(request, candidates));
+    const std::vector<LaunchCandidate> ranked = SelectTopCandidates(candidates, cleanRequest,
+        kMaxAppsPerChoice);
+    if (ranked.size() <= kMaxAppsPerChoice) {
+        return PostSystemOne(cleanKey, BuildRequestBody(cleanRequest, ranked));
     }
 
     std::vector<std::vector<LaunchCandidate>> groups;
-    for (size_t start = 0; start < candidates.size(); start += kGroupSize) {
-        const size_t end = std::min(candidates.size(), start + kGroupSize);
-        groups.emplace_back(candidates.begin() + static_cast<std::ptrdiff_t>(start),
-            candidates.begin() + static_cast<std::ptrdiff_t>(end));
+    for (size_t start = 0; start < ranked.size(); start += kGroupSize) {
+        const size_t end = std::min(ranked.size(), start + kGroupSize);
+        groups.emplace_back(ranked.begin() + static_cast<std::ptrdiff_t>(start),
+            ranked.begin() + static_cast<std::ptrdiff_t>(end));
     }
 
-    LaunchJudgment group = PostSystemOne(apiKey, BuildGroupRequestBody(request, groups));
+    LaunchJudgment group = PostSystemOne(cleanKey, BuildGroupRequestBody(cleanRequest, groups));
     if (group.action != LaunchJudgment::Action::Launch || group.chosenId.size() < 2 ||
         group.chosenId.front() != 'g') {
         if (group.action == LaunchJudgment::Action::Error) {
@@ -1076,13 +1292,14 @@ LaunchJudgment TypeSafeClient::ResolveApp(const std::wstring& apiKey, const std:
         return group;
     }
 
-    return PostSystemOne(apiKey, BuildRequestBody(request, groups[groupIndex]));
+    return PostSystemOne(cleanKey, BuildRequestBody(cleanRequest, groups[groupIndex]));
 }
 
 BoostResult TypeSafeClient::ClassifyForBoost(const std::wstring& apiKey,
     const std::vector<BoostCandidate>& candidates) {
     BoostResult result;
-    if (apiKey.empty()) {
+    const std::wstring cleanKey = SanitizeApiKey(apiKey);
+    if (cleanKey.empty()) {
         result.error = L"Set TYPESAFE_API_KEY or TypeSafeApiKey in dock.ini.";
         return result;
     }
@@ -1097,7 +1314,7 @@ BoostResult TypeSafeClient::ClassifyForBoost(const std::wstring& apiKey,
         const std::vector<BoostCandidate> batch(candidates.begin() +
                 static_cast<std::ptrdiff_t>(start),
             candidates.begin() + static_cast<std::ptrdiff_t>(end));
-        const NoulBatchResult reply = PostNoulBatch(apiKey, BuildBoostRequestBody(batch));
+        const NoulBatchResult reply = PostNoulBatch(cleanKey, BuildBoostRequestBody(batch));
         if (!reply.ok) {
             result.error = reply.error;
             return result;
