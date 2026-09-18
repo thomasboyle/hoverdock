@@ -4791,7 +4791,7 @@ void DockApp::HandlePointer(POINT cursor) {
     }
 
     if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
-        !inHotZone && !IsLaunchPromptOpen() && !IsDockSettingsOpen() && !IsCursorOverDock(cursor) &&
+        !inHotZone && !IsLaunchPromptOpen() && !IsCursorOverDock(cursor) &&
         !IsCursorWithinFlyoutZone(cursor) &&
         (cursor.y < m_visibleY ||
             MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) != m_hostMonitor)) {
