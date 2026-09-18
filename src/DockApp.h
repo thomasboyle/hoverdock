@@ -461,6 +461,10 @@ private:
     UINT m_cursorWatchAppliedMs = 0;
     UINT m_cursorWatchStationaryPumps = 0;
     HWINEVENTHOOK m_foregroundHook = nullptr;
+    LONG m_positionedWindowX = LONG_MIN;
+    LONG m_positionedWindowY = LONG_MIN;
+    UINT m_positionedWidth = 0;
+    UINT m_positionedHeight = 0;
     bool m_taskbarStateSaved = false;
     UINT m_savedTaskbarState = 0;
     RECT m_savedWorkArea{};
