@@ -257,6 +257,7 @@ private:
     void BeginOverflowHide(bool animate) noexcept;
     void FinishOverflowHide() noexcept;
     void AdvanceOverflowAnimation();
+    void ApplyOverflowRevealClip(double reveal01) noexcept;
     [[nodiscard]] bool IsOverflowAnimating() const noexcept;
     void DestroyOverflowPopup() noexcept;
     void HandleOverflowClick(const TrayFlyoutHit& hit, UINT message);
@@ -516,9 +517,9 @@ private:
     HWND m_overflowWindow = nullptr;
     VisibilityState m_overflowVisibility = VisibilityState::Hidden;
     double m_overflowAnimStartedAt = 0.0;
-    LONG m_overflowAnimFromY = 0;
-    LONG m_overflowAnimToY = 0;
-    LONG m_overflowCurrentY = 0;
+    double m_overflowReveal = 0.0;
+    double m_overflowAnimFromReveal = 0.0;
+    double m_overflowAnimToReveal = 1.0;
     std::vector<TrayNotifyIcon> m_overflowIcons;
     std::vector<TrayFlyoutHit> m_overflowHits;
     int m_overflowHover = -1;

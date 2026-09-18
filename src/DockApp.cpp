@@ -2733,18 +2733,13 @@ void DockApp::ToggleOverflowPopup() {
         return;
     }
     if (m_overflowVisibility == VisibilityState::Hiding) {
-        // Reverse an in-flight hide into a show from the current Y.
-        POINT origin{};
-        LONG caret = m_overflowCaretX;
-        if (OverflowScreenOrigin(origin, caret)) {
-            m_overflowCaretX = caret;
-            m_overflowAnimFromY = m_overflowCurrentY;
-            m_overflowAnimToY = origin.y;
-            m_overflowAnimStartedAt = QpcSeconds();
-            m_overflowVisibility = VisibilityState::Showing;
-            if (m_visibility == VisibilityState::Visible) {
-                StartTrayTimer();
-            }
+        // Reverse an in-flight hide into a reveal from the current clip.
+        m_overflowAnimFromReveal = m_overflowReveal;
+        m_overflowAnimToReveal = 1.0;
+        m_overflowAnimStartedAt = QpcSeconds();
+        m_overflowVisibility = VisibilityState::Showing;
+        if (m_visibility == VisibilityState::Visible) {
+            StartTrayTimer();
         }
         return;
     }
@@ -2988,13 +2983,38 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notify
 void DockApp::FinishOverflowHide() noexcept {
     CloseDockSettings();
     if (m_overflowWindow != nullptr) {
+        SetWindowRgn(m_overflowWindow, nullptr, TRUE);
         ShowWindow(m_overflowWindow, SW_HIDE);
     }
     m_overflowVisibility = VisibilityState::Hidden;
+    m_overflowReveal = 0.0;
     m_overflowHover = -1;
     InvalidateOverflowGlass();
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
+    }
+}
+
+void DockApp::ApplyOverflowRevealClip(double reveal01) noexcept {
+    if (m_overflowWindow == nullptr || m_overflowSize.cx <= 0 || m_overflowSize.cy <= 0) {
+        return;
+    }
+    const double clamped = std::clamp(reveal01, 0.0, 1.0);
+    m_overflowReveal = clamped;
+    const LONG width = m_overflowSize.cx;
+    const LONG height = m_overflowSize.cy;
+    if (clamped >= 1.0) {
+        SetWindowRgn(m_overflowWindow, nullptr, TRUE);
+        return;
+    }
+    const LONG visible = std::max(0L, std::lround(clamped * static_cast<double>(height)));
+    // Reveal from the bottom edge (dock-adjacent) upward — panel stays at rest.
+    HRGN region = CreateRectRgn(0, height - visible, width, height);
+    if (region == nullptr) {
+        return;
+    }
+    if (SetWindowRgn(m_overflowWindow, region, TRUE) == 0) {
+        DeleteObject(region);
     }
 }
 
@@ -3008,26 +3028,14 @@ void DockApp::BeginOverflowHide(bool animate) noexcept {
         FinishOverflowHide();
         return;
     }
-    POINT origin{};
-    LONG caret = m_overflowCaretX;
-    if (!OverflowScreenOrigin(origin, caret)) {
-        FinishOverflowHide();
-        return;
-    }
-    m_overflowCaretX = caret;
-    if (m_overflowVisibility != VisibilityState::Showing &&
-        m_overflowVisibility != VisibilityState::Hiding) {
-        m_overflowCurrentY = origin.y;
-    }
-    m_overflowAnimFromY = m_overflowCurrentY;
-    // Tuck back to the dock's top edge.
-    m_overflowAnimToY = m_currentY;
+    m_overflowAnimFromReveal = m_overflowReveal > 0.0 ? m_overflowReveal : 1.0;
+    m_overflowAnimToReveal = 0.0;
     m_overflowAnimStartedAt = QpcSeconds();
     m_overflowVisibility = VisibilityState::Hiding;
 }
 
 void DockApp::CloseOverflowPopup() noexcept {
-    // User dismiss (toggle, outside click, tray actions): same 50 ms slide as dock hide.
+    // User dismiss (toggle, outside click, tray actions): same 50 ms motion as dock hide.
     BeginOverflowHide(true);
 }
 
@@ -3049,17 +3057,16 @@ void DockApp::BeginOverflowShow() {
         return;
     }
     m_overflowCaretX = caret;
-    // Emerge from the dock's top edge (not origin.y + height, which becomes
-    // screen-bottom when the rest Y is clamped to the monitor top).
-    m_overflowAnimToY = origin.y;
-    m_overflowAnimFromY = m_currentY;
-    m_overflowCurrentY = m_overflowAnimFromY;
+    m_overflowAnimFromReveal = 0.0;
+    m_overflowAnimToReveal = 1.0;
+    m_overflowReveal = 0.0;
     m_overflowAnimStartedAt = QpcSeconds();
     m_overflowVisibility = VisibilityState::Showing;
+    // Park at the final rest position; the clip grows up from the dock edge.
     ShowWindow(m_overflowWindow, SW_SHOWNA);
-    SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x),
-        SaturatedInt(m_overflowCurrentY), SaturatedInt(m_overflowSize.cx),
-        SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
+    SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(origin.y),
+        SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
+    ApplyOverflowRevealClip(0.0);
     PositionDockSettings();
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
@@ -3076,24 +3083,18 @@ void DockApp::AdvanceOverflowAnimation() {
     const double elapsed = std::max(0.0, QpcSeconds() - m_overflowAnimStartedAt);
     const double linear = std::clamp(elapsed / duration, 0.0, 1.0);
     const double eased = linear * linear * (3.0 - 2.0 * linear);
-    m_overflowCurrentY = std::lround(static_cast<double>(m_overflowAnimFromY) +
-        static_cast<double>(m_overflowAnimToY - m_overflowAnimFromY) * eased);
+    const double reveal = m_overflowAnimFromReveal +
+        (m_overflowAnimToReveal - m_overflowAnimFromReveal) * eased;
 
     POINT origin{};
     LONG caret = m_overflowCaretX;
     if (OverflowScreenOrigin(origin, caret)) {
         m_overflowCaretX = caret;
-        // Keep X locked to the chevron while Y follows the slide.
-        if (m_overflowVisibility == VisibilityState::Showing) {
-            m_overflowAnimToY = origin.y;
-        } else if (m_overflowVisibility == VisibilityState::Hiding) {
-            m_overflowAnimToY = m_currentY;
-        }
-        SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x),
-            SaturatedInt(m_overflowCurrentY), SaturatedInt(m_overflowSize.cx),
-            SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
+        SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(origin.y),
+            SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
         PositionDockSettings();
     }
+    ApplyOverflowRevealClip(reveal);
 
     if (linear < 1.0) {
         return;
@@ -3101,7 +3102,8 @@ void DockApp::AdvanceOverflowAnimation() {
 
     if (m_overflowVisibility == VisibilityState::Showing) {
         m_overflowVisibility = VisibilityState::Visible;
-        m_overflowCurrentY = m_overflowAnimToY;
+        m_overflowReveal = 1.0;
+        ApplyOverflowRevealClip(1.0);
         PositionOverflowPopup();
         return;
     }
@@ -4240,14 +4242,11 @@ void DockApp::PositionOverflowPopup() {
         return;
     }
     m_overflowCaretX = caret;
-    LONG y = origin.y;
-    if (IsOverflowAnimating()) {
-        y = m_overflowCurrentY;
-    } else {
-        m_overflowCurrentY = origin.y;
-    }
-    SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(y),
+    SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(origin.y),
         SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
+    if (IsOverflowAnimating() || m_overflowReveal < 1.0) {
+        ApplyOverflowRevealClip(m_overflowReveal);
+    }
     // The settings panel is anchored beside Quick Settings; follow its moves.
     PositionDockSettings();
 }
