@@ -1434,7 +1434,7 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         const int hover = app->OverflowHitIndex(point);
         if (hover != app->m_overflowHover) {
             app->m_overflowHover = hover;
-            app->QueueOverflowPaint();
+            app->QueueOverflowPaint(true);
         }
         TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
         TrackMouseEvent(&track);
@@ -1457,7 +1457,7 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
     case WM_MOUSELEAVE:
         if (app != nullptr && app->m_overflowHover >= 0) {
             app->m_overflowHover = -1;
-            app->QueueOverflowPaint();
+            app->QueueOverflowPaint(true);
         }
         return 0;
 
@@ -1672,11 +1672,19 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         ApplyPinIcons(static_cast<UINT>(wParam));
         return 0;
 
-    case kOverflowPaintMessage:
+        case kOverflowPaintMessage:
         m_overflowPaintQueued = false;
-        // Guarded: a paint queued before the popup closed must not re-show it.
         if (IsOverflowOpen()) {
-            PaintOverflowPopup();
+            const bool hoverOnly = m_overflowHoverPaintOnly;
+            m_overflowHoverPaintOnly = false;
+            if (hoverOnly && !m_overflowBaseBits.empty() &&
+                m_overflowBaseBits.size() == m_overflowPresentBits.size() &&
+                m_overflowPresentSize.cx == m_overflowSize.cx &&
+                m_overflowPresentSize.cy == m_overflowSize.cy) {
+                PaintOverflowHoverFast();
+            } else {
+                PaintOverflowPopup();
+            }
         }
         return 0;
 
@@ -2746,11 +2754,19 @@ void DockApp::ToggleOverflowPopup() {
     BeginOverflowShow();
 }
 
-void DockApp::QueueOverflowPaint() {
+void DockApp::QueueOverflowPaint(bool hoverOnly) {
     // Coalesce rapid hover transitions into a single repaint so fast cursor
     // movement can't stack full synchronous paints on this thread (which also
     // services the low-level mouse hook). The latest m_overflowHover wins.
-    if (m_overflowPaintQueued || m_overflowWindow == nullptr) {
+    if (m_overflowWindow == nullptr) {
+        return;
+    }
+    if (!hoverOnly) {
+        m_overflowHoverPaintOnly = false;
+    } else if (!m_overflowPaintQueued) {
+        m_overflowHoverPaintOnly = true;
+    }
+    if (m_overflowPaintQueued) {
         return;
     }
     m_overflowPaintQueued = true;
@@ -2989,7 +3005,9 @@ void DockApp::FinishOverflowHide() noexcept {
     m_overflowReveal = 0.0;
     m_overflowHover = -1;
     std::vector<uint8_t>().swap(m_overflowPresentBits);
+    std::vector<uint8_t>().swap(m_overflowBaseBits);
     m_overflowPresentSize = {};
+    m_overflowHoverPaintOnly = false;
     InvalidateOverflowGlass();
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
@@ -4346,6 +4364,64 @@ void DockApp::RebuildOverflowPopup() {
     PaintOverflowPopup();
 }
 
+void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
+    const TrayFlyoutHit& hit) const {
+    if (pixels == nullptr || width <= 0 || height <= 0) {
+        return;
+    }
+    switch (hit.kind) {
+    case TrayFlyoutHitKind::Settings: {
+        const float cx = 0.5F * static_cast<float>(hit.bounds.left + hit.bounds.right);
+        const float cy = 0.5F * static_cast<float>(hit.bounds.top + hit.bounds.bottom);
+        const float radius = 0.36F * static_cast<float>(
+            std::max(1L, hit.bounds.right - hit.bounds.left));
+        FillCirclePremul(pixels, width, height, cx, cy, radius, 0.18F);
+        break;
+    }
+    case TrayFlyoutHitKind::Wifi:
+    case TrayFlyoutHitKind::Sound:
+    case TrayFlyoutHitKind::Boost:
+    case TrayFlyoutHitKind::Brightness: {
+        // Approximate the brighter tile disc without rerunning glyph/text layout.
+        const float cx = 0.5F * static_cast<float>(hit.bounds.left + hit.bounds.right);
+        const float top = static_cast<float>(hit.bounds.top);
+        const float tileW = static_cast<float>(std::max(1L, hit.bounds.right - hit.bounds.left));
+        const float radius = tileW * 0.28F;
+        FillCirclePremul(pixels, width, height, cx, top + radius + 4.0F, radius, 0.20F);
+        break;
+    }
+    case TrayFlyoutHitKind::ClearAll:
+        FillRectPremul(pixels, width, height, hit.bounds, 0.08F);
+        break;
+    case TrayFlyoutHitKind::NotificationCenter:
+    case TrayFlyoutHitKind::NotifyIcon:
+        FillRectPremul(pixels, width, height, hit.bounds, 0.10F);
+        break;
+    default:
+        break;
+    }
+}
+
+void DockApp::PaintOverflowHoverFast() {
+    if (m_overflowBaseBits.empty() || m_overflowWindow == nullptr) {
+        PaintOverflowPopup();
+        return;
+    }
+    m_overflowPresentBits = m_overflowBaseBits;
+    m_overflowPresentSize = m_overflowSize;
+    if (m_overflowHover >= 0 && static_cast<size_t>(m_overflowHover) < m_overflowHits.size()) {
+        ApplyOverflowHoverHighlight(m_overflowPresentBits.data(),
+            SaturatedInt(m_overflowPresentSize.cx), SaturatedInt(m_overflowPresentSize.cy),
+            m_overflowHits[static_cast<size_t>(m_overflowHover)]);
+    }
+    const double presentReveal =
+        (m_overflowVisibility == VisibilityState::Showing ||
+            m_overflowVisibility == VisibilityState::Hiding)
+        ? m_overflowReveal
+        : 1.0;
+    PresentOverflowLayer(presentReveal);
+}
+
 void DockApp::PaintOverflowPopup() {
     const UINT dpi = HostDpi();
     const float scale = static_cast<float>(dpi) / 96.0F;
@@ -4590,12 +4666,11 @@ void DockApp::PaintOverflowPopup() {
     HFONT sectionFont = m_overflowSectionFont;
     HFONT labelFont = m_overflowLabelFont;
     HFONT statusFont = m_overflowStatusFont;
+    // Hover chrome is applied after a base frame is cached so mouse moves can
+    // repaint with PaintOverflowHoverFast (no blur / text / icon redraw).
     TrayFlyoutHit hoveredHit{};
-    const bool hasHover =
-        m_overflowHover >= 0 && static_cast<size_t>(m_overflowHover) < m_overflowHits.size();
-    if (hasHover) {
-        hoveredHit = m_overflowHits[static_cast<size_t>(m_overflowHover)];
-    }
+    const bool hasHover = false;
+    const int pendingHover = m_overflowHover;
     m_overflowHits.clear();
 
     auto pushHit = [this](TrayFlyoutHitKind kind, RECT bounds, int index = -1) {
@@ -4817,6 +4892,12 @@ void DockApp::PaintOverflowPopup() {
 
 
     const size_t bytes = pixelCount * 4U;
+    m_overflowBaseBits.resize(bytes);
+    std::memcpy(m_overflowBaseBits.data(), pixels, bytes);
+    if (pendingHover >= 0 && static_cast<size_t>(pendingHover) < m_overflowHits.size()) {
+        ApplyOverflowHoverHighlight(pixels, width, height,
+            m_overflowHits[static_cast<size_t>(pendingHover)]);
+    }
     m_overflowPresentBits.resize(bytes);
     std::memcpy(m_overflowPresentBits.data(), pixels, bytes);
     m_overflowPresentSize = m_overflowSize;

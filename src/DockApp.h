@@ -211,7 +211,6 @@ private:
     void CloseOverflowPopup() noexcept;
     void RebuildOverflowPopup();
     void PaintOverflowPopup();
-    void QueueOverflowPaint();
     void DrainBrightnessWheel();
     void ScrollBrightness(int delta);
     void RefreshBrightnessAsync();
@@ -258,6 +257,10 @@ private:
     void FinishOverflowHide() noexcept;
     void AdvanceOverflowAnimation();
     void PresentOverflowLayer(double reveal01) noexcept;
+    void QueueOverflowPaint(bool hoverOnly = false);
+    void PaintOverflowHoverFast();
+    void ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
+        const TrayFlyoutHit& hit) const;
     [[nodiscard]] bool IsOverflowAnimating() const noexcept;
     void DestroyOverflowPopup() noexcept;
     void HandleOverflowClick(const TrayFlyoutHit& hit, UINT message);
@@ -559,8 +562,10 @@ private:
     std::atomic<bool> m_boostInFlight{false};
     SIZE m_overflowSize{};
     LONG m_overflowCaretX = 0;
+    std::vector<uint8_t> m_overflowBaseBits;
     std::vector<uint8_t> m_overflowPresentBits;
     SIZE m_overflowPresentSize{};
+    bool m_overflowHoverPaintOnly = false;
     std::vector<uint8_t> m_overflowGlass;
     SIZE m_overflowGlassSize{};
     POINT m_overflowGlassOrigin{};
