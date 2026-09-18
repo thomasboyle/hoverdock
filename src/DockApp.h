@@ -257,7 +257,7 @@ private:
     void BeginOverflowHide(bool animate) noexcept;
     void FinishOverflowHide() noexcept;
     void AdvanceOverflowAnimation();
-    void ApplyOverflowRevealClip(double reveal01) noexcept;
+    void PresentOverflowLayer(double reveal01) noexcept;
     [[nodiscard]] bool IsOverflowAnimating() const noexcept;
     void DestroyOverflowPopup() noexcept;
     void HandleOverflowClick(const TrayFlyoutHit& hit, UINT message);
@@ -559,6 +559,8 @@ private:
     std::atomic<bool> m_boostInFlight{false};
     SIZE m_overflowSize{};
     LONG m_overflowCaretX = 0;
+    std::vector<uint8_t> m_overflowPresentBits;
+    SIZE m_overflowPresentSize{};
     std::vector<uint8_t> m_overflowGlass;
     SIZE m_overflowGlassSize{};
     POINT m_overflowGlassOrigin{};

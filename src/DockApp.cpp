@@ -2983,48 +2983,96 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notify
 void DockApp::FinishOverflowHide() noexcept {
     CloseDockSettings();
     if (m_overflowWindow != nullptr) {
-        SetWindowRgn(m_overflowWindow, nullptr, TRUE);
         ShowWindow(m_overflowWindow, SW_HIDE);
     }
     m_overflowVisibility = VisibilityState::Hidden;
     m_overflowReveal = 0.0;
     m_overflowHover = -1;
+    std::vector<uint8_t>().swap(m_overflowPresentBits);
+    m_overflowPresentSize = {};
     InvalidateOverflowGlass();
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
     }
 }
 
-void DockApp::ApplyOverflowRevealClip(double reveal01) noexcept {
-    if (m_overflowWindow == nullptr || m_overflowSize.cx <= 0 || m_overflowSize.cy <= 0) {
+void DockApp::PresentOverflowLayer(double reveal01) noexcept {
+    if (m_overflowWindow == nullptr || m_overflowPresentBits.empty() ||
+        m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0) {
         return;
     }
     const double clamped = std::clamp(reveal01, 0.0, 1.0);
     m_overflowReveal = clamped;
-    const LONG width = m_overflowSize.cx;
-    const LONG height = m_overflowSize.cy;
-    if (clamped >= 1.0) {
-        SetWindowRgn(m_overflowWindow, nullptr, TRUE);
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (!OverflowScreenOrigin(origin, caret)) {
         return;
     }
-    const LONG visible = std::max(0L, std::lround(clamped * static_cast<double>(height)));
-    // Reveal from the bottom edge (dock-adjacent) upward — panel stays at rest.
-    HRGN region = CreateRectRgn(0, height - visible, width, height);
-    if (region == nullptr) {
+    m_overflowCaretX = caret;
+
+    const LONG width = m_overflowPresentSize.cx;
+    const LONG height = m_overflowPresentSize.cy;
+    LONG visible = std::lround(clamped * static_cast<double>(height));
+    if (visible <= 0) {
+        ShowWindow(m_overflowWindow, SW_HIDE);
         return;
     }
-    if (SetWindowRgn(m_overflowWindow, region, TRUE) == 0) {
-        DeleteObject(region);
+    visible = std::min(visible, height);
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return;
     }
+    HDC memory = CreateCompatibleDC(screen);
+    if (memory == nullptr) {
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = width;
+    header.bV5Height = -height;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    const size_t bytes =
+        static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
+    if (m_overflowPresentBits.size() >= bytes) {
+        std::memcpy(bits, m_overflowPresentBits.data(), bytes);
+    }
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    POINT source{0, height - visible};
+    POINT destination{origin.x, origin.y + (height - visible)};
+    SIZE present{width, visible};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(m_overflowWindow, nullptr, &destination, &present, memory, &source, 0,
+        &blend, ULW_ALPHA);
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+    ShowWindow(m_overflowWindow, SW_SHOWNA);
+    PositionDockSettings();
 }
 
 void DockApp::BeginOverflowHide(bool animate) noexcept {
     if (m_overflowVisibility == VisibilityState::Hidden) {
         return;
     }
-    // Settings rides with Quick Settings; drop it as soon as dismiss starts.
     CloseDockSettings();
-    if (!animate || m_overflowWindow == nullptr || m_overflowSize.cy <= 0) {
+    if (!animate || m_overflowWindow == nullptr || m_overflowPresentBits.empty()) {
         FinishOverflowHide();
         return;
     }
@@ -3035,7 +3083,6 @@ void DockApp::BeginOverflowHide(bool animate) noexcept {
 }
 
 void DockApp::CloseOverflowPopup() noexcept {
-    // User dismiss (toggle, outside click, tray actions): same 50 ms motion as dock hide.
     BeginOverflowHide(true);
 }
 
@@ -3047,27 +3094,18 @@ void DockApp::BeginOverflowShow() {
     HideHoverLabel();
     static_cast<void>(m_tray.Refresh());
     RefreshBrightnessAsync();
-    RebuildOverflowPopup();
-    if (m_overflowWindow == nullptr || m_overflowSize.cy <= 0) {
-        return;
-    }
-    POINT origin{};
-    LONG caret = m_overflowCaretX;
-    if (!OverflowScreenOrigin(origin, caret)) {
-        return;
-    }
-    m_overflowCaretX = caret;
     m_overflowAnimFromReveal = 0.0;
     m_overflowAnimToReveal = 1.0;
     m_overflowReveal = 0.0;
     m_overflowAnimStartedAt = QpcSeconds();
     m_overflowVisibility = VisibilityState::Showing;
-    // Park at the final rest position; the clip grows up from the dock edge.
-    ShowWindow(m_overflowWindow, SW_SHOWNA);
-    SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(origin.y),
-        SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
-    ApplyOverflowRevealClip(0.0);
-    PositionDockSettings();
+    // Paint caches bits then presents with reveal=0 (hidden) — no full-frame flash.
+    RebuildOverflowPopup();
+    if (m_overflowWindow == nullptr || m_overflowPresentBits.empty()) {
+        m_overflowVisibility = VisibilityState::Hidden;
+        return;
+    }
+    PresentOverflowLayer(0.0);
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
     }
@@ -3085,16 +3123,7 @@ void DockApp::AdvanceOverflowAnimation() {
     const double eased = linear * linear * (3.0 - 2.0 * linear);
     const double reveal = m_overflowAnimFromReveal +
         (m_overflowAnimToReveal - m_overflowAnimFromReveal) * eased;
-
-    POINT origin{};
-    LONG caret = m_overflowCaretX;
-    if (OverflowScreenOrigin(origin, caret)) {
-        m_overflowCaretX = caret;
-        SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(origin.y),
-            SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
-        PositionDockSettings();
-    }
-    ApplyOverflowRevealClip(reveal);
+    PresentOverflowLayer(reveal);
 
     if (linear < 1.0) {
         return;
@@ -3102,9 +3131,7 @@ void DockApp::AdvanceOverflowAnimation() {
 
     if (m_overflowVisibility == VisibilityState::Showing) {
         m_overflowVisibility = VisibilityState::Visible;
-        m_overflowReveal = 1.0;
-        ApplyOverflowRevealClip(1.0);
-        PositionOverflowPopup();
+        PresentOverflowLayer(1.0);
         return;
     }
 
@@ -4236,6 +4263,10 @@ void DockApp::PositionOverflowPopup() {
     if (m_overflowWindow == nullptr || !IsOverflowOpen()) {
         return;
     }
+    if (!m_overflowPresentBits.empty()) {
+        PresentOverflowLayer(m_overflowReveal);
+        return;
+    }
     POINT origin{};
     LONG caret = m_overflowCaretX;
     if (!OverflowScreenOrigin(origin, caret)) {
@@ -4244,10 +4275,6 @@ void DockApp::PositionOverflowPopup() {
     m_overflowCaretX = caret;
     SetWindowPos(m_overflowWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(origin.y),
         SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy), SWP_NOACTIVATE);
-    if (IsOverflowAnimating() || m_overflowReveal < 1.0) {
-        ApplyOverflowRevealClip(m_overflowReveal);
-    }
-    // The settings panel is anchored beside Quick Settings; follow its moves.
     PositionDockSettings();
 }
 
@@ -4787,16 +4814,20 @@ void DockApp::PaintOverflowPopup() {
 
 
 
-    POINT source{0, 0};
-    POINT destination = origin;
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(m_overflowWindow, nullptr, &destination, &m_overflowSize, memory, &source, 0,
-        &blend, ULW_ALPHA);
+    const size_t bytes = pixelCount * 4U;
+    m_overflowPresentBits.resize(bytes);
+    std::memcpy(m_overflowPresentBits.data(), pixels, bytes);
+    m_overflowPresentSize = m_overflowSize;
     SelectObject(memory, previousBitmap);
     DeleteObject(bitmap);
     DeleteDC(memory);
-    ShowWindow(m_overflowWindow, SW_SHOWNA);
-    PositionOverflowPopup();
+    // Use the active reveal so open-animation never flashes a full frame.
+    const double presentReveal =
+        (m_overflowVisibility == VisibilityState::Showing ||
+            m_overflowVisibility == VisibilityState::Hiding)
+        ? m_overflowReveal
+        : 1.0;
+    PresentOverflowLayer(presentReveal);
 }
 
 UINT DockApp::DesiredTrayIntervalMs() const noexcept {
