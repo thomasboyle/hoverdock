@@ -75,6 +75,10 @@ jobs:
             $version = "$($parts[0]).$($parts[1]).$($parts[2] + 1)"
             Write-Host "Tag exists, trying: $version"
           }
+          # A missing tag makes rev-parse exit 1 — the expected path, not a
+          # failure. The runner exits this step with a stale $LASTEXITCODE, so
+          # reset it explicitly (verified: plain assignment works on PS 5.1).
+          $LASTEXITCODE = 0
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Configure and build Release
