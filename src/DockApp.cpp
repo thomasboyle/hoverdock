@@ -97,6 +97,12 @@ POINT ClientFromDockOrigin(POINT screen, LONG windowX, LONG currentY) noexcept {
     return {screen.x - windowX, screen.y - currentY};
 }
 
+
+POINT ScreenFromDockClient(POINT client, LONG windowX, LONG currentY) noexcept {
+    return {client.x + windowX, client.y + currentY};
+}
+
+
 POINT ScreenPointFromClient(HWND window, LPARAM lParam) {
     POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
     if (ClientToScreen(window, &point) == FALSE) {
@@ -5740,10 +5746,8 @@ void DockApp::SnapDragGhostToInsertionSlot() {
     }
     slot = std::clamp(slot, 0, static_cast<int>(m_layoutSlotBounds.size()) - 1);
     const RECT& bounds = m_layoutSlotBounds[static_cast<size_t>(slot)];
-    POINT topLeft{bounds.left, bounds.top};
-    if (ClientToScreen(m_window, &topLeft) == FALSE) {
-        return;
-    }
+    const POINT topLeft =
+        ScreenFromDockClient({bounds.left, bounds.top}, m_windowX, m_currentY);
     UpdateDragGhostPosition({topLeft.x + m_dragGrabOffset.x, topLeft.y + m_dragGrabOffset.y});
 }
 
@@ -5912,11 +5916,23 @@ void DockApp::BeginDrag(POINT screenCursor) {
     m_dragOriginBounds = m_iconRenderData[static_cast<size_t>(m_draggedIcon)].bounds;
     m_dragInsertion = InsertionIndexForDrag(screenCursor);
 
-    POINT iconTopLeft{m_dragOriginBounds.left, m_dragOriginBounds.top};
-    if (ClientToScreen(m_window, &iconTopLeft) == FALSE) {
-        iconTopLeft = screenCursor;
-    }
-    m_dragGrabOffset = {screenCursor.x - iconTopLeft.x, screenCursor.y - iconTopLeft.y};
+    // Hit-testing uses ClientFromDockOrigin(m_windowX, m_currentY). ClientToScreen(m_window)
+    // can disagree when the HWND position briefly drifts from the layout origin, which made
+    // the ghost jump away from the press point. Keep grab math in the same space as hits.
+    // Use the original press point so the pixel they clicked stays under the cursor after
+    // the drag threshold moves the pointer slightly.
+    const POINT iconTopLeft =
+        ScreenFromDockClient({m_dragOriginBounds.left, m_dragOriginBounds.top}, m_windowX,
+            m_currentY);
+    const POINT grabCursor = (m_pressedAt.x != 0 || m_pressedAt.y != 0 || m_pressedIcon >= 0)
+        ? m_pressedAt
+        : screenCursor;
+    m_dragGrabOffset = {grabCursor.x - iconTopLeft.x, grabCursor.y - iconTopLeft.y};
+    // Ghost is the square icon face; slot bounds are taller (running dots). Clamp so a
+    // press in the indicator strip does not place the ghost with a grab outside its bitmap.
+    const LONG iconFace = std::max(1L, m_dragOriginBounds.right - m_dragOriginBounds.left);
+    m_dragGrabOffset.x = std::clamp(m_dragGrabOffset.x, 0L, iconFace - 1L);
+    m_dragGrabOffset.y = std::clamp(m_dragGrabOffset.y, 0L, iconFace - 1L);
 
     HideHoverLabel();
     EnsureDragGhostWindow();
@@ -5960,10 +5976,9 @@ void DockApp::CancelDragWithSnapBack(POINT releaseCursor) {
         return;
     }
 
-    POINT originTopLeft{m_dragOriginBounds.left, m_dragOriginBounds.top};
-    if (ClientToScreen(m_window, &originTopLeft) == FALSE) {
-        originTopLeft = releaseCursor;
-    }
+    const POINT originTopLeft =
+        ScreenFromDockClient({m_dragOriginBounds.left, m_dragOriginBounds.top}, m_windowX,
+            m_currentY);
 
     m_dragSnapFrom = {releaseCursor.x - m_dragGrabOffset.x, releaseCursor.y - m_dragGrabOffset.y};
     m_dragSnapTo = originTopLeft;
