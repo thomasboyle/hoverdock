@@ -44,10 +44,10 @@ namespace {
 constexpr double kShowDurationSeconds = 0.050;
 constexpr double kHideDurationSeconds = 0.050;
 constexpr double kDragSnapDurationSeconds = 0.050;
-constexpr double kDragThresholdLogicalPixels = 14.0;
-constexpr double kMinDragPressSeconds = 0.080;
+constexpr double kDragThresholdLogicalPixels = 20.0;
+constexpr double kMinDragPressSeconds = 0.100;
 constexpr double kMaxPointerStallSeconds = 0.220;
-constexpr size_t kMaxMissingIconsPerRefresh = 3;
+constexpr size_t kMaxMissingIconsPerRefresh = 2;
 constexpr float kMinDockScale = 0.75F;
 constexpr float kMaxDockScale = 1.5F;
 constexpr int kBottomHotZonePixels = 8;
@@ -1912,6 +1912,11 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
             m_pressedAtTime = QpcSeconds();
             m_lastPointerSampleAt = m_pressedAtTime;
             m_suppressDragUntilRelease = false;
+            m_pressedTarget =
+                static_cast<size_t>(m_pressedIcon) < m_displayApps.size()
+                    ? m_displayApps[static_cast<size_t>(m_pressedIcon)].app.target
+                    : std::wstring{};
+            m_draggedTarget.clear();
             SetCapture(window);
             RenderFrame();
         }
@@ -5849,6 +5854,10 @@ void DockApp::BeginDrag(POINT screenCursor) {
     CacheLayoutSlotBounds();
     m_draggedIcon = m_pressedIcon;
     m_dragOriginIndex = m_pressedIcon;
+    m_draggedTarget = m_pressedTarget;
+    if (m_draggedTarget.empty() && static_cast<size_t>(m_draggedIcon) < m_displayApps.size()) {
+        m_draggedTarget = m_displayApps[static_cast<size_t>(m_draggedIcon)].app.target;
+    }
     m_dragOriginBounds = m_iconRenderData[static_cast<size_t>(m_draggedIcon)].bounds;
     m_dragInsertion = InsertionIndexForDrag(screenCursor);
 
@@ -6054,6 +6063,8 @@ void DockApp::ClearPressState() noexcept {
     m_dragGrabOffset = {};
     m_pressedAt = {};
     m_pressedAtTime = 0.0;
+    m_pressedTarget.clear();
+    m_draggedTarget.clear();
     m_scalingDivider = false;
     m_hoveredDivider = -1;
 }
@@ -6087,9 +6098,68 @@ void DockApp::StopRefreshTimer() noexcept {
 
 void DockApp::ApplyPinUnpinLayoutChange() {
     ProfileScope scope("ApplyPinUnpinLayoutChange");
-    RebuildDisplayApps();
-    // Prefer geometry-only rebuild. Extent changes still need a full reload, but
-    // that path is rare during pin/unpin and is deferred to the next idle tick.
+    // CRITICAL: do NOT call RebuildDisplayApps/BuildDisplayAppsSnapshot on the UI
+    // thread. After a pin change, pin profiles are stale, so MatchesAnyPin misses and
+    // the ResolveLauncherProcessPath fallback walks every window × pin via COM/.lnk —
+    // that stalls WH_MOUSE_LL (same thread) and freezes the system cursor.
+    // Optimistically splice m_displayApps from the already-updated pin list instead.
+    const std::wstring pressedTarget = m_pressedTarget;
+    const std::wstring draggedTarget = m_draggedTarget;
+
+    std::vector<DisplayApp> byReuse;
+    byReuse.reserve(m_displayApps.size());
+    for (DisplayApp& entry : m_displayApps) {
+        if (IsSpecialDockTarget(entry.app.target) || IsLayoutOnlyTarget(entry.app.target)) {
+            continue;
+        }
+        byReuse.push_back(std::move(entry));
+    }
+
+    const auto takeMatching = [&byReuse](const PinnedApp& pin) -> DisplayApp {
+        for (auto it = byReuse.begin(); it != byReuse.end(); ++it) {
+            if (WindowCatalog::TargetsMatch(it->app.target, pin.target)) {
+                DisplayApp found = std::move(*it);
+                byReuse.erase(it);
+                found.app = pin;
+                return found;
+            }
+        }
+        return DisplayApp{pin, nullptr, -1};
+    };
+
+    std::vector<DisplayApp> next;
+    next.reserve(m_config.Pins().size() + byReuse.size() + 3U);
+    next.push_back({{L"Start", kStartTarget, L"", L""}, nullptr, -1});
+    next.push_back({{L"Search", kSearchTarget, L"", L""}, nullptr, -1});
+
+    int pinIndex = 0;
+    for (const PinnedApp& pin : m_config.Pins()) {
+        if (IsSpecialDockTarget(pin.target) || IsLayoutOnlyTarget(pin.target)) {
+            continue;
+        }
+        DisplayApp entry = takeMatching(pin);
+        entry.persistentPinIndex = pinIndex++;
+        next.push_back(std::move(entry));
+    }
+
+    std::vector<DisplayApp> unpinned;
+    unpinned.reserve(byReuse.size());
+    for (DisplayApp& entry : byReuse) {
+        entry.persistentPinIndex = -1;
+        if (entry.runningWindow != nullptr) {
+            unpinned.push_back(std::move(entry));
+        }
+    }
+    if (!unpinned.empty()) {
+        next.push_back({{L"", kDividerTarget, L"", L""}, nullptr, -1});
+        next.insert(next.end(), std::make_move_iterator(unpinned.begin()),
+            std::make_move_iterator(unpinned.end()));
+    }
+
+    m_displayApps = std::move(next);
+    m_dividerIndex = DividerIndexFromDisplayApps(m_displayApps);
+    RemapInteractionAfterLayoutChange(pressedTarget, draggedTarget);
+
     if (IconPixelExtent() != m_loadedIconExtent) {
         ScheduleDeferredRefresh();
         RebuildLayout(false);
@@ -6097,6 +6167,55 @@ void DockApp::ApplyPinUnpinLayoutChange() {
     }
     RebuildLayout(false);
     EnsureMissingPinIconsAsync();
+}
+
+void DockApp::RemapInteractionAfterLayoutChange(const std::wstring& pressedTarget,
+    const std::wstring& draggedTarget) {
+    const auto indexOfTarget = [this](const std::wstring& target) -> int {
+        if (target.empty()) {
+            return -1;
+        }
+        for (size_t index = 0; index < m_displayApps.size(); ++index) {
+            if (WindowCatalog::TargetsMatch(m_displayApps[index].app.target, target)) {
+                return static_cast<int>(index);
+            }
+        }
+        return -1;
+    };
+
+    if (!pressedTarget.empty() || m_pressedIcon >= 0) {
+        const int remapped = indexOfTarget(pressedTarget);
+        if (remapped < 0 || !IsPersistentDisplayIcon(remapped)) {
+            if (GetCapture() == m_inputWindow) {
+                ReleaseCapture();
+            }
+            ClearPressState();
+            m_suppressDragUntilRelease = true;
+            HideDragGhost();
+            return;
+        }
+        m_pressedIcon = remapped;
+        m_pressedTarget = m_displayApps[static_cast<size_t>(remapped)].app.target;
+    }
+
+    if (!draggedTarget.empty() || m_draggedIcon >= 0) {
+        const int remapped = indexOfTarget(draggedTarget.empty() ? pressedTarget : draggedTarget);
+        if (remapped < 0 || !IsPersistentDisplayIcon(remapped)) {
+            if (GetCapture() == m_inputWindow) {
+                ReleaseCapture();
+            }
+            ClearPressState();
+            m_suppressDragUntilRelease = true;
+            HideDragGhost();
+            return;
+        }
+        m_draggedIcon = remapped;
+        m_dragOriginIndex = remapped;
+        m_draggedTarget = m_displayApps[static_cast<size_t>(remapped)].app.target;
+        if (static_cast<size_t>(remapped) < m_iconRenderData.size()) {
+            m_dragOriginBounds = m_iconRenderData[static_cast<size_t>(remapped)].bounds;
+        }
+    }
 }
 
 void DockApp::ScheduleConfigSave() noexcept {
@@ -6132,7 +6251,7 @@ DockApp::RefreshSnapshot DockApp::BuildDisplayAppsSnapshot(const WindowCatalog& 
         }
     }
 
-    const auto alreadyRepresentedWindow = [&displayApps, &unpinnedApps, &windows, &pins,
+    const auto alreadyRepresentedWindow = [&displayApps, &unpinnedApps, &windows,
                                            &representedHandles](const RunningWindow& window) {
         if (representedHandles.contains(window.handle)) {
             return true;
@@ -6140,13 +6259,10 @@ DockApp::RefreshSnapshot DockApp::BuildDisplayAppsSnapshot(const WindowCatalog& 
         if (windows.MatchesAnyPin(window)) {
             return true;
         }
-        if (std::ranges::any_of(pins, [&window](const PinnedApp& pin) {
-                return WindowCatalog::TargetsMatch(
-                           WindowCatalog::ResolveLauncherProcessPath(pin), window.executablePath) ||
-                    WindowCatalog::TargetsMatch(pin.target, window.executablePath);
-            })) {
-            return true;
-        }
+        // No ResolveLauncherProcessPath here: background refresh already rebuilt pin
+        // profiles, and MatchesAnyPin/MatchesPin/FindWindowFor cover matching. The
+        // COM/.lnk resolve fallback froze WH_MOUSE_LL when this ran on the UI thread
+        // via optimistic pin RebuildDisplayApps.
         const auto referencesWindow = [&window, &windows](const DockApp::DisplayApp& app) {
             if (app.runningWindow == window.handle) {
                 return true;
@@ -6359,16 +6475,11 @@ void DockApp::ApplyBackgroundRefresh(UINT generation) {
     m_dividerIndex = DividerIndexFromDisplayApps(m_displayApps);
 
     if (snapshot.layoutChanged) {
-        // Icon slots jump under a held press during first-launch refresh storms;
-        // cancel the press so a Settings tile cannot follow the cursor.
-        if (m_pressedIcon >= 0 || m_draggedIcon >= 0) {
-            if (GetCapture() == m_inputWindow) {
-                ReleaseCapture();
-            }
-            ClearPressState();
-            m_suppressDragUntilRelease = true;
-            HideDragGhost();
-        }
+        // Prefer remapping by app.target; if the pressed/dragged app vanished or is
+        // no longer a persistent pin, cancel so a Settings tile cannot follow the cursor.
+        const std::wstring pressedTarget = m_pressedTarget;
+        const std::wstring draggedTarget = m_draggedTarget;
+        RemapInteractionAfterLayoutChange(pressedTarget, draggedTarget);
         RebuildLayout(false);
     }
 

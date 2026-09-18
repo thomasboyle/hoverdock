@@ -349,6 +349,8 @@ private:
     void PumpCursorWatch();
     [[nodiscard]] bool IsElevatedForeground() const noexcept;
     void ApplyPinUnpinLayoutChange();
+    void RemapInteractionAfterLayoutChange(const std::wstring& pressedTarget,
+        const std::wstring& draggedTarget);
     void RegisterSystemResumeNotifications();
     void UnregisterSystemResumeNotifications() noexcept;
     LRESULT HandlePowerBroadcast(WPARAM wParam, LPARAM lParam);
@@ -435,6 +437,8 @@ private:
     double m_pressedAtTime = 0.0;
     double m_lastPointerSampleAt = 0.0;
     bool m_suppressDragUntilRelease = false;
+    std::wstring m_pressedTarget;
+    std::wstring m_draggedTarget;
     bool m_taskbarHidden = false;
     int m_taskbarMonitorQuietPasses = 0;
     bool m_taskbarMonitorFast = true;
