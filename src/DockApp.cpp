@@ -1995,8 +1995,10 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
         if (m_scalingDivider) {
             ScheduleConfigSave();
             ReloadIconsIfExtentChanged();
-            // Backdrop timer (8 ms) refreshes glass; avoid a sync BitBlt on the click path.
-            QueueRenderFrame(false);
+            if (m_visibility == VisibilityState::Visible || m_visibility == VisibilityState::Showing) {
+                static_cast<void>(CaptureLiveBackdrop());
+            }
+            QueueRenderFrame();
         } else if (dragging) {
             FinishDrag(point);
         } else {
@@ -2009,7 +2011,7 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
             ClearPressState();
         }
         if (!dragging) {
-            QueueRenderFrame(false);
+            RenderFrame();
         }
         return 0;
     }
@@ -2327,28 +2329,14 @@ void DockApp::UpdateInputRegion() {
 
 void DockApp::PositionOverlayWindows() {
     ProfileScope scope("PositionOverlayWindows");
-    const bool animating = m_visibility == VisibilityState::Showing ||
-        m_visibility == VisibilityState::Hiding;
     const UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-    const bool geomChanged = m_positionedWindowX != m_windowX || m_positionedWindowY != m_currentY ||
-        m_positionedWidth != m_dockWidth || m_positionedHeight != m_dockHeight;
-    if (geomChanged) {
-        if (SetWindowPos(m_window, HWND_TOPMOST, m_windowX, m_currentY,
-                static_cast<int>(m_dockWidth), static_cast<int>(m_dockHeight), flags) == FALSE) {
-            Log(L"Could not position the renderer window.");
-        }
-        if (m_inputWindow != nullptr && SetWindowPos(m_inputWindow, m_window, m_windowX, m_currentY,
-                static_cast<int>(m_dockWidth), static_cast<int>(m_dockHeight), flags) == FALSE) {
-            Log(L"Could not position the dock input window.");
-        }
-        m_positionedWindowX = m_windowX;
-        m_positionedWindowY = m_currentY;
-        m_positionedWidth = m_dockWidth;
-        m_positionedHeight = m_dockHeight;
+    if (SetWindowPos(m_window, HWND_TOPMOST, m_windowX, m_currentY,
+            static_cast<int>(m_dockWidth), static_cast<int>(m_dockHeight), flags) == FALSE) {
+        Log(L"Could not position the renderer window.");
     }
-    // Mid-slide: skip hover label and popup layout (not interactive until Visible).
-    if (animating) {
-        return;
+    if (m_inputWindow != nullptr && SetWindowPos(m_inputWindow, m_window, m_windowX, m_currentY,
+            static_cast<int>(m_dockWidth), static_cast<int>(m_dockHeight), flags) == FALSE) {
+        Log(L"Could not position the dock input window.");
     }
     if (IsDragActive()) {
         BringDragGhostToFront();
@@ -4891,14 +4879,10 @@ void DockApp::AdvanceAnimation() {
     const double elapsed = SecondsSinceAnimationStarted();
     const double linear = std::clamp(elapsed / duration, 0.0, 1.0);
     const double eased = linear * linear * (3.0 - 2.0 * linear);
-    const LONG previousY = m_currentY;
     m_currentY = std::lround(static_cast<double>(m_animationFromY) +
         static_cast<double>(m_animationToY - m_animationFromY) * eased);
-    // Sub-pixel easing can repeat the same integer Y; skip SetWindowPos + GPU work.
-    if (m_currentY != previousY || linear >= 1.0) {
-        PositionOverlayWindows();
-        RenderFrame();
-    }
+    PositionOverlayWindows();
+    RenderFrame();
 
     if (linear < 1.0) {
         return;

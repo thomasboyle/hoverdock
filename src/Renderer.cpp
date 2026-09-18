@@ -1063,23 +1063,9 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         }
     }
 
-    if (m_desktopDc == nullptr) {
-        m_desktopDc = GetDC(nullptr);
-    }
-    HDC screen = m_desktopDc;
+    HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
         return false;
-    }
-
-    // When DWM composed somewhere on the desktop, the dock strip often did not
-    // change (other monitors / other regions). Probe a centre band first; on match
-    // skip the full BitBlt (~5 ms). Timer cadence stays 8 ms. Does not change
-    // kBackdropIntervalMs.
-    if (m_backdropValid && ProbeBackdropUnchanged(screen, screenRectangle)) {
-        if (changed != nullptr) {
-            *changed = false;
-        }
-        return true;
     }
 
     // SRCCOPY only: the dock windows are excluded from capture via
@@ -1089,16 +1075,12 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     // frosted blur anyway.
     const BOOL copied = BitBlt(m_backdropDc, 0, 0, width, height, screen, screenRectangle.left,
         screenRectangle.top, SRCCOPY);
-    if (copied == FALSE) {
+    const int released = ReleaseDC(nullptr, screen);
+    if (copied == FALSE || released == 0) {
         return false;
     }
 
     const uint64_t hash = HashBackdropPixels();
-    {
-        const UINT probeHeight = static_cast<UINT>((std::max)(1L, height / 4));
-        const UINT probeRow = static_cast<UINT>((height - static_cast<LONG>(probeHeight)) / 2);
-        m_backdropProbeHash = HashBackdropRows(probeRow, probeHeight);
-    }
     if (m_backdropValid && hash == m_backdropHash) {
         if (changed != nullptr) {
             *changed = false;
@@ -1604,11 +1586,6 @@ void Renderer::CreateBackdropResources() {
 }
 
 void Renderer::ReleaseBackdropResources() noexcept {
-    if (m_desktopDc != nullptr) {
-        ReleaseDC(nullptr, m_desktopDc);
-        m_desktopDc = nullptr;
-    }
-    m_backdropProbeHash = 0;
     if (m_backdropUpload != nullptr && m_backdropUploadPixels != nullptr) {
         m_backdropUpload->Unmap(0, nullptr);
     }
@@ -1639,47 +1616,6 @@ void Renderer::ReleaseBackdropResources() noexcept {
         DeleteDC(m_backdropDc);
     }
     m_backdropDc = nullptr;
-}
-
-
-bool Renderer::ProbeBackdropUnchanged(HDC screen, const RECT& screenRectangle) {
-    const LONG width = screenRectangle.right - screenRectangle.left;
-    const LONG height = screenRectangle.bottom - screenRectangle.top;
-    if (screen == nullptr || m_backdropDc == nullptr || m_backdropProbeHash == 0 || width <= 0 ||
-        height <= 0) {
-        return false;
-    }
-    const LONG probeHeight = (std::max)(1L, height / 4);
-    const LONG probeTop = screenRectangle.top + (height - probeHeight) / 2;
-    // Centre band into the top of the DIB for hashing only. Full BitBlt rewrites all
-    // rows on mismatch; on match the GPU texture is left unchanged.
-    if (BitBlt(m_backdropDc, 0, 0, width, probeHeight, screen, screenRectangle.left, probeTop,
-            SRCCOPY) == FALSE) {
-        return false;
-    }
-    return HashBackdropRows(0, static_cast<UINT>(probeHeight)) == m_backdropProbeHash;
-}
-
-uint64_t Renderer::HashBackdropRows(UINT startRow, UINT rowCount) const noexcept {
-    if (m_backdropDibPixels == nullptr || m_width == 0 || rowCount == 0 ||
-        startRow >= m_height || startRow + rowCount > m_height) {
-        return 0;
-    }
-    const uint32_t* words = reinterpret_cast<const uint32_t*>(m_backdropDibPixels);
-    const size_t rowStride = static_cast<size_t>(m_width);
-    const size_t begin = static_cast<size_t>(startRow) * rowStride;
-    const size_t count = static_cast<size_t>(rowCount) * rowStride;
-    uint64_t hash = 14695981039346656037ull;
-    constexpr size_t stride = 4;
-    for (size_t index = 0; index < count; index += stride) {
-        hash ^= words[begin + index];
-        hash *= 1099511628211ull;
-    }
-    hash ^= words[begin + count - 1];
-    hash ^= static_cast<uint64_t>(startRow) << 48;
-    hash ^= static_cast<uint64_t>(rowCount) << 32;
-    hash ^= m_width;
-    return hash;
 }
 
 uint64_t Renderer::HashBackdropPixels() const noexcept {

@@ -115,8 +115,6 @@ private:
     void ReleaseBackdropResources() noexcept;
     [[nodiscard]] bool UploadBackdropPixels();
     [[nodiscard]] uint64_t HashBackdropPixels() const noexcept;
-    [[nodiscard]] uint64_t HashBackdropRows(UINT startRow, UINT rowCount) const noexcept;
-    [[nodiscard]] bool ProbeBackdropUnchanged(HDC screen, const RECT& screenRectangle);
     [[nodiscard]] bool WaitForBackdropCopy(DWORD timeoutMs = INFINITE);
     [[nodiscard]] bool WaitForFrame(FrameResource& frame, DWORD timeoutMs = INFINITE);
     void WaitForAllFrames();
@@ -174,8 +172,6 @@ private:
     bool m_backdropInitialized = false;
     bool m_backdropValid = false;
     uint64_t m_backdropHash = 0;
-    uint64_t m_backdropProbeHash = 0;
-    HDC m_desktopDc = nullptr;
     // Last DWM composed-frame count seen by CaptureBackdrop. Used for the idle
     // fast path: when DWM hasn't composed since the last capture, the backdrop
     // pixels cannot have changed and the BitBlt is skipped (timer still fires).
