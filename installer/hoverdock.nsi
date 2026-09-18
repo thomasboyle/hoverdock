@@ -64,21 +64,27 @@ SetCompressor /SOLID lzma
   ${If} $0 != 0
     SendMessage $0 16 0 0 ; WM_CLOSE
     IntOp $1 0 + 0
-    loop:
+    loop_window:
       Sleep 200
       IntOp $1 $1 + 1
       FindWindow $0 "LiquidGlassDockWindow" ""
       ${If} $0 == 0
-        Goto done
+        Goto after_window
       ${EndIf}
       ${If} $1 >= 25 ; ~5 s grace, then force
-        ExecWait "$SYSDIR\taskkill.exe /F /IM ${APPEXE}" $0
+        ExecWait '"$SYSDIR\taskkill.exe" /F /IM ${APPEXE}' $0
         Sleep 500
-        Goto done
+        Goto after_window
       ${EndIf}
-      Goto loop
+      Goto loop_window
   ${EndIf}
-  done:
+  after_window:
+  ; Window can go away while Dock.exe still maps the file. Always wait briefly
+  ; then taskkill (no-op if already gone) so File can replace the binary
+  ; before Version is written.
+  Sleep 800
+  ExecWait '"$SYSDIR\taskkill.exe" /F /IM ${APPEXE}' $0
+  Sleep 400
   Pop $1
   Pop $0
 !macroend
@@ -94,7 +100,11 @@ FunctionEnd
 Section "Install"
   SetOutPath "$INSTDIR"
   Call CloseRunningDock
+  ClearErrors
   File "${SRCBIN}"
+  IfErrors 0 +3
+    DetailPrint "Failed to replace ${APPEXE} (file in use?). Aborting without changing Version."
+    Abort
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   ; Install location + Add/Remove Programs entry (per-user hive, no admin).

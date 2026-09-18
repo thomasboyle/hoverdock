@@ -10,6 +10,7 @@
 #include <ctime>
 #include <cwctype>
 #include <fstream>
+#include <iterator>
 #include <shellapi.h>
 #include <sstream>
 #include <vector>
@@ -706,6 +707,10 @@ std::wstring ReadRegString(HKEY root, const wchar_t* subkey, const wchar_t* valu
 }  // namespace
 
 std::string Updater::CurrentVersion() {
+    // Reference the searchable marker so the linker keeps it in Dock.exe;
+    // InstalledCopyInfo uses it to verify on-disk builds vs registry claims.
+    static const volatile char* const keepMarker = DockVersion::kVersionMarker;
+    (void)keepMarker;
     return TrimVersion(DockVersion::kVersion);
 }
 
@@ -908,6 +913,34 @@ std::wstring Updater::CurrentExecutablePath() {
     return std::wstring(buffer, length);
 }
 
+
+std::string ReadVersionMarkerFromExe(const std::wstring& exePath) {
+    if (exePath.empty()) {
+        return {};
+    }
+    std::ifstream file(exePath, std::ios::binary);
+    if (!file) {
+        return {};
+    }
+    std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    constexpr char kPrefix[] = "HoverdockVersion=";
+    const size_t pos = bytes.find(kPrefix);
+    if (pos == std::string::npos) {
+        return {};
+    }
+    size_t start = pos + sizeof(kPrefix) - 1U;
+    size_t end = start;
+    while (end < bytes.size()) {
+        const unsigned char c = static_cast<unsigned char>(bytes[end]);
+        if (!(std::isdigit(c) || c == '.' || c == '-' ||
+                (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_')) {
+            break;
+        }
+        ++end;
+    }
+    return TrimVersion(bytes.substr(start, end - start));
+}
+
 Updater::InstalledCopy Updater::InstalledCopyInfo() {
     InstalledCopy info;
     std::wstring dir = ReadRegString(HKEY_CURRENT_USER, L"Software\\Hoverdock", L"InstallDir");
@@ -928,7 +961,11 @@ Updater::InstalledCopy Updater::InstalledCopyInfo() {
     if (!dir.empty()) {
         info.exePath = dir + L"\\Dock.exe";
     }
-    info.version = TrimVersion(WideToUtf8Simple(version));
+    const std::string fromExe = ReadVersionMarkerFromExe(info.exePath);
+    const std::string fromReg = TrimVersion(WideToUtf8Simple(version));
+    // Prefer the binary marker when present: a silent install can stamp the
+    // registry Version even when Dock.exe was left unchanged (in-use replace).
+    info.version = !fromExe.empty() ? fromExe : fromReg;
     return info;
 }
 
@@ -957,10 +994,50 @@ bool Updater::LaunchInstallerAndExit(const std::wstring& installerPath) {
             INVALID_FILE_ATTRIBUTES) {
         return false;
     }
-    // Silent NSIS install (/S) which closes the running dock, replaces files,
-    // and relaunches it. Quote the path for ShellExecute.
-    HINSTANCE launched = ShellExecuteW(nullptr, nullptr, installerPath.c_str(), L"/S", nullptr,
-        SW_SHOWNORMAL);
+    // Wait for THIS process to exit before running Setup. Starting the
+    // silent installer while Dock.exe is still mapped is what left registry
+    // Version at 1.1.8 while the on-disk binary stayed 1.1.0: NSIS can write
+    // Uninstall.exe + Version after a failed/partial File replace, and/or
+    // relaunch while the old process still owns the image. Mirror the
+    // portable path: PID gate, then Setup /S (NSIS relaunches on success).
+    auto isAscii = [](const std::wstring& value) {
+        for (const wchar_t c : value) {
+            if (c > 127) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!isAscii(installerPath)) {
+        return false;
+    }
+    const DWORD pid = GetCurrentProcessId();
+    const std::wstring batch = TempDirectory() + L"\\hoverdock-setup-update.bat";
+    std::wstring script =
+        L"@echo off\r\n"
+        L"for /L %%i in (1,1,30) do (\r\n"
+        L"  tasklist /FI \"PID eq " +
+        std::to_wstring(pid) + L"\" | find \"" + std::to_wstring(pid) +
+        L"\" >nul\r\n"
+        L"  if errorlevel 1 goto runsetup\r\n"
+        L"  timeout /t 1 /nobreak >nul\r\n"
+        L")\r\n"
+        L":runsetup\r\n"
+        L"start \"\" /wait \"" + installerPath +
+        L"\" /S\r\n"
+        L"del \"%~f0\"\r\n";
+    std::string narrow = WideToUtf8Simple(script);
+    std::ofstream file(batch, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return false;
+    }
+    file.write(narrow.data(), static_cast<std::streamsize>(narrow.size()));
+    file.close();
+    if (!file) {
+        return false;
+    }
+    HINSTANCE launched =
+        ShellExecuteW(nullptr, L"open", batch.c_str(), nullptr, nullptr, SW_HIDE);
     return reinterpret_cast<INT_PTR>(launched) > 32;
 }
 
