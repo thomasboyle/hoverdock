@@ -43,6 +43,10 @@ namespace {
 
 constexpr double kShowDurationSeconds = 0.050;
 constexpr double kHideDurationSeconds = 0.050;
+// Overflow grow/shrink needs longer than the dock's tiny Y travel or it reads as a pop,
+// especially after PaintOverflowPopup itself can cost tens of ms.
+constexpr double kOverflowShowDurationSeconds = 0.160;
+constexpr double kOverflowHideDurationSeconds = 0.140;
 constexpr double kDragSnapDurationSeconds = 0.050;
 constexpr double kDragThresholdLogicalPixels = 20.0;
 constexpr double kMinDragPressSeconds = 0.100;
@@ -3097,7 +3101,6 @@ void DockApp::BeginOverflowShow() {
     m_overflowAnimFromReveal = 0.0;
     m_overflowAnimToReveal = 1.0;
     m_overflowReveal = 0.0;
-    m_overflowAnimStartedAt = QpcSeconds();
     m_overflowVisibility = VisibilityState::Showing;
     // Paint caches bits then presents with reveal=0 (hidden) — no full-frame flash.
     RebuildOverflowPopup();
@@ -3106,6 +3109,9 @@ void DockApp::BeginOverflowShow() {
         return;
     }
     PresentOverflowLayer(0.0);
+    // Start the clock after paint: Rebuild/Paint can exceed the anim duration and
+    // would otherwise make the first Advance jump straight to reveal=1.
+    m_overflowAnimStartedAt = QpcSeconds();
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
     }
@@ -3116,8 +3122,8 @@ void DockApp::AdvanceOverflowAnimation() {
         return;
     }
     const double duration = m_overflowVisibility == VisibilityState::Hiding
-        ? kHideDurationSeconds
-        : kShowDurationSeconds;
+        ? kOverflowHideDurationSeconds
+        : kOverflowShowDurationSeconds;
     const double elapsed = std::max(0.0, QpcSeconds() - m_overflowAnimStartedAt);
     const double linear = std::clamp(elapsed / duration, 0.0, 1.0);
     const double eased = linear * linear * (3.0 - 2.0 * linear);
