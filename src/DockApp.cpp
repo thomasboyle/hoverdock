@@ -159,8 +159,20 @@ bool IsLayoutOnlyTarget(const std::wstring& target) {
     return IsDividerTarget(target);
 }
 
-bool TryExcludeWindowFromCapture(HWND window) {
-    return window != nullptr && SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE) != FALSE;
+bool EnsureWindowCapturable(HWND window) {
+    // Dock windows stay visible to screenshots, recordings, and Snipping Tool
+    // by default. The glass backdrop grab hides them around its own BitBlt
+    // instead (see CaptureLiveBackdrop), so self-capture is still prevented.
+    // HOVERDOCK_EXCLUDE_CAPTURE=1 restores WDA_EXCLUDEFROMCAPTURE for debugging.
+    if (window == nullptr) {
+        return false;
+    }
+    wchar_t exclude[8]{};
+    if (GetEnvironmentVariableW(L"HOVERDOCK_EXCLUDE_CAPTURE", exclude,
+            static_cast<DWORD>(std::size(exclude))) != 0 && exclude[0] == L'1') {
+        return SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE) == FALSE;
+    }
+    return SetWindowDisplayAffinity(window, WDA_NONE) != FALSE;
 }
 
 HRGN CreateDockInputRegion(int width, int height, int cornerDiameter) {
@@ -1205,6 +1217,15 @@ int DockApp::Run() {
     RegisterForegroundWatch();
     StartCursorWatch();
 
+    // Demo / README capture: force the dock on-screen once at startup.
+    wchar_t forceVisible[8]{};
+    if (GetEnvironmentVariableW(L"HOVERDOCK_FORCE_VISIBLE", forceVisible,
+            static_cast<DWORD>(std::size(forceVisible))) > 0 &&
+        forceVisible[0] == L'1') {
+        BeginShow();
+        Log(L"HOVERDOCK_FORCE_VISIBLE=1: showing for capture.");
+    }
+
     GetCursorPos(&m_lastCursor);
     m_lastPointerSampleAt = QpcSeconds();
     HandlePointer(m_lastCursor);
@@ -2113,8 +2134,8 @@ void DockApp::CreateOverlayWindow() {
         DestroyWindow(m_window);
         throw std::runtime_error("Set dock input window alpha failed.");
     }
-    m_backdropCaptureRequiresHide = !TryExcludeWindowFromCapture(m_window);
-    TryExcludeWindowFromCapture(m_inputWindow);
+    m_backdropCaptureRequiresHide = EnsureWindowCapturable(m_window);
+    EnsureWindowCapturable(m_inputWindow);
     CreateHoverLabelWindow();
 }
 
@@ -3807,7 +3828,7 @@ void DockApp::PaintSettingsPopup() {
             Log(L"Could not create the dock settings window.");
             return;
         }
-        TryExcludeWindowFromCapture(m_settingsWindow);
+        EnsureWindowCapturable(m_settingsWindow);
     }
 
     POINT origin{};
@@ -4484,7 +4505,7 @@ void DockApp::PaintOverflowPopup() {
             Log(L"Could not create the tray overflow window.");
             return;
         }
-        TryExcludeWindowFromCapture(m_overflowWindow);
+        EnsureWindowCapturable(m_overflowWindow);
     }
 
     POINT origin{};
@@ -5022,45 +5043,50 @@ bool DockApp::CaptureLiveBackdrop() {
         m_windowX + static_cast<LONG>(m_dockWidth),
         m_currentY + static_cast<LONG>(m_dockHeight)};
 
+    // Idle fast path: the dock windows are capturable (visible in screenshots),
+    // so a BitBlt would photograph them — but hiding/showing every 8 ms tick
+    // would flicker. Only hide when DWM actually composed a new frame since the
+    // last capture; otherwise the pixels cannot have changed.
+    if (!m_backdropCaptureRequiresHide || !m_renderer.BackdropCaptureNeeded(captureBounds)) {
+        bool unchanged = false;
+        return m_renderer.CaptureBackdrop(captureBounds, &unchanged) && unchanged;
+    }
+
     bool rendererVisible = false;
     bool inputVisible = false;
     bool ghostVisible = false;
-    if (m_backdropCaptureRequiresHide) {
-        rendererVisible = IsWindowVisible(m_window) != FALSE;
-        inputVisible = m_inputWindow != nullptr && IsWindowVisible(m_inputWindow) != FALSE;
-        ghostVisible = m_dragGhostWindow != nullptr && IsWindowVisible(m_dragGhostWindow) != FALSE;
-        if (rendererVisible) {
-            ShowWindow(m_window, SW_HIDE);
-        }
-        if (inputVisible) {
-            ShowWindow(m_inputWindow, SW_HIDE);
-        }
-        if (ghostVisible) {
-            ShowWindow(m_dragGhostWindow, SW_HIDE);
-        }
-        // DwmFlush never returns while DWM composition is off (e.g. an
-        // exclusive-fullscreen game owns the display). Blocking the UI thread
-        // here would wedge input, timers, and paints indefinitely, so only
-        // flush when composition is actually running.
-        BOOL compositionEnabled = FALSE;
-        if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled)) && compositionEnabled) {
-            DwmFlush();
-        }
+    rendererVisible = IsWindowVisible(m_window) != FALSE;
+    inputVisible = m_inputWindow != nullptr && IsWindowVisible(m_inputWindow) != FALSE;
+    ghostVisible = m_dragGhostWindow != nullptr && IsWindowVisible(m_dragGhostWindow) != FALSE;
+    if (rendererVisible) {
+        ShowWindow(m_window, SW_HIDE);
+    }
+    if (inputVisible) {
+        ShowWindow(m_inputWindow, SW_HIDE);
+    }
+    if (ghostVisible) {
+        ShowWindow(m_dragGhostWindow, SW_HIDE);
+    }
+    // DwmFlush never returns while DWM composition is off (e.g. an
+    // exclusive-fullscreen game owns the display). Blocking the UI thread
+    // here would wedge input, timers, and paints indefinitely, so only
+    // flush when composition is actually running.
+    BOOL compositionEnabled = FALSE;
+    if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled)) && compositionEnabled) {
+        DwmFlush();
     }
 
     bool changed = true;
     const bool captured = m_renderer.CaptureBackdrop(captureBounds, &changed);
 
-    if (m_backdropCaptureRequiresHide) {
-        if (rendererVisible) {
-            ShowWindow(m_window, SW_SHOWNOACTIVATE);
-        }
-        if (inputVisible) {
-            ShowWindow(m_inputWindow, SW_SHOWNOACTIVATE);
-        }
-        if (ghostVisible) {
-            ShowWindow(m_dragGhostWindow, SW_SHOWNOACTIVATE);
-        }
+    if (rendererVisible) {
+        ShowWindow(m_window, SW_SHOWNOACTIVATE);
+    }
+    if (inputVisible) {
+        ShowWindow(m_inputWindow, SW_SHOWNOACTIVATE);
+    }
+    if (ghostVisible) {
+        ShowWindow(m_dragGhostWindow, SW_SHOWNOACTIVATE);
     }
 
     return captured && changed;
@@ -5104,6 +5130,12 @@ void DockApp::BeginShow() {
 }
 
 void DockApp::BeginHide() {
+    wchar_t forceVisible[8]{};
+    if (GetEnvironmentVariableW(L"HOVERDOCK_FORCE_VISIBLE", forceVisible,
+            static_cast<DWORD>(std::size(forceVisible))) > 0 &&
+        forceVisible[0] == L'1') {
+        return;
+    }
     ProfileScope scope("BeginHide");
     if (m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding) {
         return;
@@ -5257,7 +5289,13 @@ void DockApp::HandlePointer(POINT cursor) {
         return;
     }
 
-    if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
+    wchar_t forceVisibleHide[8]{};
+    const bool captureForceVisible =
+        GetEnvironmentVariableW(L"HOVERDOCK_FORCE_VISIBLE", forceVisibleHide,
+            static_cast<DWORD>(std::size(forceVisibleHide))) > 0 &&
+        forceVisibleHide[0] == L'1';
+    if (!captureForceVisible &&
+        (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
         !inHotZone && !IsLaunchPromptOpen() && !IsCursorOverDock(cursor) &&
         !IsCursorWithinFlyoutZone(cursor) &&
         (cursor.y < m_visibleY ||
@@ -5527,7 +5565,7 @@ bool DockApp::OpenLaunchPrompt() {
         Log(L"Could not create the launch prompt window.");
         return false;
     }
-    TryExcludeWindowFromCapture(m_launchPromptWindow);
+    EnsureWindowCapturable(m_launchPromptWindow);
 
     const DWORD corner = DWMWCP_ROUND;
     DwmSetWindowAttribute(m_launchPromptWindow, DWMWA_WINDOW_CORNER_PREFERENCE, &corner,
@@ -5974,7 +6012,7 @@ void DockApp::EnsureDragGhostWindow() {
         Log(L"Could not create the drag ghost window.");
         return;
     }
-    TryExcludeWindowFromCapture(m_dragGhostWindow);
+    EnsureWindowCapturable(m_dragGhostWindow);
 }
 
 void DockApp::UpdateDragGhostContent() {

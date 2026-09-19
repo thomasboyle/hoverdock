@@ -1024,6 +1024,24 @@ std::vector<uint8_t> Renderer::ExtractIconPixels(const std::vector<std::wstring>
         IconAtlasExtent(displayExtent));
 }
 
+bool Renderer::BackdropCaptureNeeded(const RECT& screenRectangle) const noexcept {
+    const LONG width = screenRectangle.right - screenRectangle.left;
+    const LONG height = screenRectangle.bottom - screenRectangle.top;
+    if (m_backdropDc == nullptr || m_backdropDibPixels == nullptr || m_backdropTexture == nullptr ||
+        width != static_cast<LONG>(m_width) || height != static_cast<LONG>(m_height)) {
+        return false;
+    }
+    if (!m_backdropValid) {
+        return true;
+    }
+    DWM_TIMING_INFO timing{};
+    timing.cbSize = sizeof(timing);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
+        return true;
+    }
+    return !m_backdropDwmFrameValid || timing.cFrame != m_backdropDwmFrame;
+}
+
 bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     ProfileScope scope("Renderer::CaptureBackdrop");
     const LONG width = screenRectangle.right - screenRectangle.left;
@@ -1068,11 +1086,11 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         return false;
     }
 
-    // SRCCOPY only: the dock windows are excluded from capture via
-    // WDA_EXCLUDEFROMCAPTURE, so self-capture is already prevented. CAPTUREBLT
-    // forces synchronous composition of all layered windows and measured 2-10 ms
-    // per 8 ms tick; layered content under the dock is rare and hidden by the
-    // frosted blur anyway.
+    // SRCCOPY only: the dock hides its own windows around this BitBlt (see
+    // DockApp::CaptureLiveBackdrop), so self-capture is already prevented.
+    // CAPTUREBLT forces synchronous composition of all layered windows and
+    // measured 2-10 ms per 8 ms tick; layered content under the dock is rare
+    // and hidden by the frosted blur anyway.
     const BOOL copied = BitBlt(m_backdropDc, 0, 0, width, height, screen, screenRectangle.left,
         screenRectangle.top, SRCCOPY);
     const int released = ReleaseDC(nullptr, screen);
