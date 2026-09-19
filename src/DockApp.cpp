@@ -162,15 +162,12 @@ bool IsLayoutOnlyTarget(const std::wstring& target) {
     return IsDividerTarget(target);
 }
 
-bool SetWindowCaptureExcluded(HWND window, bool excludeFromCapture) {
-    if (window == nullptr) {
-        return false;
-    }
-    // WDA_NONE: visible to Snipping Tool / Game Bar / Discord. WDA_EXCLUDEFROMCAPTURE
-    // is applied only for the duration of a backdrop BitBlt so the glass does not
-    // photograph itself (see CaptureLiveBackdrop).
-    const DWORD affinity = excludeFromCapture ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE;
-    return SetWindowDisplayAffinity(window, affinity) != FALSE;
+bool EnsureWindowCapturable(HWND window) {
+    // Always WDA_NONE. The render HWND uses WS_EX_NOREDIRECTIONBITMAP, so GDI
+    // backdrop BitBlt does not pick up the DComp glass; Snipping Tool / Game Bar
+    // still see it. Toggling WDA_EXCLUDEFROMCAPTURE on the 8 ms backdrop tick left
+    // the dock excluded for a large fraction of frames and blanked screenshots.
+    return window != nullptr && SetWindowDisplayAffinity(window, WDA_NONE) != FALSE;
 }
 
 HRGN CreateDockInputRegion(int width, int height, int cornerDiameter) {
@@ -2123,8 +2120,8 @@ void DockApp::CreateOverlayWindow() {
         DestroyWindow(m_window);
         throw std::runtime_error("Set dock input window alpha failed.");
     }
-    SetWindowCaptureExcluded(m_window, false);
-    SetWindowCaptureExcluded(m_inputWindow, false);
+    EnsureWindowCapturable(m_window);
+    EnsureWindowCapturable(m_inputWindow);
     CreateHoverLabelWindow();
 }
 
@@ -3817,7 +3814,7 @@ void DockApp::PaintSettingsPopup() {
             Log(L"Could not create the dock settings window.");
             return;
         }
-        SetWindowCaptureExcluded(m_settingsWindow, false);
+        EnsureWindowCapturable(m_settingsWindow);
     }
 
     POINT origin{};
@@ -4494,7 +4491,7 @@ void DockApp::PaintOverflowPopup() {
             Log(L"Could not create the tray overflow window.");
             return;
         }
-        SetWindowCaptureExcluded(m_overflowWindow, false);
+        EnsureWindowCapturable(m_overflowWindow);
     }
 
     POINT origin{};
@@ -5032,33 +5029,11 @@ bool DockApp::CaptureLiveBackdrop() {
         m_windowX + static_cast<LONG>(m_dockWidth),
         m_currentY + static_cast<LONG>(m_dockHeight)};
 
-    // Idle: DWM has not composed since the last backdrop — skip affinity toggles
-    // and BitBlt. Affinity/ShowWindow every 8 ms is what flickered before.
-    if (!m_renderer.NeedsBackdropBitBlt(captureBounds)) {
-        return false;
-    }
-
-    // Exclude only while reading the desktop so the glass does not capture itself.
-    // Keep the windows shown — WDA_EXCLUDEFROMCAPTURE does not hide them on-screen.
-    SetWindowCaptureExcluded(m_window, true);
-    SetWindowCaptureExcluded(m_inputWindow, true);
-    if (m_dragGhostWindow != nullptr) {
-        SetWindowCaptureExcluded(m_dragGhostWindow, true);
-    }
-    BOOL compositionEnabled = FALSE;
-    if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled)) && compositionEnabled) {
-        DwmFlush();
-    }
-
+    // No WDA_EXCLUDEFROMCAPTURE here: flipping it around BitBlt left Snipping Tool
+    // seeing a blank dock. WS_EX_NOREDIRECTIONBITMAP already keeps DComp glass out
+    // of the GDI desktop BitBlt used for the frosted backdrop.
     bool changed = true;
     const bool captured = m_renderer.CaptureBackdrop(captureBounds, &changed);
-
-    SetWindowCaptureExcluded(m_window, false);
-    SetWindowCaptureExcluded(m_inputWindow, false);
-    if (m_dragGhostWindow != nullptr) {
-        SetWindowCaptureExcluded(m_dragGhostWindow, false);
-    }
-
     return captured && changed;
 }
 
@@ -5523,7 +5498,7 @@ bool DockApp::OpenLaunchPrompt() {
         Log(L"Could not create the launch prompt window.");
         return false;
     }
-    SetWindowCaptureExcluded(m_launchPromptWindow, false);
+    EnsureWindowCapturable(m_launchPromptWindow);
 
     const DWORD corner = DWMWCP_ROUND;
     DwmSetWindowAttribute(m_launchPromptWindow, DWMWA_WINDOW_CORNER_PREFERENCE, &corner,
@@ -5970,7 +5945,7 @@ void DockApp::EnsureDragGhostWindow() {
         Log(L"Could not create the drag ghost window.");
         return;
     }
-    SetWindowCaptureExcluded(m_dragGhostWindow, false);
+    EnsureWindowCapturable(m_dragGhostWindow);
 }
 
 void DockApp::UpdateDragGhostContent() {
