@@ -406,6 +406,7 @@ private:
     HHOOK m_mouseHook = nullptr;
     HFONT m_hoverLabelFont = nullptr;
     UINT m_hoverLabelFontDpi = 0;
+    int m_hoverLabelFontPx = 0;
     HBITMAP m_dragGhostBitmap = nullptr;
     HDC m_dragGhostMemoryDc = nullptr;
     HGDIOBJ m_dragGhostPreviousBitmap = nullptr;

@@ -2143,23 +2143,27 @@ void DockApp::DestroyHoverLabelFont() noexcept {
         DeleteObject(m_hoverLabelFont);
         m_hoverLabelFont = nullptr;
         m_hoverLabelFontDpi = 0;
+        m_hoverLabelFontPx = 0;
     }
 }
 
 HFONT DockApp::HoverLabelFont() {
-    const UINT dpi = GetDpiForWindow(m_window);
-    if (m_hoverLabelFont != nullptr && dpi == m_hoverLabelFontDpi) {
+    const UINT dpi = m_window != nullptr ? GetDpiForWindow(m_window) : 96U;
+    const float scale =
+        static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F * std::max(0.75F, m_dockScale);
+    // Match the dock clock date face: Segoe UI / FW_NORMAL / ~17px at 96 DPI.
+    const int pixelHeight = std::max(15, static_cast<int>(std::lround(17.0F * scale)));
+    if (m_hoverLabelFont != nullptr && dpi == m_hoverLabelFontDpi &&
+        pixelHeight == m_hoverLabelFontPx) {
         return m_hoverLabelFont;
     }
 
     DestroyHoverLabelFont();
-    NONCLIENTMETRICSW metrics{sizeof(metrics)};
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0) == FALSE) {
-        return static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    }
-
-    m_hoverLabelFont = CreateFontIndirectW(&metrics.lfMessageFont);
+    m_hoverLabelFont = CreateFontW(-pixelHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     m_hoverLabelFontDpi = dpi;
+    m_hoverLabelFontPx = pixelHeight;
     return m_hoverLabelFont == nullptr
         ? static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))
         : m_hoverLabelFont;
