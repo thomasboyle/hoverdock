@@ -502,6 +502,70 @@ void FillPillColorPremul(uint8_t* dest, int destWidth, int destHeight, float cxL
     }
 }
 
+void FillCircleColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
+    float radius, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
+    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - 1.0F)));
+    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 1.0F)));
+    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 1.0F)));
+    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 1.0F)));
+    const float aa = 1.15F;
+    for (int y = top; y < bottom; ++y) {
+        for (int x = left; x < right; ++x) {
+            const float dx = static_cast<float>(x) + 0.5F - cx;
+            const float dy = static_cast<float>(y) + 0.5F - cy;
+            const float coverage =
+                1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / aa + 0.5F, 0.0F, 1.0F);
+            if (coverage <= 0.0F) {
+                continue;
+            }
+            const float srcA = coverage * alpha;
+            uint8_t pixel[4] = {
+                static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
+                static_cast<uint8_t>(std::lround(255.0F * srcA)),
+            };
+            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+        }
+    }
+}
+
+void FillCircleLevelColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
+    float radius, float level, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
+    level = std::clamp(level, 0.0F, 1.0F);
+    if (level <= 0.0F || radius <= 0.0F) {
+        return;
+    }
+    const float fillTop = cy + radius - 2.0F * radius * level;
+    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - 1.0F)));
+    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 1.0F)));
+    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 1.0F)));
+    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 1.0F)));
+    const float aa = 1.15F;
+    for (int y = top; y < bottom; ++y) {
+        if (static_cast<float>(y) + 0.5F < fillTop) {
+            continue;
+        }
+        for (int x = left; x < right; ++x) {
+            const float dx = static_cast<float>(x) + 0.5F - cx;
+            const float dy = static_cast<float>(y) + 0.5F - cy;
+            const float coverage =
+                1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / aa + 0.5F, 0.0F, 1.0F);
+            if (coverage <= 0.0F) {
+                continue;
+            }
+            const float srcA = coverage * alpha;
+            uint8_t levelPixel[4] = {
+                static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
+                static_cast<uint8_t>(std::lround(255.0F * srcA)),
+            };
+            CompositePremul(dest, destWidth, destHeight, x, y, levelPixel, 1, 1);
+        }
+    }
+}
+
 std::wstring NotifyIconTitle(const TrayNotifyIcon& icon) {
     if (!icon.tip.empty()) {
         const size_t cut = icon.tip.find_first_of(L"\r\n");
@@ -4320,12 +4384,17 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::Sound:
     case TrayFlyoutHitKind::Boost:
     case TrayFlyoutHitKind::Brightness: {
-        // Approximate the brighter tile disc without rerunning glyph/text layout.
+        // Hover disc must match the base tile disc exactly: same center and
+        // same radius (circle * 0.5), in the toggle amber so hovering brightens
+        // the amber toward its hovered strength instead of washing it white.
+        const float scale = static_cast<float>(HostDpi()) / 96.0F;
+        const float circle =
+            static_cast<float>(std::max(44L, std::lround(52.0F * scale)));
+        const float radius = circle * 0.5F;
         const float cx = 0.5F * static_cast<float>(hit.bounds.left + hit.bounds.right);
-        const float top = static_cast<float>(hit.bounds.top);
-        const float tileW = static_cast<float>(std::max(1L, hit.bounds.right - hit.bounds.left));
-        const float radius = tileW * 0.28F;
-        FillCirclePremul(pixels, width, height, cx, top + radius + 4.0F, radius, 0.20F);
+        const float cy = static_cast<float>(hit.bounds.top) + radius;
+        FillCircleColorPremul(pixels, width, height, cx, cy, radius, 0.20F, kAmberB, kAmberG,
+            kAmberR);
         break;
     }
     case TrayFlyoutHitKind::ClearAll:
@@ -4673,24 +4742,41 @@ void DockApp::PaintOverflowPopup() {
         const RECT tileBounds{left, y, left + tileWidth, y + tileBlock};
         const float cx = static_cast<float>(left) + static_cast<float>(tileWidth) * 0.5F;
         const float cy = static_cast<float>(y) + static_cast<float>(circle) * 0.5F;
-        FillCirclePremul(pixels, width, height, cx, cy, static_cast<float>(circle) * 0.5F,
-            hoveredKind(tiles[index].kind) ? 0.28F : 0.16F);
-        if (tiles[index].kind == TrayFlyoutHitKind::Sound ||
-            tiles[index].kind == TrayFlyoutHitKind::Brightness) {
-            // Level meter: fill from the bottom up in a slightly whiter wash.
-            // Muted (sound) or unavailable (brightness) renders empty, unless a
-            // projected scroll value is being shown.
-            const TrayStatus& trayStatus = m_tray.Status();
-            float level = 0.0F;
-            if (tiles[index].kind == TrayFlyoutHitKind::Sound) {
-                level = trayStatus.volumeMuted ? 0.0F : trayStatus.volumeLevel;
-            } else if (projectedBrightness >= 0) {
+        const float tileRadius = static_cast<float>(circle) * 0.5F;
+        const bool isHovered = hoveredKind(tiles[index].kind);
+        const bool isSlider = tiles[index].kind == TrayFlyoutHitKind::Sound ||
+            tiles[index].kind == TrayFlyoutHitKind::Brightness;
+        // Level meter source of truth (also drives the amber state): muted
+        // (sound) or unavailable (brightness) renders empty unless a projected
+        // scroll value is being shown.
+        const TrayStatus& trayStatus = m_tray.Status();
+        float level = 0.0F;
+        if (tiles[index].kind == TrayFlyoutHitKind::Sound) {
+            level = trayStatus.volumeMuted ? 0.0F : trayStatus.volumeLevel;
+        } else if (tiles[index].kind == TrayFlyoutHitKind::Brightness) {
+            if (projectedBrightness >= 0) {
                 level = static_cast<float>(projectedBrightness) / 100.0F;
             } else if (trayStatus.brightnessAvailable) {
                 level = static_cast<float>(trayStatus.brightnessPercent) / 100.0F;
             }
-            FillCircleLevelPremul(pixels, width, height, cx, cy,
-                static_cast<float>(circle) * 0.5F, level, 0.36F);
+        }
+        const bool isFullAmber = tiles[index].kind == TrayFlyoutHitKind::Boost ||
+            (tiles[index].kind == TrayFlyoutHitKind::Wifi &&
+                trayStatus.network != TrayNetworkKind::Disconnected);
+        if (isSlider) {
+            // Dim base disc plus amber fill rising with progress, mirroring the
+            // toggle's amber-on wash so volume/brightness read as levels.
+            FillCirclePremul(pixels, width, height, cx, cy, tileRadius,
+                isHovered ? 0.28F : 0.16F);
+            FillCircleLevelColorPremul(pixels, width, height, cx, cy, tileRadius, level,
+                isHovered ? 0.62F : 0.52F, kAmberB, kAmberG, kAmberR);
+        } else if (isFullAmber) {
+            // Full amber disc at the toggle's on-strength (0.52, 0.62 hovered).
+            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius,
+                isHovered ? 0.62F : 0.52F, kAmberB, kAmberG, kAmberR);
+        } else {
+            FillCirclePremul(pixels, width, height, cx, cy, tileRadius,
+                isHovered ? 0.28F : 0.16F);
         }
         // Glyph bitmaps are cached by EnsureOverflowGlyphs above; hover repaints only composite.
         const std::vector<uint8_t>* glyph = &m_overflowGlyphBrightness;
