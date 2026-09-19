@@ -1184,8 +1184,10 @@ DockApp::~DockApp() {
     CloseLaunchPrompt(false);
     DestroyDockSettings();
     DestroyOverflowPopup();
+    DestroyContextMenu();
     DestroyHoverLabelWindow();
     DestroyHoverLabelFont();
+    DestroyContextFonts();
     DestroyDragGhostWindow();
     StopCursorWatch();
     UnregisterForegroundWatch();
@@ -1544,6 +1546,79 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+LRESULT CALLBACK DockApp::ContextWindowProcedure(HWND window, UINT message, WPARAM wParam,
+    LPARAM lParam) {
+    DockApp* app = nullptr;
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        app = static_cast<DockApp*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+    } else {
+        app = reinterpret_cast<DockApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    }
+
+    switch (message) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_MOUSEMOVE: {
+        if (app == nullptr) {
+            break;
+        }
+        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const int hover = app->ContextHitIndex(point);
+        if (hover != app->m_contextHover) {
+            app->m_contextHover = hover;
+            app->QueueContextPaint(true);
+        }
+        TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
+        TrackMouseEvent(&track);
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (app == nullptr) {
+            break;
+        }
+        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const int hit = app->ContextHitIndex(point);
+        if (hit >= 0 && static_cast<size_t>(hit) < app->m_contextHits.size()) {
+            const UINT command = app->m_contextHits[static_cast<size_t>(hit)].command;
+            app->ExecuteContextCommand(command);
+        } else {
+            app->CloseContextMenu();
+        }
+        return 0;
+    }
+
+    case WM_RBUTTONUP:
+        if (app != nullptr) {
+            app->CloseContextMenu();
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        // The concept menu dismisses as soon as the cursor leaves it.
+        // Clearing hover alone left the popup stranded when moving off-menu,
+        // so close outright (click-outside and flyout-zone leave also close).
+        if (app != nullptr) {
+            app->CloseContextMenu();
+        }
+        return 0;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE && app != nullptr) {
+            app->CloseContextMenu();
+            return 0;
+        }
+        break;
+
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
@@ -1557,9 +1632,18 @@ LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
                     static_cast<WPARAM>(static_cast<INT_PTR>(mouse->pt.x)),
                     static_cast<LPARAM>(mouse->pt.y));
             }
+        } else if ((wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
+                       wParam == WM_MBUTTONDOWN) &&
+            s_instance->IsContextMenuOpen() &&
+            !s_instance->IsCursorOverContextMenu(mouse->pt)) {
+            // Clicking elsewhere dismisses the context menu. A right-button
+            // press on another icon is allowed through so its RBUTTONUP can
+            // open a fresh menu for that icon.
+            s_instance->CloseContextMenu();
         } else if (wParam == WM_LBUTTONDOWN && s_instance->IsOverflowOpen() &&
             !s_instance->IsCursorOverOverflow(mouse->pt) &&
             !s_instance->IsCursorOverSettings(mouse->pt) &&
+            !s_instance->IsCursorOverContextMenu(mouse->pt) &&
             s_instance->IconAtScreenPoint(mouse->pt) < 0) {
             s_instance->CloseOverflowPopup();
         } else if (wParam == WM_MOUSEWHEEL && s_instance->IsOverflowOpen() &&
@@ -1677,7 +1761,9 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
 
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            if (IsDockSettingsOpen()) {
+            if (IsContextMenuOpen()) {
+                CloseContextMenu();
+            } else if (IsDockSettingsOpen()) {
                 CloseDockSettings();
             } else {
                 BeginHide();
@@ -1829,6 +1915,23 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         }
         return 0;
 
+    case kContextPaintMessage:
+        m_contextPaintQueued = false;
+        // Guarded: a paint queued before the menu closed must not re-show it.
+        if (IsContextMenuOpen()) {
+            const bool hoverOnly = m_contextHoverPaintOnly;
+            m_contextHoverPaintOnly = false;
+            if (hoverOnly && !m_contextBaseBits.empty() &&
+                m_contextBaseBits.size() == m_contextPresentBits.size() &&
+                m_contextPresentSize.cx == m_contextSize.cx &&
+                m_contextPresentSize.cy == m_contextSize.cy) {
+                PaintContextHoverFast();
+            } else {
+                PaintContextMenu();
+            }
+        }
+        return 0;
+
     case kOverflowWheelMessage: {
         // Scroll wheel over the volume/brightness circles adjusts that level.
         // Other positions ignore the wheel so underlying apps keep scrolling.
@@ -1946,10 +2049,12 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         } else if (wParam == kCursorWatchTimerId) {
             PumpCursorWatch();
         } else if (wParam == kBackdropTimerId) {
-            // Paused while Quick Settings is open: the 8ms capture + upload budget
-            // stays available for input and hover paints instead. The blur refreshes
-            // on the next tick after the popup closes.
+            // Paused while Quick Settings or the context menu is open: the 8ms
+            // capture + upload budget stays available for input and hover
+            // paints instead. The blur refreshes on the next tick after the
+            // popup closes.
             if (m_visibility == VisibilityState::Visible && !IsDragActive() && !IsOverflowOpen() &&
+                !IsContextMenuOpen() &&
                 QpcSeconds() >= m_suppressBackdropUntil && CaptureLiveBackdrop()) {
                 QueueRenderFrame(false);
             }
@@ -2008,6 +2113,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         DestroyDockSettings();
         BeginOverflowHide(false);
         DestroyOverflowPopup();
+        DestroyContextMenu();
         HideHoverLabel();
         DestroyHoverLabelWindow();
         ClearPressState();
@@ -2531,10 +2637,12 @@ void DockApp::PositionOverlayWindows() {
     PositionLaunchPrompt();
     PositionOverflowPopup();
     PositionDockSettings();
+    PositionContextMenu();
 }
 
 void DockApp::UpdateHoverLabel() {
-    if (IsDragActive() || m_draggedIcon >= 0 || m_hoveredDivider >= 0 || IsOverflowOpen()) {
+    if (IsDragActive() || m_draggedIcon >= 0 || m_hoveredDivider >= 0 || IsOverflowOpen() ||
+        IsContextMenuOpen()) {
         HideHoverLabel();
         return;
     }
@@ -2563,6 +2671,36 @@ void DockApp::UpdateHoverLabel() {
         return;
     }
 
+    const UINT dpi = GetDpiForWindow(m_window);
+    const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
+    const std::wstring cacheKey =
+        text + L'|' + std::to_wstring(static_cast<int>(std::lround(scale * 100.0F)));
+    const HoverLabelBits* cached = nullptr;
+    {
+        const auto found = m_hoverLabelCache.find(cacheKey);
+        if (found != m_hoverLabelCache.end()) {
+            cached = &found->second;
+        }
+    }
+    SIZE labelSize{};
+    const std::vector<uint8_t>* labelBits = nullptr;
+    std::vector<uint8_t> rasterized;
+    if (cached != nullptr) {
+        labelSize = cached->size;
+        labelBits = &cached->pixels;
+    } else {
+        if (!RasterizeHoverLabel(text, scale, labelSize, rasterized)) {
+            HideHoverLabel();
+            return;
+        }
+        if (m_hoverLabelCache.size() >= 64) {
+            m_hoverLabelCache.clear();
+        }
+        labelBits = &m_hoverLabelCache
+                         .emplace(cacheKey, HoverLabelBits{labelSize, rasterized})
+                         .first->second.pixels;
+    }
+
     POINT iconTopLeft{m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].bounds.left,
         m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].bounds.top};
     POINT iconBottomRight{m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].bounds.right,
@@ -2572,26 +2710,96 @@ void DockApp::UpdateHoverLabel() {
         HideHoverLabel();
         return;
     }
+    const LONG gap = GreaterOf(2L, static_cast<LONG>(std::lround(4.0F * scale)));
+    const size_t byteCount =
+        static_cast<size_t>(labelSize.cx) * static_cast<size_t>(labelSize.cy) * 4U;
+    if (labelBits->size() != byteCount || labelSize.cx <= 0 || labelSize.cy <= 0) {
+        HideHoverLabel();
+        return;
+    }
 
-    HFONT font = HoverLabelFont();
-    HGDIOBJ fontObject = font;
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
         HideHoverLabel();
         return;
     }
-    HDC memory = CreateCompatibleDC(screen);
-    if (memory == nullptr) {
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = labelSize.cx;
+    header.bV5Height = -labelSize.cy;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* dibBits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &dibBits, nullptr, 0);
+    if (bitmap == nullptr || dibBits == nullptr) {
         ReleaseDC(nullptr, screen);
         HideHoverLabel();
         return;
+    }
+    std::memcpy(dibBits, labelBits->data(), byteCount);
+    HDC memory = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    if (memory == nullptr) {
+        DeleteObject(bitmap);
+        HideHoverLabel();
+        return;
+    }
+    HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
+    if (previousBitmap == nullptr || previousBitmap == HGDI_ERROR) {
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+        HideHoverLabel();
+        return;
+    }
+
+    POINT destination{iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L -
+            labelSize.cx / 2L,
+        iconTopLeft.y - labelSize.cy - gap};
+    POINT source{0L, 0L};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    const BOOL updated = UpdateLayeredWindow(m_hoverLabelWindow, nullptr, &destination, &labelSize,
+        memory, &source, 0, &blend, ULW_ALPHA);
+
+    SelectObject(memory, previousBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    if (updated == FALSE) {
+        Log(L"Could not update the hover label window.");
+        HideHoverLabel();
+        return;
+    }
+    if (SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, SaturatedInt(destination.x),
+            SaturatedInt(destination.y), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy),
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW) == FALSE) {
+        Log(L"Could not position the hover label window.");
+    }
+    m_hoverLabelIcon = m_hoveredIcon;
+}
+
+bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, SIZE& labelSize,
+    std::vector<uint8_t>& bits) {
+    HFONT font = HoverLabelFont();
+    HGDIOBJ fontObject = font;
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return false;
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    if (memory == nullptr) {
+        ReleaseDC(nullptr, screen);
+        return false;
     }
     HGDIOBJ previousFont = SelectObject(memory, fontObject);
     if (previousFont == nullptr || previousFont == HGDI_ERROR) {
         DeleteDC(memory);
         ReleaseDC(nullptr, screen);
-        HideHoverLabel();
-        return;
+        return false;
     }
 
     SIZE textSize{};
@@ -2600,21 +2808,17 @@ void DockApp::UpdateHoverLabel() {
         SelectObject(memory, previousFont);
         DeleteDC(memory);
         ReleaseDC(nullptr, screen);
-        HideHoverLabel();
-        return;
+        return false;
     }
 
-    const UINT dpi = GetDpiForWindow(m_window);
-    const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
     const LONG horizontalPadding = GreaterOf(8L, static_cast<LONG>(std::lround(12.0F * scale)));
     const LONG verticalPadding = GreaterOf(5L, static_cast<LONG>(std::lround(6.0F * scale)));
     const LONG triangleWidth = GreaterOf(10L, static_cast<LONG>(std::lround(12.0F * scale)));
     const LONG triangleHeight = GreaterOf(6L, static_cast<LONG>(std::lround(7.0F * scale)));
     const LONG cornerRadius = GreaterOf(5L, static_cast<LONG>(std::lround(7.0F * scale)));
-    const LONG gap = GreaterOf(2L, static_cast<LONG>(std::lround(4.0F * scale)));
     const LONG bubbleWidth = GreaterOf(60L, textSize.cx + horizontalPadding * 2L);
     const LONG bubbleHeight = GreaterOf(24L, textSize.cy + verticalPadding * 2L);
-    SIZE labelSize{bubbleWidth, bubbleHeight + triangleHeight};
+    labelSize = {bubbleWidth, bubbleHeight + triangleHeight};
 
     BITMAPV5HEADER header{};
     header.bV5Size = sizeof(header);
@@ -2627,27 +2831,25 @@ void DockApp::UpdateHoverLabel() {
     header.bV5GreenMask = 0x0000ff00U;
     header.bV5BlueMask = 0x000000ffU;
     header.bV5AlphaMask = 0xff000000U;
-    void* bits = nullptr;
+    void* dibBits = nullptr;
     HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
-        DIB_RGB_COLORS, &bits, nullptr, 0);
+        DIB_RGB_COLORS, &dibBits, nullptr, 0);
     ReleaseDC(nullptr, screen);
-    if (bitmap == nullptr || bits == nullptr) {
+    if (bitmap == nullptr || dibBits == nullptr) {
         SelectObject(memory, previousFont);
         DeleteDC(memory);
-        HideHoverLabel();
-        return;
+        return false;
     }
     HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
     if (previousBitmap == nullptr || previousBitmap == HGDI_ERROR) {
         DeleteObject(bitmap);
         SelectObject(memory, previousFont);
         DeleteDC(memory);
-        HideHoverLabel();
-        return;
+        return false;
     }
 
     const size_t pixelCount = static_cast<size_t>(labelSize.cx) * static_cast<size_t>(labelSize.cy);
-    std::memset(bits, 0, pixelCount * sizeof(DWORD));
+    std::memset(dibBits, 0, pixelCount * sizeof(DWORD));
     HBRUSH bubbleBrush = CreateSolidBrush(RGB(42, 42, 46));
     HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(112, 112, 120));
     if (bubbleBrush == nullptr || borderPen == nullptr) {
@@ -2661,8 +2863,7 @@ void DockApp::UpdateHoverLabel() {
         DeleteObject(bitmap);
         SelectObject(memory, previousFont);
         DeleteDC(memory);
-        HideHoverLabel();
-        return;
+        return false;
     }
     HGDIOBJ previousBrush = SelectObject(memory, bubbleBrush);
     HGDIOBJ previousPen = SelectObject(memory, borderPen);
@@ -2680,8 +2881,7 @@ void DockApp::UpdateHoverLabel() {
         DeleteObject(bitmap);
         SelectObject(memory, previousFont);
         DeleteDC(memory);
-        HideHoverLabel();
-        return;
+        return false;
     }
 
     RoundRect(memory, 0, 0, SaturatedInt(bubbleWidth), SaturatedInt(bubbleHeight),
@@ -2699,20 +2899,14 @@ void DockApp::UpdateHoverLabel() {
     DrawTextW(memory, text.c_str(), textLength, &textBounds,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-    DWORD* pixels = static_cast<DWORD*>(bits);
+    DWORD* pixels = static_cast<DWORD*>(dibBits);
     for (size_t index = 0; index < pixelCount; ++index) {
         if ((pixels[index] & 0x00ffffffU) != 0) {
             pixels[index] |= 0xff000000U;
         }
     }
-
-    POINT destination{iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L -
-            labelSize.cx / 2L,
-        iconTopLeft.y - labelSize.cy - gap};
-    POINT source{0L, 0L};
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    const BOOL updated = UpdateLayeredWindow(m_hoverLabelWindow, nullptr, &destination, &labelSize,
-        memory, &source, 0, &blend, ULW_ALPHA);
+    bits.assign(static_cast<const uint8_t*>(dibBits), static_cast<const uint8_t*>(dibBits) +
+        pixelCount * sizeof(DWORD));
 
     SelectObject(memory, previousPen);
     SelectObject(memory, previousBrush);
@@ -2722,17 +2916,7 @@ void DockApp::UpdateHoverLabel() {
     DeleteObject(bitmap);
     SelectObject(memory, previousFont);
     DeleteDC(memory);
-    if (updated == FALSE) {
-        Log(L"Could not update the hover label window.");
-        HideHoverLabel();
-        return;
-    }
-    if (SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, SaturatedInt(destination.x),
-            SaturatedInt(destination.y), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy),
-            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW) == FALSE) {
-        Log(L"Could not position the hover label window.");
-    }
-    m_hoverLabelIcon = m_hoveredIcon;
+    return true;
 }
 
 void DockApp::HideHoverLabel() noexcept {
@@ -4280,6 +4464,15 @@ bool DockApp::IsCursorWithinFlyoutZone(POINT cursor) const noexcept {
             return true;
         }
     }
+    if (IsContextMenuOpen()) {
+        RECT menu{};
+        GetWindowRect(m_contextWindow, &menu);
+        const RECT menuZone{menu.left - margin, menu.top - margin, menu.right + margin,
+            menu.bottom + margin};
+        if (IsInside(menuZone, cursor.x, cursor.y)) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -5219,6 +5412,7 @@ void DockApp::BeginHide() {
     HideDragGhost();
     HideHoverLabel();
     BeginOverflowHide(false);
+    CloseContextMenu();
     StopRefreshTimer();
     StopTrayTimer();
     StopBackdropTimer();
@@ -5263,6 +5457,7 @@ void DockApp::AdvanceAnimation() {
     StopRefreshTimer();
     StopTrayTimer();
     BeginOverflowHide(false);
+    CloseContextMenu();
     ClearPressState();
     HideHoverLabel();
     ShowWindow(m_inputWindow, SW_HIDE);
@@ -5400,47 +5595,704 @@ void DockApp::UpdateDividerScaleDrag(POINT screenCursor) {
     QueueRenderFrame();
 }
 
-void DockApp::HandleContextMenu(POINT screenPoint) {
-    const int icon = IconAtScreenPoint(screenPoint);
-    HMENU menu = CreatePopupMenu();
-    if (menu == nullptr) {
-        return;
-    }
-
-    DisplayApp app;
-    const bool hasApp = icon >= 0 && static_cast<size_t>(icon) < m_displayApps.size() &&
+std::vector<DockApp::ContextItem> DockApp::BuildContextItems(int icon, DisplayApp& outApp,
+    bool& outHasApp, bool& outIsSpecial) const {
+    std::vector<ContextItem> items;
+    outApp = {};
+    outHasApp = icon >= 0 && static_cast<size_t>(icon) < m_displayApps.size() &&
         !IsLayoutOnlyTarget(m_displayApps[static_cast<size_t>(icon)].app.target) &&
         !IsTrayRenderIndex(icon);
-    const bool isSpecial = hasApp && IsSpecialDockTarget(m_displayApps[static_cast<size_t>(icon)].app.target);
-    if (hasApp) {
-        app = m_displayApps[static_cast<size_t>(icon)];
-        if (isSpecial) {
-            AppendMenuW(menu, MF_STRING, kContextOpen, L"Open");
+    outIsSpecial = outHasApp && IsSpecialDockTarget(m_displayApps[static_cast<size_t>(icon)].app.target);
+    const bool showBounds = m_config.ShowDevBounds();
+    if (outHasApp) {
+        outApp = m_displayApps[static_cast<size_t>(icon)];
+        if (outIsSpecial) {
+            ContextItem open;
+            open.command = kContextOpen;
+            open.label = L"Open";
+            open.glyph = L'\uE8A7';
+            items.push_back(std::move(open));
         } else {
-            const bool running = app.runningWindow != nullptr;
-            AppendMenuW(menu, MF_STRING,
-                app.persistentPinIndex >= 0 ? kContextUnpin : kContextPin,
-                app.persistentPinIndex >= 0 ? L"Unpin from taskbar" : L"Pin to taskbar");
-            if (running) {
-                AppendMenuW(menu, MF_STRING, kContextEndTask, L"End task");
-                AppendMenuW(menu, MF_STRING, kContextClose, L"Close window");
+            const bool running = outApp.runningWindow != nullptr;
+            ContextItem pin;
+            if (outApp.persistentPinIndex >= 0) {
+                pin.command = kContextUnpin;
+                pin.label = L"Unpin from taskbar";
+                pin.glyph = L'\uE719';
+            } else {
+                pin.command = kContextPin;
+                pin.label = L"Pin to taskbar";
+                pin.glyph = L'\uE718';
             }
-            if (app.app.target.rfind(L"shell:", 0) != 0) {
-                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-                AppendMenuW(menu, MF_STRING, kContextOpenLocation, L"Open location");
+            items.push_back(std::move(pin));
+            if (running) {
+                ContextItem end;
+                end.command = kContextEndTask;
+                end.label = L"End task";
+                end.glyph = L'\uE71A';
+                items.push_back(std::move(end));
+                ContextItem close;
+                close.command = kContextClose;
+                close.label = L"Close window";
+                close.glyph = L'\uE8BB';
+                items.push_back(std::move(close));
+            }
+            if (outApp.app.target.rfind(L"shell:", 0) != 0) {
+                ContextItem location;
+                location.command = kContextOpenLocation;
+                location.label = L"Open location";
+                location.glyph = L'\uE825';
+                location.separatorBefore = true;
+                items.push_back(std::move(location));
             }
         }
     } else {
-        AppendMenuW(menu, MF_STRING, kContextPinForeground, L"Pin foreground application");
+        ContextItem foreground;
+        foreground.command = kContextPinForeground;
+        foreground.label = L"Pin foreground application";
+        foreground.glyph = L'\uE718';
+        items.push_back(std::move(foreground));
     }
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kContextToggleBounds,
-        m_config.ShowDevBounds() ? L"Hide developer bounds" : L"Show developer bounds");
+    ContextItem bounds;
+    bounds.command = kContextToggleBounds;
+    bounds.label = showBounds ? L"Hide developer bounds" : L"Show developer bounds";
+    bounds.glyph = L'\uE943';
+    bounds.separatorBefore = true;
+    items.push_back(std::move(bounds));
+    return items;
+}
 
-    const HWND menuOwner = m_inputWindow == nullptr ? m_window : m_inputWindow;
-    const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-        screenPoint.x, screenPoint.y, menuOwner, nullptr);
-    DestroyMenu(menu);
+void DockApp::HandleContextMenu(POINT screenPoint) {
+    const int icon = IconAtScreenPoint(screenPoint);
+    // Toggle: right-clicking while the menu is open for the same spot just
+    // re-anchors; a plain re-open keeps hover state sane.
+    ShowContextMenu(screenPoint, icon);
+}
+
+void DockApp::ShowContextMenu(POINT screenPoint, int icon) {
+    DisplayApp app;
+    bool hasApp = false;
+    bool isSpecial = false;
+    std::vector<ContextItem> items = BuildContextItems(icon, app, hasApp, isSpecial);
+
+    // Anchor to the clicked icon's screen center so the menu sits above it
+    // like the concept; fall back to the cursor for empty glass.
+    POINT anchor = screenPoint;
+    if (icon >= 0 && static_cast<size_t>(icon) < m_iconRenderData.size()) {
+        RECT bounds = m_iconRenderData[static_cast<size_t>(icon)].bounds;
+        POINT topLeft{bounds.left, bounds.top};
+        POINT bottomRight{bounds.right, bounds.bottom};
+        if (ClientToScreen(m_window, &topLeft) != FALSE &&
+            ClientToScreen(m_window, &bottomRight) != FALSE) {
+            anchor.x = topLeft.x + (bottomRight.x - topLeft.x) / 2L;
+            anchor.y = topLeft.y;
+        }
+    }
+
+    CloseContextMenu();
+    BeginOverflowHide(false);
+    CloseDockSettings();
+    m_contextItems = std::move(items);
+    m_contextApp = app;
+    m_contextHasApp = hasApp;
+    m_contextIsSpecial = isSpecial;
+    m_contextAnchor = anchor;
+    m_contextHover = -1;
+    InvalidateContextGlass();
+    HideHoverLabel();
+    PaintContextMenu();
+    SyncCursorWatchInterval();
+}
+
+void DockApp::CloseContextMenu() noexcept {
+    m_contextHover = -1;
+    m_contextPaintQueued = false;
+    m_contextHoverPaintOnly = false;
+    if (m_contextWindow != nullptr) {
+        ShowWindow(m_contextWindow, SW_HIDE);
+    }
+    InvalidateContextGlass();
+    std::vector<uint8_t>().swap(m_contextBaseBits);
+    std::vector<uint8_t>().swap(m_contextPresentBits);
+    m_contextPresentSize = {};
+    SyncCursorWatchInterval();
+}
+
+void DockApp::DestroyContextMenu() noexcept {
+    CloseContextMenu();
+    m_contextItems.clear();
+    m_contextHits.clear();
+    m_contextGlyphs.clear();
+    DestroyContextFonts();
+    if (m_contextWindow != nullptr) {
+        DestroyWindow(m_contextWindow);
+        m_contextWindow = nullptr;
+    }
+}
+
+void DockApp::PositionContextMenu() {
+    if (m_contextWindow == nullptr || !IsContextMenuOpen()) {
+        return;
+    }
+    // The menu floats above the dock, so slide animation must carry it along.
+    // Recompute the origin from the current dock Y; a move needs fresh glass.
+    const POINT previous = m_contextOrigin;
+    POINT origin{};
+    if (!ContextScreenOrigin(origin)) {
+        return;
+    }
+    if (origin.x != previous.x || origin.y != previous.y) {
+        InvalidateContextGlass();
+        PaintContextMenu();
+        return;
+    }
+    if (!m_contextPresentBits.empty()) {
+        PaintContextHoverFast();
+        return;
+    }
+    SetWindowPos(m_contextWindow, HWND_TOPMOST, SaturatedInt(origin.x), SaturatedInt(origin.y),
+        SaturatedInt(m_contextSize.cx), SaturatedInt(m_contextSize.cy), SWP_NOACTIVATE);
+}
+
+bool DockApp::ContextScreenOrigin(POINT& origin) const {
+    if (m_contextSize.cx <= 0 || m_contextSize.cy <= 0) {
+        return false;
+    }
+    const UINT dpi = HostDpi();
+    const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
+    const LONG gap = std::max(8L, std::lround(10.0F * scale));
+    const LONG margin = std::max(8L, std::lround(8.0F * scale));
+    LONG x = m_contextAnchor.x - m_contextSize.cx / 2L;
+    LONG y = m_currentY - gap - m_contextSize.cy;
+    // If the dock geometry is not ready yet, fall back above the cursor.
+    if (m_currentY == 0) {
+        y = m_contextAnchor.y - gap - m_contextSize.cy;
+    }
+    const LONG minX = m_hostBounds.left + margin;
+    const LONG maxX = m_hostBounds.right - m_contextSize.cx - margin;
+    if (maxX >= minX) {
+        x = std::clamp(x, minX, maxX);
+    } else {
+        x = minX;
+    }
+    y = std::max(m_hostBounds.top + margin, y);
+    origin = {x, y};
+    // Remember for the glass cache + layered present.
+    const_cast<DockApp*>(this)->m_contextOrigin = origin;
+    return true;
+}
+
+int DockApp::ContextHitIndex(POINT point) const noexcept {
+    for (size_t index = 0; index < m_contextHits.size(); ++index) {
+        if (IsInside(m_contextHits[index].bounds, point.x, point.y)) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+bool DockApp::IsContextMenuOpen() const noexcept {
+    return m_contextWindow != nullptr && IsWindowVisible(m_contextWindow) != FALSE &&
+        !m_contextItems.empty();
+}
+
+bool DockApp::IsCursorOverContextMenu(POINT cursor) const noexcept {
+    if (!IsContextMenuOpen()) {
+        return false;
+    }
+    RECT bounds{};
+    GetWindowRect(m_contextWindow, &bounds);
+    return IsInside(bounds, cursor.x, cursor.y);
+}
+
+void DockApp::InvalidateContextGlass() noexcept {
+    std::vector<uint8_t>().swap(m_contextGlass);
+    m_contextGlassSize = {};
+    m_contextGlassOrigin = {};
+}
+
+bool DockApp::ContextGlassValid(POINT origin) const noexcept {
+    return !m_contextGlass.empty() && m_contextGlassSize.cx == m_contextSize.cx &&
+        m_contextGlassSize.cy == m_contextSize.cy && m_contextGlassOrigin.x == origin.x &&
+        m_contextGlassOrigin.y == origin.y &&
+        m_contextGlass.size() ==
+            static_cast<size_t>(m_contextSize.cx) * static_cast<size_t>(m_contextSize.cy) * 4U;
+}
+
+void DockApp::EnsureContextFonts(float scale) {
+    if (m_contextLabelFont != nullptr && m_contextFontScale == scale) {
+        return;
+    }
+    DestroyContextFonts();
+    m_contextLabelFont = CreateFlyoutFont(std::max(14, static_cast<int>(std::lround(15.0F * scale))),
+        FW_NORMAL);
+    m_contextFontScale = scale;
+}
+
+void DockApp::DestroyContextFonts() noexcept {
+    if (m_contextLabelFont != nullptr) {
+        DeleteObject(m_contextLabelFont);
+        m_contextLabelFont = nullptr;
+    }
+    m_contextFontScale = 0.0F;
+}
+
+void DockApp::QueueContextPaint(bool hoverOnly) {
+    if (m_contextWindow == nullptr || !IsContextMenuOpen()) {
+        return;
+    }
+    if (!hoverOnly) {
+        m_contextHoverPaintOnly = false;
+    } else if (!m_contextPaintQueued) {
+        m_contextHoverPaintOnly = true;
+    }
+    if (m_contextPaintQueued) {
+        return;
+    }
+    m_contextPaintQueued = true;
+    PostMessageW(m_window, kContextPaintMessage, 0, 0);
+}
+
+void DockApp::PaintContextHoverFast() {
+    if (m_contextBaseBits.empty() || m_contextWindow == nullptr ||
+        m_contextPresentSize.cx <= 0 || m_contextPresentSize.cy <= 0) {
+        PaintContextMenu();
+        return;
+    }
+    m_contextPresentBits = m_contextBaseBits;
+    m_contextPresentSize = m_contextSize;
+    if (m_contextHover >= 0 && static_cast<size_t>(m_contextHover) < m_contextHits.size() &&
+        static_cast<size_t>(m_contextHover) < m_contextItems.size() &&
+        static_cast<size_t>(m_contextHover) < m_contextGlyphs.size()) {
+        const RECT& hit = m_contextHits[static_cast<size_t>(m_contextHover)].bounds;
+        const int width = SaturatedInt(m_contextPresentSize.cx);
+        const int height = SaturatedInt(m_contextPresentSize.cy);
+        const UINT dpi = HostDpi();
+        const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
+        const float radius = std::max(8.0F, 10.0F * scale);
+        const float cxL = static_cast<float>(hit.left) + radius;
+        const float cxR = static_cast<float>(hit.right) - radius;
+        const float cy = 0.5F * static_cast<float>(hit.top + hit.bottom);
+        // Concept hover: pale periwinkle blue (#DDE6FB-ish in BGR).
+        FillPillColorPremul(m_contextPresentBits.data(), width, height, cxL, cxR, cy, radius, 0.85F,
+            251, 234, 221);
+        // Re-draw the hovered row over the highlight so glyph + text stay crisp.
+        const LONG outerPad = std::max(6L, std::lround(8.0F * scale));
+        const LONG rowHeight = std::max(36L, std::lround(44.0F * scale));
+        const LONG iconBox = std::max(28L, std::lround(32.0F * scale));
+        const LONG iconGap = std::max(8L, std::lround(10.0F * scale));
+        const UINT glyphExtent =
+            static_cast<UINT>(std::max(14L, std::lround(20.0F * scale)));
+        const LONG panelWidth = SaturatedInt(m_contextSize.cx);
+        const size_t rowIndex = static_cast<size_t>(m_contextHover);
+        const ContextItem& item = m_contextItems[rowIndex];
+        const LONG rowTop = hit.top;
+        const std::vector<uint8_t>& glyph = m_contextGlyphs[rowIndex];
+        if (!glyph.empty()) {
+            const LONG iconLeft = outerPad + (iconBox - static_cast<LONG>(glyphExtent)) / 2L;
+            const LONG iconTop = rowTop + (rowHeight - static_cast<LONG>(glyphExtent)) / 2L;
+            CompositePremul(m_contextPresentBits.data(), width, height, SaturatedInt(iconLeft),
+                SaturatedInt(iconTop), glyph.data(), SaturatedInt(glyphExtent),
+                SaturatedInt(glyphExtent));
+        }
+        RECT label{outerPad + iconBox + iconGap, rowTop, panelWidth - outerPad - 8,
+            rowTop + rowHeight};
+        DrawFlyoutText(m_contextPresentBits.data(), width, height, label, m_contextLabelFont,
+            item.label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
+    }
+    POINT origin = m_contextOrigin;
+    if (origin.x == 0 && origin.y == 0) {
+        if (!ContextScreenOrigin(origin)) {
+            return;
+        }
+    }
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return;
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    if (memory == nullptr) {
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = m_contextPresentSize.cx;
+    header.bV5Height = -m_contextPresentSize.cy;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    const size_t bytes =
+        static_cast<size_t>(m_contextPresentSize.cx) * static_cast<size_t>(m_contextPresentSize.cy) * 4U;
+    if (m_contextPresentBits.size() >= bytes) {
+        std::memcpy(bits, m_contextPresentBits.data(), bytes);
+    }
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    POINT source{0, 0};
+    POINT destination{origin.x, origin.y};
+    SIZE present{m_contextPresentSize.cx, m_contextPresentSize.cy};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(m_contextWindow, nullptr, &destination, &present, memory, &source, 0,
+        &blend, ULW_ALPHA);
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+    ShowWindow(m_contextWindow, SW_SHOWNA);
+}
+
+void DockApp::PaintContextMenu() {
+    if (m_contextItems.empty()) {
+        return;
+    }
+    const UINT dpi = HostDpi();
+    const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
+    EnsureContextFonts(scale);
+    const LONG outerPad = std::max(6L, std::lround(8.0F * scale));
+    const LONG rowHeight = std::max(36L, std::lround(44.0F * scale));
+    const LONG iconBox = std::max(28L, std::lround(32.0F * scale));
+    const LONG iconGap = std::max(8L, std::lround(10.0F * scale));
+    const LONG sepGap = std::max(6L, std::lround(7.0F * scale));
+    const LONG radius = std::max(14L, std::lround(18.0F * scale));
+
+    // Measure the longest label so the menu hugs its content like the concept.
+    LONG maxText = 0;
+    {
+        HDC screen = GetDC(nullptr);
+        if (screen != nullptr) {
+            HGDIOBJ previous = SelectObject(screen, m_contextLabelFont);
+            for (const ContextItem& item : m_contextItems) {
+                SIZE extent{};
+                if (GetTextExtentPoint32W(screen, item.label.c_str(),
+                        static_cast<int>(item.label.size()), &extent) != FALSE) {
+                    maxText = std::max(maxText, extent.cx);
+                }
+            }
+            SelectObject(screen, previous);
+            ReleaseDC(nullptr, screen);
+        }
+    }
+    if (maxText <= 0) {
+        maxText = std::lround(180.0F * scale);
+    }
+    const LONG textPad = std::max(12L, std::lround(16.0F * scale));
+    LONG panelWidth = outerPad * 2L + iconBox + iconGap + maxText + textPad;
+    panelWidth = std::clamp(panelWidth, std::max(220L, std::lround(260.0F * scale)),
+        std::max(300L, std::lround(360.0F * scale)));
+
+    LONG contentY = outerPad;
+    for (const ContextItem& item : m_contextItems) {
+        if (item.separatorBefore) {
+            contentY += sepGap * 2L + 1L;
+        }
+        contentY += rowHeight;
+    }
+    contentY += outerPad;
+    m_contextSize.cx = panelWidth;
+    m_contextSize.cy = contentY;
+
+    if (m_contextWindow == nullptr) {
+        const wchar_t className[] = L"LiquidGlassDockContextMenu";
+        WNDCLASSEXW windowClass{sizeof(windowClass)};
+        windowClass.lpfnWndProc = &DockApp::ContextWindowProcedure;
+        windowClass.hInstance = m_instance;
+        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        windowClass.lpszClassName = className;
+        if (RegisterClassExW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            Log(L"Could not register the context menu window class.");
+            return;
+        }
+        constexpr DWORD extendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED |
+            WS_EX_TOPMOST;
+        m_contextWindow = CreateWindowExW(extendedStyle, className, L"", WS_POPUP, 0, 0, 1, 1,
+            m_window, nullptr, m_instance, this);
+        if (m_contextWindow == nullptr) {
+            Log(L"Could not create the context menu window.");
+            return;
+        }
+        EnsureWindowCapturable(m_contextWindow);
+    }
+
+    POINT origin{};
+    if (!ContextScreenOrigin(origin)) {
+        return;
+    }
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return;
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    if (memory == nullptr) {
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = m_contextSize.cx;
+    header.bV5Height = -m_contextSize.cy;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
+    auto* pixels = static_cast<uint8_t*>(bits);
+    const size_t pixelCount =
+        static_cast<size_t>(m_contextSize.cx) * static_cast<size_t>(m_contextSize.cy);
+    ReleaseDC(nullptr, screen);
+    if (ContextGlassValid(origin)) {
+        std::memcpy(pixels, m_contextGlass.data(), m_contextGlass.size());
+    } else {
+        std::memset(pixels, 0, pixelCount * 4U);
+        screen = GetDC(nullptr);
+        if (screen == nullptr) {
+            SelectObject(memory, previousBitmap);
+            DeleteObject(bitmap);
+            DeleteDC(memory);
+            return;
+        }
+        BitBlt(memory, 0, 0, SaturatedInt(m_contextSize.cx), SaturatedInt(m_contextSize.cy), screen,
+            SaturatedInt(origin.x), SaturatedInt(origin.y), SRCCOPY);
+        ReleaseDC(nullptr, screen);
+        const int frostRadius = std::max(4, static_cast<int>(std::lround(12.0F * scale)));
+        const int width = SaturatedInt(m_contextSize.cx);
+        const int height = SaturatedInt(m_contextSize.cy);
+        BoxBlurRgb(pixels, width, height, frostRadius);
+        BoxBlurRgb(pixels, width, height, frostRadius);
+        BoxBlurRgb(pixels, width, height, frostRadius);
+
+        constexpr LONG kMaskSupersample = 2;
+        const LONG maskW = m_contextSize.cx * kMaskSupersample;
+        const LONG maskH = m_contextSize.cy * kMaskSupersample;
+        HDC maskDc = CreateCompatibleDC(memory);
+        void* maskBits = nullptr;
+        HBITMAP maskBitmap = nullptr;
+        if (maskDc != nullptr) {
+            BITMAPV5HEADER maskHeader = header;
+            maskHeader.bV5Width = maskW;
+            maskHeader.bV5Height = -maskH;
+            maskBitmap = CreateDIBSection(maskDc, reinterpret_cast<const BITMAPINFO*>(&maskHeader),
+                DIB_RGB_COLORS, &maskBits, nullptr, 0);
+        }
+        if (maskDc != nullptr && maskBitmap != nullptr && maskBits != nullptr) {
+            HGDIOBJ previousMask = SelectObject(maskDc, maskBitmap);
+            RECT all{0, 0, maskW, maskH};
+            FillRect(maskDc, &all, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            HBRUSH whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+            HPEN whitePen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+            HGDIOBJ previousBrush = SelectObject(maskDc, whiteBrush);
+            HGDIOBJ previousPen = SelectObject(maskDc, whitePen);
+            RoundRect(maskDc, 0, 0, maskW, maskH, SaturatedInt(radius * 2L * kMaskSupersample),
+                SaturatedInt(radius * 2L * kMaskSupersample));
+            SelectObject(maskDc, previousPen);
+            SelectObject(maskDc, previousBrush);
+            DeleteObject(whitePen);
+            DeleteObject(whiteBrush);
+            auto* mask = static_cast<uint8_t*>(maskBits);
+            const LONG glassW = m_contextSize.cx;
+            const LONG glassH = m_contextSize.cy;
+            std::vector<float> coverage(pixelCount);
+            const float kMaskSamples = static_cast<float>(kMaskSupersample * kMaskSupersample);
+            for (LONG y = 0; y < glassH; ++y) {
+                for (LONG x = 0; x < glassW; ++x) {
+                    unsigned covered = 0;
+                    for (LONG sampleY = 0; sampleY < kMaskSupersample; ++sampleY) {
+                        const size_t maskRow = (static_cast<size_t>(y) * kMaskSupersample +
+                            static_cast<size_t>(sampleY)) *
+                            static_cast<size_t>(maskW);
+                        for (LONG sampleX = 0; sampleX < kMaskSupersample; ++sampleX) {
+                            covered += mask[(maskRow + static_cast<size_t>(x) * kMaskSupersample +
+                                static_cast<size_t>(sampleX)) *
+                                4U];
+                        }
+                    }
+                    coverage[static_cast<size_t>(y) * glassW + x] =
+                        static_cast<float>(covered) / (255.0F * kMaskSamples);
+                }
+            }
+            std::vector<float> blurredCoverage = coverage;
+            BoxBlurFloatPlane(blurredCoverage, SaturatedInt(glassW), SaturatedInt(glassH),
+                std::max(1, static_cast<int>(std::lround(2.6F * scale))));
+            const float tint = DOCK_GLASS_TINT * 255.0F;
+            const float mix = DOCK_GLASS_MIX;
+            const float alpha = DOCK_GLASS_ALPHA;
+            constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F};
+            for (LONG y = 0; y < glassH; ++y) {
+                for (LONG x = 0; x < glassW; ++x) {
+                    const size_t flat = static_cast<size_t>(y) * glassW + x;
+                    const float shape = coverage[flat];
+                    const float rim = std::clamp((blurredCoverage[flat] - shape) * 2.0F, 0.0F, 1.0F);
+                    const float rim4 = rim * rim * rim * rim;
+                    float noise = static_cast<float>(x) * 0.06711056F +
+                        static_cast<float>(y) * 0.00583715F;
+                    noise = noise - std::floor(noise);
+                    noise = 52.9829189F * noise;
+                    noise = (noise - std::floor(noise)) - 0.5F;
+                    uint8_t* pixel = pixels + flat * 4U;
+                    for (int channel = 0; channel < 3; ++channel) {
+                        const float frosted = static_cast<float>(pixel[channel]);
+                        const float base = frosted * (1.0F - mix) + tint * mix;
+                        const float target = base * kChannelK[channel] + tint * 0.08F;
+                        float shaded = base + 0.22F * (target - base);
+                        shaded += tint * rim * 0.12F + 255.0F * rim4 * 0.18F;
+                        shaded = std::clamp(shaded + noise, 0.0F, 255.0F);
+                        pixel[channel] =
+                            static_cast<uint8_t>(std::lround(shaded * shape * alpha));
+                    }
+                    pixel[3] = static_cast<uint8_t>(std::lround(255.0F * shape * alpha));
+                }
+            }
+            SelectObject(maskDc, previousMask);
+            DeleteObject(maskBitmap);
+            DeleteDC(maskDc);
+        }
+        m_contextGlass.assign(pixels, pixels + pixelCount * 4U);
+        m_contextGlassSize = m_contextSize;
+        m_contextGlassOrigin = origin;
+    }
+
+    const int width = SaturatedInt(m_contextSize.cx);
+    const int height = SaturatedInt(m_contextSize.cy);
+    const int pendingHover = m_contextHover;
+    m_contextHits.clear();
+    m_contextGlyphs.clear();
+    m_contextGlyphs.reserve(m_contextItems.size());
+
+    const UINT glyphExtent =
+        static_cast<UINT>(std::max(14L, std::lround(20.0F * scale)));
+    for (const ContextItem& item : m_contextItems) {
+        if (item.glyph != 0) {
+            m_contextGlyphs.push_back(m_tray.RasterizeSymbol(item.glyph, glyphExtent));
+        } else {
+            m_contextGlyphs.emplace_back();
+        }
+    }
+
+    LONG y = outerPad;
+    for (size_t index = 0; index < m_contextItems.size(); ++index) {
+        const ContextItem& item = m_contextItems[index];
+        if (item.separatorBefore) {
+            const LONG lineY = y + sepGap;
+            FillRectPremul(pixels, width, height,
+                {outerPad + 4, lineY, panelWidth - outerPad - 4, lineY + 1}, 0.16F);
+            y += sepGap * 2L + 1L;
+        }
+        const RECT rowBounds{outerPad, y, panelWidth - outerPad, y + rowHeight};
+        m_contextHits.push_back({item.command, rowBounds});
+        y += rowHeight;
+    }
+
+    // Base frame without hover, then hover applied to the present copy so
+    // mouse moves can use the fast path.
+    const size_t bytes = pixelCount * 4U;
+    m_contextBaseBits.resize(bytes);
+    std::memcpy(m_contextBaseBits.data(), pixels, bytes);
+
+    // Content: icons + labels + separators already have glass; draw text/icons.
+    y = outerPad;
+    for (size_t index = 0; index < m_contextItems.size(); ++index) {
+        const ContextItem& item = m_contextItems[index];
+        if (item.separatorBefore) {
+            y += sepGap * 2L + 1L;
+        }
+        const LONG rowTop = y;
+        const LONG iconLeft = outerPad + (iconBox - static_cast<LONG>(glyphExtent)) / 2L;
+        const LONG iconTop = rowTop + (rowHeight - static_cast<LONG>(glyphExtent)) / 2L;
+        const std::vector<uint8_t>& glyph = m_contextGlyphs[index];
+        if (!glyph.empty()) {
+            CompositePremul(pixels, width, height, SaturatedInt(iconLeft), SaturatedInt(iconTop),
+                glyph.data(), SaturatedInt(glyphExtent), SaturatedInt(glyphExtent));
+        } else if (item.command == kContextToggleBounds) {
+            RECT fallback{outerPad, rowTop, outerPad + iconBox, rowTop + rowHeight};
+            DrawFlyoutText(pixels, width, height, fallback, m_contextLabelFont, L"</>",
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 230);
+        }
+        RECT labelBounds{outerPad + iconBox + iconGap, rowTop, panelWidth - outerPad - 8,
+            rowTop + rowHeight};
+        DrawFlyoutText(pixels, width, height, labelBounds, m_contextLabelFont, item.label,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
+        y += rowHeight;
+    }
+    std::memcpy(m_contextBaseBits.data(), pixels, bytes);
+    m_contextPresentBits.resize(bytes);
+    std::memcpy(m_contextPresentBits.data(), pixels, bytes);
+    m_contextPresentSize = m_contextSize;
+    if (pendingHover >= 0 && static_cast<size_t>(pendingHover) < m_contextHits.size()) {
+        const RECT& hit = m_contextHits[static_cast<size_t>(pendingHover)].bounds;
+        const float hoverRadius = std::max(8.0F, 10.0F * scale);
+        const float cxL = static_cast<float>(hit.left) + hoverRadius;
+        const float cxR = static_cast<float>(hit.right) - hoverRadius;
+        const float cy = 0.5F * static_cast<float>(hit.top + hit.bottom);
+        FillPillColorPremul(m_contextPresentBits.data(), width, height, cxL, cxR, cy, hoverRadius,
+            0.85F, 251, 234, 221);
+        // Redraw the hovered row's content above the highlight so text stays crisp.
+        // Icons/text were already in base; re-composite them onto present.
+        const size_t rowIndex = static_cast<size_t>(pendingHover);
+        const ContextItem& item = m_contextItems[rowIndex];
+        // Re-draw highlight-aware content: copy base row then re-draw text/icon.
+        // Simplest correct: re-draw text + icon from base composition.
+        // Since base already has them, composite the highlight first would have
+        // been ideal; instead re-draw text over the highlight now.
+        LONG rowTop = m_contextHits[rowIndex].bounds.top;
+        const std::vector<uint8_t>& glyph = m_contextGlyphs[rowIndex];
+        if (!glyph.empty()) {
+            const LONG hlIconLeft = outerPad + (iconBox - static_cast<LONG>(glyphExtent)) / 2L;
+            const LONG hlIconTop = rowTop + (rowHeight - static_cast<LONG>(glyphExtent)) / 2L;
+            CompositePremul(m_contextPresentBits.data(), width, height, SaturatedInt(hlIconLeft),
+                SaturatedInt(hlIconTop), glyph.data(), SaturatedInt(glyphExtent),
+                SaturatedInt(glyphExtent));
+        }
+        RECT hlLabel{outerPad + iconBox + iconGap, rowTop, panelWidth - outerPad - 8,
+            rowTop + rowHeight};
+        DrawFlyoutText(m_contextPresentBits.data(), width, height, hlLabel, m_contextLabelFont,
+            item.label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
+        std::memcpy(pixels, m_contextPresentBits.data(), bytes);
+    }
+
+    POINT source{0, 0};
+    POINT destination = origin;
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(m_contextWindow, nullptr, &destination, &m_contextSize, memory, &source,
+        0, &blend, ULW_ALPHA);
+    SelectObject(memory, previousBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    // m_contextBaseBits already holds the clean no-hover frame (captured before
+    // the pending-hover highlight above), so the fast hover path stays valid.
+    ShowWindow(m_contextWindow, SW_SHOWNA);
+}
+
+void DockApp::ExecuteContextCommand(UINT command) {
+    if (!IsContextMenuOpen()) {
+        return;
+    }
+    const DisplayApp app = m_contextApp;
+    const bool hasApp = m_contextHasApp;
+    const bool isSpecial = m_contextIsSpecial;
+    CloseContextMenu();
 
     if (command == 0) {
         return;
@@ -5485,9 +6337,6 @@ void DockApp::HandleContextMenu(POINT screenPoint) {
         Log(L"Dock context action did not complete.");
     }
     if (configChanged) {
-        // Keep WH_MOUSE_LL responsive: never run COM/shortcut RebuildPinProfiles,
-        // full icon atlas extraction, Save, or a forced window enum on this thread.
-        // Optimistic geometry + async icons; deferred refresh rebuilds profiles off-thread.
         m_config.StopFollowingTaskbarPins();
         ScheduleConfigSave();
         ++m_refreshGeneration;
@@ -7536,14 +8385,16 @@ UINT DockApp::DesiredCursorWatchIntervalMs() const noexcept {
     // foreground window may UIPI-block WH_MOUSE_LL. When Hidden with a healthy hook,
     // return 0: no timer — hot-zone entry arrives via the hook; FG changes arrive via
     // WinEvent. Visible + stationary pointer uses a calmer poll (hover still works;
-    // leave/hide remains hook-assisted). Does not change kBackdropIntervalMs.
+    // leave/hide remains hook-assisted), unless the context menu is open where a
+    // prompt leave-dismiss needs the fast cadence. Does not change kBackdropIntervalMs.
     if (m_visibility == VisibilityState::Hidden) {
         if (m_mouseHook == nullptr || IsElevatedForeground()) {
             return kCursorWatchIntervalMs;
         }
         return kCursorWatchHiddenIntervalMs;
     }
-    if (m_visibility == VisibilityState::Visible && m_cursorWatchCalm && !IsDragActive()) {
+    if (m_visibility == VisibilityState::Visible && m_cursorWatchCalm && !IsDragActive() &&
+        !IsContextMenuOpen()) {
         return kCursorWatchCalmIntervalMs;
     }
     return kCursorWatchIntervalMs;
@@ -7749,6 +8600,7 @@ void DockApp::HideOverlayForShellFlyout() {
     StopBackdropTimer();
     HideHoverLabel();
     CloseOverflowPopup();
+    CloseContextMenu();
     if (m_window != nullptr) {
         ShowWindow(m_window, SW_HIDE);
     }

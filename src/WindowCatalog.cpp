@@ -1147,6 +1147,31 @@ std::vector<std::wstring> WindowCatalog::IconResolutionCandidates(const PinnedAp
 }
 
 std::wstring WindowCatalog::DisplayNameForApp(const PinnedApp& app, HWND runningWindow) {
+    const std::wstring runningExe =
+        runningWindow != nullptr ? ExecutablePath(runningWindow) : std::wstring{};
+    const std::wstring key = app.target + L'|' + app.name + L'|' + runningExe;
+    {
+        const std::lock_guard lock(s_displayNameMutex);
+        const auto cached = s_displayNameCache.find(key);
+        if (cached != s_displayNameCache.end()) {
+            return cached->second;
+        }
+    }
+    std::wstring name = DisplayNameForAppSlow(app, runningWindow);
+    {
+        const std::lock_guard lock(s_displayNameMutex);
+        if (s_displayNameCache.size() >= 128) {
+            s_displayNameCache.clear();
+        }
+        s_displayNameCache.emplace(key, name);
+    }
+    return name;
+}
+
+std::unordered_map<std::wstring, std::wstring> WindowCatalog::s_displayNameCache;
+std::mutex WindowCatalog::s_displayNameMutex;
+
+std::wstring WindowCatalog::DisplayNameForAppSlow(const PinnedApp& app, HWND runningWindow) {
     if (runningWindow != nullptr &&
         IsApplicationFrameHostPath(NormalizedPath(ExecutablePath(runningWindow)))) {
         // The frame host's product name ("Application Frame Host") would mislabel

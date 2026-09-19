@@ -111,4 +111,11 @@ private:
     static std::mutex s_normalizedPathMutex;
     static std::unordered_map<HWND, AumidEntry> s_aumidCache;
     static std::mutex s_aumidMutex;
+    // Display-name cache: DisplayNameForApp reads version resources from disk
+    // and COM shell names (~0.5-3ms), and the hover path calls it on EVERY
+    // icon change — fast cursor waggles burned a third of a core on it. The
+    // name is stable per (target, pin name, running exe), so cache it.
+    static std::wstring DisplayNameForAppSlow(const PinnedApp& app, HWND runningWindow);
+    static std::unordered_map<std::wstring, std::wstring> s_displayNameCache;
+    static std::mutex s_displayNameMutex;
 };

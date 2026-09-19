@@ -143,6 +143,7 @@ private:
     static constexpr UINT kContextPinForeground = 6;
     static constexpr UINT kContextToggleBounds = 7;
     static constexpr UINT kContextEndTask = 8;
+    static constexpr UINT kContextPaintMessage = WM_APP + 18;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -175,6 +176,18 @@ private:
         RECT bounds{};
     };
 
+    struct ContextItem {
+        UINT command = 0;
+        std::wstring label;
+        wchar_t glyph = 0;
+        bool separatorBefore = false;
+    };
+
+    struct ContextHit {
+        UINT command = 0;
+        RECT bounds{};
+    };
+
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK InputWindowProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
@@ -187,6 +200,8 @@ private:
     static LRESULT CALLBACK LaunchEditProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
     static LRESULT CALLBACK OverflowWindowProcedure(HWND window, UINT message, WPARAM wParam,
+        LPARAM lParam);
+    static LRESULT CALLBACK ContextWindowProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
     static LRESULT CALLBACK DockSettingsProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
@@ -203,6 +218,16 @@ private:
     void PositionOverlayWindows();
     void UpdateHoverLabel();
     void HideHoverLabel() noexcept;
+    // GDI raster of a hover bubble: 32-bit BGRA bits with the displayed alpha
+    // baked in. Pure function of (text, scale); UpdateHoverLabel caches results
+    // so fast cursor waggles blit instead of re-running font/DC churn per icon.
+    [[nodiscard]] bool RasterizeHoverLabel(const std::wstring& text, float scale, SIZE& labelSize,
+        std::vector<uint8_t>& bits);
+    struct HoverLabelBits {
+        SIZE size{};
+        std::vector<uint8_t> pixels;
+    };
+    std::unordered_map<std::wstring, HoverLabelBits> m_hoverLabelCache;
     void DestroyHoverLabelFont() noexcept;
     [[nodiscard]] HFONT HoverLabelFont();
     void LoadIconTextures();
@@ -285,6 +310,24 @@ private:
     void StopBackdropTimer() noexcept;
     void HandlePointer(POINT cursor);
     void HandleContextMenu(POINT screenPoint);
+    [[nodiscard]] std::vector<ContextItem> BuildContextItems(int icon, DisplayApp& outApp,
+        bool& outHasApp, bool& outIsSpecial) const;
+    void ShowContextMenu(POINT screenPoint, int icon);
+    void CloseContextMenu() noexcept;
+    void DestroyContextMenu() noexcept;
+    void PositionContextMenu();
+    void PaintContextMenu();
+    void PaintContextHoverFast();
+    void QueueContextPaint(bool hoverOnly = false);
+    void ExecuteContextCommand(UINT command);
+    [[nodiscard]] int ContextHitIndex(POINT point) const noexcept;
+    [[nodiscard]] bool ContextScreenOrigin(POINT& origin) const;
+    [[nodiscard]] bool IsContextMenuOpen() const noexcept;
+    [[nodiscard]] bool IsCursorOverContextMenu(POINT cursor) const noexcept;
+    void InvalidateContextGlass() noexcept;
+    [[nodiscard]] bool ContextGlassValid(POINT origin) const noexcept;
+    void EnsureContextFonts(float scale);
+    void DestroyContextFonts() noexcept;
     void ActivatePressedApp();
     bool OpenLaunchPrompt();
     void CloseLaunchPrompt(bool hideDockIfAway = true);
@@ -590,6 +633,27 @@ private:
     HFONT m_overflowSectionFont = nullptr;
     HFONT m_overflowLabelFont = nullptr;
     HFONT m_overflowStatusFont = nullptr;
+    HWND m_contextWindow = nullptr;
+    std::vector<ContextItem> m_contextItems;
+    std::vector<ContextHit> m_contextHits;
+    std::vector<std::vector<uint8_t>> m_contextGlyphs;
+    int m_contextHover = -1;
+    bool m_contextPaintQueued = false;
+    SIZE m_contextSize{};
+    POINT m_contextOrigin{};
+    POINT m_contextAnchor{};
+    DisplayApp m_contextApp;
+    bool m_contextHasApp = false;
+    bool m_contextIsSpecial = false;
+    std::vector<uint8_t> m_contextGlass;
+    SIZE m_contextGlassSize{};
+    POINT m_contextGlassOrigin{};
+    std::vector<uint8_t> m_contextBaseBits;
+    std::vector<uint8_t> m_contextPresentBits;
+    SIZE m_contextPresentSize{};
+    bool m_contextHoverPaintOnly = false;
+    float m_contextFontScale = 0.0F;
+    HFONT m_contextLabelFont = nullptr;
 
     static DockApp* s_instance;
     bool m_shellFlyoutIsTray = false;
