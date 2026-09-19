@@ -110,6 +110,8 @@ private:
     static constexpr UINT kSettingsPaintMessage = WM_APP + 13;
     static constexpr UINT kCursorWatchSyncMessage = WM_APP + 14;
     static constexpr UINT kBeginShowDeferredMessage = WM_APP + 15;
+    static constexpr UINT kLayoutApplyMessage = WM_APP + 16;
+    static constexpr UINT kDeferredClickMessage = WM_APP + 17;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
     static constexpr UINT_PTR kConfigSaveTimerId = 3;
@@ -307,6 +309,8 @@ private:
     void CompleteDrag();
     void ApplyDragPreviewLayout();
     void CacheLayoutSlotBounds();
+    [[nodiscard]] std::wstring TrayIconsKey() const;
+    [[nodiscard]] bool TrayIconsNeedApply() const;
     void UpdateDividerScaleDrag(POINT screenCursor);
     void EnsureDragGhostWindow();
     void UpdateDragGhostContent();
@@ -494,6 +498,22 @@ private:
     int m_hoverLabelIcon = -1;
     int m_dividerIndex = -1;
     UINT m_showSessionId = 0;
+    // Deferred GPU-backed layout apply (UpdateInputRegion + reposition +
+    // swapchain Resize): set when RebuildLayout changes the size, cleared by the
+    // kLayoutApplyMessage handler. Coalesces bursts (scale-drag) so only the
+    // latest dims are applied, keeping RebuildLayout itself under 1ms.
+    bool m_layoutApplyPending = false;
+    // Tray glyph upload pending (clock raster + atlas re-upload with GPU waits):
+    // set by RebuildLayout when the tray visual key changes, serviced by the
+    // same kLayoutApplyMessage handler so layout math stays under 1ms.
+    bool m_trayIconsApplyPending = false;
+    // Last rect applied by PositionOverlayWindows: skips redundant DWM
+    // SetWindowPos round-trips so steady calls cost microseconds.
+    bool m_overlayPosValid = false;
+    LONG m_overlayX = 0;
+    LONG m_overlayY = 0;
+    LONG m_overlayW = 0;
+    LONG m_overlayH = 0;
     UINT m_loadedIconExtent = 0;
     UINT m_shellFlyoutAttempts = 0;
     bool m_shellFlyoutIsSearch = false;

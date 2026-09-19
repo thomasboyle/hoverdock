@@ -618,13 +618,8 @@ bool WindowCatalog::WindowsSnapshotEqual(const std::vector<RunningWindow>& left,
 }
 
 std::wstring WindowCatalog::CachedNormalizedPath(const std::wstring& path) {
-    const auto cached = m_normalizedPathCache.find(path);
-    if (cached != m_normalizedPathCache.end()) {
-        return cached->second;
-    }
-    const std::wstring normalized = NormalizedPath(path);
-    m_normalizedPathCache.emplace(path, normalized);
-    return normalized;
+    // Shared static store so throwaway background-refresh catalogs benefit too.
+    return CachedNormalizedPathStatic(path);
 }
 
 void WindowCatalog::EnrichWindows() {
@@ -633,12 +628,59 @@ void WindowCatalog::EnrichWindows() {
         window.normalizedPath = CachedNormalizedPath(window.executablePath);
         window.executableName = FileNameWithoutExtension(window.executablePath);
         if (m_pinMatchingNeedsAumid) {
-            window.appUserModelId = AppUserModelId(window.handle);
+            window.appUserModelId = CachedAppUserModelId(window.handle);
         } else {
             window.appUserModelId.clear();
         }
     }
     m_enrichedAumid = m_pinMatchingNeedsAumid;
+}
+
+std::wstring WindowCatalog::CachedNormalizedPathStatic(const std::wstring& path) {
+    if (path.empty()) {
+        return {};
+    }
+    {
+        const std::lock_guard lock(s_normalizedPathMutex);
+        const auto cached = s_normalizedPathCache.find(path);
+        if (cached != s_normalizedPathCache.end()) {
+            return cached->second;
+        }
+    }
+    const std::wstring normalized = NormalizedPath(path);
+    {
+        const std::lock_guard lock(s_normalizedPathMutex);
+        if (s_normalizedPathCache.size() >= 512) {
+            s_normalizedPathCache.clear();
+        }
+        s_normalizedPathCache.emplace(path, normalized);
+    }
+    return normalized;
+}
+
+std::wstring WindowCatalog::CachedAppUserModelId(HWND window) {
+    if (window == nullptr || IsWindow(window) == FALSE) {
+        return {};
+    }
+    DWORD pid = 0;
+    const DWORD tid = GetWindowThreadProcessId(window, &pid);
+    if (pid != 0 && tid != 0) {
+        const std::lock_guard lock(s_aumidMutex);
+        const auto cached = s_aumidCache.find(window);
+        if (cached != s_aumidCache.end() && cached->second.processId == pid &&
+            cached->second.threadId == tid) {
+            return cached->second.aumid;
+        }
+    }
+    std::wstring aumid = AppUserModelId(window);
+    if (pid != 0 && tid != 0) {
+        const std::lock_guard lock(s_aumidMutex);
+        if (s_aumidCache.size() >= 512) {
+            s_aumidCache.clear();
+        }
+        s_aumidCache[window] = {pid, tid, aumid};
+    }
+    return aumid;
 }
 
 bool WindowCatalog::Refresh() {
@@ -1012,7 +1054,8 @@ bool WindowCatalog::AddForegroundApplication(std::vector<PinnedApp>& pins) const
 }
 
 bool WindowCatalog::TargetsMatch(const std::wstring& left, const std::wstring& right) {
-    return EqualInsensitive(NormalizedPath(left), NormalizedPath(right));
+    return EqualInsensitive(
+        CachedNormalizedPathStatic(left), CachedNormalizedPathStatic(right));
 }
 
 std::wstring WindowCatalog::ResolveLauncherProcessPath(const PinnedApp& app) {
@@ -1217,10 +1260,39 @@ std::wstring WindowCatalog::ExecutablePath(HWND window) {
     if (processId == 0) {
         return {};
     }
+    return CachedExecutablePath(processId);
+}
 
+std::unordered_map<DWORD, WindowCatalog::ProcessPathEntry> WindowCatalog::s_processPathCache;
+std::mutex WindowCatalog::s_processPathMutex;
+std::unordered_map<std::wstring, std::wstring> WindowCatalog::s_normalizedPathCache;
+std::mutex WindowCatalog::s_normalizedPathMutex;
+std::unordered_map<HWND, WindowCatalog::AumidEntry> WindowCatalog::s_aumidCache;
+std::mutex WindowCatalog::s_aumidMutex;
+
+std::wstring WindowCatalog::CachedExecutablePath(DWORD processId) {
+    if (processId == 0) {
+        return {};
+    }
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
     if (process == nullptr) {
         return {};
+    }
+    FILETIME createdFileTime{};
+    FILETIME ignored{};
+    ULONGLONG creationTime = 0;
+    if (GetProcessTimes(process, &createdFileTime, &ignored, &ignored, &ignored) != FALSE) {
+        creationTime = (static_cast<ULONGLONG>(createdFileTime.dwHighDateTime) << 32) |
+            createdFileTime.dwLowDateTime;
+    }
+    {
+        const std::lock_guard lock(s_processPathMutex);
+        const auto cached = s_processPathCache.find(processId);
+        if (cached != s_processPathCache.end() && cached->second.creationTime == creationTime &&
+            creationTime != 0) {
+            CloseHandle(process);
+            return cached->second.path;
+        }
     }
 
     std::wstring path(32768, L'\0');
@@ -1230,8 +1302,15 @@ std::wstring WindowCatalog::ExecutablePath(HWND window) {
     if (success == FALSE) {
         return {};
     }
-
     path.resize(length);
+    {
+        const std::lock_guard lock(s_processPathMutex);
+        // Bounded: process tables turn over; drop the cache rather than grow it.
+        if (s_processPathCache.size() >= 512) {
+            s_processPathCache.clear();
+        }
+        s_processPathCache[processId] = {path, creationTime};
+    }
     return path;
 }
 

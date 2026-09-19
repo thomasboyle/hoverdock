@@ -1131,7 +1131,12 @@ bool Renderer::Render(const DockRenderState& state) {
     }
 
     if (m_frameLatencyWaitableObject != nullptr) {
-        const DWORD timeout = state.allowBlockingGpuWait ? 50 : 0;
+        // Never block: a signaled waitable returns immediately (~us) and an
+        // unsignaled one means the GPU is a frame behind, in which case waiting
+        // here only stalls input on the UI thread. Pacing is preserved by the
+        // blocking Present below; the fence check after this still guards
+        // resource hazards. Keeps this scope at microseconds max.
+        const DWORD timeout = 0;
         DWORD waitResult = WAIT_OBJECT_0;
         {
             ProfileScope waitScope("Renderer::WaitLatency");

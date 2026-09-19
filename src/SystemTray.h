@@ -105,4 +105,12 @@ private:
     // prefers this over power-scheme values (which don't track external
     // monitors) so it never clobbers freshly adjusted state with stale data.
     int m_ddcPercent = -1;
+    // MeasureClock cache: GDI font creation + text measurement costs ~1ms per
+    // call, and RebuildLayout invokes it every time. The result only depends on
+    // the clock texts and the scale, so cache it (mutable: MeasureClock is
+    // const and UI-thread confined like the rest of SystemTray).
+    mutable std::wstring m_clockMeasureTime;
+    mutable std::wstring m_clockMeasureDate;
+    mutable float m_clockMeasureScale = -1.0F;
+    mutable SIZE m_clockMeasureSize{};
 };

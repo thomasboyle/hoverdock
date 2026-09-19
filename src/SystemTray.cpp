@@ -1234,6 +1234,13 @@ std::vector<uint8_t> SystemTray::RasterizeClock(UINT atlasExtent, UINT displayWi
 }
 
 SIZE SystemTray::MeasureClock(float layoutScale) const {
+    // Cache hit: same texts + scale measure identically. RebuildLayout calls
+    // this on every invocation (clock text changes at most once a minute), so
+    // this saves ~1ms of GDI font/DC churn per call.
+    if (layoutScale == m_clockMeasureScale && m_status.timeText == m_clockMeasureTime &&
+        m_status.dateText == m_clockMeasureDate) {
+        return m_clockMeasureSize;
+    }
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
         return {static_cast<LONG>(88 * layoutScale), static_cast<LONG>(40 * layoutScale)};
@@ -1263,8 +1270,12 @@ SIZE SystemTray::MeasureClock(float layoutScale) const {
 
     const LONG gap = ClockGapPx(layoutScale);
     const LONG padding = std::max(2L, static_cast<LONG>(std::lround(4.0F * layoutScale)));
-    return {std::max(timeSize.cx, dateSize.cx) + padding,
+    m_clockMeasureTime = m_status.timeText;
+    m_clockMeasureDate = m_status.dateText;
+    m_clockMeasureScale = layoutScale;
+    m_clockMeasureSize = {std::max(timeSize.cx, dateSize.cx) + padding,
         timeSize.cy + gap + dateSize.cy + padding};
+    return m_clockMeasureSize;
 }
 
 std::wstring ProcessImagePath(DWORD pid) {

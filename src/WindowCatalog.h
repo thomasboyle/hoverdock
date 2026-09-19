@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -60,6 +61,32 @@ private:
 
     static BOOL CALLBACK EnumerateWindows(HWND window, LPARAM data);
     static bool IsApplicationWindow(HWND window);
+    // PID-validated executable path: OpenProcess + QueryFullProcessImageName
+    // costs ~30-100us per window, dominating Refresh. Cache by PID, validated
+    // against process creation time so recycled PIDs never serve stale paths.
+    // Shared across catalog instances (background refreshes use throwaway
+    // catalogs); mutex-guarded, uncontended in practice.
+    struct ProcessPathEntry {
+        std::wstring path;
+        ULONGLONG creationTime = 0;
+    };
+    static std::wstring CachedExecutablePath(DWORD processId);
+    // Normalized-path cache: GetLongPathName hits FS metadata (~10-50us) per
+    // call, and TargetsMatch normalizes both sides on every comparison
+    // (RemapInteraction does dozens per pin change). Pure function of the
+    // string; bounded shared cache, same threading as above. Stale only if a
+    // pinned target is renamed mid-session (mismatch until restart).
+    static std::wstring CachedNormalizedPathStatic(const std::wstring& path);
+    // AUMID cache: SHGetPropertyStoreForWindow is COM (~100us+) per window per
+    // refresh. A window's AUMID never changes during its lifetime, so cache by
+    // HWND validated by live PID (+TID): a recycled handle with a different
+    // owner fails validation and is re-queried.
+    struct AumidEntry {
+        DWORD processId = 0;
+        DWORD threadId = 0;
+        std::wstring aumid;
+    };
+    static std::wstring CachedAppUserModelId(HWND window);
     static std::wstring ExecutablePath(HWND window);
     static std::wstring WindowTitle(HWND window);
     static std::wstring NormalizedPath(const std::wstring& path);
@@ -76,7 +103,12 @@ private:
     std::vector<RunningWindow> m_windows;
     std::vector<PinMatchProfile> m_pinProfiles;
     std::vector<PinnedApp> m_cachedPinProfileSources;
-    std::unordered_map<std::wstring, std::wstring> m_normalizedPathCache;
     bool m_pinMatchingNeedsAumid = false;
     bool m_enrichedAumid = false;
+    static std::unordered_map<DWORD, ProcessPathEntry> s_processPathCache;
+    static std::mutex s_processPathMutex;
+    static std::unordered_map<std::wstring, std::wstring> s_normalizedPathCache;
+    static std::mutex s_normalizedPathMutex;
+    static std::unordered_map<HWND, AumidEntry> s_aumidCache;
+    static std::mutex s_aumidMutex;
 };

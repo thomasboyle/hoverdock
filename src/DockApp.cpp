@@ -1749,6 +1749,54 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
     }
 
+    case kLayoutApplyMessage:
+        if (m_layoutApplyPending) {
+            m_layoutApplyPending = false;
+            UpdateInputRegion();
+            PositionOverlayWindows();
+            if (m_rendererInitialized) {
+                m_renderer.Resize(m_dockWidth, m_dockHeight);
+            }
+        }
+        if (m_trayIconsApplyPending) {
+            m_trayIconsApplyPending = false;
+            EnsureTrayIcons();
+            QueueRenderFrame();
+        }
+        return 0;
+
+    case kDeferredClickMessage: {
+        const POINT point{static_cast<LONG>(static_cast<SHORT>(LOWORD(lParam))),
+            static_cast<LONG>(static_cast<SHORT>(HIWORD(lParam)))};
+        if (m_dragSnapAnimating) {
+            return 0;
+        }
+        const int branch = static_cast<int>(wParam);
+        if (branch == 0) {
+            ScheduleConfigSave();
+            ReloadIconsIfExtentChanged();
+            if (m_visibility == VisibilityState::Visible ||
+                m_visibility == VisibilityState::Showing) {
+                static_cast<void>(CaptureLiveBackdrop());
+            }
+            QueueRenderFrame();
+        } else if (branch == 1) {
+            FinishDrag(point);
+        } else {
+            ActivatePressedApp();
+        }
+        if (GetCapture() == m_inputWindow) {
+            ReleaseCapture();
+        }
+        if (!m_dragSnapAnimating) {
+            ClearPressState();
+        }
+        if (branch != 1) {
+            QueueRenderFrame();
+        }
+        return 0;
+    }
+
     case kRefreshApplyMessage:
         ApplyBackgroundRefresh(static_cast<UINT>(wParam));
         return 0;
@@ -2089,28 +2137,14 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
         if (m_dragSnapAnimating) {
             return 0;
         }
-        const bool dragging = m_draggedIcon >= 0;
-        if (m_scalingDivider) {
-            ScheduleConfigSave();
-            ReloadIconsIfExtentChanged();
-            if (m_visibility == VisibilityState::Visible || m_visibility == VisibilityState::Showing) {
-                static_cast<void>(CaptureLiveBackdrop());
-            }
-            QueueRenderFrame();
-        } else if (dragging) {
-            FinishDrag(point);
-        } else {
-            ActivatePressedApp();
-        }
-        if (GetCapture() == window) {
-            ReleaseCapture();
-        }
-        if (!m_dragSnapAnimating) {
-            ClearPressState();
-        }
-        if (!dragging) {
-            RenderFrame();
-        }
+        // Input-critical work only: the actions below (app Focus/launch via
+        // shell IPC, drag-finish, scale-save + live capture, sync render with
+        // GPU waits) measured up to 72ms. Snapshot the branch + UP point and
+        // defer past this scope so the hook thread stays under 1ms. Same-thread
+        // FIFO preserves ordering; the point travels in lParam because the
+        // cursor may move before dispatch.
+        const WPARAM branch = m_scalingDivider ? 0 : (m_draggedIcon >= 0 ? 1 : 2);
+        PostMessageW(m_window, kDeferredClickMessage, branch, MAKELPARAM(point.x, point.y));
         return 0;
     }
 
@@ -2390,18 +2424,33 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     const bool sizeChanged = previousWidth != m_dockWidth || previousHeight != m_dockHeight;
     m_hoverLabelIcon = -1;
     if (sizeChanged) {
-        UpdateInputRegion();
-        PositionOverlayWindows();
-        if (m_rendererInitialized) {
-            m_renderer.Resize(m_dockWidth, m_dockHeight);
+        if (m_window != nullptr) {
+            // GPU-backed apply (region + reposition + swapchain Resize with its
+            // unbounded Flush wait) leaves via kLayoutApplyMessage so this
+            // function stays under 1ms. Posts coalesce: rapid bursts
+            // (scale-drag) set the flag repeatedly and the handler applies the
+            // latest dims once.
+            m_layoutApplyPending = true;
+            PostMessageW(m_window, kLayoutApplyMessage, 0, 0);
+        } else {
+            UpdateInputRegion();
+            PositionOverlayWindows();
+            if (m_rendererInitialized) {
+                m_renderer.Resize(m_dockWidth, m_dockHeight);
+            }
         }
     }
     if (reloadIcons && m_rendererInitialized) {
         LoadIconTextures();
     }
     AssignIconTextureIndices();
-    if (m_rendererInitialized) {
-        EnsureTrayIcons();
+    if (TrayIconsNeedApply()) {
+        // Glyph raster + atlas re-upload (GPU waits) leaves via
+        // kLayoutApplyMessage; the key check itself is microseconds.
+        m_trayIconsApplyPending = true;
+        if (m_window != nullptr) {
+            PostMessageW(m_window, kLayoutApplyMessage, 0, 0);
+        }
     }
     if (IsOverflowOpen()) {
         PositionOverflowPopup();
@@ -2431,14 +2480,48 @@ void DockApp::UpdateInputRegion() {
 
 void DockApp::PositionOverlayWindows() {
     ProfileScope scope("PositionOverlayWindows");
-    const UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-    if (SetWindowPos(m_window, HWND_TOPMOST, m_windowX, m_currentY,
-            static_cast<int>(m_dockWidth), static_cast<int>(m_dockHeight), flags) == FALSE) {
-        Log(L"Could not position the renderer window.");
-    }
-    if (m_inputWindow != nullptr && SetWindowPos(m_inputWindow, m_window, m_windowX, m_currentY,
-            static_cast<int>(m_dockWidth), static_cast<int>(m_dockHeight), flags) == FALSE) {
-        Log(L"Could not position the dock input window.");
+    // Change-cache: animation ticks and layout callers invoke this far more
+    // often than the rect actually moves. Skipping the DWM round-trips when
+    // nothing moved drops steady calls to microseconds; the hover/popup tail
+    // below still runs every time.
+    const LONG width = static_cast<LONG>(m_dockWidth);
+    const LONG height = static_cast<LONG>(m_dockHeight);
+    if (!m_overlayPosValid || m_overlayX != m_windowX || m_overlayY != m_currentY ||
+        m_overlayW != width || m_overlayH != height || m_inputWindow == nullptr) {
+        // One DWM round-trip for both windows instead of two: DeferWindowPos
+        // batches the topmost renderer + layered input moves atomically.
+        // NOREDRAW + NOCOPYBITS: frames come from the D3D present, so GDI
+        // invalidation and bit-shifting on move are pure overhead.
+        constexpr UINT kMoveFlags =
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOREDRAW | SWP_NOCOPYBITS;
+        ProfileScope moveScope("PositionOverlayWindows::Move");
+        bool positioned = false;
+        if (HDWP batch = BeginDeferWindowPos(m_inputWindow != nullptr ? 2 : 1)) {
+            if (DeferWindowPos(batch, m_window, HWND_TOPMOST, m_windowX, m_currentY, width,
+                    height, kMoveFlags) != nullptr &&
+                (m_inputWindow == nullptr ||
+                    DeferWindowPos(batch, m_inputWindow, m_window, m_windowX, m_currentY, width,
+                        height, kMoveFlags) != nullptr) &&
+                EndDeferWindowPos(batch) != FALSE) {
+                positioned = true;
+            }
+        }
+        if (!positioned) {
+            // Batch unavailable: fall back to direct moves (previous behavior).
+            if (SetWindowPos(m_window, HWND_TOPMOST, m_windowX, m_currentY, width, height,
+                    kMoveFlags) == FALSE) {
+                Log(L"Could not position the renderer window.");
+            } else if (m_inputWindow != nullptr &&
+                SetWindowPos(m_inputWindow, m_window, m_windowX, m_currentY, width, height,
+                    kMoveFlags) == FALSE) {
+                Log(L"Could not position the dock input window.");
+            }
+        }
+        m_overlayX = m_windowX;
+        m_overlayY = m_currentY;
+        m_overlayW = width;
+        m_overlayH = height;
+        m_overlayPosValid = true;
     }
     if (IsDragActive()) {
         BringDragGhostToFront();
@@ -2685,6 +2768,37 @@ void DockApp::LoadIconTextures() {
     EnsureTrayIcons();
 }
 
+std::wstring DockApp::TrayIconsKey() const {
+    RECT clockBounds{};
+    for (const DockIconRenderData& icon : m_iconRenderData) {
+        if (icon.kind == DockIconKind::Clock) {
+            clockBounds = icon.bounds;
+            break;
+        }
+    }
+    const UINT atlas = m_renderer.IconAtlasPixelExtent();
+    const UINT clockWidth = clockBounds.right > clockBounds.left
+        ? static_cast<UINT>(clockBounds.right - clockBounds.left)
+        : 128U;
+    const UINT clockHeight = clockBounds.bottom > clockBounds.top
+        ? static_cast<UINT>(clockBounds.bottom - clockBounds.top)
+        : 48U;
+    const TrayStatus& status = m_tray.Status();
+    return std::to_wstring(atlas) + L"|" + std::to_wstring(clockWidth) + L"x" +
+        std::to_wstring(clockHeight) + L"|" + status.timeText + L"|" + status.dateText + L"|" +
+        (status.hasBattery ? L"1" : L"0") + L"|" + (status.batteryCharging ? L"1" : L"0") + L"|" +
+        std::to_wstring(status.batteryPercent);
+}
+
+bool DockApp::TrayIconsNeedApply() const {
+    // Microseconds: key compare (+ icon-exists check mirroring EnsureTrayIcons
+    // so a missing clock glyph is never skipped). The raster + atlas upload
+    // half runs deferred via kLayoutApplyMessage.
+    return m_rendererInitialized &&
+        (TrayIconsKey() != m_trayVisualKey ||
+            !m_renderer.HasIconForTarget(SystemTray::TargetForSlot(TraySlot::Clock)));
+}
+
 void DockApp::AssignIconTextureIndices() {
     if (!m_rendererInitialized) {
         return;
@@ -2713,6 +2827,16 @@ void DockApp::EnsureTrayIcons() {
         return;
     }
 
+    const std::wstring key = TrayIconsKey();
+    if (key == m_trayVisualKey && m_renderer.HasIconForTarget(
+            SystemTray::TargetForSlot(TraySlot::Clock))) {
+        AssignIconTextureIndices();
+        return;
+    }
+    m_trayVisualKey = key;
+
+    const TrayStatus& status = m_tray.Status();
+    const UINT atlas = m_renderer.IconAtlasPixelExtent();
     RECT clockBounds{};
     for (const DockIconRenderData& icon : m_iconRenderData) {
         if (icon.kind == DockIconKind::Clock) {
@@ -2720,24 +2844,12 @@ void DockApp::EnsureTrayIcons() {
             break;
         }
     }
-    const UINT atlas = m_renderer.IconAtlasPixelExtent();
     const UINT clockWidth = clockBounds.right > clockBounds.left
         ? static_cast<UINT>(clockBounds.right - clockBounds.left)
         : 128U;
     const UINT clockHeight = clockBounds.bottom > clockBounds.top
         ? static_cast<UINT>(clockBounds.bottom - clockBounds.top)
         : 48U;
-    const TrayStatus& status = m_tray.Status();
-    std::wstring key = std::to_wstring(atlas) + L"|" + std::to_wstring(clockWidth) + L"x" +
-        std::to_wstring(clockHeight) + L"|" + status.timeText + L"|" + status.dateText + L"|" +
-        (status.hasBattery ? L"1" : L"0") + L"|" + (status.batteryCharging ? L"1" : L"0") + L"|" +
-        std::to_wstring(status.batteryPercent);
-    if (key == m_trayVisualKey && m_renderer.HasIconForTarget(
-            SystemTray::TargetForSlot(TraySlot::Clock))) {
-        AssignIconTextureIndices();
-        return;
-    }
-    m_trayVisualKey = std::move(key);
 
     std::vector<std::wstring> targets;
     std::vector<std::vector<uint8_t>> pixels;
