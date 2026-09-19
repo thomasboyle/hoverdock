@@ -56,6 +56,9 @@ constexpr BYTE kInputWindowAlpha = 1;
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
+#ifndef WDA_NONE
+#define WDA_NONE 0x00000000
+#endif
 #ifndef DWMWA_WINDOW_CORNER_PREFERENCE
 #define DWMWA_WINDOW_CORNER_PREFERENCE 33
 #endif
@@ -159,8 +162,15 @@ bool IsLayoutOnlyTarget(const std::wstring& target) {
     return IsDividerTarget(target);
 }
 
-bool TryExcludeWindowFromCapture(HWND window) {
-    return window != nullptr && SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE) != FALSE;
+bool SetWindowCaptureExcluded(HWND window, bool excludeFromCapture) {
+    if (window == nullptr) {
+        return false;
+    }
+    // WDA_NONE: visible to Snipping Tool / Game Bar / Discord. WDA_EXCLUDEFROMCAPTURE
+    // is applied only for the duration of a backdrop BitBlt so the glass does not
+    // photograph itself (see CaptureLiveBackdrop).
+    const DWORD affinity = excludeFromCapture ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE;
+    return SetWindowDisplayAffinity(window, affinity) != FALSE;
 }
 
 HRGN CreateDockInputRegion(int width, int height, int cornerDiameter) {
@@ -2113,8 +2123,8 @@ void DockApp::CreateOverlayWindow() {
         DestroyWindow(m_window);
         throw std::runtime_error("Set dock input window alpha failed.");
     }
-    m_backdropCaptureRequiresHide = !TryExcludeWindowFromCapture(m_window);
-    TryExcludeWindowFromCapture(m_inputWindow);
+    SetWindowCaptureExcluded(m_window, false);
+    SetWindowCaptureExcluded(m_inputWindow, false);
     CreateHoverLabelWindow();
 }
 
@@ -3807,7 +3817,7 @@ void DockApp::PaintSettingsPopup() {
             Log(L"Could not create the dock settings window.");
             return;
         }
-        TryExcludeWindowFromCapture(m_settingsWindow);
+        SetWindowCaptureExcluded(m_settingsWindow, false);
     }
 
     POINT origin{};
@@ -4484,7 +4494,7 @@ void DockApp::PaintOverflowPopup() {
             Log(L"Could not create the tray overflow window.");
             return;
         }
-        TryExcludeWindowFromCapture(m_overflowWindow);
+        SetWindowCaptureExcluded(m_overflowWindow, false);
     }
 
     POINT origin{};
@@ -5022,45 +5032,31 @@ bool DockApp::CaptureLiveBackdrop() {
         m_windowX + static_cast<LONG>(m_dockWidth),
         m_currentY + static_cast<LONG>(m_dockHeight)};
 
-    bool rendererVisible = false;
-    bool inputVisible = false;
-    bool ghostVisible = false;
-    if (m_backdropCaptureRequiresHide) {
-        rendererVisible = IsWindowVisible(m_window) != FALSE;
-        inputVisible = m_inputWindow != nullptr && IsWindowVisible(m_inputWindow) != FALSE;
-        ghostVisible = m_dragGhostWindow != nullptr && IsWindowVisible(m_dragGhostWindow) != FALSE;
-        if (rendererVisible) {
-            ShowWindow(m_window, SW_HIDE);
-        }
-        if (inputVisible) {
-            ShowWindow(m_inputWindow, SW_HIDE);
-        }
-        if (ghostVisible) {
-            ShowWindow(m_dragGhostWindow, SW_HIDE);
-        }
-        // DwmFlush never returns while DWM composition is off (e.g. an
-        // exclusive-fullscreen game owns the display). Blocking the UI thread
-        // here would wedge input, timers, and paints indefinitely, so only
-        // flush when composition is actually running.
-        BOOL compositionEnabled = FALSE;
-        if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled)) && compositionEnabled) {
-            DwmFlush();
-        }
+    // Idle: DWM has not composed since the last backdrop — skip affinity toggles
+    // and BitBlt. Affinity/ShowWindow every 8 ms is what flickered before.
+    if (!m_renderer.NeedsBackdropBitBlt(captureBounds)) {
+        return false;
+    }
+
+    // Exclude only while reading the desktop so the glass does not capture itself.
+    // Keep the windows shown — WDA_EXCLUDEFROMCAPTURE does not hide them on-screen.
+    SetWindowCaptureExcluded(m_window, true);
+    SetWindowCaptureExcluded(m_inputWindow, true);
+    if (m_dragGhostWindow != nullptr) {
+        SetWindowCaptureExcluded(m_dragGhostWindow, true);
+    }
+    BOOL compositionEnabled = FALSE;
+    if (SUCCEEDED(DwmIsCompositionEnabled(&compositionEnabled)) && compositionEnabled) {
+        DwmFlush();
     }
 
     bool changed = true;
     const bool captured = m_renderer.CaptureBackdrop(captureBounds, &changed);
 
-    if (m_backdropCaptureRequiresHide) {
-        if (rendererVisible) {
-            ShowWindow(m_window, SW_SHOWNOACTIVATE);
-        }
-        if (inputVisible) {
-            ShowWindow(m_inputWindow, SW_SHOWNOACTIVATE);
-        }
-        if (ghostVisible) {
-            ShowWindow(m_dragGhostWindow, SW_SHOWNOACTIVATE);
-        }
+    SetWindowCaptureExcluded(m_window, false);
+    SetWindowCaptureExcluded(m_inputWindow, false);
+    if (m_dragGhostWindow != nullptr) {
+        SetWindowCaptureExcluded(m_dragGhostWindow, false);
     }
 
     return captured && changed;
@@ -5527,7 +5523,7 @@ bool DockApp::OpenLaunchPrompt() {
         Log(L"Could not create the launch prompt window.");
         return false;
     }
-    TryExcludeWindowFromCapture(m_launchPromptWindow);
+    SetWindowCaptureExcluded(m_launchPromptWindow, false);
 
     const DWORD corner = DWMWCP_ROUND;
     DwmSetWindowAttribute(m_launchPromptWindow, DWMWA_WINDOW_CORNER_PREFERENCE, &corner,
@@ -5974,7 +5970,7 @@ void DockApp::EnsureDragGhostWindow() {
         Log(L"Could not create the drag ghost window.");
         return;
     }
-    TryExcludeWindowFromCapture(m_dragGhostWindow);
+    SetWindowCaptureExcluded(m_dragGhostWindow, false);
 }
 
 void DockApp::UpdateDragGhostContent() {

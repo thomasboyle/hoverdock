@@ -72,6 +72,7 @@ public:
     [[nodiscard]] static std::vector<uint8_t> ExtractIconPixels(
         const std::vector<std::wstring>& candidates, UINT iconPixelExtent);
     [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle, bool* changed = nullptr);
+    [[nodiscard]] bool NeedsBackdropBitBlt(const RECT& screenRectangle) const noexcept;
     [[nodiscard]] bool BackdropValid() const noexcept;
     [[nodiscard]] bool Render(const DockRenderState& state);
     void Flush();

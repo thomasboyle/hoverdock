@@ -491,7 +491,6 @@ private:
     bool m_rendererInitialized = false;
     bool m_renderQueued = false;
     bool m_renderAllowBlockingGpuWait = true;
-    bool m_backdropCaptureRequiresHide = true;
     double m_lastWindowRefresh = 0.0;
     int m_hoverLabelIcon = -1;
     int m_dividerIndex = -1;
