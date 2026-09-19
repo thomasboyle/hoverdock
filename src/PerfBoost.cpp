@@ -5,6 +5,7 @@
 #include <WtsApi32.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cwctype>
 #include <unordered_map>
 #include <unordered_set>
@@ -211,6 +212,20 @@ bool PerfBoost::IsProtectedExecutable(const std::wstring& exePath) noexcept {
 
 std::wstring PerfBoost::FormatMegabytes(uint64_t bytes) {
     const uint64_t megabytes = (bytes + 524288ULL) / 1048576ULL;
+    // Quick Settings tiles are ~70px wide (~12 chars at 11px Segoe UI), so a
+    // 4-digit MB value ("Freed 5790 MB", 13 chars) ellipsizes to "Freed 5790 ...".
+    // Switch to GB at 1000 MB to stay inside the tile: 5790 MB -> "5.7 GB".
+    // "%.0f" above 9.95 GB keeps "10 GB" (5 chars) instead of "10.0 GB" (6).
+    if (megabytes >= 1000ULL) {
+        const double gigabytes = static_cast<double>(bytes) / 1073741824.0;
+        wchar_t buffer[32]{};
+        if (gigabytes >= 9.95) {
+            std::swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%.0f GB", gigabytes);
+        } else {
+            std::swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%.1f GB", gigabytes);
+        }
+        return buffer;
+    }
     return std::to_wstring(megabytes) + L" MB";
 }
 
