@@ -109,6 +109,7 @@ private:
     static constexpr UINT kUpdateResultMessage = WM_APP + 12;
     static constexpr UINT kSettingsPaintMessage = WM_APP + 13;
     static constexpr UINT kCursorWatchSyncMessage = WM_APP + 14;
+    static constexpr UINT kBeginShowDeferredMessage = WM_APP + 15;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
     static constexpr UINT_PTR kConfigSaveTimerId = 3;

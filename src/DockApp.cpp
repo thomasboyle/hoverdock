@@ -1730,6 +1730,25 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         }
         return 0;
 
+    case kBeginShowDeferredMessage: {
+        // Deferred half of BeginShow: full tray refresh (COM/IPC + forced layout)
+        // runs after the first animation tick has positioned and painted, so the
+        // reveal itself is just the two ShowWindow calls. Stale-show guard: a
+        // hide flicker between PostMessage and dispatch must not refresh a
+        // hidden dock.
+        if (m_visibility != VisibilityState::Showing &&
+            m_visibility != VisibilityState::Visible) {
+            return 0;
+        }
+        if (static_cast<UINT>(wParam) != m_showSessionId) {
+            return 0;
+        }
+        // Tray timer is stopped while hidden; pull a fresh clock/battery now that
+        // the first frame is on its way instead of before it.
+        RefreshTray(true);
+        return 0;
+    }
+
     case kRefreshApplyMessage:
         ApplyBackgroundRefresh(static_cast<UINT>(wParam));
         return 0;
@@ -5049,31 +5068,24 @@ void DockApp::BeginShow() {
     HideHoverLabel();
     ++m_showSessionId;
 
-    // Elevated foreground (Task Manager, etc.) can make BitBlt/UIPI desktop reads
-    // stall for hundreds of ms on the same thread that owns WH_MOUSE_LL. Prefer a
-    // cached backdrop and start the slide immediately; live capture resumes on the
-    // backdrop timer once visible.
-    const bool elevatedFg = IsElevatedForeground();
-    if (!elevatedFg) {
-        const RECT captureBounds{m_windowX, m_visibleY,
-            m_windowX + static_cast<LONG>(m_dockWidth),
-            m_visibleY + static_cast<LONG>(m_dockHeight)};
-        if (!m_renderer.CaptureBackdrop(captureBounds)) {
-            Log(L"Desktop backdrop capture failed; using fallback glass.");
-        }
-    }
-
+    // Hot-path diet: everything that can block leaves this function. The
+    // synchronous BitBlt capture (~6ms avg, 15ms max), the full tray COM/IPC
+    // refresh plus its forced layout rebuild (~2-12ms), and the redundant
+    // SetWindowPos pair (already at the hidden position from the hide-end tick;
+    // the first animation tick repositions anyway) all move to
+    // kBeginShowDeferredMessage below. What remains is the two ShowWindow calls
+    // (~3ms measured). The slide starts immediately on the cached backdrop and
+    // the backdrop timer refreshes it live once visible, exactly what the
+    // elevated-foreground path always did.
     m_visibility = VisibilityState::Showing;
     ShowWindow(m_window, SW_SHOWNOACTIVATE);
     ShowWindow(m_inputWindow, SW_SHOWNOACTIVATE);
-    PositionOverlayWindows();
     m_animationFromY = m_currentY;
     m_animationToY = m_visibleY;
     m_animationStartedAt = QpcSeconds();
-    // Tray timer is stopped while hidden; pull a fresh clock/battery before first paint.
-    RefreshTray(true);
     StartCursorWatch();
     QueueRenderFrame(false);
+    PostMessageW(m_window, kBeginShowDeferredMessage, static_cast<WPARAM>(m_showSessionId), 0);
 }
 
 void DockApp::BeginHide() {
