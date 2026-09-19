@@ -72,11 +72,6 @@ public:
     [[nodiscard]] static std::vector<uint8_t> ExtractIconPixels(
         const std::vector<std::wstring>& candidates, UINT iconPixelExtent);
     [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle, bool* changed = nullptr);
-    // Cheap pre-check for CaptureBackdrop: true when a BitBlt would actually run
-    // (no valid backdrop yet, size matches, and DWM composed a new frame — or
-    // composition info is unavailable). Lets callers hide capturable windows
-    // only around real captures instead of on every idle tick.
-    [[nodiscard]] bool BackdropCaptureNeeded(const RECT& screenRectangle) const noexcept;
     [[nodiscard]] bool BackdropValid() const noexcept;
     [[nodiscard]] bool Render(const DockRenderState& state);
     void Flush();
