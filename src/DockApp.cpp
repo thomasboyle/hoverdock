@@ -5419,9 +5419,7 @@ void DockApp::ActivatePressedApp() {
     }
 
     const DisplayApp app = m_displayApps[static_cast<size_t>(m_pressedIcon)];
-    // Clear press/drag BEFORE ActivateOrLaunch. Heavy apps (Settings) make
-    // ShellExecuteEx pump WM_MOUSEMOVE on this thread; with press still armed that
-    // falsely begins a drag and ApplyDragPreviewLayout hides the icon off-screen.
+    // Clear press before launch so nested ShellExecute message pumps cannot start a drag.
     m_suppressDragUntilRelease = true;
     m_launchClickInProgress = true;
     ClearPressState();
@@ -5446,12 +5444,7 @@ void DockApp::ActivatePressedApp() {
         return;
     }
 
-    // Fast path stays on the UI thread: activating an existing window is cheap
-    // (ShowWindowAsync/SetForegroundWindow) and keeps foreground semantics.
-    // The launch path goes to a worker thread: ShellExecuteEx — even with
-    // SEE_MASK_ASYNCOK — plus working-directory/filesystem probing can stall
-    // this thread, which also services WH_MOUSE_LL. A stall there freezes the
-    // system cursor until a heavy app (e.g. Grok/Electron) finishes opening.
+    // Activate on the UI thread; ShellExecuteEx launches go to a worker so WH_MOUSE_LL stays responsive.
     if (m_windows.TryActivate(app.app, app.runningWindow)) {
         m_lastWindowRefresh = 0.0;
         ScheduleDeferredRefresh();
@@ -6179,9 +6172,7 @@ void DockApp::BeginDrag(POINT screenCursor) {
         !IsPersistentDisplayIcon(m_pressedIcon)) {
         return;
     }
-    // ShellExecute / Settings activation pumps messages on this thread. A nested
-    // move must not start a drag after the user already released (or while a click
-    // activate is in progress) — that parked the icon at -32000 until a layout rebuild.
+    // ShellExecute can pump messages; do not start a drag if the button is already up.
     if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
         ClearPressState();
         m_suppressDragUntilRelease = true;
@@ -6201,20 +6192,12 @@ void DockApp::BeginDrag(POINT screenCursor) {
     m_dragOriginBounds = m_iconRenderData[static_cast<size_t>(m_draggedIcon)].bounds;
     m_dragInsertion = InsertionIndexForDrag(screenCursor);
 
-    // Hit-testing uses ClientFromDockOrigin(m_windowX, m_currentY). ClientToScreen(m_window)
-    // can disagree when the HWND position briefly drifts from the layout origin, which made
-    // the ghost jump away from the press point. Keep grab math in the same space as hits.
-    // Use the original press point so the pixel they clicked stays under the cursor after
-    // the drag threshold moves the pointer slightly.
+    // Same origin as hit-testing (m_windowX/m_currentY); keep press pixel under the cursor.
     const POINT iconTopLeft =
         ScreenFromDockClient({m_dragOriginBounds.left, m_dragOriginBounds.top}, m_windowX,
             m_currentY);
-    const POINT grabCursor = (m_pressedAt.x != 0 || m_pressedAt.y != 0 || m_pressedIcon >= 0)
-        ? m_pressedAt
-        : screenCursor;
-    m_dragGrabOffset = {grabCursor.x - iconTopLeft.x, grabCursor.y - iconTopLeft.y};
-    // Ghost is the square icon face; slot bounds are taller (running dots). Clamp so a
-    // press in the indicator strip does not place the ghost with a grab outside its bitmap.
+    m_dragGrabOffset = {m_pressedAt.x - iconTopLeft.x, m_pressedAt.y - iconTopLeft.y};
+    // Slot bounds include running dots; ghost is the square icon face.
     const LONG iconFace = std::max(1L, m_dragOriginBounds.right - m_dragOriginBounds.left);
     m_dragGrabOffset.x = std::clamp(m_dragGrabOffset.x, 0L, iconFace - 1L);
     m_dragGrabOffset.y = std::clamp(m_dragGrabOffset.y, 0L, iconFace - 1L);

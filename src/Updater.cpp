@@ -963,8 +963,7 @@ Updater::InstalledCopy Updater::InstalledCopyInfo() {
     }
     const std::string fromExe = ReadVersionMarkerFromExe(info.exePath);
     const std::string fromReg = TrimVersion(WideToUtf8Simple(version));
-    // Prefer the binary marker when present: a silent install can stamp the
-    // registry Version even when Dock.exe was left unchanged (in-use replace).
+    // Prefer the on-disk marker over registry Version after a partial install.
     info.version = !fromExe.empty() ? fromExe : fromReg;
     return info;
 }
@@ -994,12 +993,7 @@ bool Updater::LaunchInstallerAndExit(const std::wstring& installerPath) {
             INVALID_FILE_ATTRIBUTES) {
         return false;
     }
-    // Wait for THIS process to exit before running Setup. Starting the
-    // silent installer while Dock.exe is still mapped is what left registry
-    // Version at 1.1.8 while the on-disk binary stayed 1.1.0: NSIS can write
-    // Uninstall.exe + Version after a failed/partial File replace, and/or
-    // relaunch while the old process still owns the image. Mirror the
-    // portable path: PID gate, then Setup /S (NSIS relaunches on success).
+    // Wait for this process to exit, then run Setup /S (same PID gate as portable updates).
     auto isAscii = [](const std::wstring& value) {
         for (const wchar_t c : value) {
             if (c > 127) {
@@ -1068,11 +1062,7 @@ bool Updater::StagePortableUpdateAndRestart(const std::wstring& downloadedExe) {
         return false;
     }
     const std::wstring batch = TempDirectory() + L"\\hoverdock-update.bat";
-    // Wait for the dock to exit (PID gate), replace the binary, relaunch, and
-    // delete the helper. The wait loops (~20 s) instead of a fixed short sleep:
-    // replacing Dock.exe while the old process still holds it silently keeps
-    // the old version in place, and the relaunch then reports the stale
-    // version as if the update had succeeded.
+    // Wait for the dock PID to exit, then replace and relaunch.
     const DWORD pid = GetCurrentProcessId();
     std::wstring script =
         L"@echo off\r\n"

@@ -79,9 +79,7 @@ SetCompressor /SOLID lzma
       Goto loop_window
   ${EndIf}
   after_window:
-  ; Window can go away while Dock.exe still maps the file. Always wait briefly
-  ; then taskkill (no-op if already gone) so File can replace the binary
-  ; before Version is written.
+  ; Ensure Dock.exe has exited so File can replace it before Version is written.
   Sleep 800
   ExecWait '"$SYSDIR\taskkill.exe" /F /IM ${APPEXE}' $0
   Sleep 400
