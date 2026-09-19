@@ -26,6 +26,15 @@ public:
     [[nodiscard]] bool IsRunning(const PinnedApp& app) const;
     [[nodiscard]] HWND FindWindowFor(const PinnedApp& app) const;
     [[nodiscard]] bool ActivateOrLaunch(const PinnedApp& app, HWND preferredWindow = nullptr) const;
+    // Fast, UI-thread safe: activates an already-running window without launching.
+    // Returns true when a window was found and activation was attempted.
+    [[nodiscard]] bool TryActivate(const PinnedApp& app, HWND preferredWindow = nullptr) const;
+    // Thread-safe fire-and-forget launcher. Must NOT touch WindowCatalog instance
+    // state so DockApp can call it from a worker thread without stalling the
+    // WH_MOUSE_LL hook thread (which shares the UI thread — a stalled UI thread
+    // freezes the system cursor until ShellExecute returns, e.g. heavy Electron
+    // apps like Grok). Uses SEE_MASK_ASYNCOK so the shell returns immediately.
+    [[nodiscard]] static bool LaunchApp(const PinnedApp& app);
     [[nodiscard]] bool Close(const PinnedApp& app, HWND preferredWindow = nullptr) const;
     [[nodiscard]] bool EndTask(const PinnedApp& app, HWND preferredWindow = nullptr) const;
     [[nodiscard]] bool OpenLocation(const PinnedApp& app) const;

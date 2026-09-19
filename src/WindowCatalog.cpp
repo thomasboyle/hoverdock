@@ -890,6 +890,13 @@ bool WindowCatalog::MatchesAnyPin(const RunningWindow& window) const {
 }
 
 bool WindowCatalog::ActivateOrLaunch(const PinnedApp& app, HWND preferredWindow) const {
+    if (TryActivate(app, preferredWindow)) {
+        return true;
+    }
+    return LaunchApp(app);
+}
+
+bool WindowCatalog::TryActivate(const PinnedApp& app, HWND preferredWindow) const {
     HWND window = preferredWindow;
     if (window == nullptr || IsWindow(window) == FALSE) {
         window = FindWindowFor(app);
@@ -897,6 +904,10 @@ bool WindowCatalog::ActivateOrLaunch(const PinnedApp& app, HWND preferredWindow)
     if (window != nullptr) {
         return ActivateWindow(window);
     }
+    return false;
+}
+
+bool WindowCatalog::LaunchApp(const PinnedApp& app) {
 
     // A stale working directory (e.g. a Squirrel app-* folder removed by an
     // update) makes ShellExecute fail outright, so a tray-hidden app could never
@@ -919,7 +930,12 @@ bool WindowCatalog::ActivateOrLaunch(const PinnedApp& app, HWND preferredWindow)
     }
 
     SHELLEXECUTEINFOW launch{sizeof(launch)};
-    launch.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    // CRITICAL: use SEE_MASK_ASYNCOK, never SEE_MASK_NOASYNC here. NOASYNC blocks
+    // the caller until the target finishes its launch-phase DDE/COM handshake.
+    // DockApp calls this from the same thread that services WH_MOUSE_LL, so a
+    // heavy app (e.g. Grok/Electron) froze the system cursor until its window
+    // appeared. ASYNCOK returns as soon as the launch is dispatched.
+    launch.fMask = SEE_MASK_ASYNCOK | SEE_MASK_FLAG_NO_UI;
     launch.lpVerb = L"open";
     launch.lpFile = app.target.c_str();
     launch.lpParameters = app.arguments.empty() ? nullptr : app.arguments.c_str();

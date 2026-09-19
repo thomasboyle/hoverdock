@@ -5446,9 +5446,23 @@ void DockApp::ActivatePressedApp() {
         return;
     }
 
-    if (!m_windows.ActivateOrLaunch(app.app, app.runningWindow)) {
-        Log(L"Application did not launch or accept focus.");
+    // Fast path stays on the UI thread: activating an existing window is cheap
+    // (ShowWindowAsync/SetForegroundWindow) and keeps foreground semantics.
+    // The launch path goes to a worker thread: ShellExecuteEx — even with
+    // SEE_MASK_ASYNCOK — plus working-directory/filesystem probing can stall
+    // this thread, which also services WH_MOUSE_LL. A stall there freezes the
+    // system cursor until a heavy app (e.g. Grok/Electron) finishes opening.
+    if (m_windows.TryActivate(app.app, app.runningWindow)) {
+        m_lastWindowRefresh = 0.0;
+        ScheduleDeferredRefresh();
+        return;
     }
+    const PinnedApp launchApp = app.app;
+    std::thread([launchApp]() {
+        if (!WindowCatalog::LaunchApp(launchApp)) {
+            OutputDebugStringW(L"Application did not launch.\n");
+        }
+    }).detach();
     m_lastWindowRefresh = 0.0;
     // Defer refresh so Settings' window storm does not rebuild the dock mid-click.
     ScheduleDeferredRefresh();
@@ -5913,10 +5927,20 @@ bool DockApp::ActivateLaunchTarget(const LaunchTarget& target) {
     if (target.isStart) {
         return OpenStartMenuFromDock();
     }
-    if (!m_windows.ActivateOrLaunch(target.app, target.runningWindow)) {
-        Log(L"Application did not launch or accept focus.");
-        return false;
+    // Same split as ActivatePressedApp: activate synchronously, launch off the
+    // UI thread so the low-level mouse hook keeps pumping and the cursor never
+    // freezes while a heavy app starts.
+    if (m_windows.TryActivate(target.app, target.runningWindow)) {
+        m_lastWindowRefresh = 0.0;
+        RefreshRunningWindows();
+        return true;
     }
+    const PinnedApp launchApp = target.app;
+    std::thread([launchApp]() {
+        if (!WindowCatalog::LaunchApp(launchApp)) {
+            OutputDebugStringW(L"Application did not launch.\n");
+        }
+    }).detach();
     m_lastWindowRefresh = 0.0;
     RefreshRunningWindows();
     return true;
