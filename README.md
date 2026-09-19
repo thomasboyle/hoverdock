@@ -1,153 +1,56 @@
-# Liquid Glass Dock
+# Hoverdock ✨
 
-Liquid Glass Dock is a single-process native Windows desktop overlay that hides the normal taskbar and replaces it with a centered macOS Dock-style launcher. It is written in C++ and Win32 with Direct3D 12, DXGI, DirectComposition, GDI capture, and HLSL only. The glass is a custom D3D12 pass; it does not use Acrylic, Mica, Fluent, WebView2, or third-party libraries.
+A macOS-style dock for Windows — with real liquid glass.
 
-`Dock.exe` is the only runtime artifact. HLSL is compiled to DXIL headers at build time and embedded into the executable.
+Hoverdock hides the taskbar and replaces it with a centered, floating dock rendered in native C++ / Direct3D 12. No Electron, no WebView, no Acrylic. Just one fast `Dock.exe`.
 
-## Requirements
+Hover the bottom edge → it slides in (50 ms). Move away → it disappears.
 
-- Windows 10 19041 or newer, with the latest Windows SDK installed
-- Visual Studio 2022 with the Desktop development with C++ workload and MSVC x64 tools
-- A GPU and driver exposing D3D12 Feature Level 12_0 or later and Shader Model 6.0 or later
-- CMake 3.25 or later
+## Why you'll like it
 
-No vcpkg, NuGet, Conan, package manager, Agility SDK, or runtime redistribution is required. This build uses inbox D3D12 and links only Windows SDK system libraries:
+- **Gorgeous glass** — custom D3D12 shader with frosted blur, refraction, and rim light, sampled from your actual wallpaper
+- **Fast** — single process, zero allocations during animations, 120 Hz friendly
+- **Familiar** — pins, running apps, drag-to-reorder, right-click to pin / close / reveal location
+- **Thoughtful** — auto-imports your taskbar pins on first run, restores the taskbar on exit/crash
+- **Quiet** — per-user install, launch at startup, silent auto-updates from GitHub Releases
 
-```text
-d3d12 dxgi dcomp dwmapi shcore shell32 ole32 advapi32 windowscodecs gdi32
-```
+Plus: Quick Settings, Start/Search shortcuts, Per-Monitor V2 DPI, UWP support.
 
-The binary probes feature levels in this exact order: 12_2, 12_1, then 12_0. It never assumes a feature level. It uses Shader Model 6.6 when the driver reports it; otherwise it uses the separately compiled SM 6.0 shaders for devices such as a GTX 1070 Ti-class GPU.
+## Get it
 
-## Build
+Download `Hoverdock-Setup-*.exe` from [Releases](../../releases) and run it. No admin needed.
 
-Open an x64 Native Tools Command Prompt for Visual Studio, from the repository root:
+Or build it yourself (Windows 10 19041+, VS 2022, CMake 3.25+):
 
 ```bat
 cmake -S . -B out -G "Visual Studio 17 2022" -A x64
 cmake --build out --config Release
-```
-
-The executable is:
-
-```text
 out\bin\Release\Dock.exe
 ```
 
-The CMake project asks MSVC for `/std:c++26` first and falls back to `/std:c++latest` only when the installed MSVC does not recognize the C++26 switch. `/permissive-`, `/W4`, `/WX`, `/EHsc`, `/Zc:__cplusplus`, and `/utf-8` are also enabled.
-
-The Windows SDK `dxc.exe` is required at build time. CMake searches the SDK paths exposed by `WindowsSdkDir` and `WindowsSDKVersion`. If your SDK does not expose those variables, pass the exact SDK compiler path:
+Installer (optional, per-user, silent `/S` supported):
 
 ```bat
-cmake -S . -B out -G "Visual Studio 17 2022" -A x64 ^
-  -DDXC_EXECUTABLE="C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe"
-cmake --build out --config Release
-```
-
-DXC emits `vs_6_0`, `ps_6_0`, `vs_6_6`, and `ps_6_6` blobs into the build directory as generated C++ headers. The headers are compiled into `Dock.exe`; do not copy any generated shader files beside the EXE.
-
-## Installer (NSIS)
-
-Per-user install, no elevation required (so silent auto-updates work without UAC):
-
-```bat
-cmake -S . -B out -G "Visual Studio 17 2022" -A x64
 cmake --build out --config Release --target installer
 ```
 
-Output:
+That's it — no vcpkg, NuGet, or extra SDKs. Just the Windows SDK.
 
-```text
-out\Hoverdock-Setup-<version>.exe
-```
+## Use it
 
-The installer closes a running dock (which restores the taskbar on exit),
-installs to `%LOCALAPPDATA%\Programs\Hoverdock`, registers Add/Remove Programs,
-creates Start Menu shortcuts, enables launch-at-startup on fresh installs only
-(existing Run-key choices are never clobbered), and relaunches the dock. Silent
-mode (`Hoverdock-Setup-<version>.exe /S`) is what the auto-updater runs: it
-installs without prompts and always reopens the new build. Every merge to
-`main` auto-publishes a GitHub Release with `Dock.exe` +
-`Hoverdock-Setup-*.exe`, bumping the patch version off the latest `v*` tag
-(`release.yml`; manual `v*` tags still work and take precedence).
+- **Show:** touch the bottom edge of your primary monitor
+- **Launch / focus:** click an icon
+- **Pin / close / locate:** right-click an icon
+- **Pin current app:** right-click empty glass
+- **Reorder:** drag an icon onto another slot
+- **Settings:** gear icon → startup, updates, version
 
-## Run
+Config lives at `%LOCALAPPDATA%\LiquidGlassDock\dock.ini`.
 
-```bat
-out\bin\Release\Dock.exe
-```
+Stuck with a hidden taskbar after a crash? Just launch `Dock.exe` once and quit — it restores everything.
 
-The program is intentionally a single instance. It restores any previously hidden taskbar before it hides the current one, which is the failsafe for a prior unexpected process termination. It restores the taskbar on normal application shutdown and Windows session shutdown. If a hard crash or power loss leaves the taskbar hidden, start `Dock.exe` once and exit it normally to restore it.
+## Notes
 
-Settings are written as UTF-8 to:
-
-```text
-%LOCALAPPDATA%\LiquidGlassDock\dock.ini
-```
-
-On first run, the dock imports taskbar pins in native order from the Windows 11 CloudStore taskbar store or Windows Taskband data, then uses the Windows 10 pinned-shortcut folder only to fill pins absent from those stores. Shell shortcuts are resolved through Windows Shell COM, including wrappers around AppsFolder AUMIDs, and recovered pins are persisted. Existing custom `dock.ini` files are preserved; an older file containing only the Explorer, Notepad, and Calculator defaults is upgraded from available OS pins. If no pin can be recovered, it falls back to File Explorer, Notepad, and Calculator. For UWP targets, launch is best effort through the AppsFolder shell target; running-window matching is intentionally limited to normal top-level desktop windows.
-
-## Interaction
-
-- Move the pointer into the full-width, 2-pixel bottom edge of the primary monitor to show the dock.
-- The dock slides from below the monitor to its resting position over exactly 50 ms of QPC time.
-- While the dock is showing or visible, moving the pointer above its resting top edge immediately starts the 50 ms hide animation. This also applies when the first post-hot-edge pointer sample is already above that edge.
-- Leaving through the left or right side does not hide the dock. The pointer remains unrestricted inside the resting dock bounds, which makes edge-to-edge icon targeting practical.
-- Start and Search are always the first two nonpersistent items. Their **Open** action sends the corresponding Windows keyboard shortcut; they cannot be pinned, closed, opened in Explorer, or reordered.
-- Click a running app to focus it; Windows foreground policy remains authoritative. If Windows rejects focus, the app is flashed instead of using an input-attachment foreground-stealing workaround.
-- Click a stopped app to launch it with `ShellExecuteEx`.
-- Right-click an application icon for Focus/Open, Open location, Close, and Unpin. Transient running applications offer Pin instead. Right-click empty dock glass to pin the current foreground desktop application. UWP pinning and location are best effort.
-- Drag a persistent icon and release it over another slot to persist a left-to-right reorder.
-- Right-click empty glass and select **Show developer bounds** to draw the capsule edge. `F12` toggles the same option when the window has keyboard input.
-- The gear in Quick Settings pops a **Hoverdock Settings** glass panel out beside Quick Settings (not Windows Settings): **Launch at startup** and **Check for updates** toggle switches, a **Check for updates now** button, and the current version + update status. Quick Settings stays open behind it; the dock stays visible while either is open, `Esc` closes Settings first, and clicking away dismisses both.
-
-The D3D12/DirectComposition renderer is intentionally hit-transparent. A separate titleless, topmost, 1-alpha layered input window follows the DPI-scaled capsule region, never activates the process, and receives dock clicks while it is visible. The dock is always on top, owns no taskbar button, uses Per-Monitor V2 DPI, and handles 100%, 125%, and 150% scaling. It is primary-monitor only in v1.
-
-## Rendering and timing
-
-The overlay is a transparent DirectComposition visual backed by a D3D12 `FLIP_DISCARD` composition swap chain with three buffers and `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`. It has one D3D12 device, one DIRECT queue, reusable frame allocators and command list, persistently mapped per-frame CBVs, a persistently mapped instanced-icon buffer, and a static shader-visible SRV heap for an icon texture array and desktop backdrop. No buffer, command allocator, descriptor layout, icon texture, or backdrop resource is allocated during the 50 ms show or hide path. Presentation is synchronized and does not opt into tearing: tearing is not appropriate for this transparent composition overlay.
-
-The render loop uses `QueryPerformanceCounter` for elapsed time and the DXGI frame-latency waitable object while the state machine is animating. It presents synchronized frames and targets the display cadence, up to 120 FPS on a 120 Hz display. A literal “120 unique frames in 50 ms at 120 Hz” cannot occur: 50 ms at 120 Hz contains 6 display intervals. This implementation produces one QPC-derived unique animation sample per available presentation interval, so the show and hide intervals each have up to 6 unique visible positions on a 120 Hz panel.
-
-The capsule’s slide distance is its current DPI-scaled height plus a 10-DIP margin. Its easing is cubic smoothstep (`t²(3−2t)`) for `t = elapsed / duration`, where duration is 0.05 seconds for both showing and hiding. The window is content-sized from display item count, icon size, gaps, and horizontal padding; it is centered rather than monitor-width.
-
-Before each hidden-to-show transition, a preallocated GDI DIB captures the dock rectangle with `BitBlt` and `CAPTUREBLT` while both dock windows are hidden. A precreated D3D12 command allocator and command list upload that snapshot into a reusable backdrop texture. The glass shader samples the real desktop with multi-tap frosted blur, edge-normal refraction, and Fresnel/specular rim highlights at a 0.6 alpha tint; capture failure keeps the prior snapshot or a transparent fallback. This remains one D3D12 device and one DIRECT queue, with no D3D11 desktop duplication. Instanced icon quads are sampled from high-resolution Windows shell images (or transparent Start/Search glyphs) with their native alpha; only the glass pass contributes a background behind app icons.
-
-The native taskbar remains part of the primary monitor’s normal work area. The dock is deliberately positioned against the physical primary-monitor bottom edge after it hides the taskbar; it does not modify the system work area or replace Explorer.
-
-## Updates
-
-When **Check for updates automatically** is on (default), the dock checks
-`https://api.github.com/repos/<owner>/<repo>/releases/latest` ~15 s after
-startup and every 6 h after. When a newer tag is found, the update is
-**automatically downloaded and installed and the new build is reopened**: the
-`*Setup*.exe` installer asset is preferred (run `/S` silent, which closes the
-dock, replaces files, and relaunches), with the portable `Dock.exe` asset as
-fallback (staged over the running binary via a helper batch file, then
-relaunched). `dock.ini` sets `CheckForUpdates=1/0` and `LaunchAtStartup=1/0`
-(the latter owns `HKCU\...\Run\Hoverdock`). Forks can point the feed at their
-own releases with `-DDOCK_REPO_OWNER=... -DDOCK_REPO_NAME=...`; tag builds pass
-`-DDOCK_VERSION=<tag>` so the compiled version matches the release.
-
-## Project layout
-
-```text
-CMakeLists.txt        MSVC/DXC build definition
-dock.default.ini      Default persisted pin order and settings
-installer/
-  hoverdock.nsi       Per-user NSIS installer (silent /S for auto-update)
-src/
-  main.cpp            Win32 entry point
-  DockApp.*           Overlay, input, state machine, taskbar safety, UI actions
-  DockConfig.*        In-tree UTF-8 INI parser, taskbar import, and writer
-  Startup.*           HKCU Run-key launch-at-startup helper
-  Updater.*           GitHub Releases check/download/install/restart
-  Version.h           Compiled version + update-feed identity
-  WindowCatalog.*     Window enumeration, launch, focus, close, pin actions
-  Renderer.*          D3D12/DXGI/DirectComposition renderer, backdrop, and icon uploads
-  Shaders.hlsl        Custom liquid-glass and icon HLSL
-```
-
-## v1 non-goals
-
-Win+X, a full system tray, Task View, Copilot, Widgets, Explorer replacement, Mission Control, and Stage Manager are intentionally outside this version.
+- Primary monitor only (v1)
+- D3D12 Feature Level 12_0+ required
+- MIT licensed — see [LICENSE](LICENSE)
