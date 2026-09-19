@@ -1232,20 +1232,15 @@ int DockApp::Run() {
     for (;;) {
         const bool slideAnimating = m_visibility == VisibilityState::Showing ||
             m_visibility == VisibilityState::Hiding;
-        const bool overflowAnimating = IsOverflowAnimating();
         HANDLE frameWaitable = slideAnimating ? m_renderer.FrameLatencyWaitableObject() : nullptr;
         const DWORD count = frameWaitable == nullptr ? 0 : 1;
-        const DWORD timeout =
-            (slideAnimating || overflowAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
+        const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
         const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, QS_ALLINPUT,
             MWMO_INPUTAVAILABLE);
 
         if (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT) {
             if (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Hiding) {
                 AdvanceAnimation();
-            }
-            if (overflowAnimating) {
-                AdvanceOverflowAnimation();
             }
             if (m_dragSnapAnimating) {
                 AdvanceDragSnapBack();
@@ -2746,20 +2741,8 @@ void DockApp::OpenTraySlot(TraySlot slot) {
 }
 
 void DockApp::ToggleOverflowPopup() {
-    if (m_overflowVisibility == VisibilityState::Visible ||
-        m_overflowVisibility == VisibilityState::Showing) {
-        BeginOverflowHide(true);
-        return;
-    }
-    if (m_overflowVisibility == VisibilityState::Hiding) {
-        // Reverse an in-flight hide into a reveal from the current clip.
-        m_overflowAnimFromReveal = m_overflowReveal;
-        m_overflowAnimToReveal = 1.0;
-        m_overflowAnimStartedAt = QpcSeconds();
-        m_overflowVisibility = VisibilityState::Showing;
-        if (m_visibility == VisibilityState::Visible) {
-            StartTrayTimer();
-        }
+    if (IsOverflowOpen()) {
+        BeginOverflowHide(false);
         return;
     }
     BeginOverflowShow();
@@ -3013,7 +2996,6 @@ void DockApp::FinishOverflowHide() noexcept {
         ShowWindow(m_overflowWindow, SW_HIDE);
     }
     m_overflowVisibility = VisibilityState::Hidden;
-    m_overflowReveal = 0.0;
     m_overflowHover = -1;
     std::vector<uint8_t>().swap(m_overflowPresentBits);
     std::vector<uint8_t>().swap(m_overflowBaseBits);
@@ -3025,13 +3007,11 @@ void DockApp::FinishOverflowHide() noexcept {
     }
 }
 
-void DockApp::PresentOverflowLayer(double reveal01) noexcept {
+void DockApp::PresentOverflowLayer() noexcept {
     if (m_overflowWindow == nullptr || m_overflowPresentBits.empty() ||
         m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0) {
         return;
     }
-    const double clamped = std::clamp(reveal01, 0.0, 1.0);
-    m_overflowReveal = clamped;
     POINT origin{};
     LONG caret = m_overflowCaretX;
     if (!OverflowScreenOrigin(origin, caret)) {
@@ -3041,12 +3021,6 @@ void DockApp::PresentOverflowLayer(double reveal01) noexcept {
 
     const LONG width = m_overflowPresentSize.cx;
     const LONG height = m_overflowPresentSize.cy;
-    LONG visible = std::lround(clamped * static_cast<double>(height));
-    if (visible <= 0) {
-        ShowWindow(m_overflowWindow, SW_HIDE);
-        return;
-    }
-    visible = std::min(visible, height);
 
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
@@ -3082,9 +3056,9 @@ void DockApp::PresentOverflowLayer(double reveal01) noexcept {
         std::memcpy(bits, m_overflowPresentBits.data(), bytes);
     }
     HGDIOBJ previous = SelectObject(memory, bitmap);
-    POINT source{0, height - visible};
-    POINT destination{origin.x, origin.y + (height - visible)};
-    SIZE present{width, visible};
+    POINT source{0, 0};
+    POINT destination{origin.x, origin.y};
+    SIZE present{width, height};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     UpdateLayeredWindow(m_overflowWindow, nullptr, &destination, &present, memory, &source, 0,
         &blend, ULW_ALPHA);
@@ -3097,76 +3071,34 @@ void DockApp::PresentOverflowLayer(double reveal01) noexcept {
 }
 
 void DockApp::BeginOverflowHide(bool animate) noexcept {
+    static_cast<void>(animate);
     if (m_overflowVisibility == VisibilityState::Hidden) {
         return;
     }
-    CloseDockSettings();
-    if (!animate || m_overflowWindow == nullptr || m_overflowPresentBits.empty()) {
-        FinishOverflowHide();
-        return;
-    }
-    m_overflowAnimFromReveal = m_overflowReveal > 0.0 ? m_overflowReveal : 1.0;
-    m_overflowAnimToReveal = 0.0;
-    m_overflowAnimStartedAt = QpcSeconds();
-    m_overflowVisibility = VisibilityState::Hiding;
+    FinishOverflowHide();
 }
 
 void DockApp::CloseOverflowPopup() noexcept {
-    BeginOverflowHide(true);
+    BeginOverflowHide(false);
 }
 
 void DockApp::BeginOverflowShow() {
-    if (m_overflowVisibility == VisibilityState::Visible ||
-        m_overflowVisibility == VisibilityState::Showing) {
+    if (IsOverflowOpen()) {
         return;
     }
     HideHoverLabel();
     static_cast<void>(m_tray.Refresh());
     RefreshBrightnessAsync();
-    m_overflowAnimFromReveal = 0.0;
-    m_overflowAnimToReveal = 1.0;
-    m_overflowReveal = 0.0;
-    m_overflowVisibility = VisibilityState::Showing;
-    // Paint caches bits then presents with reveal=0 (hidden) — no full-frame flash.
+    m_overflowVisibility = VisibilityState::Visible;
     RebuildOverflowPopup();
     if (m_overflowWindow == nullptr || m_overflowPresentBits.empty()) {
         m_overflowVisibility = VisibilityState::Hidden;
         return;
     }
-    PresentOverflowLayer(0.0);
-    // Start the clock after paint: Rebuild/Paint can exceed the anim duration and
-    // would otherwise make the first Advance jump straight to reveal=1.
-    m_overflowAnimStartedAt = QpcSeconds();
+    PresentOverflowLayer();
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
     }
-}
-
-void DockApp::AdvanceOverflowAnimation() {
-    if (!IsOverflowAnimating()) {
-        return;
-    }
-    const double duration = m_overflowVisibility == VisibilityState::Hiding
-        ? kHideDurationSeconds
-        : kShowDurationSeconds;
-    const double elapsed = std::max(0.0, QpcSeconds() - m_overflowAnimStartedAt);
-    const double linear = std::clamp(elapsed / duration, 0.0, 1.0);
-    const double eased = linear * linear * (3.0 - 2.0 * linear);
-    const double reveal = m_overflowAnimFromReveal +
-        (m_overflowAnimToReveal - m_overflowAnimFromReveal) * eased;
-    PresentOverflowLayer(reveal);
-
-    if (linear < 1.0) {
-        return;
-    }
-
-    if (m_overflowVisibility == VisibilityState::Showing) {
-        m_overflowVisibility = VisibilityState::Visible;
-        PresentOverflowLayer(1.0);
-        return;
-    }
-
-    FinishOverflowHide();
 }
 
 void DockApp::DestroyOverflowPopup() noexcept {
@@ -4113,11 +4045,6 @@ bool DockApp::IsOverflowOpen() const noexcept {
     return m_overflowWindow != nullptr && m_overflowVisibility != VisibilityState::Hidden;
 }
 
-bool DockApp::IsOverflowAnimating() const noexcept {
-    return m_overflowVisibility == VisibilityState::Showing ||
-        m_overflowVisibility == VisibilityState::Hiding;
-}
-
 bool DockApp::IsCursorOverOverflow(POINT cursor) const noexcept {
     if (!IsOverflowOpen()) {
         return false;
@@ -4295,7 +4222,7 @@ void DockApp::PositionOverflowPopup() {
         return;
     }
     if (!m_overflowPresentBits.empty()) {
-        PresentOverflowLayer(m_overflowReveal);
+        PresentOverflowLayer();
         return;
     }
     POINT origin{};
@@ -4425,12 +4352,7 @@ void DockApp::PaintOverflowHoverFast() {
             SaturatedInt(m_overflowPresentSize.cx), SaturatedInt(m_overflowPresentSize.cy),
             m_overflowHits[static_cast<size_t>(m_overflowHover)]);
     }
-    const double presentReveal =
-        (m_overflowVisibility == VisibilityState::Showing ||
-            m_overflowVisibility == VisibilityState::Hiding)
-        ? m_overflowReveal
-        : 1.0;
-    PresentOverflowLayer(presentReveal);
+    PresentOverflowLayer();
 }
 
 void DockApp::PaintOverflowPopup() {
@@ -4915,13 +4837,7 @@ void DockApp::PaintOverflowPopup() {
     SelectObject(memory, previousBitmap);
     DeleteObject(bitmap);
     DeleteDC(memory);
-    // Use the active reveal so open-animation never flashes a full frame.
-    const double presentReveal =
-        (m_overflowVisibility == VisibilityState::Showing ||
-            m_overflowVisibility == VisibilityState::Hiding)
-        ? m_overflowReveal
-        : 1.0;
-    PresentOverflowLayer(presentReveal);
+    PresentOverflowLayer();
 }
 
 UINT DockApp::DesiredTrayIntervalMs() const noexcept {

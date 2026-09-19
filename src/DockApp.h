@@ -255,13 +255,11 @@ private:
     void BeginOverflowShow();
     void BeginOverflowHide(bool animate) noexcept;
     void FinishOverflowHide() noexcept;
-    void AdvanceOverflowAnimation();
-    void PresentOverflowLayer(double reveal01) noexcept;
+    void PresentOverflowLayer() noexcept;
     void QueueOverflowPaint(bool hoverOnly = false);
     void PaintOverflowHoverFast();
     void ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
         const TrayFlyoutHit& hit) const;
-    [[nodiscard]] bool IsOverflowAnimating() const noexcept;
     void DestroyOverflowPopup() noexcept;
     void HandleOverflowClick(const TrayFlyoutHit& hit, UINT message);
     [[nodiscard]] int OverflowHitIndex(POINT point) const noexcept;
@@ -519,10 +517,6 @@ private:
     SystemTray m_tray;
     HWND m_overflowWindow = nullptr;
     VisibilityState m_overflowVisibility = VisibilityState::Hidden;
-    double m_overflowAnimStartedAt = 0.0;
-    double m_overflowReveal = 0.0;
-    double m_overflowAnimFromReveal = 0.0;
-    double m_overflowAnimToReveal = 1.0;
     std::vector<TrayNotifyIcon> m_overflowIcons;
     std::vector<TrayFlyoutHit> m_overflowHits;
     int m_overflowHover = -1;
