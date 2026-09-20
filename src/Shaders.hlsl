@@ -1,5 +1,9 @@
 #include "DockTheme.hlsli"
 
+// Refraction-only diagnostic (see GlassPS). 1 = raw warped backdrop,
+// no material. Flip back to 0 after the warp check.
+#define LIQUID_DEBUG_REFRACTION_ONLY 0
+
 cbuffer FrameData : register(b0)
 {
     float4 scene0; // output width, output height, glass alpha, dock scale
@@ -121,8 +125,8 @@ float InterleavedGradientNoise(float2 pixel)
 // ---------------------------------------------------------------------------
 // 5. Frosted / scattering blur AFTER refraction, per chromatic channel.
 //    9 taps per channel (center + 8 rotated ring) = 27 backdrop fetches.
-//    Radius is modulated by slab height f: thin rim ~1px, thick center ~2.5px
-//    (Clear end of the range; the frosted look hid all detail). Rotation by IGN hides ring banding.
+//    Radius is modulated by slab height f: thin rim ~0.75px, thick center
+//    ~2px (Clear end of the range; the frosted look hid all detail). Rotation by IGN hides ring banding.
 //    Each channel is blurred around its own Snell-displaced UV so dispersion
 //    survives the frosted lobe instead of being averaged away.
 // ---------------------------------------------------------------------------
@@ -267,26 +271,33 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float2 uvG = clamp(uv - outward * dG * texel, lo, hi);
         const float2 uvB = clamp(uv - outward * dB * texel, lo, hi);
 
+#if LIQUID_DEBUG_REFRACTION_ONLY
+        // Refraction-only diagnostic: raw backdrop at the refracted UV, no
+        // tint/blur/dispersion/Fresnel/lights. If straight edges behind the
+        // dock don't kink at the rim here, displacement is zero and material
+        // tuning is pointless. Production builds set this to 0.
+        {
+            float3 dbg = backdropTexture.Sample(linearClamp, clamp(uvG, lo, hi)).rgb;
+            return float4(dbg * mask, mask);
+        }
+#endif
+
         // ---- 5. Scattering blur modulated by slab height ------------------
-        // Lean hard toward Clear: 1px at the rim, 2.5px in the thick center.
-        // A sharp refracted image is what makes the warp readable; frosted
-        // mush hides it. Icon legibility still comes from the compressive
-        // tint, not the blur.
-        const float blurPx = (1.0 + height01 * 1.5) * dpi; // 1 rim .. 2.5 center
+        // Lean hard toward Clear: sharp in the thin rim, light frost in the
+        // thick center. A sharp refracted image is what makes the warp
+        // readable; frosted mush hides it. Icon legibility still comes from
+        // the tint backing, not the blur.
+        const float blurPx = (0.75 + height01 * 1.25) * dpi; // 0.75 rim .. 2 center
         frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
     }
 
     // ---- 6. Conditional transmission tint -------------------------------
     // Multiplicative, modulated by slab height: nearly clear at the rim
-    // (refraction + caustic carry the edge), deeper toward the flat field
-    // where icons need backing. tintAmount = 0.10 rim .. 0.38 center.
-    // Over white the field meters ~0.945 pre-premult (~#f3 composited);
-    // over black it falls near 0, so bright icons keep contrast while the
-    // desktop shows through almost untouched.
-    // A small chroma bleed keeps hue tied to underlying content.
+    // (refraction + caustic carry the edge), light veil over the flat field
+    // where icons need backing. tintAmount = 0.08 rim .. 0.25 center.
     const float backLuma = dot(frostedBackground, float3(0.299, 0.587, 0.114));
     const float3 backChroma = frostedBackground - backLuma;
-    const float tintAmount = lerp(0.10, 0.38, height01);
+    const float tintAmount = lerp(0.08, 0.25, height01);
     float3 color = lerp(frostedBackground, frostedBackground * glassTint, tintAmount);
     color += backChroma * 0.08;
     color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22);
