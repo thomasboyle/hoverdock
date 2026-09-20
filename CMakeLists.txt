@@ -89,6 +89,8 @@ target_link_libraries(Dock PRIVATE
     shcore
     shell32
     ole32
+    oleaut32
+    taskschd
     advapi32
     propsys
     windowscodecs

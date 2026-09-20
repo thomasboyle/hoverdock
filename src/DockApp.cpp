@@ -1233,9 +1233,10 @@ int DockApp::Run() {
     if (const std::optional<int> handOff = HandOffToNewerInstalledCopy()) {
         return *handOff;
     }
-    // The Run key is authoritative for startup, but the toggle owns it: repair
-    // a stale path (portable copy moved) or clear a leftover entry so the
-    // persisted setting and the registry never disagree after restart.
+    // Startup entries are authoritative for logon launch, but the toggle owns
+    // them: repair a stale path (portable copy moved) or clear leftover
+    // entries so the persisted setting and the system never disagree after
+    // restart.
     Startup::SyncWithConfig(m_config.LaunchAtStartup());
     {
         std::string current = Updater::CurrentVersion();
@@ -1250,6 +1251,14 @@ int DockApp::Run() {
     RestoreTaskbar();
     CreateOverlayWindow();
     UpdatePrimaryMonitor();
+    // Hide the native taskbar BEFORE any heavy startup work (window
+    // enumeration, D3D12 device creation, shell icon extraction). Those steps
+    // can take a second or more on a busy logon, and every millisecond before
+    // HideTaskbar is time the old taskbar stays visible. The taskbar monitor
+    // keeps it suppressed while the rest of init proceeds below.
+    m_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+    RegisterSystemResumeNotifications();
+    HideTaskbar();
     // Profiles first: enrichment (AppUserModelId coverage) depends on knowing
     // which pins need it before windows are enriched.
     m_windows.RebuildPinProfiles(m_config.Pins());
@@ -1268,9 +1277,6 @@ int DockApp::Run() {
         throw;
     }
 
-    m_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
-    RegisterSystemResumeNotifications();
-    HideTaskbar();
     m_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, &DockApp::MouseHook, m_instance, 0);
     if (m_mouseHook == nullptr) {
         Log(L"Low-level mouse hook unavailable; the dock can still be shown by moving over its window.");

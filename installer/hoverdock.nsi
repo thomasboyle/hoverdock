@@ -127,18 +127,40 @@ Section "Install"
   skipDesktop:
 
   ; Launch-at-startup default: on for fresh installs so the dock survives
-  ; reboot; the in-app Settings toggle owns the key afterwards. Silent
+  ; reboot; the in-app Settings toggle owns both entries afterwards. Silent
   ; re-installs (auto-update) never clobber an explicit user choice.
+  ;
+  ; Two channels for speed: the Run key alone is delayed by Explorer after
+  ; logon (~10-30 s of visible native taskbar). A logon-triggered scheduled
+  ; task with no delay fires much earlier, so the dock hides the taskbar
+  ; sooner. Both launch the same exe; the single-instance mutex makes the
+  ; loser exit instantly. StartupDelayInMSec=0 removes the Explorer delay
+  ; for the Run fallback.
   ReadRegStr $0 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${RUNVALUE}"
   ${If} $0 == ""
     ; No prior choice: enable. An existing value (even for an older path) is
     ; left alone here; the dock repairs stale paths on next launch.
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${RUNVALUE}" '"$INSTDIR\${APPEXE}"'
+    WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize" "StartupDelayInMSec" 0
+  ${EndIf}
+  ; Always (re)create the logon task when startup is on (fresh install or
+  ; enabled): /F refreshes a stale path after updates. Skipped only when the
+  ; user explicitly turned startup off (no Run value and no task yet — the
+  ; query below exits non-zero). Failures are non-fatal: the Run key above
+  ; remains as fallback.
+  ${If} $0 != ""
+    ExecWait '$SYSDIR\schtasks.exe /Create /TN "${RUNVALUE}" /TR "$\"$INSTDIR\${APPEXE}$\"" /SC ONLOGON /RL LIMITED /F' $1
+  ${Else}
+    ExecWait '"$SYSDIR\schtasks.exe" /Query /TN "${RUNVALUE}"' $1
+    ${If} $1 != 0
+      ExecWait '$SYSDIR\schtasks.exe /Create /TN "${RUNVALUE}" /TR "$\"$INSTDIR\${APPEXE}$\"" /SC ONLOGON /RL LIMITED /F' $1
+    ${EndIf}
   ${EndIf}
 SectionEnd
 
 Section "Uninstall"
   Call un.CloseRunningDock
+  ExecWait '"$SYSDIR\schtasks.exe" /Delete /TN "${RUNVALUE}" /F' $0
   Delete "$INSTDIR\${APPEXE}"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
