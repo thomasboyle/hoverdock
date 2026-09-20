@@ -196,10 +196,15 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float3 glassTint = DOCK_GLASS_TINT;
 
     // ---- Bevel geometry ---------------------------------------------------
-    // Bevel width stays inside the corner radius so the flat interior (x=1)
-    // really is flat; 14pt with 20pt corners leaves a stable flat field.
-    float bevelWidth = clamp(14.0 * dpi, 6.0 * dpi, max(cornerRadius * 0.85, 4.0 * dpi));
-    bevelWidth = min(bevelWidth, max(min(halfSize.x, halfSize.y) * 0.9, 1.0));
+    // Wide optical bevel (~24pt) so the lensing ring spans ~10px instead of
+    // hiding inside edge AA: the superellipse height profile concentrates
+    // slope near the rim, and with a 14px bevel the whole bow lived in a
+    // ~2px strip under the rim light (measured: zero pixel change). 24px
+    // stays in the physical 8-48px range. The flat field is preserved
+    // because SdSquircleBox returns TRUE interior depth (not saturated at
+    // -r): x = saturate(depth/bevel) still reaches 1 wherever depth > 24px,
+    // which holds across the dock's middle at any DPI.
+    float bevelWidth = clamp(24.0 * dpi, 10.0 * dpi, max(min(halfSize.x, halfSize.y) * 0.9, 1.0));
     const float x = saturate(insideDistance / max(bevelWidth, 1e-3)); // 0 rim -> 1 flat
     const float oneMinusX = 1.0 - x;
     const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
@@ -236,11 +241,12 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float thetaRR = asin(sinRR);
         const float thetaRG = asin(sinRG);
         const float thetaRB = asin(sinRB);
-        // Artistic gain on the physical shape: BK7 at this slab thickness
-        // displaces only ~4px at the rim, which reads as "same blur" at a
-        // glance. 2.75x keeps Snell's curve (peak at rim, zero in field)
-        // but makes the magnification bow unmistakable on real content.
-        const float lensGain = 2.75;
+        // Artistic gain on the physical shape. Rim displacement is
+        // T_rim*tan(dtheta)*gain ~= 0.45*bevel*0.6*gain: with the 24px bevel
+        // and gain 2.0 the silhouette pulls ~13px, decaying to 0 across the
+        // band - a readable liquid bow. (2.75x on the old 14px bevel peaked
+        // at ~10px but inside a 2px strip, so it measured invisible.)
+        const float lensGain = 2.0;
         float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain;
         float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain;
         float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain;
