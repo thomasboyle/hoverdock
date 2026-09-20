@@ -193,10 +193,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float rim = exp(-insideDistance / max(2.2 * dpi, 1.5));
     const bool hasBackdrop = scene1.w > 0.5;
     // Glass tint shared with the Quick Settings popup (see DockTheme.hlsli),
-    // but the dock face runs the Clear variant: DOCK_GLASS_FACE_MIX lets
-    // 40% of the refracted background through (popups keep 15%). Metered
-    // over white the face outputs ~0.909, compositing to #ebebeb at
-    // DOCK_GLASS_ALPHA (0.909*0.88+0.12=0.920).
+    // but the dock face runs conditional transmission (section 6 below):
+    // nearly clear at the rim, deeper over the flat field.
     const float3 glassTint = DOCK_GLASS_TINT;
 
     // ---- Bevel geometry ---------------------------------------------------
@@ -278,15 +276,18 @@ float4 GlassPS(VertexOutput input) : SV_Target
         frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
     }
 
-    // ---- 6. Adaptive tint / luminosity / legibility -----------------------
-    // Compressive mix toward the calibrated tint: over white the face
-    // meters ~0.909 pre-premult (#ebebeb composited); over black it lands
-    // ~0.51, so the full range breathes with content (Clear-variant
-    // behavior) while icons drawn on top keep full contrast.
-    // A small chroma bleed keeps the tint influenced by underlying content.
+    // ---- 6. Conditional transmission tint -------------------------------
+    // Multiplicative, modulated by slab height: nearly clear at the rim
+    // (refraction + caustic carry the edge), deeper toward the flat field
+    // where icons need backing. tintAmount = 0.10 rim .. 0.38 center.
+    // Over white the field meters ~0.945 pre-premult (~#f3 composited);
+    // over black it falls near 0, so bright icons keep contrast while the
+    // desktop shows through almost untouched.
+    // A small chroma bleed keeps hue tied to underlying content.
     const float backLuma = dot(frostedBackground, float3(0.299, 0.587, 0.114));
     const float3 backChroma = frostedBackground - backLuma;
-    float3 color = lerp(frostedBackground, glassTint, DOCK_GLASS_FACE_MIX);
+    const float tintAmount = lerp(0.10, 0.38, height01);
+    float3 color = lerp(frostedBackground, frostedBackground * glassTint, tintAmount);
     color += backChroma * 0.08;
     color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22);
 
@@ -307,10 +308,12 @@ float4 GlassPS(VertexOutput input) : SV_Target
     color += specular * float3(1.0, 1.0, 1.0) * 0.55;
 
     // Established edge treatment: faint thickness shading, bright rim
-    // caustic (the focused edge-lensing highlight), and top key sheen.
+    // caustic (the focused edge-lensing highlight, following the key light
+    // around the squircle via NdotL rather than a uniform ring), and top
+    // key sheen.
     color *= 1.0 - bevelFactor * bevelFactor * 0.03;
     color += glassTint * rim * 0.12;
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.26;
+    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.26 * (0.35 + 0.65 * ndl);
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
     color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08;
 
