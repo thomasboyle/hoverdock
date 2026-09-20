@@ -482,23 +482,6 @@ std::wstring ResolveShortcutTarget(const std::wstring& shortcut) {
     return {};
 }
 
-bool ActivateWindow(HWND window) {
-    if (IsIconic(window) != FALSE) {
-        ShowWindowAsync(window, SW_RESTORE);
-    }
-    BringWindowToTop(window);
-    if (SetForegroundWindow(window) != FALSE) {
-        return true;
-    }
-
-    FLASHWINFO flash{sizeof(flash)};
-    flash.hwnd = window;
-    flash.dwFlags = FLASHW_TRAY;
-    flash.uCount = 3;
-    FlashWindowEx(&flash);
-    return false;
-}
-
 std::wstring SanitizeAppDisplayName(std::wstring name) {
     const size_t urlSuffix = name.find(L" - http");
     if (urlSuffix != std::wstring::npos) {
@@ -938,15 +921,85 @@ bool WindowCatalog::ActivateOrLaunch(const PinnedApp& app, HWND preferredWindow)
     return LaunchApp(app);
 }
 
+std::vector<HWND> WindowCatalog::FindWindowsFor(const PinnedApp& app) const {
+    std::vector<HWND> matches;
+    if (IsShellTarget(app.target) && !IsAppsFolderTarget(app.target)) {
+        return matches;
+    }
+    const PinMatchProfile* profile = ProfileForPin(app);
+    if (profile == nullptr) {
+        return matches;
+    }
+    // GetTopWindow + GW_HWNDNEXT walks top-level windows topmost-first, the
+    // same z-order EnumWindows uses. Fresh walk (not the snapshot) so a
+    // window opened since the last refresh is still found on click.
+    for (HWND window = GetTopWindow(nullptr); window != nullptr;
+         window = GetWindow(window, GW_HWNDNEXT)) {
+        if (!IsApplicationWindow(window)) {
+            continue;
+        }
+        if (IsPictureInPictureTitle(WindowTitle(window))) {
+            continue;
+        }
+        const std::wstring path = ExecutablePath(window);
+        if (path.empty()) {
+            continue;
+        }
+        RunningWindow candidate{};
+        candidate.handle = window;
+        candidate.executablePath = path;
+        candidate.normalizedPath = CachedNormalizedPathStatic(path);
+        candidate.executableName = FileNameWithoutExtension(path);
+        if (m_pinMatchingNeedsAumid) {
+            candidate.appUserModelId = CachedAppUserModelId(window);
+        }
+        if (MatchWindowAgainstProfile(*profile, candidate)) {
+            matches.push_back(window);
+        }
+    }
+    return matches;
+}
+
 bool WindowCatalog::TryActivate(const PinnedApp& app, HWND preferredWindow) const {
-    HWND window = preferredWindow;
-    if (window == nullptr || IsWindow(window) == FALSE) {
-        window = FindWindowFor(app);
+    // macOS-style: activate the application, not one window. Every live
+    // window comes forward together with its relative z-order preserved and
+    // the frontmost focused. No minimize toggle: clicking an already-active
+    // app is a harmless re-assertion, exactly like the macOS Dock.
+    const std::vector<HWND> windows = FindWindowsFor(app);
+    if (windows.empty()) {
+        return false;
     }
-    if (window != nullptr) {
-        return ActivateWindow(window);
+    HWND foreground = windows.front();
+    if (preferredWindow != nullptr && IsWindow(preferredWindow) != FALSE &&
+        std::ranges::find(windows, preferredWindow) != windows.end()) {
+        foreground = preferredWindow;
     }
-    return false;
+    // Restore minimized windows bottom-first (async: never blocks on a hung
+    // app), then reassert the z-order bottom-first without activating, so the
+    // final foreground handoff lands on the intended window. One deliberate
+    // deviation from macOS: minimized windows are restored, since Windows
+    // users expect click-to-restore and there is no thumbnail strip here.
+    for (auto it = windows.rbegin(); it != windows.rend(); ++it) {
+        if (IsIconic(*it) != FALSE) {
+            ShowWindowAsync(*it, SW_RESTORE);
+        }
+    }
+    for (auto it = windows.rbegin(); it != windows.rend(); ++it) {
+        SetWindowPos(*it, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    if (SetForegroundWindow(foreground) != FALSE) {
+        return true;
+    }
+
+    FLASHWINFO flash{sizeof(flash)};
+    flash.hwnd = foreground;
+    flash.dwFlags = FLASHW_TRAY;
+    flash.uCount = 3;
+    FlashWindowEx(&flash);
+    // The app is running and was brought forward: a denied foreground grab
+    // (foreground-lock timeout) must not read as "not running" and launch a
+    // duplicate.
+    return true;
 }
 
 bool WindowCatalog::LaunchApp(const PinnedApp& app) {

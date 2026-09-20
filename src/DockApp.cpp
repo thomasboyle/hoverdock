@@ -6397,7 +6397,9 @@ void DockApp::ActivatePressedApp() {
     }
 
     // Activate on the UI thread; ShellExecuteEx launches go to a worker so WH_MOUSE_LL stays responsive.
-    if (m_windows.TryActivate(app.app, app.runningWindow)) {
+    // No preferred window: macOS-style activation brings every window forward
+    // with the frontmost focused. (Voice launch passes its specific window.)
+    if (m_windows.TryActivate(app.app)) {
         m_lastWindowRefresh = 0.0;
         ScheduleDeferredRefresh();
         return;
