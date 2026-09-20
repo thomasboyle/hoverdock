@@ -17,3 +17,11 @@
 #define DOCK_GLASS_TINT 0.829f
 #define DOCK_GLASS_MIX 0.85f
 #define DOCK_GLASS_ALPHA 0.88f
+
+// Clear-variant face mix for the GPU dock only (popups stay on
+// DOCK_GLASS_MIX). 40% background signal instead of 15%, so refraction,
+// dispersion and blur stay visible instead of hiding behind flat tint.
+// Metered over white: face outputs ~0.909 pre-premult, compositing to
+// #ebebeb at DOCK_GLASS_ALPHA. Over black the face lands ~#828282, so
+// bright icons keep contrast (Apple Clear-variant behavior).
+#define DOCK_GLASS_FACE_MIX 0.60f

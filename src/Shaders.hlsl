@@ -121,8 +121,8 @@ float InterleavedGradientNoise(float2 pixel)
 // ---------------------------------------------------------------------------
 // 5. Frosted / scattering blur AFTER refraction, per chromatic channel.
 //    9 taps per channel (center + 8 rotated ring) = 27 backdrop fetches.
-//    Radius is modulated by slab height f: thin rim ~2px, thick center ~5px
-//    (lean Clear end of the Regular 2-12px range so detail survives). Rotation by IGN hides ring banding.
+//    Radius is modulated by slab height f: thin rim ~1px, thick center ~3px
+//    (Clear end of the range; the frosted look hid all detail). Rotation by IGN hides ring banding.
 //    Each channel is blurred around its own Snell-displaced UV so dispersion
 //    survives the frosted lobe instead of being averaged away.
 // ---------------------------------------------------------------------------
@@ -190,9 +190,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float insideDistance = max(-distance, 0.0);
     const float rim = exp(-insideDistance / max(2.6 * dpi, 1.75));
     const bool hasBackdrop = scene1.w > 0.5;
-    // Glass recipe shared with the Quick Settings popup (see DockTheme.hlsli).
-    // Calibrated so the dock face meters #e1e1e1 over a white backdrop at
-    // DOCK_GLASS_ALPHA: shader must output 0.8663 so that 0.8663*0.88+0.12=0.8824.
+    // Glass tint shared with the Quick Settings popup (see DockTheme.hlsli),
+    // but the dock face runs the Clear variant: DOCK_GLASS_FACE_MIX lets
+    // 40% of the refracted background through (popups keep 15%). Metered
+    // over white the face outputs ~0.909, compositing to #ebebeb at
+    // DOCK_GLASS_ALPHA (0.909*0.88+0.12=0.920).
     const float3 glassTint = DOCK_GLASS_TINT;
 
     // ---- Bevel geometry ---------------------------------------------------
@@ -243,18 +245,17 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float thetaRB = asin(sinRB);
         // Artistic gain on the physical shape. Rim displacement is
         // T_rim*tan(dtheta)*gain ~= 0.45*bevel*0.6*gain: with the 24px bevel
-        // and gain 2.0 the silhouette pulls ~13px, decaying to 0 across the
-        // band - a readable liquid bow. (2.75x on the old 14px bevel peaked
-        // at ~10px but inside a 2px strip, so it measured invisible.)
-        const float lensGain = 2.0;
+        // and gain 3.0 the silhouette pulls ~19px, decaying to 0 across the
+        // band - an unmistakable liquid suck-in even on photographic content
+        // with no straight edges to bend.
+        const float lensGain = 3.0;
         float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain;
         float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain;
         float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain;
-        // Exaggerate the physical fringe ~12x around green for visibility;
-        // ratios stay physical (blue bends most). At BK7's real dispersion
-        // the R-B split is ~0.04px (invisible); 12x lands ~0.5px: a faint
-        // spectral edge on contrast boundaries, not a rainbow overlay.
-        const float fringeBoost = 12.0;
+        // Exaggerate the physical fringe ~18x around green for visibility;
+        // ratios stay physical (blue bends most). Lands ~0.7px R-B split on
+        // contrast boundaries: a faint spectral edge, not a rainbow overlay.
+        const float fringeBoost = 18.0;
         dR = dG + (dR - dG) * fringeBoost;
         dB = dG + (dB - dG) * fringeBoost;
 
@@ -265,22 +266,22 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float2 uvB = clamp(uv - outward * dB * texel, lo, hi);
 
         // ---- 5. Scattering blur modulated by slab height ------------------
-        // Lean toward the Clear end of the Regular range so background
-        // detail survives: 2px at the rim, 5px in the thick center. The old
-        // frosted recipe used ~20px+ and smeared text into mush; legibility
-        // of the icons themselves still comes from the compressive tint.
-        const float blurPx = (2.0 + height01 * 3.0) * dpi; // 2 rim .. 5 center
+        // Lean hard toward Clear: 1px at the rim, 3px in the thick center.
+        // Frosted mush is what hid the detail in the busy-background test;
+        // legibility of icons comes from the compressive tint, not the blur.
+        const float blurPx = (1.0 + height01 * 2.0) * dpi; // 1 rim .. 3 center
         frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
     }
 
     // ---- 6. Adaptive tint / luminosity / legibility -----------------------
-    // Compressive mix toward the calibrated tint: over white the face still
-    // meters 0.8663 pre-premult; over dark content the range compresses to
-    // ~0.70-0.88 so icons/text stay readable (Regular-variant behavior).
+    // Compressive mix toward the calibrated tint: over white the face
+    // meters ~0.909 pre-premult (#ebebeb composited); over black it lands
+    // ~0.51, so the full range breathes with content (Clear-variant
+    // behavior) while icons drawn on top keep full contrast.
     // A small chroma bleed keeps the tint influenced by underlying content.
     const float backLuma = dot(frostedBackground, float3(0.299, 0.587, 0.114));
     const float3 backChroma = frostedBackground - backLuma;
-    float3 color = lerp(frostedBackground, glassTint, DOCK_GLASS_MIX);
+    float3 color = lerp(frostedBackground, glassTint, DOCK_GLASS_FACE_MIX);
     color += backChroma * 0.08;
     color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22);
 
@@ -297,8 +298,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Bevel-weighted so the flat field keeps the #e1e1e1 calibration exact;
     // the rim picks up the reflective veil + HDR-ish push (clamped by the
     // final saturate, LDR backbuffer).
-    color += fresnel * float3(0.90, 0.95, 1.0) * 0.35 * bevelFactor;
-    color += specular * float3(1.0, 1.0, 1.0) * 0.35;
+    color += fresnel * float3(0.90, 0.95, 1.0) * 0.45 * bevelFactor;
+    color += specular * float3(1.0, 1.0, 1.0) * 0.55;
 
     // Established edge treatment: faint thickness shading, bright rim
     // caustic, and top key sheen.
