@@ -41,7 +41,9 @@ struct DockRenderState {
     UINT width = 1;
     UINT height = 1;
     float glassAlpha = DOCK_GLASS_ALPHA;
-    float slideProgress = 0.0F;
+    // Icon count for the glass pass (icon-calm halos). Written to scene1.x;
+    // the old slide-progress channel was unused by every shader.
+    UINT iconCount = 0;
     float timeSeconds = 0.0F;
     bool showDevBounds = false;
     bool allowBlockingGpuWait = true;

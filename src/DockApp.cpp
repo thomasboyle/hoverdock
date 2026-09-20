@@ -5501,8 +5501,7 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     state.width = m_dockWidth;
     state.height = m_dockHeight;
     state.glassAlpha = DOCK_GLASS_ALPHA;
-    state.slideProgress = m_dockHeight == 0 ? 0.0F :
-        static_cast<float>(m_visibleY - m_currentY) / static_cast<float>(m_dockHeight);
+    state.iconCount = static_cast<UINT>(m_iconRenderData.size());
     state.timeSeconds = static_cast<float>(QpcSeconds());
     state.showDevBounds = m_config.ShowDevBounds();
     state.skipIfGpuBusy = m_dropPresentPending || (IsDragActive() && !m_dragSnapAnimating);

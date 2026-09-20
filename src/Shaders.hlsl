@@ -3,7 +3,7 @@
 cbuffer FrameData : register(b0)
 {
     float4 scene0; // output width, output height, glass alpha, time
-    float4 scene1; // slide progress, DPI scale, dev bounds, backdrop valid
+    float4 scene1; // glass icon count, DPI scale, dev bounds, backdrop valid
 };
 
 struct IconInstance
@@ -213,7 +213,28 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
     const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
     // True surface slope dH/dDist = (B/bevel) * f'(x), B = 0.75*bevel.
-    const float slopeMag = 0.75 * slopeN;
+    float slopeMag = 0.75 * slopeN;
+    // ---- Icon-calm halos --------------------------------------------------
+    // Edge optics ignore icons: within a feather of any icon rect the slab
+    // relaxes toward flat, so refraction, Fresnel and speculars peak in the
+    // background gaps instead of crowding glyphs. Base tint and frost are
+    // untouched (icons are opaque; only the visible glass calms).
+    const uint haloCount = min((uint)max(scene1.x, 0.0), 64u);
+    float minIconDist = 1e9;
+    for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
+    {
+        if (haloIndex >= haloCount)
+        {
+            break;
+        }
+        const float4 haloRect = iconInstances[haloIndex].iconRect; // l,t,w,h px
+        const float2 haloCenter = haloRect.xy + haloRect.zw * 0.5;
+        const float2 haloQ = abs(pixel - haloCenter) - haloRect.zw * 0.5;
+        minIconDist = min(minIconDist, length(max(haloQ, 0.0)));
+    }
+    const float calm = 1.0 - smoothstep(0.0, 10.0 * dpi, minIconDist);
+    const float damp = 1.0 - calm * 0.9;
+    slopeMag *= damp;
     // Slab thickness T(x) = T0 + B*f(x), T0 = 0.45*bevel (0.3-0.5 range).
     const float thicknessPx = (0.45 + 0.75 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
@@ -304,10 +325,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Established edge treatment: faint thickness shading, bright rim
     // caustic, and top key sheen.
     color *= 1.0 - bevelFactor * bevelFactor * 0.03;
-    color += glassTint * rim * 0.12;
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 4.0) * 0.18;
+    color += glassTint * rim * 0.12 * damp;
+    color += float3(1.0, 1.0, 1.0) * pow(rim, 4.0) * 0.18 * damp;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
-    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08;
+    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08 * damp;
 
     if (scene1.z > 0.5)
     {
