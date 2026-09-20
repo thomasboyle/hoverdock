@@ -25,12 +25,49 @@ struct VertexOutput
     nointerpolation uint instanceIndex : TEXCOORD2;
 };
 
-float SquircleBoxSdf(float2 position, float2 halfSize, float cornerRadius, float exponent)
+// ---------------------------------------------------------------------------
+// 1. Core geometry: superellipse / squircle SDF (Apple-like continuous
+//    curvature, n = 4) with analytic interior distance.
+//
+//    sd = (|qx|^n + |qy|^n)^(1/n) + min(max(qx,qy),0) - r,
+//    q = |p| - (halfSize - r).
+//
+//    The `outside` term uses the L4 norm (sqrt(sqrt(x^4+y^4))) so corners have
+//    continuous curvature instead of circular arcs. The `inside` term gives the
+//    true negative distance deep in the interior (the old max(...,0) version
+//    saturated at -r, which is fine for a thin bevel but wrong for height
+//    profiles). Gradient magnitude is ~1 near the edge; surface normals come
+//    from the SDF gradient as in CASDFLayer.
+// ---------------------------------------------------------------------------
+float SdSquircleBox(float2 position, float2 halfSize, float cornerRadius)
 {
-    position = abs(position);
-    position -= halfSize - cornerRadius;
-    position = max(position, 0.0);
-    return pow(pow(position.x, exponent) + pow(position.y, exponent), 1.0 / exponent) - cornerRadius;
+    float2 q = abs(position) - (halfSize - cornerRadius);
+    float qx = max(q.x, 0.0);
+    float qy = max(q.y, 0.0);
+    float quartic = qx * qx * qx * qx + qy * qy * qy * qy;
+    float outside = sqrt(sqrt(max(quartic, 0.0)));
+    float inside = min(max(q.x, q.y), 0.0);
+    return outside + inside - cornerRadius;
+}
+
+// Convex slab height vs. normalized edge distance x in [0,1] (0 = outer rim,
+// 1 = flat interior). Superellipse n=4 profile: f(x) = (1-(1-x)^4)^(1/4).
+// Thickness is highest in the center and tapers toward the rim; the slope is
+// steepest at the rim, which is where refraction / Fresnel / dispersion peak.
+float BevelHeight(float oneMinusX4)
+{
+    return sqrt(sqrt(saturate(1.0 - oneMinusX4)));
+}
+
+// Normalized slope df/dx = (1-x)^3 / (1-(1-x)^4)^(3/4), clamped to keep the
+// rim tilt finite (true superellipse is vertical at x=0). Max ~3.5 is ~74 deg.
+float BevelSlopeN(float oneMinusX, float oneMinusX4)
+{
+    float numer = oneMinusX * oneMinusX * oneMinusX;
+    float denomBase = max(1.0 - oneMinusX4, 1e-4);
+    // pow(x, 0.75) = sqrt(sqrt(x^3)); use pow for clarity, safe on [1e-4,1].
+    float denom = pow(denomBase, 0.75);
+    return min(numer / max(denom, 1e-3), 3.5);
 }
 
 VertexOutput FullscreenVS(uint vertexId : SV_VertexID)
@@ -81,37 +118,48 @@ float InterleavedGradientNoise(float2 pixel)
     return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
-float3 SampleFrostedBackdrop(float2 uv, float2 texel, float2 normal, float rim, float dpi)
+// ---------------------------------------------------------------------------
+// 5. Frosted / scattering blur AFTER refraction, per chromatic channel.
+//    9 taps per channel (center + 8 rotated ring) = 27 backdrop fetches.
+//    Radius is modulated by slab height f: thin rim ~3px, thick center ~8px
+//    (Regular-variant range 2-12px). Rotation by IGN hides ring banding.
+//    Each channel is blurred around its own Snell-displaced UV so dispersion
+//    survives the frosted lobe instead of being averaged away.
+// ---------------------------------------------------------------------------
+float3 SampleChromaticGlass(float2 uvR, float2 uvG, float2 uvB, float2 texel,
+    float blurPx, float2 pixel)
 {
-    const float2 centerUv = clamp(uv + normal * rim * 1.6 * texel, texel * 0.5, 1.0 - texel * 0.5);
-    const float noise = InterleavedGradientNoise(uv / max(texel, 1e-6));
+    const float noise = InterleavedGradientNoise(pixel);
     float sine;
     float cosine;
     sincos(noise * 6.2831853, sine, cosine);
     const float2x2 rot = float2x2(cosine, -sine, sine, cosine);
-    // Apple-like frosted blur: wide kernel in texel units, scaled by display
-    // factor so the blur stays proportional to logical size. Same 17 taps,
-    // so no extra GPU cost.
-    const float radius = (20.0 + rim * 6.0) * dpi;
 
-    float3 acc = backdropTexture.Sample(linearClamp, centerUv).rgb * 0.16;
-    float weight = 0.16;
-    const float2 taps[16] = {
-        float2(0.15, 0.00), float2(-0.15, 0.00), float2(0.00, 0.15), float2(0.00, -0.15),
-        float2(0.28, 0.28), float2(-0.28, 0.28), float2(0.28, -0.28), float2(-0.28, -0.28),
-        float2(0.42, 0.10), float2(-0.42, 0.10), float2(0.10, 0.42), float2(-0.10, 0.42),
-        float2(0.42, -0.10), float2(-0.42, -0.10), float2(0.10, -0.42), float2(-0.10, -0.42)
+    const float2 dirs[8] = {
+        float2(1.0, 0.0), float2(-1.0, 0.0), float2(0.0, 1.0), float2(0.0, -1.0),
+        float2(0.70710678, 0.70710678), float2(-0.70710678, 0.70710678),
+        float2(0.70710678, -0.70710678), float2(-0.70710678, -0.70710678)
     };
+
+    const float wCenter = 0.18;
+    const float wRing = 0.1025; // 0.18 + 8*0.1025 = 1.0
+    const float2 lo = texel * 0.5;
+    const float2 hi = 1.0 - texel * 0.5;
+
+    float3 centerR = backdropTexture.Sample(linearClamp, clamp(uvR, lo, hi)).rgb;
+    float3 centerG = backdropTexture.Sample(linearClamp, clamp(uvG, lo, hi)).rgb;
+    float3 centerB = backdropTexture.Sample(linearClamp, clamp(uvB, lo, hi)).rgb;
+    float3 acc = float3(centerR.r, centerG.g, centerB.b) * wCenter;
+
     [unroll]
-    for (int i = 0; i < 16; ++i)
+    for (int i = 0; i < 8; ++i)
     {
-        const float2 offset = mul(taps[i] * 2.4, rot) * radius * texel;
-        const float w = 0.0525;
-        acc += backdropTexture.Sample(linearClamp,
-            clamp(centerUv + offset, texel * 0.5, 1.0 - texel * 0.5)).rgb * w;
-        weight += w;
+        const float2 offset = mul(dirs[i], rot) * blurPx * texel;
+        acc.r += backdropTexture.Sample(linearClamp, clamp(uvR + offset, lo, hi)).r * wRing;
+        acc.g += backdropTexture.Sample(linearClamp, clamp(uvG + offset, lo, hi)).g * wRing;
+        acc.b += backdropTexture.Sample(linearClamp, clamp(uvB + offset, lo, hi)).b * wRing;
     }
-    return acc / weight;
+    return acc;
 }
 
 float4 GlassPS(VertexOutput input) : SV_Target
@@ -120,13 +168,16 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float2 pixel = input.position.xy;
     const float dpi = max(scene1.y, 1.0);
     const float2 halfSize = outputSize * 0.5 - 1.5 * dpi;
-    // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli): same radius as the
-    // Quick Settings popup. Exponent 2.0 = true circular arcs, matching the
-    // popup's GDI RoundRect geometry exactly (higher exponents look squarer).
+    // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli). Squircle n=4 gives
+    // Apple-like continuous curvature (slightly fuller corners than the true
+    // circular arcs of GDI RoundRect used for the input region; the few-px
+    // corner difference is outside the interactive icon area).
     const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
-    const float distance = SquircleBoxSdf(pixel - outputSize * 0.5, halfSize, cornerRadius, 2.0);
+    const float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
     const float aa = 1.35 * dpi;
     const float mask = 1.0 - smoothstep(-aa, aa, distance);
+    // SDF gradient = 2D surface direction (CASDFLayer-style). ddx/ddy gives
+    // screen-space analytic derivatives of the SDF field.
     const float2 gradient = float2(ddx(distance), ddy(distance));
     if (mask <= 0.0)
     {
@@ -134,7 +185,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     }
     const float2 texel = 1.0 / outputSize;
     const float2 uv = pixel * texel;
-    const float2 normal = gradient / max(length(gradient), 0.0001);
+    const float gradLen = length(gradient);
+    const float2 outward = gradient / max(gradLen, 0.0001);
     const float insideDistance = max(-distance, 0.0);
     const float rim = exp(-insideDistance / max(2.6 * dpi, 1.75));
     const bool hasBackdrop = scene1.w > 0.5;
@@ -142,12 +194,101 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Calibrated so the dock face meters #e1e1e1 over a white backdrop at
     // DOCK_GLASS_ALPHA: shader must output 0.8663 so that 0.8663*0.88+0.12=0.8824.
     const float3 glassTint = DOCK_GLASS_TINT;
-    const float3 frostedBackground = hasBackdrop
-        ? SampleFrostedBackdrop(uv, texel, normal, rim, dpi)
-        : glassTint;
 
+    // ---- Bevel geometry ---------------------------------------------------
+    // Bevel width stays inside the corner radius so the flat interior (x=1)
+    // really is flat; 14pt with 20pt corners leaves a stable flat field.
+    float bevelWidth = clamp(14.0 * dpi, 6.0 * dpi, max(cornerRadius * 0.85, 4.0 * dpi));
+    bevelWidth = min(bevelWidth, max(min(halfSize.x, halfSize.y) * 0.9, 1.0));
+    const float x = saturate(insideDistance / max(bevelWidth, 1e-3)); // 0 rim -> 1 flat
+    const float oneMinusX = 1.0 - x;
+    const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
+    const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
+    const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
+    // True surface slope dH/dDist = (B/bevel) * f'(x), B = 0.75*bevel.
+    const float slopeMag = 0.75 * slopeN;
+    // Slab thickness T(x) = T0 + B*f(x), T0 = 0.45*bevel (0.3-0.5 range).
+    const float thicknessPx = (0.45 + 0.75 * height01) * bevelWidth;
+    const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
+
+    float3 frostedBackground;
+    if (!hasBackdrop)
+    {
+        frostedBackground = glassTint;
+    }
+    else
+    {
+        // ---- 2. Snell refraction through the convex slab ------------------
+        // theta_s = atan(slope) = incidence (view is normal to the plate).
+        // theta_r = asin(sin(theta_s)/n) per wavelength, BK7 crown glass.
+        // d(x) = T(x) * tan(theta_s - theta_r), peak at the rim.
+        // uv' = uv - outward * d (inward pull => magnified look).
+        const float thetaS = atan(slopeMag);
+        const float sinS = sin(thetaS);
+        // 3. Chromatic dispersion: real BK7 Fraunhofer indices (d/F/C lines).
+        // Red 656nm 1.5143, Green 588nm 1.5168, Blue 486nm 1.5224.
+        const float nR = 1.5143;
+        const float nG = 1.5168;
+        const float nB = 1.5224;
+        const float sinRR = clamp(sinS / nR, 0.0, 0.999);
+        const float sinRG = clamp(sinS / nG, 0.0, 0.999);
+        const float sinRB = clamp(sinS / nB, 0.0, 0.999);
+        const float thetaRR = asin(sinRR);
+        const float thetaRG = asin(sinRG);
+        const float thetaRB = asin(sinRB);
+        // 1.35x artistic gain: physical shape, slightly stronger lensing so
+        // the magnification reads on desktop viewing distances.
+        const float lensGain = 1.35;
+        float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain;
+        float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain;
+        float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain;
+        // Exaggerate the physical fringe ~2.5x around green for visibility;
+        // ratios stay physical (blue bends most), strength stays subtle.
+        const float fringeBoost = 2.5;
+        dR = dG + (dR - dG) * fringeBoost;
+        dB = dG + (dB - dG) * fringeBoost;
+
+        const float2 lo = texel * 0.5;
+        const float2 hi = 1.0 - texel * 0.5;
+        const float2 uvR = clamp(uv - outward * dR * texel, lo, hi);
+        const float2 uvG = clamp(uv - outward * dG * texel, lo, hi);
+        const float2 uvB = clamp(uv - outward * dB * texel, lo, hi);
+
+        // ---- 5. Scattering blur modulated by slab height ------------------
+        const float blurPx = (3.0 + height01 * 5.0) * dpi; // 3 rim .. 8 center
+        frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
+    }
+
+    // ---- 6. Adaptive tint / luminosity / legibility -----------------------
+    // Compressive mix toward the calibrated tint: over white the face still
+    // meters 0.8663 pre-premult; over dark content the range compresses to
+    // ~0.70-0.88 so icons/text stay readable (Regular-variant behavior).
+    // A small chroma bleed keeps the tint influenced by underlying content.
+    const float backLuma = dot(frostedBackground, float3(0.299, 0.587, 0.114));
+    const float3 backChroma = frostedBackground - backLuma;
     float3 color = lerp(frostedBackground, glassTint, DOCK_GLASS_MIX);
+    color += backChroma * 0.08;
     color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22);
+
+    // ---- 4. Fresnel reflection + specular ---------------------------------
+    // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on
+    // the bevel. Schlick F0 = 0.04. Light is a virtual top-left key (desktop
+    // has no gyroscope): speculars ride the bevel, strongest at the rim.
+    const float3 surfN = normalize(float3(outward * slopeMag, 1.0));
+    const float cosTheta = saturate(surfN.z);
+    const float fresnel = 0.04 + 0.96 * pow(1.0 - cosTheta, 5.0);
+    const float3 lightDir = normalize(float3(-0.35, -0.6, 0.7));
+    const float ndl = saturate(dot(surfN, lightDir));
+    const float specular = pow(ndl, 64.0) * bevelFactor;
+    // Bevel-weighted so the flat field keeps the #e1e1e1 calibration exact;
+    // the rim picks up the reflective veil + HDR-ish push (clamped by the
+    // final saturate, LDR backbuffer).
+    color += fresnel * float3(0.90, 0.95, 1.0) * 0.35 * bevelFactor;
+    color += specular * float3(1.0, 1.0, 1.0) * 0.35;
+
+    // Established edge treatment: faint thickness shading, bright rim
+    // caustic, and top key sheen.
+    color *= 1.0 - bevelFactor * bevelFactor * 0.03;
     color += glassTint * rim * 0.12;
     color += float3(1.0, 1.0, 1.0) * pow(rim, 4.0) * 0.18;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
