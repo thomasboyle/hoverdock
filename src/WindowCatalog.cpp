@@ -11,6 +11,7 @@
 #include <array>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <vector>
 
@@ -322,6 +323,364 @@ void AppendProcessStartCandidates(std::vector<std::wstring>& candidates, const P
                 FindProcessStartInSiblingAppFolders(targetDirectory.wstring(), processStart));
         }
     }
+}
+
+// --- Steam game resolution ------------------------------------------------
+// A Steam pin (steam.exe -applaunch <id>, steam://rungameid/<id>, or a .url
+// desktop shortcut) launches a game process with a different exe
+// (valheim.exe, ...). Without resolving the AppID to the installed game
+// exe, the pin never matches its windows and every click launches a
+// duplicate instead of activating.
+
+std::wstring Lowercased(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
+        return static_cast<wchar_t>(std::towlower(character));
+    });
+    return value;
+}
+
+// Digit run following `marker` in already-lowercased text. Characters that
+// cannot separate a flag from its value (letters, '-') abort the match so
+// "applaunchfoo" never parses; separators like ' ', '/', '=' are skipped.
+std::wstring DigitsAfter(const std::wstring& lower, std::wstring_view marker) {
+    size_t position = lower.find(marker);
+    while (position != std::wstring::npos) {
+        size_t start = position + marker.size();
+        bool aborted = false;
+        while (start < lower.size() && (lower[start] < L'0' || lower[start] > L'9')) {
+            const wchar_t c = lower[start];
+            if ((c >= L'a' && c <= L'z') || c == L'-') {
+                aborted = true;
+                break;
+            }
+            ++start;
+        }
+        if (!aborted) {
+            size_t end = start;
+            while (end < lower.size() && lower[end] >= L'0' && lower[end] <= L'9') {
+                ++end;
+            }
+            if (end > start) {
+                return lower.substr(start, end - start);
+            }
+        }
+        position = lower.find(marker, position + 1);
+    }
+    return {};
+}
+
+std::wstring ExtractSteamAppIdFromText(const std::wstring& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const std::wstring lower = Lowercased(text);
+    if (lower.find(L"steam") == std::wstring::npos &&
+        lower.find(L"rungameid") == std::wstring::npos &&
+        lower.find(L"applaunch") == std::wstring::npos) {
+        return {};
+    }
+    if (std::wstring id = DigitsAfter(lower, L"rungameid/"); !id.empty()) {
+        return id;
+    }
+    if (std::wstring id = DigitsAfter(lower, L"-applaunch"); !id.empty()) {
+        return id;
+    }
+    if (std::wstring id = DigitsAfter(lower, L"/applaunch"); !id.empty()) {
+        return id;
+    }
+    return {};
+}
+
+std::string ReadSmallFileBytes(const std::wstring& path, size_t maxBytes) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file || maxBytes == 0) {
+        return {};
+    }
+    std::string bytes(maxBytes, '\0');
+    file.read(bytes.data(), static_cast<std::streamsize>(maxBytes));
+    bytes.resize(static_cast<size_t>(file.gcount()));
+    return bytes;
+}
+
+std::wstring WidenUtf8(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int count = MultiByteToWideChar(CP_UTF8, 0, text.data(),
+        static_cast<int>(text.size()), nullptr, 0);
+    if (count <= 0) {
+        return {};
+    }
+    std::wstring out(static_cast<size_t>(count), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), count);
+    return out;
+}
+
+std::wstring ExtractSteamAppId(const std::wstring& target, const std::wstring& arguments) {
+    // Steam desktop shortcuts are .url files ([InternetShortcut] URL=...).
+    if (EndsWithInsensitive(target, L".url")) {
+        const std::string bytes = ReadSmallFileBytes(target, 8192);
+        if (!bytes.empty()) {
+            if (std::wstring id = ExtractSteamAppIdFromText(WidenUtf8(bytes)); !id.empty()) {
+                return id;
+            }
+        }
+    }
+    if (std::wstring id = ExtractSteamAppIdFromText(arguments); !id.empty()) {
+        return id;
+    }
+    return ExtractSteamAppIdFromText(target);
+}
+
+std::wstring ReadSteamRegistryString(HKEY root, const wchar_t* valueName) {
+    wchar_t buffer[1024]{};
+    DWORD size = sizeof(buffer);
+    DWORD type = 0;
+    if (RegGetValueW(root, L"Software\\Valve\\Steam", valueName, RRF_RT_REG_SZ, &type, buffer,
+            &size) != ERROR_SUCCESS ||
+        type != REG_SZ) {
+        return {};
+    }
+    return buffer;
+}
+
+bool IsExistingDirectory(const std::wstring& path) {
+    if (path.empty()) {
+        return false;
+    }
+    std::error_code statusError;
+    return std::filesystem::is_directory(path, statusError);
+}
+
+std::wstring SteamInstallDirectory() {
+    // SteamPath uses forward slashes ("C:/Program Files (x86)/Steam").
+    if (std::wstring path = ReadSteamRegistryString(HKEY_CURRENT_USER, L"SteamPath");
+        !path.empty()) {
+        std::replace(path.begin(), path.end(), L'/', L'\\');
+        if (IsExistingDirectory(path)) {
+            return path;
+        }
+    }
+    // SteamExe points at steam.exe; its folder is the install dir.
+    if (std::wstring exe = ReadSteamRegistryString(HKEY_CURRENT_USER, L"SteamExe");
+        !exe.empty()) {
+        const std::filesystem::path parent = std::filesystem::path(exe).parent_path();
+        if (!parent.empty() && IsExistingDirectory(parent.wstring())) {
+            return parent.wstring();
+        }
+    }
+    // 64-bit view first, then the 32-bit view where 32-bit Steam registers.
+    for (const wchar_t* subkey :
+        {L"SOFTWARE\\Valve\\Steam", L"SOFTWARE\\Wow6432Node\\Valve\\Steam"}) {
+        wchar_t buffer[1024]{};
+        DWORD size = sizeof(buffer);
+        DWORD type = 0;
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, subkey, L"InstallPath", RRF_RT_REG_SZ, &type,
+                buffer, &size) == ERROR_SUCCESS &&
+            type == REG_SZ && buffer[0] != L'\0' && IsExistingDirectory(buffer)) {
+            return buffer;
+        }
+    }
+    constexpr wchar_t kDefault[] = L"C:\\Program Files (x86)\\Steam";
+    if (IsExistingDirectory(kDefault)) {
+        return kDefault;
+    }
+    return {};
+}
+
+// Value of the first `"key" "value"` pair in VDF/ACF text (case-insensitive
+// key). libraryfolders.vdf and appmanifest_*.acf are flat enough for this.
+std::string FindVdfStringValue(const std::string& bytes, const char* key) {
+    const std::string wanted(key);
+    size_t position = 0;
+    while ((position = bytes.find('"', position)) != std::string::npos) {
+        const size_t keyEnd = bytes.find('"', position + 1);
+        if (keyEnd == std::string::npos) {
+            return {};
+        }
+        const std::string found = bytes.substr(position + 1, keyEnd - position - 1);
+        size_t valueQuote = keyEnd + 1;
+        while (valueQuote < bytes.size() &&
+            (bytes[valueQuote] == ' ' || bytes[valueQuote] == '\t' ||
+                bytes[valueQuote] == '\r' || bytes[valueQuote] == '\n')) {
+            ++valueQuote;
+        }
+        if (valueQuote >= bytes.size() || bytes[valueQuote] != '"') {
+            position = keyEnd + 1;
+            continue;
+        }
+        const size_t valueEnd = bytes.find('"', valueQuote + 1);
+        if (valueEnd == std::string::npos) {
+            return {};
+        }
+        if (found.size() == wanted.size() &&
+            std::equal(found.begin(), found.end(), wanted.begin(), [](char left, char right) {
+                return std::tolower(static_cast<unsigned char>(left)) ==
+                    std::tolower(static_cast<unsigned char>(right));
+            })) {
+            return bytes.substr(valueQuote + 1, valueEnd - valueQuote - 1);
+        }
+        position = valueEnd + 1;
+    }
+    return {};
+}
+
+void UnescapeVdfSeparators(std::string& path) {
+    // VDF escapes backslashes: "C:\\Steam" -> "C:\Steam".
+    std::string out;
+    out.reserve(path.size());
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (path[i] == '\\' && i + 1 < path.size() && path[i + 1] == '\\') {
+            out.push_back('\\');
+            ++i;
+        } else {
+            out.push_back(path[i]);
+        }
+    }
+    path = std::move(out);
+}
+
+std::vector<std::wstring> SteamLibraryDirectories(const std::wstring& steamDir) {
+    std::vector<std::wstring> libraries{steamDir};
+    const std::string bytes =
+        ReadSmallFileBytes(steamDir + L"\\steamapps\\libraryfolders.vdf", 65536);
+    if (bytes.empty()) {
+        return libraries;
+    }
+    // New format: "path" "<dir>". Old format: "1" "<dir>". Every entry is
+    // validated as a directory; junk pairs are harmless.
+    size_t position = 0;
+    while ((position = bytes.find('"', position)) != std::string::npos) {
+        const size_t keyEnd = bytes.find('"', position + 1);
+        if (keyEnd == std::string::npos) {
+            break;
+        }
+        const std::string key = bytes.substr(position + 1, keyEnd - position - 1);
+        size_t valueQuote = keyEnd + 1;
+        while (valueQuote < bytes.size() &&
+            (bytes[valueQuote] == ' ' || bytes[valueQuote] == '\t' ||
+                bytes[valueQuote] == '\r' || bytes[valueQuote] == '\n')) {
+            ++valueQuote;
+        }
+        if (valueQuote >= bytes.size() || bytes[valueQuote] != '"') {
+            position = keyEnd + 1;
+            continue;
+        }
+        const size_t valueEnd = bytes.find('"', valueQuote + 1);
+        if (valueEnd == std::string::npos) {
+            break;
+        }
+        std::string value = bytes.substr(valueQuote + 1, valueEnd - valueQuote - 1);
+        position = valueEnd + 1;
+        const bool isPathKey = key.size() == 4 &&
+            std::equal(key.begin(), key.end(), "path", [](char left, char right) {
+                return std::tolower(static_cast<unsigned char>(left)) ==
+                    std::tolower(static_cast<unsigned char>(right));
+            });
+        const bool isNumberedKey = !key.empty() &&
+            std::all_of(key.begin(), key.end(), [](char c) { return c >= '0' && c <= '9'; });
+        if (!isPathKey && !isNumberedKey) {
+            continue;
+        }
+        UnescapeVdfSeparators(value);
+        const std::wstring directory = WidenUtf8(value);
+        if (directory.empty() || !IsExistingDirectory(directory)) {
+            continue;
+        }
+        const bool known = std::ranges::any_of(libraries, [&directory](const std::wstring& knownDir) {
+            return EqualInsensitive(knownDir, directory);
+        });
+        if (!known) {
+            libraries.push_back(directory);
+        }
+    }
+    return libraries;
+}
+
+bool IsSteamHelperExeName(const std::wstring& stemLower) {
+    if (stemLower.starts_with(L"unins")) {
+        return true;
+    }
+    constexpr std::wstring_view kHelpers[] = {L"unitycrashhandler", L"unitycrashhandler64",
+        L"unitycrashhandler32", L"crashhandler", L"crashreporter", L"crashpad_handler", L"setup",
+        L"vcredist", L"vcredist_x64", L"vcredist_x86", L"dxsetup", L"oalinst", L"dotnet",
+        L"uninstall"};
+    return std::ranges::any_of(kHelpers,
+        [&stemLower](std::wstring_view helper) { return stemLower == helper; });
+}
+
+std::vector<std::wstring> DiscoverSteamGameExecutables(
+    const std::wstring& gameDir, const std::wstring& installDirName) {
+    std::vector<std::wstring> exes;
+    std::vector<std::wstring> allExes;
+    std::error_code iterateError;
+    std::filesystem::directory_iterator entries(gameDir, iterateError);
+    if (iterateError) {
+        return {};
+    }
+    const std::wstring wanted = Lowercased(installDirName);
+    for (const std::filesystem::directory_entry& entry : entries) {
+        std::error_code entryError;
+        if (!entry.is_regular_file(entryError) || entryError) {
+            continue;
+        }
+        const std::filesystem::path file = entry.path();
+        if (!EqualInsensitive(file.extension().wstring(), L".exe")) {
+            continue;
+        }
+        const std::wstring stemLower = Lowercased(file.stem().wstring());
+        allExes.push_back(file.wstring());
+        // installdir "Valheim" -> valheim.exe: the common convention, exact.
+        if (!wanted.empty() && stemLower == wanted) {
+            return {file.wstring()};
+        }
+        if (!IsSteamHelperExeName(stemLower)) {
+            exes.push_back(file.wstring());
+        }
+    }
+    // Last resort: every top-level exe (a crash handler has no app window, so
+    // an extra candidate here is harmless; a missing one launches dupes).
+    return !exes.empty() ? exes : allExes;
+}
+
+std::vector<std::wstring> SteamGameExecutables(const std::wstring& appId) {
+    static std::mutex mutex;
+    static std::unordered_map<std::wstring, std::vector<std::wstring>> cache;
+    {
+        const std::lock_guard lock(mutex);
+        if (const auto cached = cache.find(appId); cached != cache.end()) {
+            return cached->second;
+        }
+    }
+    std::vector<std::wstring> exes;
+    if (const std::wstring steamDir = SteamInstallDirectory(); !steamDir.empty()) {
+        const std::vector<std::wstring> libraries = SteamLibraryDirectories(steamDir);
+        const std::wstring manifestName = L"\\steamapps\\appmanifest_" + appId + L".acf";
+        for (const std::wstring& library : libraries) {
+            std::string installDir = FindVdfStringValue(
+                ReadSmallFileBytes(library + manifestName, 32768), "installdir");
+            if (installDir.empty()) {
+                continue;
+            }
+            const std::wstring gameDir =
+                library + L"\\steamapps\\common\\" + WidenUtf8(installDir);
+            if (!IsExistingDirectory(gameDir)) {
+                continue;
+            }
+            exes = DiscoverSteamGameExecutables(gameDir, WidenUtf8(installDir));
+            if (!exes.empty()) {
+                break;
+            }
+        }
+    }
+    {
+        const std::lock_guard lock(mutex);
+        if (cache.size() >= 64) {
+            cache.clear();
+        }
+        cache.emplace(appId, exes);
+    }
+    return exes;
 }
 
 bool IsApplicationFrameHostPath(const std::wstring& path) {
@@ -772,6 +1131,16 @@ void WindowCatalog::RebuildPinProfiles(const std::vector<PinnedApp>& pins) {
         }
         if (EndsWithInsensitive(pin.target, L".lnk") && IsExistingFile(pin.target)) {
             addCandidate(ResolveShortcutTarget(pin.target));
+        }
+        // Steam pins launch a different exe than the shortcut names
+        // (valheim.exe for a steam://rungameid/892970 pin). Without the real
+        // game exe in the profile, its windows never match and every click
+        // launches a duplicate instead of activating.
+        if (const std::wstring steamAppId = ExtractSteamAppId(pin.target, pin.arguments);
+            !steamAppId.empty()) {
+            for (const std::wstring& gameExe : SteamGameExecutables(steamAppId)) {
+                addCandidate(gameExe);
+            }
         }
         if (IsAppsFolderTarget(pin.target)) {
             profile.appsFolderAumid = AppsFolderAumid(pin.target);
