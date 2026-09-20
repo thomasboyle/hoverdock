@@ -121,8 +121,8 @@ float InterleavedGradientNoise(float2 pixel)
 // ---------------------------------------------------------------------------
 // 5. Frosted / scattering blur AFTER refraction, per chromatic channel.
 //    9 taps per channel (center + 8 rotated ring) = 27 backdrop fetches.
-//    Radius is modulated by slab height f: thin rim ~3px, thick center ~8px
-//    (Regular-variant range 2-12px). Rotation by IGN hides ring banding.
+//    Radius is modulated by slab height f: thin rim ~2px, thick center ~5px
+//    (lean Clear end of the Regular 2-12px range so detail survives). Rotation by IGN hides ring banding.
 //    Each channel is blurred around its own Snell-displaced UV so dispersion
 //    survives the frosted lobe instead of being averaged away.
 // ---------------------------------------------------------------------------
@@ -236,15 +236,19 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float thetaRR = asin(sinRR);
         const float thetaRG = asin(sinRG);
         const float thetaRB = asin(sinRB);
-        // 1.35x artistic gain: physical shape, slightly stronger lensing so
-        // the magnification reads on desktop viewing distances.
-        const float lensGain = 1.35;
+        // Artistic gain on the physical shape: BK7 at this slab thickness
+        // displaces only ~4px at the rim, which reads as "same blur" at a
+        // glance. 2.75x keeps Snell's curve (peak at rim, zero in field)
+        // but makes the magnification bow unmistakable on real content.
+        const float lensGain = 2.75;
         float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain;
         float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain;
         float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain;
-        // Exaggerate the physical fringe ~2.5x around green for visibility;
-        // ratios stay physical (blue bends most), strength stays subtle.
-        const float fringeBoost = 2.5;
+        // Exaggerate the physical fringe ~12x around green for visibility;
+        // ratios stay physical (blue bends most). At BK7's real dispersion
+        // the R-B split is ~0.04px (invisible); 12x lands ~0.5px: a faint
+        // spectral edge on contrast boundaries, not a rainbow overlay.
+        const float fringeBoost = 12.0;
         dR = dG + (dR - dG) * fringeBoost;
         dB = dG + (dB - dG) * fringeBoost;
 
@@ -255,7 +259,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float2 uvB = clamp(uv - outward * dB * texel, lo, hi);
 
         // ---- 5. Scattering blur modulated by slab height ------------------
-        const float blurPx = (3.0 + height01 * 5.0) * dpi; // 3 rim .. 8 center
+        // Lean toward the Clear end of the Regular range so background
+        // detail survives: 2px at the rim, 5px in the thick center. The old
+        // frosted recipe used ~20px+ and smeared text into mush; legibility
+        // of the icons themselves still comes from the compressive tint.
+        const float blurPx = (2.0 + height01 * 3.0) * dpi; // 2 rim .. 5 center
         frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
     }
 
