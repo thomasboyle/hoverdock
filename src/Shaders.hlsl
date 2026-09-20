@@ -2,8 +2,8 @@
 
 cbuffer FrameData : register(b0)
 {
-    float4 scene0; // output width, output height, glass alpha, time
-    float4 scene1; // glass icon count, DPI scale, dev bounds, backdrop valid
+    float4 scene0; // output width, output height, glass alpha, dock scale
+    float4 scene1; // slide progress, DPI scale, dev bounds, backdrop valid
 };
 
 struct IconInstance
@@ -198,43 +198,23 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float3 glassTint = DOCK_GLASS_TINT;
 
     // ---- Bevel geometry ---------------------------------------------------
-    // Wide optical bevel (~24pt) so the lensing ring spans ~10px instead of
-    // hiding inside edge AA: the superellipse height profile concentrates
-    // slope near the rim, and with a 14px bevel the whole bow lived in a
-    // ~2px strip under the rim light (measured: zero pixel change). 24px
-    // stays in the physical 8-48px range. The flat field is preserved
-    // because SdSquircleBox returns TRUE interior depth (not saturated at
-    // -r): x = saturate(depth/bevel) still reaches 1 wherever depth > 24px,
-    // which holds across the dock's middle at any DPI.
-    float bevelWidth = clamp(24.0 * dpi, 10.0 * dpi, max(min(halfSize.x, halfSize.y) * 0.9, 1.0));
+    // Optical bevel ~20pt, SCALED by the dock content scale (scene0.w) so it
+    // stays proportional to the layout: layout padding is 24pt, giving a
+    // fixed 1.2x clearance so icons never enter the lensing band at any
+    // dock scale. (An absolute 24px bevel overlapped the 20pt padding, worst
+    // at small scales where padding shrinks but the bevel did not.) The flat
+    // field is preserved because SdSquircleBox returns TRUE interior depth:
+    // x = saturate(depth/bevel) still reaches 1 wherever depth > bevel.
+    const float dockScale = clamp(scene0.w, 0.5, 2.0);
+    float bevelWidth = clamp(20.0 * dpi * dockScale, 8.0 * dpi,
+        max(min(halfSize.x, halfSize.y) * 0.9, 1.0));
     const float x = saturate(insideDistance / max(bevelWidth, 1e-3)); // 0 rim -> 1 flat
     const float oneMinusX = 1.0 - x;
     const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
     const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
     const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
     // True surface slope dH/dDist = (B/bevel) * f'(x), B = 0.75*bevel.
-    float slopeMag = 0.75 * slopeN;
-    // ---- Icon-calm halos --------------------------------------------------
-    // Edge optics ignore icons: within a feather of any icon rect the slab
-    // relaxes toward flat, so refraction, Fresnel and speculars peak in the
-    // background gaps instead of crowding glyphs. Base tint and frost are
-    // untouched (icons are opaque; only the visible glass calms).
-    const uint haloCount = min((uint)max(scene1.x, 0.0), 64u);
-    float minIconDist = 1e9;
-    for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
-    {
-        if (haloIndex >= haloCount)
-        {
-            break;
-        }
-        const float4 haloRect = iconInstances[haloIndex].iconRect; // l,t,w,h px
-        const float2 haloCenter = haloRect.xy + haloRect.zw * 0.5;
-        const float2 haloQ = abs(pixel - haloCenter) - haloRect.zw * 0.5;
-        minIconDist = min(minIconDist, length(max(haloQ, 0.0)));
-    }
-    const float calm = 1.0 - smoothstep(0.0, 10.0 * dpi, minIconDist);
-    const float damp = 1.0 - calm * 0.9;
-    slopeMag *= damp;
+    const float slopeMag = 0.75 * slopeN;
     // Slab thickness T(x) = T0 + B*f(x), T0 = 0.45*bevel (0.3-0.5 range).
     const float thicknessPx = (0.45 + 0.75 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
@@ -265,8 +245,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float thetaRG = asin(sinRG);
         const float thetaRB = asin(sinRB);
         // Artistic gain on the physical shape. Rim displacement is
-        // T_rim*tan(dtheta)*gain ~= 0.45*bevel*0.6*gain: with the 24px bevel
-        // and gain 3.0 the silhouette pulls ~19px, decaying to 0 across the
+        // T_rim*tan(dtheta)*gain ~= 0.45*bevel*0.6*gain: with the 20pt bevel
+        // and gain 3.0 the silhouette pulls ~16px, decaying to 0 across the
         // band - an unmistakable liquid suck-in even on photographic content
         // with no straight edges to bend.
         const float lensGain = 3.0;
@@ -325,10 +305,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Established edge treatment: faint thickness shading, bright rim
     // caustic, and top key sheen.
     color *= 1.0 - bevelFactor * bevelFactor * 0.03;
-    color += glassTint * rim * 0.12 * damp;
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 4.0) * 0.18 * damp;
+    color += glassTint * rim * 0.12;
+    color += float3(1.0, 1.0, 1.0) * pow(rim, 4.0) * 0.18;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
-    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08 * damp;
+    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08;
 
     if (scene1.z > 0.5)
     {

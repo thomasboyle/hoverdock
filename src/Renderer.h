@@ -41,10 +41,11 @@ struct DockRenderState {
     UINT width = 1;
     UINT height = 1;
     float glassAlpha = DOCK_GLASS_ALPHA;
-    // Icon count for the glass pass (icon-calm halos). Written to scene1.x;
-    // the old slide-progress channel was unused by every shader.
-    UINT iconCount = 0;
-    float timeSeconds = 0.0F;
+    float slideProgress = 0.0F;
+    // Dock content scale (1.0 = default). Drives the shader's optical bevel
+    // width so icons always clear the lensing band (see Shaders.hlsl).
+    // (Previously wall-clock seconds; the shader never consumed it.)
+    float dockScale = 1.0F;
     bool showDevBounds = false;
     bool allowBlockingGpuWait = true;
     bool skipIfGpuBusy = false;

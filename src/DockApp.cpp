@@ -2422,7 +2422,11 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     const LONG dotSize = std::max(2L, std::lround(5.0F * layoutScale));
     const LONG dotGap = std::max(1L, std::lround(2.0F * layoutScale));
     const LONG iconSlotHeight = iconSize + dotGap + dotSize;
-    const LONG padding = std::lround(20.0F * layoutScale);
+    // Padding clears the glass bevel: the shader's lensing band runs
+    // ~20*dockScale device px, so 24pt keeps icons (and their running dots)
+    // out of the refraction zone on all sides at every scale. (20pt left
+    // icon tops/bottoms inside the band, smearing background over them.)
+    const LONG padding = std::lround(24.0F * layoutScale);
     const LONG gap = std::lround(10.0F * layoutScale);
     const LONG dividerSlotWidth = std::lround(10.0F * layoutScale);
     const LONG margin = std::lround(10.0F * scale);
@@ -5501,8 +5505,9 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     state.width = m_dockWidth;
     state.height = m_dockHeight;
     state.glassAlpha = DOCK_GLASS_ALPHA;
-    state.iconCount = static_cast<UINT>(m_iconRenderData.size());
-    state.timeSeconds = static_cast<float>(QpcSeconds());
+    state.slideProgress = m_dockHeight == 0 ? 0.0F :
+        static_cast<float>(m_visibleY - m_currentY) / static_cast<float>(m_dockHeight);
+    state.dockScale = m_dockScale;
     state.showDevBounds = m_config.ShowDevBounds();
     state.skipIfGpuBusy = m_dropPresentPending || (IsDragActive() && !m_dragSnapAnimating);
     state.allowBlockingGpuWait = allowBlockingGpuWait && !IsAnimating() && !IsDragActive() &&
