@@ -1295,8 +1295,13 @@ std::vector<HWND> WindowCatalog::FindWindowsFor(const PinnedApp& app) const {
     if (IsShellTarget(app.target) && !IsAppsFolderTarget(app.target)) {
         return matches;
     }
+    // Unpinned running entries (target = exe path) have no pin profile; match
+    // them directly by executable path, the same predicate the snapshot
+    // builder uses. Without this, clicks on unpinned apps find nothing and
+    // launch a duplicate.
     const PinMatchProfile* profile = ProfileForPin(app);
-    if (profile == nullptr) {
+    const bool directExeMatch = profile == nullptr && !IsShellTarget(app.target);
+    if (profile == nullptr && !directExeMatch) {
         return matches;
     }
     // GetTopWindow + GW_HWNDNEXT walks top-level windows topmost-first, the
@@ -1322,7 +1327,10 @@ std::vector<HWND> WindowCatalog::FindWindowsFor(const PinnedApp& app) const {
         if (m_pinMatchingNeedsAumid) {
             candidate.appUserModelId = CachedAppUserModelId(window);
         }
-        if (MatchWindowAgainstProfile(*profile, candidate)) {
+        const bool matched = profile != nullptr
+            ? MatchWindowAgainstProfile(*profile, candidate)
+            : TargetsMatch(app.target, path);
+        if (matched) {
             matches.push_back(window);
         }
     }

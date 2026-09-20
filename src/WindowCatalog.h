@@ -28,8 +28,9 @@ public:
     [[nodiscard]] HWND FindWindowFor(const PinnedApp& app) const;
     // Every live window matching the pin, topmost first. Fresh z-order walk
     // (not the handle-sorted snapshot) so a just-opened second window is
-    // seen immediately. Powers macOS-style activation: the whole app comes
-    // forward, not a single window.
+    // seen immediately. Unpinned running entries (target = exe path, no pin
+    // profile) match by executable path. Powers macOS-style activation: the
+    // whole app comes forward, not a single window.
     [[nodiscard]] std::vector<HWND> FindWindowsFor(const PinnedApp& app) const;
     [[nodiscard]] bool ActivateOrLaunch(const PinnedApp& app, HWND preferredWindow = nullptr) const;
     // Fast, UI-thread safe: brings all of the app's windows forward
