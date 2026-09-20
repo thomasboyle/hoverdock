@@ -121,7 +121,7 @@ float InterleavedGradientNoise(float2 pixel)
 // ---------------------------------------------------------------------------
 // 5. Frosted / scattering blur AFTER refraction, per chromatic channel.
 //    9 taps per channel (center + 8 rotated ring) = 27 backdrop fetches.
-//    Radius is modulated by slab height f: thin rim ~1px, thick center ~3px
+//    Radius is modulated by slab height f: thin rim ~1px, thick center ~2.5px
 //    (Clear end of the range; the frosted look hid all detail). Rotation by IGN hides ring banding.
 //    Each channel is blurred around its own Snell-displaced UV so dispersion
 //    survives the frosted lobe instead of being averaged away.
@@ -188,7 +188,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float gradLen = length(gradient);
     const float2 outward = gradient / max(gradLen, 0.0001);
     const float insideDistance = max(-distance, 0.0);
-    const float rim = exp(-insideDistance / max(2.6 * dpi, 1.75));
+    // Tight edge falloff (~2px) so the refraction caustic sits exactly on
+    // the lensing peak instead of washing over the band.
+    const float rim = exp(-insideDistance / max(2.2 * dpi, 1.5));
     const bool hasBackdrop = scene1.w > 0.5;
     // Glass tint shared with the Quick Settings popup (see DockTheme.hlsli),
     // but the dock face runs the Clear variant: DOCK_GLASS_FACE_MIX lets
@@ -246,10 +248,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float thetaRB = asin(sinRB);
         // Artistic gain on the physical shape. Rim displacement is
         // T_rim*tan(dtheta)*gain ~= 0.45*bevel*0.6*gain: with the 20pt bevel
-        // and gain 3.0 the silhouette pulls ~16px, decaying to 0 across the
+        // and gain 3.5 the silhouette pulls ~19px, decaying to 0 across the
         // band - an unmistakable liquid suck-in even on photographic content
-        // with no straight edges to bend.
-        const float lensGain = 3.0;
+        // with no straight edges to bend. This is the edge-lensing signature:
+        // background visibly warps and magnifies through the bevel.
+        const float lensGain = 3.5;
         float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain;
         float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain;
         float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain;
@@ -267,10 +270,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float2 uvB = clamp(uv - outward * dB * texel, lo, hi);
 
         // ---- 5. Scattering blur modulated by slab height ------------------
-        // Lean hard toward Clear: 1px at the rim, 3px in the thick center.
-        // Frosted mush is what hid the detail in the busy-background test;
-        // legibility of icons comes from the compressive tint, not the blur.
-        const float blurPx = (1.0 + height01 * 2.0) * dpi; // 1 rim .. 3 center
+        // Lean hard toward Clear: 1px at the rim, 2.5px in the thick center.
+        // A sharp refracted image is what makes the warp readable; frosted
+        // mush hides it. Icon legibility still comes from the compressive
+        // tint, not the blur.
+        const float blurPx = (1.0 + height01 * 1.5) * dpi; // 1 rim .. 2.5 center
         frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
     }
 
@@ -303,10 +307,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     color += specular * float3(1.0, 1.0, 1.0) * 0.55;
 
     // Established edge treatment: faint thickness shading, bright rim
-    // caustic, and top key sheen.
+    // caustic (the focused edge-lensing highlight), and top key sheen.
     color *= 1.0 - bevelFactor * bevelFactor * 0.03;
     color += glassTint * rim * 0.12;
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 4.0) * 0.18;
+    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.26;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
     color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08;
 
