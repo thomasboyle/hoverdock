@@ -19,3 +19,8 @@
 #define DOCK_GLASS_TINT 0.829f
 #define DOCK_GLASS_MIX 0.85f
 #define DOCK_GLASS_ALPHA 0.88f
+
+// Drop-shadow margin around the dock pill, shared by layout (window
+// inflation, input-region inset, popup anchors) and the glass shader (pill
+// inset, shadow band). Device px at 1x; both sides scale by display DPI.
+#define DOCK_SHADOW_MARGIN_PT 18.0f

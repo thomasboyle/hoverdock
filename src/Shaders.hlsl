@@ -171,7 +171,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float2 outputSize = scene0.xy;
     const float2 pixel = input.position.xy;
     const float dpi = max(scene1.y, 1.0);
-    const float2 halfSize = outputSize * 0.5 - 1.5 * dpi;
+    // Pill geometry: the window carries a shadow margin ring (shared
+    // DOCK_SHADOW_MARGIN_PT); the glass sits inset, the shader draws the
+    // drop shade into the margin outside the mask.
+    const float marginDev = DOCK_SHADOW_MARGIN_PT * dpi;
+    const float2 halfSize = outputSize * 0.5 - marginDev - 1.5 * dpi;
     // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli). Squircle n=4 gives
     // Apple-like continuous curvature (slightly fuller corners than the true
     // circular arcs of GDI RoundRect used for the input region; the few-px
@@ -185,6 +189,19 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float2 gradient = float2(ddx(distance), ddy(distance));
     if (mask <= 0.0)
     {
+        // Soft outer contact shadow: the pill SDF re-evaluated with a small
+        // down-right offset (top-left key light), quadratic falloff over a
+        // 14px band. Premultiplied black over the desktop = drop shade via
+        // the DComp blend. Fits inside the layout margin (18px) with room.
+        const float2 shadowCenter = outputSize * 0.5 + float2(2.0, 5.0) * dpi;
+        const float shadowSdf = SdSquircleBox(pixel - shadowCenter, halfSize, cornerRadius);
+        const float shadowWidth = 14.0 * dpi;
+        if (shadowSdf < shadowWidth)
+        {
+            float s = 1.0 - max(shadowSdf, 0.0) / shadowWidth;
+            const float shadowAlpha = s * s * 0.30;
+            return float4(0.0, 0.0, 0.0, shadowAlpha);
+        }
         return float4(0.0, 0.0, 0.0, 0.0);
     }
     const float2 texel = 1.0 / outputSize;
@@ -192,10 +209,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float gradLen = length(gradient);
     const float2 outward = gradient / max(gradLen, 0.0001);
     const float insideDistance = max(-distance, 0.0);
-    // Soft Fresnel-like edge falloff: cubic curve over an 8px rim band
-    // instead of a tight exponential, so veil/caustic/sheen decay naturally
-    // and the rim reads softer, driven by shape rather than a hard glow.
-    const float rim = pow(saturate(1.0 - insideDistance / max(8.0 * dpi, 2.0)), 3.0);
+    // Soft Fresnel-like edge falloff: near-cubic (2.8) curve over an 8px
+    // rim band, so veil/caustic/sheen decay naturally and the rim reads
+    // softer, driven by shape rather than a hard glow.
+    const float rim = pow(saturate(1.0 - insideDistance / max(8.0 * dpi, 2.0)), 2.8);
     const bool hasBackdrop = scene1.w > 0.5;
     // Gray tint token shared with the Quick Settings popup; the dock face
     // itself runs adaptive transmission (section 1 below), so no fixed mix
@@ -300,8 +317,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // dimmed toward the rim where lensing takes over. Tint is near-white
     // with a whisper of backdrop hue.
     const float backLuma = dot(frostedBackground, float3(0.2126, 0.7152, 0.0722));
-    const float adapt = saturate((backLuma - 0.25) / 0.55);
-    const float transmission = lerp(0.78, 0.93, adapt) * (1.0 - 0.22 * bevelFactor);
+    const float adapt = pow(saturate((backLuma - 0.22) / 0.58), 0.85);
+    const float transmission = lerp(0.80, 0.955, adapt) * (1.0 - 0.18 * bevelFactor);
     const float3 tintCol = lerp(float3(0.97, 0.98, 1.0), frostedBackground, 0.08);
     float3 color = frostedBackground * transmission * tintCol;
 
@@ -314,21 +331,26 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float fresnel = 0.04 + 0.96 * pow(1.0 - cosTheta, 5.0);
     const float3 lightDir = normalize(float3(-0.35, -0.6, 0.7));
     const float ndl = saturate(dot(surfN, lightDir));
-    const float specular = pow(ndl, 64.0) * bevelFactor;
-    // Bevel-weighted so the flat field keeps the #e1e1e1 calibration exact;
-    // the rim picks up the reflective veil + HDR-ish push (clamped by the
-    // final saturate, LDR backbuffer).
-    color += fresnel * float3(0.90, 0.95, 1.0) * 0.45 * bevelFactor;
+    const float specular = pow(ndl, 80.0) * (bevelFactor * 0.7 + rim * 0.5);
+    // Cool bounce fill from the opposite side so highlights travel instead
+    // of sitting in one static lobe.
+    const float3 fillDir = normalize(float3(0.55, 0.6, 0.45));
+    const float fillSpec = pow(saturate(dot(surfN, fillDir)), 24.0) * bevelFactor;
+    // Tight Fresnel veil at the rim (sharper optical edge definition) on
+    // top of the broad gray veil below; final saturate keeps LDR range.
+    color += fresnel * float3(0.90, 0.95, 1.0) * 0.55 * rim;
     color += specular * float3(1.0, 1.0, 1.0) * 0.55;
+    color += fillSpec * float3(0.75, 0.85, 1.0) * 0.18;
 
     // Established edge treatment: faint thickness shading, bright rim
     // caustic (the focused edge-lensing highlight, following the key light
     // around the squircle via NdotL rather than a uniform ring), and top
     // key sheen.
-    // Ambient-occlusion-style inner shading: grounds the glass against the
-    // backdrop (a true cast shadow needs window inflation; this is the
-    // in-face approximation).
-    color *= 1.0 - bevelFactor * bevelFactor * 0.08;
+    // Edge thickness shading: darkens just inside the silhouette (peaks at
+    // the rim, gone by 0.6 bevel) so the bright caustic sits against a
+    // grounded edge. True outer shadow is drawn outside the mask below.
+    const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
+    color *= thicknessShade;
     color += glassTint * rim * 0.12;
     color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.26 * (0.35 + 0.65 * ndl);
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));

@@ -180,6 +180,11 @@ HRGN CreateDockInputRegion(int width, int height, int cornerDiameter) {
     return CreateRoundRectRgn(0, 0, width + 1, height + 1, rounding, rounding);
 }
 
+// Shadow margin around the pill, in device px (shared DOCK_SHADOW_MARGIN_PT).
+LONG DockShadowMarginPx(float scale) noexcept {
+    return std::lround(DOCK_SHADOW_MARGIN_PT * scale);
+}
+
 void CompositePremul(uint8_t* dest, int destWidth, int destHeight, int destX, int destY,
     const uint8_t* source, int sourceWidth, int sourceHeight) {
     for (int y = 0; y < sourceHeight; ++y) {
@@ -2475,8 +2480,12 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     }
     contentWidth += trayWidth;
 
-    m_dockWidth = static_cast<UINT>(padding * 2 + contentWidth);
-    m_dockHeight = static_cast<UINT>(padding * 2 + iconSlotHeight);
+    // The window carries a shadow margin around the pill (shared
+    // DOCK_SHADOW_MARGIN_PT): icons stay pill-relative, the shader draws the
+    // drop shade into the margin ring.
+    const LONG shadowMargin = DockShadowMarginPx(scale);
+    m_dockWidth = static_cast<UINT>(padding * 2 + contentWidth + shadowMargin * 2);
+    m_dockHeight = static_cast<UINT>(padding * 2 + iconSlotHeight + shadowMargin * 2);
     m_visibleY = m_hostBounds.bottom - static_cast<LONG>(m_dockHeight);
     m_hiddenY = m_visibleY + static_cast<LONG>(m_dockHeight) + margin;
     if (m_visibility == VisibilityState::Hidden) {
@@ -2494,7 +2503,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     m_iconRenderData.clear();
     m_iconRenderData.reserve(displayCount + 8U);
     const LONG top = (static_cast<LONG>(m_dockHeight) - iconSlotHeight) / 2;
-    LONG left = padding;
+    LONG left = padding + shadowMargin;
     for (size_t index = 0; index < displayCount; ++index) {
         DockIconRenderData data;
         if (IsLayoutOnlyTarget(m_displayApps[index].app.target)) {
@@ -2581,13 +2590,17 @@ void DockApp::UpdateInputRegion() {
     const int width = static_cast<int>(m_dockWidth);
     const int height = static_cast<int>(m_dockHeight);
     // Hit-testing matches the shared DOCK_CORNER_RADIUS_PT (diameter = 2 x radius).
+    // The region covers the pill only: inset by the shadow margin so clicks
+    // fall through the drop shade to the desktop.
     const float scale = static_cast<float>(HostDpi()) / 96.0F;
-    HRGN region = CreateDockInputRegion(width, height,
+    const int shadowMargin = static_cast<int>(DockShadowMarginPx(scale));
+    HRGN region = CreateDockInputRegion(width - shadowMargin * 2, height - shadowMargin * 2,
         static_cast<int>(std::lround(2.0F * DOCK_CORNER_RADIUS_PT * scale)));
     if (region == nullptr) {
         Log(L"Could not create the dock input region.");
         return;
     }
+    OffsetRgn(region, shadowMargin, shadowMargin);
     if (SetWindowRgn(m_inputWindow, region, FALSE) == 0) {
         DeleteObject(region);
         Log(L"Could not apply the dock input region.");
@@ -4528,9 +4541,10 @@ bool DockApp::OverflowScreenOrigin(POINT& origin, LONG& caretX) const noexcept {
     const float scale = static_cast<float>(dpi) / 96.0F;
     const LONG gap = std::max(8L, std::lround(10.0F * scale));
     const LONG margin = std::max(8L, std::lround(8.0F * scale));
+    const LONG shadowMargin = DockShadowMarginPx(scale);
     const LONG chevronCenter = chevronTopLeft.x + (chevronBottomRight.x - chevronTopLeft.x) / 2L;
     LONG x = chevronCenter - m_overflowSize.cx / 2L;
-    LONG y = m_currentY - gap - m_overflowSize.cy;
+    LONG y = m_currentY + shadowMargin - gap - m_overflowSize.cy;
     const LONG minX = m_hostBounds.left + margin;
     const LONG maxX = m_hostBounds.right - m_overflowSize.cx - margin;
     if (maxX >= minX) {
@@ -5772,8 +5786,9 @@ bool DockApp::ContextScreenOrigin(POINT& origin) const {
     const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
     const LONG gap = std::max(8L, std::lround(10.0F * scale));
     const LONG margin = std::max(8L, std::lround(8.0F * scale));
+    const LONG shadowMargin = DockShadowMarginPx(scale);
     LONG x = m_contextAnchor.x - m_contextSize.cx / 2L;
-    LONG y = m_currentY - gap - m_contextSize.cy;
+    LONG y = m_currentY + shadowMargin - gap - m_contextSize.cy;
     // If the dock geometry is not ready yet, fall back above the cursor.
     if (m_currentY == 0) {
         y = m_contextAnchor.y - gap - m_contextSize.cy;
