@@ -192,13 +192,14 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float gradLen = length(gradient);
     const float2 outward = gradient / max(gradLen, 0.0001);
     const float insideDistance = max(-distance, 0.0);
-    // Tight edge falloff (~2px) so the refraction caustic sits exactly on
-    // the lensing peak instead of washing over the band.
-    const float rim = exp(-insideDistance / max(2.2 * dpi, 1.5));
+    // Soft Fresnel-like edge falloff: cubic curve over an 8px rim band
+    // instead of a tight exponential, so veil/caustic/sheen decay naturally
+    // and the rim reads softer, driven by shape rather than a hard glow.
+    const float rim = pow(saturate(1.0 - insideDistance / max(8.0 * dpi, 2.0)), 3.0);
     const bool hasBackdrop = scene1.w > 0.5;
-    // Glass tint shared with the Quick Settings popup (see DockTheme.hlsli),
-    // but the dock face runs conditional transmission (section 6 below):
-    // nearly clear at the rim, deeper over the flat field.
+    // Gray tint token shared with the Quick Settings popup; the dock face
+    // itself runs adaptive transmission (section 1 below), so no fixed mix
+    // applies here.
     const float3 glassTint = DOCK_GLASS_TINT;
 
     // ---- Bevel geometry ---------------------------------------------------
@@ -217,10 +218,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
     const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
     const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
-    // True surface slope dH/dDist = (B/bevel) * f'(x), B = 0.75*bevel.
-    const float slopeMag = 0.75 * slopeN;
-    // Slab thickness T(x) = T0 + B*f(x), T0 = 0.45*bevel (0.3-0.5 range).
-    const float thicknessPx = (0.45 + 0.75 * height01) * bevelWidth;
+    // True surface slope dH/dDist = (B/bevel) * f'(x), B = 0.65*bevel.
+    const float slopeMag = 0.65 * slopeN;
+    // Slab thickness T(x) = T0 + B*f(x), T0 = 0.35*bevel, B = 0.65*bevel.
+    const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
 
     float3 frostedBackground;
@@ -291,16 +292,18 @@ float4 GlassPS(VertexOutput input) : SV_Target
         frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
     }
 
-    // ---- 6. Conditional transmission tint -------------------------------
-    // Multiplicative, modulated by slab height: nearly clear at the rim
-    // (refraction + caustic carry the edge), light veil over the flat field
-    // where icons need backing. tintAmount = 0.08 rim .. 0.25 center.
-    const float backLuma = dot(frostedBackground, float3(0.299, 0.587, 0.114));
-    const float3 backChroma = frostedBackground - backLuma;
-    const float tintAmount = lerp(0.08, 0.25, height01);
-    float3 color = lerp(frostedBackground, frostedBackground * glassTint, tintAmount);
-    color += backChroma * 0.08;
-    color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22);
+    // ---- 1. Adaptive Luminosity / Tint ----------------------------------
+    // Content-aware compressive transmission: luminance of the frosted
+    // backdrop drives how much light the glass passes, so the face stays
+    // luminous on dark content and near-clear on bright content instead of
+    // wearing a fixed gray veil. transmission 0.78 (dark) .. 0.93 (bright),
+    // dimmed toward the rim where lensing takes over. Tint is near-white
+    // with a whisper of backdrop hue.
+    const float backLuma = dot(frostedBackground, float3(0.2126, 0.7152, 0.0722));
+    const float adapt = saturate((backLuma - 0.25) / 0.55);
+    const float transmission = lerp(0.78, 0.93, adapt) * (1.0 - 0.22 * bevelFactor);
+    const float3 tintCol = lerp(float3(0.97, 0.98, 1.0), frostedBackground, 0.08);
+    float3 color = frostedBackground * transmission * tintCol;
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
     // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on
@@ -322,7 +325,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // caustic (the focused edge-lensing highlight, following the key light
     // around the squircle via NdotL rather than a uniform ring), and top
     // key sheen.
-    color *= 1.0 - bevelFactor * bevelFactor * 0.03;
+    // Ambient-occlusion-style inner shading: grounds the glass against the
+    // backdrop (a true cast shadow needs window inflation; this is the
+    // in-face approximation).
+    color *= 1.0 - bevelFactor * bevelFactor * 0.08;
     color += glassTint * rim * 0.12;
     color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.26 * (0.35 + 0.65 * ndl);
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
