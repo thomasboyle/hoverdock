@@ -4179,13 +4179,42 @@ void DockApp::PaintSettingsPopup() {
     const LONG switchHeight = std::max(22L, std::lround(24.0F * scale));
     const LONG panelWidth = std::max(280L, std::lround(308.0F * scale));
 
+    // Switch rows live here (above the size math) so the panel always fits
+    // exactly the rows it paints - adding a row never clips again.
+    struct SettingsRow {
+        SettingsHitKind kind;
+        const wchar_t* label;
+        const wchar_t* sublabel;
+        bool enabled;
+    };
+    const SettingsRow rows[] = {
+        {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows",
+            m_config.LaunchAtStartup()},
+        {SettingsHitKind::Updates, L"Check for updates", L"Auto-download and install builds",
+            m_config.CheckForUpdates()},
+        {SettingsHitKind::RimLight, L"Rim light", L"Edge glow and caustic on the glass",
+            m_config.RimLight()},
+        {SettingsHitKind::Lensing, L"Lensing", L"Refraction warp through the bevel",
+            m_config.Lensing()},
+        {SettingsHitKind::Dispersion, L"Dispersion", L"Spectral fringe at glass edges",
+            m_config.Dispersion()},
+        {SettingsHitKind::FrostBlur, L"Frost blur", L"Softens the backdrop inside the glass",
+            m_config.FrostBlur()},
+        {SettingsHitKind::Tint, L"Tint", L"Warm veil over the backdrop",
+            m_config.Tint()},
+        {SettingsHitKind::Specular, L"Speculars", L"Key and fill glints on the surface",
+            m_config.Specular()},
+        {SettingsHitKind::DropShadow, L"Drop shadow", L"Soft contact shade under the dock",
+            m_config.DropShadow()},
+        {SettingsHitKind::DepthShade, L"Depth shade", L"Inner shading at the glass edge",
+            m_config.DepthShade()},
+    };
+    const LONG switchRowCount = static_cast<LONG>(sizeof(rows) / sizeof(rows[0]));
+
     LONG contentY = padding;
     contentY += headerHeight;
     contentY += dividerGap;
-    contentY += rowHeight;
-    contentY += rowGap;
-    contentY += rowHeight;
-    contentY += rowGap;
+    contentY += (rowHeight + rowGap) * switchRowCount;
     contentY += buttonHeight;
     contentY += dividerGap;
     contentY += statusHeight;
@@ -4439,34 +4468,7 @@ void DockApp::PaintSettingsPopup() {
     FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
         y - dividerGap / 2L + 1}, 0.16F);
 
-    struct SettingsRow {
-        SettingsHitKind kind;
-        const wchar_t* label;
-        const wchar_t* sublabel;
-        bool enabled;
-    };
-    const SettingsRow rows[] = {
-        {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows",
-            m_config.LaunchAtStartup()},
-        {SettingsHitKind::Updates, L"Check for updates", L"Auto-download and install builds",
-            m_config.CheckForUpdates()},
-        {SettingsHitKind::RimLight, L"Rim light", L"Edge glow and caustic on the glass",
-            m_config.RimLight()},
-        {SettingsHitKind::Lensing, L"Lensing", L"Refraction warp through the bevel",
-            m_config.Lensing()},
-        {SettingsHitKind::Dispersion, L"Dispersion", L"Spectral fringe at glass edges",
-            m_config.Dispersion()},
-        {SettingsHitKind::FrostBlur, L"Frost blur", L"Softens the backdrop inside the glass",
-            m_config.FrostBlur()},
-        {SettingsHitKind::Tint, L"Tint", L"Warm veil over the backdrop",
-            m_config.Tint()},
-        {SettingsHitKind::Specular, L"Speculars", L"Key and fill glints on the surface",
-            m_config.Specular()},
-        {SettingsHitKind::DropShadow, L"Drop shadow", L"Soft contact shade under the dock",
-            m_config.DropShadow()},
-        {SettingsHitKind::DepthShade, L"Depth shade", L"Inner shading at the glass edge",
-            m_config.DepthShade()},
-    };
+    // (Switch rows are defined above the size computation.)
     const LONG labelHeight = std::max(16L, std::lround(18.0F * scale));
     const LONG subHeight = std::max(14L, std::lround(16.0F * scale));
     for (const SettingsRow& row : rows) {
