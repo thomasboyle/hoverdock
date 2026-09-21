@@ -403,7 +403,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Wash does not shift pure white (plated white == glassTint already).
     const float plateMix = tintOn * lerp(0.35, 1.0, frostOn);
     float3 plated = frostedBackground * lerp(1.0, glassTint, plateMix);
-    const float wash = 0.55 * frostOn * tintOn;
+    const float wash = 0.82 * frostOn * tintOn;
     float3 color = lerp(plated, glassTint, wash);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------

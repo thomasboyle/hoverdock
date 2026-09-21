@@ -5617,7 +5617,10 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     DockRenderState state;
     state.width = m_dockWidth;
     state.height = m_dockHeight;
-    state.glassAlpha = DOCK_GLASS_ALPHA;
+    // Frost must paint an opaque plate: any glassAlpha < 1 lets the real
+    // (sharp) desktop leak through DComp premultiplied blending, which
+    // makes blur look like it "has no effect" on text behind the dock.
+    state.glassAlpha = m_config.Frost() ? 1.0f : DOCK_GLASS_ALPHA;
     UINT glassFx = 0;
     if (m_config.RimLight()) {
         glassFx |= DOCK_FX_RIM;
