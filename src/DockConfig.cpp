@@ -950,7 +950,7 @@ bool DockConfig::Load() {
     m_rimLight = true;
     m_lensing = true;
     m_dispersion = true;
-    m_frost = true;
+    m_frostAmount = 1.0F;
     m_tint = true;
     m_specular = true;
     m_dropShadow = true;
@@ -998,10 +998,15 @@ bool DockConfig::Load() {
         }
         const auto frost = dockSection->second.find(L"frost");
         if (frost != dockSection->second.end()) {
-            try {
-                m_frost = std::stoi(frost->second) > 0;
-            } catch (...) {
-                m_frost = ParseBoolean(frost->second);
+            // Legacy bool (0/1/true/false) or continuous 0..1 slider amount.
+            const float parsed = ParseFloat(frost->second, -1.0F);
+            if (parsed >= 0.0F) {
+                m_frostAmount = std::clamp(parsed, 0.0F, 1.0F);
+                // Old toggles wrote "0"/"1"; keep those as the endpoints.
+            } else if (ParseBoolean(frost->second)) {
+                m_frostAmount = 1.0F;
+            } else {
+                m_frostAmount = 0.0F;
             }
         }
         const auto tint = dockSection->second.find(L"tint");
@@ -1090,7 +1095,7 @@ bool DockConfig::Save() const {
     contents << L"RimLight=" << (m_rimLight ? L"1" : L"0") << L"\n";
     contents << L"Lensing=" << (m_lensing ? L"1" : L"0") << L"\n";
     contents << L"Dispersion=" << (m_dispersion ? L"1" : L"0") << L"\n";
-    contents << L"Frost=" << (m_frost ? L"1" : L"0") << L"\n";
+    contents << L"Frost=" << m_frostAmount << L"\n";
     contents << L"Tint=" << (m_tint ? L"1" : L"0") << L"\n";
     contents << L"Specular=" << (m_specular ? L"1" : L"0") << L"\n";
     contents << L"DropShadow=" << (m_dropShadow ? L"1" : L"0") << L"\n";
@@ -1192,12 +1197,16 @@ void DockConfig::SetDispersion(bool enabled) noexcept {
     m_dispersion = enabled;
 }
 
-bool DockConfig::Frost() const noexcept {
-    return m_frost;
+float DockConfig::FrostAmount() const noexcept {
+    return m_frostAmount;
 }
 
-void DockConfig::SetFrost(bool enabled) noexcept {
-    m_frost = enabled;
+void DockConfig::SetFrostAmount(float amount) noexcept {
+    m_frostAmount = std::clamp(amount, 0.0F, 1.0F);
+}
+
+bool DockConfig::Frost() const noexcept {
+    return m_frostAmount > 0.001F;
 }
 
 bool DockConfig::Tint() const noexcept {
@@ -1282,5 +1291,5 @@ void DockConfig::SetDefaults() {
     m_specular = true;
     m_dropShadow = true;
     m_depthShade = true;
-    m_frost = true;
+    m_frostAmount = 1.0F;
 }

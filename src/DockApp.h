@@ -261,6 +261,7 @@ private:
     void QueueSettingsPaint();
     void RebuildSettingsPopup();
     void HandleSettingsClick(const SettingsHit& hit, UINT message);
+    void ApplyFrostSliderAt(LONG clientX);
     [[nodiscard]] int SettingsHitIndex(POINT point) const noexcept;
     [[nodiscard]] bool SettingsScreenOrigin(POINT& origin) const noexcept;
     void InvalidateSettingsGlass() noexcept;
@@ -605,6 +606,8 @@ private:
     std::vector<SettingsHit> m_settingsHits;
     int m_settingsHover = -1;
     bool m_settingsPaintQueued = false;
+    bool m_frostSliderDragging = false;
+    RECT m_frostSliderTrack{};
     SIZE m_settingsSize{};
     std::vector<uint8_t> m_settingsGlass;
     SIZE m_settingsGlassSize{};

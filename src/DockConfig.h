@@ -35,8 +35,10 @@ public:
     void SetLensing(bool enabled) noexcept;
     [[nodiscard]] bool Dispersion() const noexcept;
     void SetDispersion(bool enabled) noexcept;
+    [[nodiscard]] float FrostAmount() const noexcept;
+    void SetFrostAmount(float amount) noexcept;
+    // True when frost is above a whisper (blur passes worth running).
     [[nodiscard]] bool Frost() const noexcept;
-    void SetFrost(bool enabled) noexcept;
     [[nodiscard]] bool Tint() const noexcept;
     void SetTint(bool enabled) noexcept;
     [[nodiscard]] bool Specular() const noexcept;
@@ -74,7 +76,7 @@ private:
     bool m_rimLight = true;
     bool m_lensing = true;
     bool m_dispersion = true;
-    bool m_frost = true;
+    float m_frostAmount = 1.0F;
     bool m_tint = true;
     bool m_specular = true;
     bool m_dropShadow = true;

@@ -3867,11 +3867,29 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
 
+    case WM_LBUTTONDOWN: {
+        if (app == nullptr) {
+            break;
+        }
+        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (PtInRect(&app->m_frostSliderTrack, point)) {
+            SetCapture(window);
+            app->m_frostSliderDragging = true;
+            app->ApplyFrostSliderAt(point.x);
+            return 0;
+        }
+        return 0;
+    }
+
     case WM_MOUSEMOVE: {
         if (app == nullptr) {
             break;
         }
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (app->m_frostSliderDragging) {
+            app->ApplyFrostSliderAt(point.x);
+            return 0;
+        }
         const int hover = app->SettingsHitIndex(point);
         if (hover != app->m_settingsHover) {
             app->m_settingsHover = hover;
@@ -3888,8 +3906,19 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
             break;
         }
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (app->m_frostSliderDragging) {
+            app->m_frostSliderDragging = false;
+            ReleaseCapture();
+            app->ApplyFrostSliderAt(point.x);
+            app->ScheduleConfigSave();
+            return 0;
+        }
         const int hit = app->SettingsHitIndex(point);
         if (hit >= 0 && static_cast<size_t>(hit) < app->m_settingsHits.size()) {
+            // Frost is a drag slider (handled above); ignore click toggles.
+            if (app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::Frost) {
+                return 0;
+            }
             app->HandleSettingsClick(app->m_settingsHits[static_cast<size_t>(hit)], message);
         }
         return 0;
@@ -4010,6 +4039,18 @@ void DockApp::RebuildSettingsPopup() {
     PaintSettingsPopup();
 }
 
+void DockApp::ApplyFrostSliderAt(LONG clientX) {
+    const LONG left = m_frostSliderTrack.left;
+    const LONG right = m_frostSliderTrack.right;
+    const LONG span = std::max(1L, right - left);
+    const float amount = std::clamp(static_cast<float>(clientX - left) / static_cast<float>(span), 0.0F, 1.0F);
+    if (std::abs(amount - m_config.FrostAmount()) < 0.001F && !m_frostSliderDragging) {
+        return;
+    }
+    m_config.SetFrostAmount(amount);
+    PaintSettingsPopup();
+    QueueRenderFrame();
+}
 void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
     (void)message;
     switch (hit.kind) {
@@ -4069,11 +4110,8 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         break;
     }
     case SettingsHitKind::Frost: {
-        const bool enabled = !m_config.Frost();
-        m_config.SetFrost(enabled);
-        ScheduleConfigSave();
-        PaintSettingsPopup();
-        QueueRenderFrame();
+        // Click/drag on the frost slider sets the amount from the cursor X
+        // within the track (0 = clear glass, 1 = full mica).
         break;
     }
     case SettingsHitKind::Tint: {
@@ -4180,7 +4218,7 @@ void DockApp::PaintSettingsPopup() {
     const LONG radius = std::max(16L, std::lround(DOCK_CORNER_RADIUS_PT * scale));
     const LONG headerHeight = std::max(28L, std::lround(32.0F * scale));
     const LONG closeExtent = std::max(22L, std::lround(24.0F * scale));
-    const LONG rowHeight = std::max(44L, std::lround(50.0F * scale));
+    const LONG rowHeight = std::max(56L, std::lround(60.0F * scale));
     const LONG rowGap = std::max(6L, std::lround(8.0F * scale));
     const LONG buttonHeight = std::max(34L, std::lround(38.0F * scale));
     const LONG dividerGap = std::max(10L, std::lround(12.0F * scale));
@@ -4195,29 +4233,31 @@ void DockApp::PaintSettingsPopup() {
         SettingsHitKind kind;
         const wchar_t* label;
         const wchar_t* sublabel;
+        bool slider;
         bool enabled;
+        float amount;
     };
     const SettingsRow rows[] = {
-        {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows",
-            m_config.LaunchAtStartup()},
-        {SettingsHitKind::Updates, L"Check for updates", L"Auto-download and install builds",
-            m_config.CheckForUpdates()},
-        {SettingsHitKind::RimLight, L"Rim light", L"Edge glow and caustic on the glass",
-            m_config.RimLight()},
-        {SettingsHitKind::Lensing, L"Lensing", L"Refraction warp through the bevel",
-            m_config.Lensing()},
-        {SettingsHitKind::Dispersion, L"Dispersion", L"Spectral fringe at glass edges",
-            m_config.Dispersion()},
-        {SettingsHitKind::Frost, L"Frost", L"Mica frost with glass effects",
-            m_config.Frost()},
-        {SettingsHitKind::Tint, L"Tint", L"Warm veil over the backdrop",
-            m_config.Tint()},
-        {SettingsHitKind::Specular, L"Speculars", L"Key and fill glints on the surface",
-            m_config.Specular()},
-        {SettingsHitKind::DropShadow, L"Drop shadow", L"Soft contact shade under the dock",
-            m_config.DropShadow()},
-        {SettingsHitKind::DepthShade, L"Depth shade", L"Inner shading at the glass edge",
-            m_config.DepthShade()},
+        {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows", false,
+            m_config.LaunchAtStartup(), 0.0F},
+        {SettingsHitKind::Updates, L"Check for updates", L"Auto-download and install builds", false,
+            m_config.CheckForUpdates(), 0.0F},
+        {SettingsHitKind::RimLight, L"Rim light", L"Edge glow and caustic on the glass", false,
+            m_config.RimLight(), 0.0F},
+        {SettingsHitKind::Lensing, L"Lensing", L"Refraction warp through the bevel", false,
+            m_config.Lensing(), 0.0F},
+        {SettingsHitKind::Dispersion, L"Dispersion", L"Spectral fringe at glass edges", false,
+            m_config.Dispersion(), 0.0F},
+        {SettingsHitKind::Frost, L"Frost", L"Clear glass to full mica frost", true, false,
+            m_config.FrostAmount()},
+        {SettingsHitKind::Tint, L"Tint", L"Warm veil over the backdrop", false, m_config.Tint(),
+            0.0F},
+        {SettingsHitKind::Specular, L"Speculars", L"Key and fill glints on the surface", false,
+            m_config.Specular(), 0.0F},
+        {SettingsHitKind::DropShadow, L"Drop shadow", L"Soft contact shade under the dock", false,
+            m_config.DropShadow(), 0.0F},
+        {SettingsHitKind::DepthShade, L"Depth shade", L"Inner shading at the glass edge", false,
+            m_config.DepthShade(), 0.0F},
     };
     const LONG switchRowCount = static_cast<LONG>(sizeof(rows) / sizeof(rows[0]));
 
@@ -4456,6 +4496,24 @@ void DockApp::PaintSettingsPopup() {
         const float knobCx = enabled ? trackCxR : trackCxL;
         FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
     };
+    auto drawSlider = [&](LONG centerY, LONG left, LONG right, float amount, bool hovered) {
+        const LONG trackHeight = std::max(4L, std::lround(5.0F * scale));
+        const float trackRadius = static_cast<float>(trackHeight) * 0.5F;
+        const float trackCy = static_cast<float>(centerY);
+        const float trackCxL = static_cast<float>(left) + trackRadius;
+        const float trackCxR = static_cast<float>(right) - trackRadius;
+        FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
+            hovered ? 0.22F : 0.16F, 255, 255, 255);
+        const float filled = std::clamp(amount, 0.0F, 1.0F);
+        const float fillRight = trackCxL + (trackCxR - trackCxL) * filled;
+        if (fillRight > trackCxL + 0.5F) {
+            FillPillColorPremul(pixels, width, height, trackCxL, fillRight, trackCy, trackRadius,
+                hovered ? 0.62F : 0.52F, kAmberB, kAmberG, kAmberR);
+        }
+        const float knobRadius = std::max(7.0F, 8.0F * scale);
+        const float knobCx = trackCxL + (trackCxR - trackCxL) * filled;
+        FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
+    };
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
@@ -4486,18 +4544,36 @@ void DockApp::PaintSettingsPopup() {
         if (hoveredKind(row.kind)) {
             FillRectPremul(pixels, width, height, rowBounds, 0.10F);
         }
-        const LONG textRight = panelWidth - padding - switchWidth - 12L;
-        RECT labelBounds{padding + 4, y + (rowHeight - labelHeight - subHeight) / 2L, textRight,
-            y + (rowHeight - labelHeight - subHeight) / 2L + labelHeight};
-        RECT subBounds{labelBounds.left, labelBounds.bottom, textRight,
-            labelBounds.bottom + subHeight};
-        DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
-            DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
-        DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
-            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
-        drawSwitch(y + rowHeight / 2L, panelWidth - padding - 4L, row.enabled,
-            hoveredKind(row.kind));
-        pushHit(row.kind, rowBounds);
+        if (row.slider) {
+            const LONG sliderLeft = padding + 4L;
+            const LONG sliderRight = panelWidth - padding - 4L;
+            RECT labelBounds{sliderLeft, y + 4L, sliderRight,
+                y + 4L + labelHeight};
+            RECT subBounds{sliderLeft, labelBounds.bottom, sliderRight,
+                labelBounds.bottom + subHeight};
+            DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
+            DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
+            const LONG sliderY = y + rowHeight - std::max(14L, std::lround(16.0F * scale));
+            m_frostSliderTrack = {sliderLeft, sliderY - 10L, sliderRight, sliderY + 10L};
+            drawSlider(sliderY, sliderLeft, sliderRight, row.amount, hoveredKind(row.kind) ||
+                m_frostSliderDragging);
+            pushHit(row.kind, rowBounds);
+        } else {
+            const LONG textRight = panelWidth - padding - switchWidth - 12L;
+            RECT labelBounds{padding + 4, y + (rowHeight - labelHeight - subHeight) / 2L, textRight,
+                y + (rowHeight - labelHeight - subHeight) / 2L + labelHeight};
+            RECT subBounds{labelBounds.left, labelBounds.bottom, textRight,
+                labelBounds.bottom + subHeight};
+            DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
+            DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
+            drawSwitch(y + rowHeight / 2L, panelWidth - padding - 4L, row.enabled,
+                hoveredKind(row.kind));
+            pushHit(row.kind, rowBounds);
+        }
         y += rowHeight + rowGap;
     }
 
@@ -5617,10 +5693,11 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     DockRenderState state;
     state.width = m_dockWidth;
     state.height = m_dockHeight;
-    // Frost must paint an opaque plate: any glassAlpha < 1 lets the real
-    // (sharp) desktop leak through DComp premultiplied blending, which
-    // makes blur look like it "has no effect" on text behind the dock.
-    state.glassAlpha = m_config.Frost() ? 1.0f : DOCK_GLASS_ALPHA;
+    // FrostAmount 0 = clear glass (legacy toggle off): translucent optics.
+    // FrostAmount 1 = full mica (legacy toggle on): opaque frosted plate.
+    // In between, alpha and blur strength track the slider continuously.
+    const float frostAmount = m_config.FrostAmount();
+    state.glassAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
     UINT glassFx = 0;
     if (m_config.RimLight()) {
         glassFx |= DOCK_FX_RIM;
@@ -5631,7 +5708,7 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     if (m_config.Dispersion()) {
         glassFx |= DOCK_FX_DISPERSION;
     }
-    if (m_config.Frost()) {
+    if (frostAmount > 0.001f) {
         glassFx |= DOCK_FX_BLUR;
     }
     if (m_config.Tint()) {
@@ -5646,11 +5723,12 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     if (m_config.DepthShade()) {
         glassFx |= DOCK_FX_THICKNESS;
     }
-    // Pack the live icon count into the high bits so the glass pass can
-    // calm lensing near icons (halos). Low 8 bits stay the toggle mask.
-    // Icon count capped to 6 bits so it never collides with the frost bits.
+    // Pack live icon count in bits 8-13 (halos) and frost amount 0..255 in
+    // bits 16-23 so the glass/blur shaders can scale mica continuously.
+    // Low 8 bits stay the DOCK_FX_* toggle mask.
     const UINT haloSlots = std::min(static_cast<UINT>(m_iconRenderData.size()), 63u);
-    state.fxFlags = (haloSlots << 8) | glassFx;
+    const UINT frostByte = static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0f, 1.0f) * 255.0f));
+    state.fxFlags = (frostByte << 16) | (haloSlots << 8) | glassFx;
     state.dockScale = m_dockScale;
     state.showDevBounds = m_config.ShowDevBounds();
     state.skipIfGpuBusy = m_dropPresentPending || (IsDragActive() && !m_dragSnapAnimating);

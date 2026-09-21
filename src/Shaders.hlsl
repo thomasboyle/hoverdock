@@ -218,6 +218,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float lensOn = FxEnabled(fxBits, 2.0);
     const float dispOn = FxEnabled(fxBits, 4.0);
     const float frostOn = FxEnabled(fxBits, 8.0);
+    // Continuous mica strength from bits 16-23 (0..255). Toggle off/on used
+    // to be the endpoints; the settings slider lands anywhere between.
+    const float frostAmount = saturate(((uint)fxBits >> 16) / 255.0);
     const float tintOn = FxEnabled(fxBits, 16.0);
     const float specOn = FxEnabled(fxBits, 32.0);
     const float shadowOn = FxEnabled(fxBits, 64.0);
@@ -307,16 +310,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // is uniform (DOCK_FROST_OVER_WHITE) so white meters #e1e1e1 flat.
     float frostRim;
     float frostCore;
-    if (frostOn < 0.5)
-    {
-        frostRim = 0.0;
-        frostCore = 0.0;
-    }
-    else
-    {
-        frostRim = kMicaBlurRim;
-        frostCore = kMicaBlurCore;
-    }
+    frostRim = kMicaBlurRim * frostAmount;
+    frostCore = kMicaBlurCore * frostAmount;
 
     float3 frostedBackground;
     if (!hasBackdrop)
@@ -401,9 +396,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // plate so leftover mid-frequency detail (readable text) dies — Apple
     // liquid glass does not leave glyphs legible through the dock.
     // Wash does not shift pure white (plated white == glassTint already).
-    const float plateMix = tintOn * lerp(0.35, 1.0, frostOn);
+    const float plateMix = tintOn * lerp(0.35, 1.0, frostAmount);
     float3 plated = frostedBackground * lerp(1.0, glassTint, plateMix);
-    const float wash = 0.82 * frostOn * tintOn;
+    const float wash = 0.82 * frostAmount * tintOn;
     float3 color = lerp(plated, glassTint, wash);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
@@ -525,7 +520,8 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     uvR = clamp(uv - outward * dR * texel, lo, hi);
     uvG = clamp(uv - outward * dG * texel, lo, hi);
     uvB = clamp(uv - outward * dB * texel, lo, hi);
-    blurPx = lerp(kMicaBlurRim, kMicaBlurCore, height01) * dpi;
+    const float frostAmt = saturate(((uint)(scene1.x + 0.5) >> 16) / 255.0);
+    blurPx = lerp(kMicaBlurRim, kMicaBlurCore, height01) * dpi * frostAmt;
 }
 
 // Pass 1: horizontal Gaussian axis from the live backdrop into temp.
