@@ -78,6 +78,7 @@ public:
     [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle, bool* changed = nullptr);
     [[nodiscard]] bool NeedsBackdropBitBlt(const RECT& screenRectangle) const noexcept;
     [[nodiscard]] bool BackdropValid() const noexcept;
+    void InvalidateBackdrop() noexcept;
     [[nodiscard]] bool Render(const DockRenderState& state);
     void Flush();
 

@@ -5489,15 +5489,22 @@ void DockApp::BeginShow() {
     HideHoverLabel();
     ++m_showSessionId;
 
-    // Hot-path diet: everything that can block leaves this function. The
-    // synchronous BitBlt capture (~6ms avg, 15ms max), the full tray COM/IPC
-    // refresh plus its forced layout rebuild (~2-12ms), and the redundant
-    // SetWindowPos pair (already at the hidden position from the hide-end tick;
-    // the first animation tick repositions anyway) all move to
-    // kBeginShowDeferredMessage below. What remains is the two ShowWindow calls
-    // (~3ms measured). The slide starts immediately on the cached backdrop and
-    // the backdrop timer refreshes it live once visible, exactly what the
-    // elevated-foreground path always did.
+    // Fresh desktop under the dock before the first painted frame. The prior
+    // hot-path diet started the slide on the cached backdrop and let the timer
+    // catch up, which left a few frames of stale frost after the user hid the
+    // dock, scrolled, and revealed again. Capture while still SW_HIDE at the
+    // visible rect (~6ms typical). Elevated FG skips BitBlt (can stall the hook
+    // thread) and invalidates so we never reuse the previous reveal's texture.
+    m_renderer.InvalidateBackdrop();
+    if (m_rendererInitialized && !IsElevatedForeground()) {
+        const RECT captureBounds{m_windowX, m_visibleY,
+            m_windowX + static_cast<LONG>(m_dockWidth),
+            m_visibleY + static_cast<LONG>(m_dockHeight)};
+        static_cast<void>(m_renderer.CaptureBackdrop(captureBounds));
+    }
+
+    // Tray COM/IPC refresh stays deferred (can be 2-12ms); first paint only
+    // needs the backdrop above.
     m_visibility = VisibilityState::Showing;
     ShowWindow(m_window, SW_SHOWNOACTIVATE);
     ShowWindow(m_inputWindow, SW_SHOWNOACTIVATE);

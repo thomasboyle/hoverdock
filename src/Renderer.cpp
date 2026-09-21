@@ -997,6 +997,15 @@ bool Renderer::BackdropValid() const noexcept {
     return m_backdropValid;
 }
 
+void Renderer::InvalidateBackdrop() noexcept {
+    // Drop the cached frost source so the next CaptureBackdrop BitBlts again and
+    // Render cannot sample a desktop frame from a previous reveal.
+    m_backdropValid = false;
+    m_backdropHash = 0;
+    m_backdropDwmFrameValid = false;
+    m_backdropDwmFrame = 0;
+}
+
 UINT Renderer::TextureIndexForTarget(const std::wstring& target) const noexcept {
     const auto found = m_iconTextureByTarget.find(target);
     return found != m_iconTextureByTarget.end() ? found->second : 0;
