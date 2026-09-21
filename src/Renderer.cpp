@@ -1046,31 +1046,81 @@ bool Renderer::NeedsBackdropBitBlt(const RECT& screenRectangle) const noexcept {
     return true;
 }
 
-namespace {
-
-// Reads the desktop into a memory DC while hiding one window from legacy GDI
-// capture. POD-only so __try is legal here (C2712): __finally restores the
-// affinity even on fault, so an exception can never leave the dock stuck
-// invisible to Snipping Tool / Game Bar (which a naive toggle did before).
-BOOL BitBltDesktopExcluding(HWND exclude, HDC destDc, LONG width, LONG height, HDC screen,
-    LONG left, LONG top) noexcept {
-    DWORD previousAffinity = WDA_NONE;
-    const BOOL affinityRead = GetWindowDisplayAffinity(exclude, &previousAffinity) != FALSE;
-    BOOL copied = FALSE;
-    __try {
-        if (affinityRead != FALSE) {
-            SetWindowDisplayAffinity(exclude, WDA_EXCLUDEFROMCAPTURE);
+// Overwrites dilated icon footprints in the fresh screen capture with their
+// border average (flat local fill). The dock's own icons otherwise leak into
+// the legacy GDI surface and refract back through the glass as ghost smears.
+// Frost blur destroys exactly the detail this removes, so the glass is
+// unaffected while ghosts can never form - deterministically, with no
+// display-affinity games that could blank external captures.
+void Renderer::InpaintIconRects() noexcept {
+    if (m_backdropDibPixels == nullptr || m_lastIconRects.empty() || m_width == 0 ||
+        m_height == 0) {
+        return;
+    }
+    const LONG width = static_cast<LONG>(m_width);
+    const LONG height = static_cast<LONG>(m_height);
+    for (const RECT& icon : m_lastIconRects) {
+        const LONG x0 = std::max(icon.left - kIconGhostDilatePx, 0L);
+        const LONG y0 = std::max(icon.top - kIconGhostDilatePx, 0L);
+        const LONG x1 = std::min(icon.right + kIconGhostDilatePx, width);
+        const LONG y1 = std::min(icon.bottom + kIconGhostDilatePx, height);
+        if (x1 <= x0 + 2 || y1 <= y0 + 2) {
+            continue;
         }
-        copied = BitBlt(destDc, 0, 0, width, height, screen, left, top, SRCCOPY);
-    } __finally {
-        if (affinityRead != FALSE) {
-            SetWindowDisplayAffinity(exclude, previousAffinity);
+        uint64_t blue = 0;
+        uint64_t green = 0;
+        uint64_t red = 0;
+        uint64_t alpha = 0;
+        uint64_t count = 0;
+        for (LONG x = x0; x < x1; ++x) {
+            for (int edge = 0; edge < 2; ++edge) {
+                const LONG y = edge == 0 ? y0 : y1 - 1;
+                const size_t offset = (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                          static_cast<size_t>(x)) *
+                    4U;
+                blue += m_backdropDibPixels[offset];
+                green += m_backdropDibPixels[offset + 1];
+                red += m_backdropDibPixels[offset + 2];
+                alpha += m_backdropDibPixels[offset + 3];
+                ++count;
+            }
+        }
+        for (LONG y = y0 + 1; y < y1 - 1; ++y) {
+            for (int edge = 0; edge < 2; ++edge) {
+                const LONG x = edge == 0 ? x0 : x1 - 1;
+                const size_t offset = (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                          static_cast<size_t>(x)) *
+                    4U;
+                blue += m_backdropDibPixels[offset];
+                green += m_backdropDibPixels[offset + 1];
+                red += m_backdropDibPixels[offset + 2];
+                alpha += m_backdropDibPixels[offset + 3];
+                ++count;
+            }
+        }
+        if (count == 0) {
+            continue;
+        }
+        const uint8_t fill[4] = {
+            static_cast<uint8_t>(blue / count),
+            static_cast<uint8_t>(green / count),
+            static_cast<uint8_t>(red / count),
+            static_cast<uint8_t>(alpha / count),
+        };
+        for (LONG y = y0; y < y1; ++y) {
+            uint8_t* row = m_backdropDibPixels +
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x0)) *
+                    4U;
+            for (LONG x = x0; x < x1; ++x) {
+                row[0] = fill[0];
+                row[1] = fill[1];
+                row[2] = fill[2];
+                row[3] = fill[3];
+                row += 4;
+            }
         }
     }
-    return copied;
 }
-
-}  // namespace
 
 bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     ProfileScope scope("Renderer::CaptureBackdrop");
@@ -1126,18 +1176,23 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         return false;
     }
 
-    // SRCCOPY only (CAPTUREBLT forces sync composition of layered windows and
+    // Plain SRCCOPY (CAPTUREBLT forces sync composition of layered windows and
     // measured 2-10 ms per 8 ms tick; layered content under the dock is rare).
-    // The render window is excluded for exactly this BitBlt: despite
-    // WS_EX_NOREDIRECTIONBITMAP its swapchain otherwise leaks into the legacy
-    // GDI surface, and captured icons refract back through the glass as
-    // ghost smears. Affinity is restored in __finally (see helper above).
-    const BOOL copied = BitBltDesktopExcluding(m_window, m_backdropDc, width, height, screen,
-        screenRectangle.left, screenRectangle.top);
+    // Deliberately no display-affinity exclusion here: toggling it around the
+    // BitBlt blanks concurrent external captures (Snipping Tool) whenever
+    // they land inside the exclusion window. Leaked dock pixels are scrubbed
+    // below by icon-footprint inpainting instead.
+    const BOOL copied = BitBlt(m_backdropDc, 0, 0, width, height, screen, screenRectangle.left,
+        screenRectangle.top, SRCCOPY);
     const int released = ReleaseDC(nullptr, screen);
     if (copied == FALSE || released == 0) {
         return false;
     }
+
+    // Scrub the dock's own icons out of the fresh capture before hashing and
+    // uploading: they would otherwise refract back through the glass as
+    // ghost smears. See InpaintIconRects.
+    InpaintIconRects();
 
     const uint64_t hash = HashBackdropPixels();
     if (m_backdropValid && hash == m_backdropHash) {
@@ -1312,6 +1367,13 @@ bool Renderer::Render(const DockRenderState& state) {
         instance.iconMeta[2] = icon.dragged ? 1.0F : 0.0F;
         const UINT safeIconCount = std::max(m_iconCount, 1U);
         instance.iconMeta[3] = static_cast<float>(std::min(icon.textureIndex, safeIconCount - 1));
+    }
+    // Cache icon footprints for backdrop ghost inpainting (same UI thread as
+    // CaptureBackdrop, so no sync needed).
+    m_lastIconRects.clear();
+    m_lastIconRects.reserve(state.icons.size());
+    for (const DockIconRenderData& icon : state.icons) {
+        m_lastIconRects.push_back(icon.bounds);
     }
     if (iconCount > 0) {
         m_commandList->DrawInstanced(6, iconCount, 0, 0);
@@ -1744,6 +1806,7 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropDwmFrame = 0;
     m_backdropDwmFrameValid = false;
     m_backdropIdleSkips = 0;
+    m_lastIconRects.clear();
 
     if (m_backdropDc != nullptr && m_backdropPreviousBitmap != nullptr &&
         m_backdropPreviousBitmap != HGDI_ERROR) {
