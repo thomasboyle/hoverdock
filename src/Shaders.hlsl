@@ -310,18 +310,14 @@ float4 GlassPS(VertexOutput input) : SV_Target
         frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
     }
 
-    // ---- 1. Adaptive Luminosity / Tint ----------------------------------
-    // Content-aware compressive transmission: luminance of the frosted
-    // backdrop drives how much light the glass passes, so the face stays
-    // luminous on dark content and near-clear on bright content instead of
-    // wearing a fixed gray veil. transmission 0.88 (dark) .. 0.97 (bright),
-    // dimmed toward the rim where lensing takes over. Tint is near-white
-    // with a whisper of backdrop hue.
-    const float backLuma = dot(frostedBackground, float3(0.2126, 0.7152, 0.0722));
-    const float adapt = pow(saturate((backLuma - 0.22) / 0.58), 0.85);
-    const float transmission = lerp(0.88, 0.97, adapt) * (1.0 - 0.18 * bevelFactor);
-    const float3 tintCol = lerp(float3(0.97, 0.98, 1.0), frostedBackground, 0.08);
-    float3 color = frostedBackground * transmission * tintCol;
+    // ---- 1. Fixed transmission tint -------------------------------------
+    // Multiplicative, modulated by slab height only - no backdrop-driven
+    // adaptation. Nearly clear at the rim (refraction + caustic carry the
+    // edge), light veil over the flat field where icons need backing.
+    // tintAmount = 0.08 rim .. 0.25 center.
+    const float tintAmount = lerp(0.08, 0.25, height01);
+    float3 color = lerp(frostedBackground, frostedBackground * glassTint, tintAmount);
+    color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
     // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on
