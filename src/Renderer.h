@@ -97,6 +97,7 @@ private:
     static constexpr UINT kIconTextureDescriptor = 0;
     static constexpr UINT kBackdropTextureDescriptor = 1;
     static constexpr UINT kTempBlurDescriptor = 2;
+    static constexpr UINT kTempBlurDescriptor2 = 3;
 
     struct alignas(256) FrameConstants {
         float scene0[4]{};
@@ -160,6 +161,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_glassPipeline;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_iconPipeline;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_blurPipeline;
+    // Iteration passes for the compounded frost (pass 2 vertical from temp,
+    // pass 3 horizontal from temp2 back into temp).
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_blurVPipeline;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_blurH2Pipeline;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_commandList;
     Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kBufferCount> m_backBuffers;
@@ -169,6 +174,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_blurTemp;
     // Tracks the temp target state across frames (starts as render target).
     bool m_blurTempIsShaderResource = false;
+    // Second ping-pong target for the iterated frost (same size/format as
+    // temp; the final iteration lands back in temp so GlassPS is unchanged).
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_blurTemp2;
+    bool m_blurTemp2IsShaderResource = false;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_backdropUpload;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_backdropCopyAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_backdropCopyCommandList;

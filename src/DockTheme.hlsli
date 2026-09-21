@@ -12,10 +12,13 @@
 #define DOCK_INK_G 34
 #define DOCK_INK_B 36
 
-// Glass tint/alpha shared by the dock shader (GlassPS) and the Quick
-// Settings popup CPU compositor. Calibrated so the popup face meters
-// #e1e1e1 over white. (The dock face itself uses conditional transmission
-// tinting in GlassPS section 6 instead of a flat mix.)
+// Dock face frost plate: with frost+tint on, a fully blurred solid-white
+// backdrop must meter #e1e1e1 (225/255). Multiplicative so colored
+// backdrops keep hue. Used by GlassPS; popup compositor keeps its own mix.
+#define DOCK_FROST_OVER_WHITE (225.0f / 255.0f)
+
+// Glass tint/alpha for the Quick Settings popup CPU compositor. Calibrated
+// so the popup face meters #e1e1e1 over white with DOCK_GLASS_MIX/ALPHA.
 #define DOCK_GLASS_TINT 0.829f
 #define DOCK_GLASS_MIX 0.85f
 #define DOCK_GLASS_ALPHA 0.88f

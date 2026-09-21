@@ -20,6 +20,7 @@ StructuredBuffer<IconInstance> iconInstances : register(t0);
 Texture2DArray iconTexture : register(t1);
 Texture2D backdropTexture : register(t2);
 Texture2D blurTemp : register(t3);
+Texture2D blurTemp2 : register(t4);
 SamplerState linearClamp : register(s0);
 
 struct VertexOutput
@@ -136,29 +137,37 @@ float InterleavedGradientNoise(float2 pixel)
 // 5. Separable Gaussian frost, split across two passes (smooth by
 //    construction: dense axis coverage, fixed taps, no rotation, no radius
 //    jitter, no dither - nothing in the blur can add grain or bands).
-//    True 1D Gaussian, sigma = blurPx/2 over taps -4..+4 (see kGaussW).
-//    Radius is modulated by slab height f. Each channel is blurred around
-//    its own Snell-displaced UV so dispersion survives both axes.
+//    True 1D Gaussian, sigma = blurPx/2 over taps -8..+8 (see kGaussW).
+//    Tap spacing is blurPx/8 so the kernel stays dense (<=2px gaps at 1x,
+//    bilinear-filtered) at every radius; the old -4..+4 kernel spaced taps
+//    blurPx/4 apart and skipped whole pixels, which read as blocky
+//    pixelation on text/edges behind the dock. Radius is modulated by slab
+//    height f. Each channel is blurred around its own Snell-displaced UV so
+//    dispersion survives both axes.
 // ---------------------------------------------------------------------------
 // Optical constants shared by both separable passes (GlassPS + BlurHPS).
 // Both passes must compute identical UVs or the split is invalid.
 static const float kLensGain = 2.3;
 static const float kFringeBoost = 24.0;
-static const float kMicaBlurRim = 6.0;
-static const float kMicaBlurCore = 16.0;
-static const float kGaussW[5] = { 0.2042, 0.1802, 0.1238, 0.0663, 0.0276 };
+// Heavy mica: rim soft enough for refraction; core dissolves wallpaper.
+// Iterated separable passes compound these radii further.
+static const float kMicaBlurRim = 28.0;
+static const float kMicaBlurCore = 52.0;
+// Dense 17-tap Gaussian, sigma = 0.5 * blurPx, taps at multiples of
+// blurPx/8: w(x) = exp(-2x^2), normalized (sums to 1.0 with mirrors).
+static const float kGaussW[9] = { 0.1031, 0.1000, 0.0910, 0.0779, 0.0626, 0.0472, 0.0335, 0.0223, 0.0140 };
 
 float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
     float2 texel, float blurPx, float2 axis)
 {
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
-    const float step = blurPx * 0.25;
+    const float step = blurPx * 0.125;
     float3 acc = float3(tex.Sample(linearClamp, clamp(uvR, lo, hi)).r,
         tex.Sample(linearClamp, clamp(uvG, lo, hi)).g,
         tex.Sample(linearClamp, clamp(uvB, lo, hi)).b) * kGaussW[0];
     [unroll]
-    for (int k = 1; k <= 4; ++k)
+    for (int k = 1; k <= 8; ++k)
     {
         const float2 off = axis * (float(k) * step) * texel;
         const float w = kGaussW[k];
@@ -236,10 +245,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // softer, driven by shape rather than a hard glow.
     const float rim = pow(saturate(1.0 - insideDistance / max(8.0 * dpi, 2.0)), 2.8);
     const bool hasBackdrop = scene1.w > 0.5;
-    // Gray tint token shared with the Quick Settings popup; the dock face
-    // itself runs adaptive transmission (section 1 below), so no fixed mix
-    // applies here.
-    const float3 glassTint = DOCK_GLASS_TINT;
+    // Face plate: DOCK_FROST_OVER_WHITE so blurred white meters #e1e1e1.
+    // Rim/specular accents still reference this as the glass body color.
+    const float3 glassTint = DOCK_FROST_OVER_WHITE;
 
     // ---- Bevel geometry: one slab -----------------------------------------
     // The bevel spans the short half-axis so the whole face refracts as one
@@ -287,26 +295,19 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
 
-    // Frost presets: off = pure optics, on = mica (heavy blur + veil).
-    // Function scope: both the backdrop branch and the tint section below
-    // consume them.
+    // Frost presets: off = pure optics, on = heavy mica blur. Tint plate
+    // is uniform (DOCK_FROST_OVER_WHITE) so white meters #e1e1e1 flat.
     float frostRim;
     float frostCore;
-    float frostTintLo;
-    float frostTintHi;
     if (frostOn < 0.5)
     {
         frostRim = 0.0;
         frostCore = 0.0;
-        frostTintLo = 0.0;
-        frostTintHi = 0.0;
     }
     else
     {
-            frostRim = kMicaBlurRim;
-            frostCore = kMicaBlurCore;
-        frostTintLo = 0.7;
-        frostTintHi = 0.9;
+        frostRim = kMicaBlurRim;
+        frostCore = kMicaBlurCore;
     }
 
     float3 frostedBackground;
@@ -364,15 +365,13 @@ float4 GlassPS(VertexOutput input) : SV_Target
 #endif
 
         // ---- 5. Scattering blur modulated by slab height ------------------
-        // Lean hard toward Clear: sharp in the thin rim, light frost in the
-        // thick center. A sharp refracted image is what makes the warp
-        // readable; frosted mush hides it. Icon legibility still comes from
-        // the tint backing, not the blur.
-        // Notch radii/veil come from the function-scope ladder above.
+        // Heavy mica: soft rim (refraction still reads), near-opaque frost
+        // in the thick center. Iterated separable passes compound radii.
+        // Icon legibility comes from blur + the #e1e1e1 plate, not sharpness.
         const float blurPx = lerp(frostRim, frostCore, height01) * dpi;
         // Frost off samples each channel once at its (possibly refracted)
-        // UV instead of the 9-tap ring: same result as a zero-radius blur
-        // with a ninth of the fetches.
+        // UV instead of the 17-tap ring: same result as a zero-radius blur
+        // with a seventeenth of the fetches.
         // Frost off samples each channel once (no frost); on runs the ring.
         if (frostOn < 0.5)
         {
@@ -389,14 +388,12 @@ float4 GlassPS(VertexOutput input) : SV_Target
         }
     }
 
-    // ---- 1. Fixed transmission tint -------------------------------------
-    // Multiplicative, modulated by slab height only - no backdrop-driven
-    // adaptation. Nearly clear at the rim (refraction + caustic carry the
-    // edge), light veil over the flat field where icons need backing.
-    // veil amounts come from the frost ladder above.
-    const float tintAmount = lerp(frostTintLo, frostTintHi, height01) * tintOn;
-    float3 color = lerp(frostedBackground, frostedBackground * glassTint, tintAmount);
-    color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22 * tintOn * frostOn);
+    // ---- 1. Frost plate (white -> #e1e1e1) --------------------------------
+    // Multiplicative: blurred white * DOCK_FROST_OVER_WHITE = #e1e1e1.
+    // Colored backdrops keep hue. Full plate when tint+frost are on; tint
+    // alone keeps a light veil; frost alone leaves optics un-plated.
+    const float plateMix = tintOn * lerp(0.35, 1.0, frostOn);
+    float3 color = frostedBackground * lerp(1.0, glassTint, plateMix);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
     // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on
@@ -446,18 +443,22 @@ float4 GlassPS(VertexOutput input) : SV_Target
 }
 
 // ---------------------------------------------------------------------------
-// Separable frost pass 1: horizontal Gaussian axis into the temp target.
-// Recomputes the identical lens UVs as GlassPS (same SDF, bevel, halos,
-// Snell, fringe, shared constants above): equal inputs yield equal UVs, and
-// that equality is what makes the split valid. Runs only when frost is on
-// and the backdrop is live (C++ skips it otherwise), so the mica recipe
-// below is unconditional. GlassPS finishes the vertical axis from temp.
+// Iterated separable frost (H/V/H + GlassPS vertical finish). Every pass
+// must compute identical lens UVs (same SDF, bevel, halos, Snell, fringe):
+// equal inputs yield equal UVs, and that equality is what makes the split
+// valid, so all passes share ComputeFrostUVs below. Iterating moderate
+// dense kernels compounds into a heavy blur (per-axis sigma grows ~x1.4
+// per H/V pair) without ever opening sparse tap gaps, which is what a
+// single wide kernel does (blocky pixelation on text/edges). Passes after
+// the first only run when frost is on and the backdrop is live (C++ skips
+// them otherwise), so the mica radii are unconditional. GlassPS finishes
+// the final vertical axis from temp.
 // ---------------------------------------------------------------------------
-float4 BlurHPS(VertexOutput input) : SV_Target
+// Shared lens-UV computation for every frost pass. Must stay identical to
+// the UV block in GlassPS above.
+void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
+    out float2 uvR, out float2 uvG, out float2 uvB, out float blurPx)
 {
-    const float2 outputSize = scene0.xy;
-    const float2 pixel = input.position.xy;
-    const float dpi = max(scene1.y, 1.0);
     const float marginDev = DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = outputSize * 0.5 - marginDev - 1.5 * dpi;
     const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
@@ -510,11 +511,52 @@ float4 BlurHPS(VertexOutput input) : SV_Target
     dB = lerp(dG, dB, dispOn);
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
-    const float2 uvR = clamp(uv - outward * dR * texel, lo, hi);
-    const float2 uvG = clamp(uv - outward * dG * texel, lo, hi);
-    const float2 uvB = clamp(uv - outward * dB * texel, lo, hi);
-    const float blurPx = lerp(kMicaBlurRim, kMicaBlurCore, height01) * dpi;
+    uvR = clamp(uv - outward * dR * texel, lo, hi);
+    uvG = clamp(uv - outward * dG * texel, lo, hi);
+    uvB = clamp(uv - outward * dB * texel, lo, hi);
+    blurPx = lerp(kMicaBlurRim, kMicaBlurCore, height01) * dpi;
+}
+
+// Pass 1: horizontal Gaussian axis from the live backdrop into temp.
+float4 BlurHPS(VertexOutput input) : SV_Target
+{
+    const float2 outputSize = scene0.xy;
+    const float2 texel = 1.0 / outputSize;
+    float2 uvR;
+    float2 uvG;
+    float2 uvB;
+    float blurPx;
+    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
     const float3 h = SampleGlassAxis(backdropTexture, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
+    return float4(h, 1.0);
+}
+
+// Pass 2: vertical Gaussian axis from temp into temp2.
+float4 BlurVPS(VertexOutput input) : SV_Target
+{
+    const float2 outputSize = scene0.xy;
+    const float2 texel = 1.0 / outputSize;
+    float2 uvR;
+    float2 uvG;
+    float2 uvB;
+    float blurPx;
+    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
+    const float3 v = SampleGlassAxis(blurTemp, uvR, uvG, uvB, texel, blurPx, float2(0.0, 1.0));
+    return float4(v, 1.0);
+}
+
+// Pass 3: horizontal Gaussian axis from temp2 back into temp; GlassPS
+// finishes the final vertical axis from temp.
+float4 BlurHPS2(VertexOutput input) : SV_Target
+{
+    const float2 outputSize = scene0.xy;
+    const float2 texel = 1.0 / outputSize;
+    float2 uvR;
+    float2 uvG;
+    float2 uvB;
+    float blurPx;
+    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
+    const float3 h = SampleGlassAxis(blurTemp2, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
     return float4(h, 1.0);
 }
 
