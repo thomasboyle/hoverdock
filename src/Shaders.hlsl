@@ -149,12 +149,14 @@ float InterleavedGradientNoise(float2 pixel)
 // Both passes must compute identical UVs or the split is invalid.
 static const float kLensGain = 2.3;
 static const float kFringeBoost = 24.0;
-// Heavy mica: rim soft enough for refraction; core dissolves wallpaper.
-// Iterated separable passes compound these radii further.
-static const float kMicaBlurRim = 36.0;
-static const float kMicaBlurCore = 64.0;
+// Per-pass mica radius kept <= 8 so the 17-tap kernel steps by at most
+// 1 px (pixel-accurate; no sparse gaps). C++ iterates H/V to compound
+// into a heavy frost without ever opening tap spacing.
+static const float kMicaBlurRim = 8.0;
+static const float kMicaBlurCore = 8.0;
 // Dense 17-tap Gaussian, sigma = 0.5 * blurPx, taps at multiples of
 // blurPx/8: w(x) = exp(-2x^2), normalized (sums to 1.0 with mirrors).
+// With blurPx == 8, step == 1 texel — every pixel under the lobe is hit.
 static const float kGaussW[9] = { 0.1031, 0.1000, 0.0910, 0.0779, 0.0626, 0.0472, 0.0335, 0.0223, 0.0140 };
 
 float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
@@ -162,7 +164,10 @@ float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
 {
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
-    const float step = blurPx * 0.125;
+    // Cap at 1 texel so taps never leave unsampled gaps (the blocky
+    // pixelation a sparse wide kernel produces). Heavy blur comes from
+    // iterating this dense pass, not from stretching the step.
+    const float step = min(blurPx * 0.125, 1.0);
     float3 acc = float3(tex.Sample(linearClamp, clamp(uvR, lo, hi)).r,
         tex.Sample(linearClamp, clamp(uvG, lo, hi)).g,
         tex.Sample(linearClamp, clamp(uvB, lo, hi)).b) * kGaussW[0];
