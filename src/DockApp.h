@@ -167,6 +167,7 @@ private:
         None,
         Startup,
         Updates,
+        RimLight,
         CheckNow,
         Close,
     };

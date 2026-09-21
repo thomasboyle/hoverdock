@@ -4034,6 +4034,14 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         }
         break;
     }
+    case SettingsHitKind::RimLight: {
+        const bool enabled = !m_config.RimLight();
+        m_config.SetRimLight(enabled);
+        ScheduleConfigSave();
+        PaintSettingsPopup();
+        QueueRenderFrame();
+        break;
+    }
     case SettingsHitKind::CheckNow:
         if (!m_updateInFlight.load() && !m_updateInstalling.load()) {
             CheckForUpdatesAsync(true);
@@ -4386,6 +4394,8 @@ void DockApp::PaintSettingsPopup() {
             m_config.LaunchAtStartup()},
         {SettingsHitKind::Updates, L"Check for updates", L"Auto-download and install builds",
             m_config.CheckForUpdates()},
+        {SettingsHitKind::RimLight, L"Rim light", L"Edge glow and caustic on the glass",
+            m_config.RimLight()},
     };
     const LONG labelHeight = std::max(16L, std::lround(18.0F * scale));
     const LONG subHeight = std::max(14L, std::lround(16.0F * scale));
