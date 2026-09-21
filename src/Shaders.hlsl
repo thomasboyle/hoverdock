@@ -149,30 +149,33 @@ float InterleavedGradientNoise(float2 pixel)
 // Both passes must compute identical UVs or the split is invalid.
 static const float kLensGain = 2.3;
 static const float kFringeBoost = 24.0;
-// Per-pass mica radius kept <= 8 so the 17-tap kernel steps by at most
-// 1 px (pixel-accurate; no sparse gaps). C++ iterates H/V to compound
-// into a heavy frost without ever opening tap spacing.
-static const float kMicaBlurRim = 8.0;
-static const float kMicaBlurCore = 8.0;
-// Dense 17-tap Gaussian, sigma = 0.5 * blurPx, taps at multiples of
-// blurPx/8: w(x) = exp(-2x^2), normalized (sums to 1.0 with mirrors).
-// With blurPx == 8, step == 1 texel — every pixel under the lobe is hit.
-static const float kGaussW[9] = { 0.1031, 0.1000, 0.0910, 0.0779, 0.0626, 0.0472, 0.0335, 0.0223, 0.0140 };
+// Per-pass mica radius 16 with a 33-tap (k=0..16) unit-pixel Gaussian
+// (sigma = 8). Step capped at 1 px so the frost stays pixel-accurate;
+// C++ iterates many H/V passes so text behind the dock dissolves the
+// way Apple liquid glass does — readable glyphs must not survive.
+static const float kMicaBlurRim = 16.0;
+static const float kMicaBlurCore = 16.0;
+// Dense 33-tap Gaussian, sigma = 8, taps at 1-pixel multiples.
+// w(k) = exp(-k^2 / (2*sigma^2)), normalized with mirrors.
+static const float kGaussW[17] = {
+    0.051893, 0.051489, 0.050297, 0.048370, 0.045796, 0.042686, 0.039171,
+    0.035388, 0.031475, 0.027560, 0.023758, 0.020164, 0.016847, 0.013858,
+    0.011223, 0.008948, 0.007023
+};
 
 float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
     float2 texel, float blurPx, float2 axis)
 {
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
-    // Cap at 1 texel so taps never leave unsampled gaps (the blocky
-    // pixelation a sparse wide kernel produces). Heavy blur comes from
-    // iterating this dense pass, not from stretching the step.
-    const float step = min(blurPx * 0.125, 1.0);
+    // Unit-pixel steps (never sparse). blurPx scales how far the lobe
+    // reaches; with blurPx == 16, step == 1 and all 33 taps are used.
+    const float step = min(blurPx / 16.0, 1.0);
     float3 acc = float3(tex.Sample(linearClamp, clamp(uvR, lo, hi)).r,
         tex.Sample(linearClamp, clamp(uvG, lo, hi)).g,
         tex.Sample(linearClamp, clamp(uvB, lo, hi)).b) * kGaussW[0];
     [unroll]
-    for (int k = 1; k <= 8; ++k)
+    for (int k = 1; k <= 16; ++k)
     {
         const float2 off = axis * (float(k) * step) * texel;
         const float w = kGaussW[k];
@@ -393,12 +396,15 @@ float4 GlassPS(VertexOutput input) : SV_Target
         }
     }
 
-    // ---- 1. Frost plate (white -> #e1e1e1) --------------------------------
-    // Multiplicative: blurred white * DOCK_FROST_OVER_WHITE = #e1e1e1.
-    // Colored backdrops keep hue. Full plate when tint+frost are on; tint
-    // alone keeps a light veil; frost alone leaves optics un-plated.
+    // ---- 1. Frost plate + liquid-glass wash (white -> #e1e1e1) ------------
+    // Multiply first so blurred white meters #e1e1e1. Then wash toward the
+    // plate so leftover mid-frequency detail (readable text) dies — Apple
+    // liquid glass does not leave glyphs legible through the dock.
+    // Wash does not shift pure white (plated white == glassTint already).
     const float plateMix = tintOn * lerp(0.35, 1.0, frostOn);
-    float3 color = frostedBackground * lerp(1.0, glassTint, plateMix);
+    float3 plated = frostedBackground * lerp(1.0, glassTint, plateMix);
+    const float wash = 0.55 * frostOn * tintOn;
+    float3 color = lerp(plated, glassTint, wash);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
     // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on

@@ -1320,10 +1320,20 @@ bool Renderer::Render(const DockRenderState& state) {
             m_device->CreateShaderResourceView(target, &blurView, blurSrv);
         };
 
-        // H (backdrop->temp), V (temp->temp2), H (temp2->temp), V, H;
-        // GlassPS does the final V from temp.
+        // Dense liquid-glass stack: 5H + 5V effective (GlassPS finishes the
+        // last V). Each pass is a 33-tap unit-pixel Gaussian (radius 16) so
+        // text behind the dock dissolves instead of staying readable.
+        // H (backdrop->temp), V, H, V, H, V, H, V, H; GlassPS final V.
         blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
             kTempBlurDescriptor, m_blurPipeline.Get());
+        blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
+            kTempBlurDescriptor2, m_blurVPipeline.Get());
+        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
+            kTempBlurDescriptor, m_blurH2Pipeline.Get());
+        blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
+            kTempBlurDescriptor2, m_blurVPipeline.Get());
+        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
+            kTempBlurDescriptor, m_blurH2Pipeline.Get());
         blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
             kTempBlurDescriptor2, m_blurVPipeline.Get());
         blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
