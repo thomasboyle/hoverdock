@@ -950,7 +950,7 @@ bool DockConfig::Load() {
     m_rimLight = true;
     m_lensing = true;
     m_dispersion = true;
-    m_frostBlur = true;
+    m_frostLevel = 1;
     m_tint = true;
     m_specular = true;
     m_dropShadow = true;
@@ -996,9 +996,13 @@ bool DockConfig::Load() {
         if (dispersion != dockSection->second.end()) {
             m_dispersion = ParseBoolean(dispersion->second);
         }
-        const auto frostBlur = dockSection->second.find(L"frostblur");
-        if (frostBlur != dockSection->second.end()) {
-            m_frostBlur = ParseBoolean(frostBlur->second);
+        const auto frost = dockSection->second.find(L"frost");
+        if (frost != dockSection->second.end()) {
+            try {
+                m_frostLevel = std::clamp(std::stoi(frost->second), 0, 2);
+            } catch (...) {
+                m_frostLevel = 1;
+            }
         }
         const auto tint = dockSection->second.find(L"tint");
         if (tint != dockSection->second.end()) {
@@ -1086,7 +1090,7 @@ bool DockConfig::Save() const {
     contents << L"RimLight=" << (m_rimLight ? L"1" : L"0") << L"\n";
     contents << L"Lensing=" << (m_lensing ? L"1" : L"0") << L"\n";
     contents << L"Dispersion=" << (m_dispersion ? L"1" : L"0") << L"\n";
-    contents << L"FrostBlur=" << (m_frostBlur ? L"1" : L"0") << L"\n";
+    contents << L"Frost=" << m_frostLevel << L"\n";
     contents << L"Tint=" << (m_tint ? L"1" : L"0") << L"\n";
     contents << L"Specular=" << (m_specular ? L"1" : L"0") << L"\n";
     contents << L"DropShadow=" << (m_dropShadow ? L"1" : L"0") << L"\n";
@@ -1188,12 +1192,12 @@ void DockConfig::SetDispersion(bool enabled) noexcept {
     m_dispersion = enabled;
 }
 
-bool DockConfig::FrostBlur() const noexcept {
-    return m_frostBlur;
+int DockConfig::FrostLevel() const noexcept {
+    return m_frostLevel;
 }
 
-void DockConfig::SetFrostBlur(bool enabled) noexcept {
-    m_frostBlur = enabled;
+void DockConfig::SetFrostLevel(int level) noexcept {
+    m_frostLevel = std::clamp(level, 0, 2);
 }
 
 bool DockConfig::Tint() const noexcept {
@@ -1274,9 +1278,9 @@ void DockConfig::SetDefaults() {
     m_rimLight = true;
     m_lensing = true;
     m_dispersion = true;
-    m_frostBlur = true;
     m_tint = true;
     m_specular = true;
     m_dropShadow = true;
     m_depthShade = true;
+    m_frostLevel = 1;
 }

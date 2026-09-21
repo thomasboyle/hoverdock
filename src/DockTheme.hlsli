@@ -33,9 +33,11 @@
 #define DOCK_FX_RIM 1
 #define DOCK_FX_LENS 2
 #define DOCK_FX_DISPERSION 4
-#define DOCK_FX_BLUR 8
+// Bit 3 retired (was FrostBlur on/off); frost notches now ride bits 17-18.
 #define DOCK_FX_TINT 16
 #define DOCK_FX_SPECULAR 32
 #define DOCK_FX_SHADOW 64
 #define DOCK_FX_THICKNESS 128
+#define DOCK_FX_FROSTB0 (1 << 17)
+#define DOCK_FX_FROSTB1 (1 << 18)
 #define DOCK_FX_ALL 255

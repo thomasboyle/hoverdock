@@ -204,7 +204,6 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float rimGain = FxEnabled(fxBits, 1.0);
     const float lensOn = FxEnabled(fxBits, 2.0);
     const float dispOn = FxEnabled(fxBits, 4.0);
-    const float blurOn = FxEnabled(fxBits, 8.0);
     const float tintOn = FxEnabled(fxBits, 16.0);
     const float specOn = FxEnabled(fxBits, 32.0);
     const float shadowOn = FxEnabled(fxBits, 64.0);
@@ -267,7 +266,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // on top regardless; this stills the glass around them.) Tint and frost
     // are untouched - only the visible warp calms. Live count rides the high
     // bits of scene1.x; lookups capped at 64.
-    const uint haloCount = min((uint)floor(fxBits / 256.0), 64u);
+    const uint fxU = (uint)fxBits;
+    const uint haloCount = min((fxU >> 8) & 63u, 64u);
+    // Frost notches ride bits 17-18: 0 clear, 1 balanced, 2 full frost.
+    const uint frostLevel = min((fxU >> 17) & 3u, 2u);
     float minIconDist = 1e9;
     for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
     {
@@ -286,6 +288,35 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Slab thickness T(x) = T0 + B*f(x), T0 = 0.35*bevel, B = 0.65*bevel.
     const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
+
+    // Frost notch presets (settings slider, bits 17-18): blur radii in px
+    // at 1x plus multiplicative veil endpoints. Function scope: both the
+    // backdrop branch and the tint section below consume them.
+    float frostRim;
+    float frostCore;
+    float frostTintLo;
+    float frostTintHi;
+    if (frostLevel == 0u)
+    {
+        frostRim = 0.0;
+        frostCore = 0.0;
+        frostTintLo = 0.0;
+        frostTintHi = 0.0;
+    }
+    else if (frostLevel == 1u)
+    {
+        frostRim = 2.0;
+        frostCore = 6.0;
+        frostTintLo = 0.5;
+        frostTintHi = 0.85;
+    }
+    else
+    {
+        frostRim = 8.0;
+        frostCore = 18.0;
+        frostTintLo = 0.8;
+        frostTintHi = 0.95;
+    }
 
     float3 frostedBackground;
     if (!hasBackdrop)
@@ -352,23 +383,30 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // thick center. A sharp refracted image is what makes the warp
         // readable; frosted mush hides it. Icon legibility still comes from
         // the tint backing, not the blur.
-        const float blurPx = (0.5 + height01 * 1.0) * dpi; // 0.5 rim .. 1.5 center
+        // Notch radii/veil come from the function-scope ladder above.
+        const float blurPx = lerp(frostRim, frostCore, height01) * dpi;
         // Frost off samples each channel once at its (possibly refracted)
         // UV instead of the 9-tap ring: same result as a zero-radius blur
         // with a ninth of the fetches.
-        frostedBackground = blurOn > 0.5
-            ? SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel)
-            : float3(backdropTexture.Sample(linearClamp, clamp(uvR, lo, hi)).r,
+        // Notch 0 samples each channel once (no frost); 1-2 run the ring.
+        if (frostLevel == 0u)
+        {
+            frostedBackground = float3(backdropTexture.Sample(linearClamp, clamp(uvR, lo, hi)).r,
                 backdropTexture.Sample(linearClamp, clamp(uvG, lo, hi)).g,
                 backdropTexture.Sample(linearClamp, clamp(uvB, lo, hi)).b);
+        }
+        else
+        {
+            frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
+        }
     }
 
     // ---- 1. Fixed transmission tint -------------------------------------
     // Multiplicative, modulated by slab height only - no backdrop-driven
     // adaptation. Nearly clear at the rim (refraction + caustic carry the
     // edge), light veil over the flat field where icons need backing.
-    // tintAmount = 0.08 rim .. 0.25 center.
-    const float tintAmount = lerp(0.08, 0.25, height01) * tintOn;
+    // veil amounts come from the frost ladder above.
+    const float tintAmount = lerp(frostTintLo, frostTintHi, height01) * tintOn;
     float3 color = lerp(frostedBackground, frostedBackground * glassTint, tintAmount);
     color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22 * tintOn);
 

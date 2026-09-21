@@ -35,8 +35,8 @@ public:
     void SetLensing(bool enabled) noexcept;
     [[nodiscard]] bool Dispersion() const noexcept;
     void SetDispersion(bool enabled) noexcept;
-    [[nodiscard]] bool FrostBlur() const noexcept;
-    void SetFrostBlur(bool enabled) noexcept;
+    [[nodiscard]] int FrostLevel() const noexcept;
+    void SetFrostLevel(int level) noexcept;
     [[nodiscard]] bool Tint() const noexcept;
     void SetTint(bool enabled) noexcept;
     [[nodiscard]] bool Specular() const noexcept;
@@ -74,7 +74,7 @@ private:
     bool m_rimLight = true;
     bool m_lensing = true;
     bool m_dispersion = true;
-    bool m_frostBlur = true;
+    int m_frostLevel = 1;
     bool m_tint = true;
     bool m_specular = true;
     bool m_dropShadow = true;
