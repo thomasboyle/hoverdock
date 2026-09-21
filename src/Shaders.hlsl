@@ -151,8 +151,8 @@ static const float kLensGain = 2.3;
 static const float kFringeBoost = 24.0;
 // Heavy mica: rim soft enough for refraction; core dissolves wallpaper.
 // Iterated separable passes compound these radii further.
-static const float kMicaBlurRim = 28.0;
-static const float kMicaBlurCore = 52.0;
+static const float kMicaBlurRim = 36.0;
+static const float kMicaBlurCore = 64.0;
 // Dense 17-tap Gaussian, sigma = 0.5 * blurPx, taps at multiples of
 // blurPx/8: w(x) = exp(-2x^2), normalized (sums to 1.0 with mirrors).
 static const float kGaussW[9] = { 0.1031, 0.1000, 0.0910, 0.0779, 0.0626, 0.0472, 0.0335, 0.0223, 0.0140 };
@@ -443,7 +443,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
 }
 
 // ---------------------------------------------------------------------------
-// Iterated separable frost (H/V/H + GlassPS vertical finish). Every pass
+// Separable frost (BlurHPS + GlassPS vertical finish). Every pass
 // must compute identical lens UVs (same SDF, bevel, halos, Snell, fringe):
 // equal inputs yield equal UVs, and that equality is what makes the split
 // valid, so all passes share ComputeFrostUVs below. Iterating moderate

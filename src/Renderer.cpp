@@ -1,4 +1,4 @@
-#include "Renderer.h"
+﻿#include "Renderer.h"
 #include "DockTheme.hlsli"
 #include "Profile.h"
 
@@ -1258,54 +1258,59 @@ bool Renderer::Render(const DockRenderState& state) {
         m_srvHeap->GetGPUDescriptorHandleForHeapStart());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    // Iterated separable frost when frost is on and the backdrop is live:
-    // pass 1 blurs horizontally from the backdrop into temp, then two
-    // vertical/horizontal pairs ping-pong temp <-> temp2; the glass pass
-    // below finishes vertically from temp. Each pass uses the same dense
-    // kernel so no pass ever skips pixels (the blocky pixelation a single
-    // wide kernel produces), and the iteration compounds into a heavy blur
-    // (per-axis sigma grows ~x1.7 over a single pass). Skipped otherwise
-    // (stale temps are never sampled: GlassPS takes the direct path when
-    // frost is off or invalid).
+    // Separable frost pass 1: horizontal Gaussian from the live backdrop into
+    // blurTemp. GlassPS finishes the vertical axis from blurTemp. Only one
+    // temp is written here so we never bind the same resource as RTV and SRV
+    // in one draw (the iterated ping-pong did that and zeroed the frost).
+    // Skipped when frost is off or the backdrop is invalid (GlassPS then
+    // samples the backdrop directly).
     const bool frostPass = (state.fxFlags & DOCK_FX_BLUR) != 0 && m_backdropValid &&
-        m_blurTemp != nullptr && m_blurTemp2 != nullptr;
+        m_blurTemp != nullptr;
     if (frostPass) {
-        const D3D12_CPU_DESCRIPTOR_HANDLE rtvHeapStart =
-            m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        const auto blurPass = [&](ID3D12Resource* target, bool& isShaderResource,
-                                  SIZE_T rtvIndex, ID3D12PipelineState* pipeline) {
-            if (isShaderResource) {
-                D3D12_RESOURCE_BARRIER toRender{};
-                toRender.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                toRender.Transition.pResource = target;
-                toRender.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                toRender.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                toRender.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                m_commandList->ResourceBarrier(1, &toRender);
-                isShaderResource = false;
-            }
-            D3D12_CPU_DESCRIPTOR_HANDLE blurTarget = rtvHeapStart;
-            blurTarget.ptr += rtvIndex * m_rtvDescriptorSize;
-            m_commandList->OMSetRenderTargets(1, &blurTarget, FALSE, nullptr);
-            m_commandList->SetPipelineState(pipeline);
-            m_commandList->DrawInstanced(3, 1, 0, 0);
+        if (m_blurTempIsShaderResource) {
+            D3D12_RESOURCE_BARRIER toRender{};
+            toRender.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toRender.Transition.pResource = m_blurTemp.Get();
+            toRender.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            toRender.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toRender.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            m_commandList->ResourceBarrier(1, &toRender);
+            m_blurTempIsShaderResource = false;
+        }
+        // Null blurTemp's SRV while it is an RTV â€” D3D12 forbids a resource
+        // appearing as both in the same draw, even if the PS does not sample it.
+        D3D12_CPU_DESCRIPTOR_HANDLE blurSrv =
+            m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        blurSrv.ptr += static_cast<SIZE_T>(kTempBlurDescriptor) * m_srvDescriptorSize;
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+        nullSrv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nullSrv.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(nullptr, &nullSrv, blurSrv);
 
-            D3D12_RESOURCE_BARRIER toShader{};
-            toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            toShader.Transition.pResource = target;
-            toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            m_commandList->ResourceBarrier(1, &toShader);
-            isShaderResource = true;
-        };
-        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount, m_blurPipeline.Get());
-        blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
-            m_blurVPipeline.Get());
-        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount, m_blurH2Pipeline.Get());
-        blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
-            m_blurVPipeline.Get());
-        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount, m_blurH2Pipeline.Get());
+        D3D12_CPU_DESCRIPTOR_HANDLE blurTarget =
+            m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        blurTarget.ptr += static_cast<SIZE_T>(kBufferCount) * m_rtvDescriptorSize;
+        m_commandList->OMSetRenderTargets(1, &blurTarget, FALSE, nullptr);
+        m_commandList->SetPipelineState(m_blurPipeline.Get());
+        m_commandList->DrawInstanced(3, 1, 0, 0);
+
+        D3D12_RESOURCE_BARRIER toShader{};
+        toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toShader.Transition.pResource = m_blurTemp.Get();
+        toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        m_commandList->ResourceBarrier(1, &toShader);
+        m_blurTempIsShaderResource = true;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC blurView{};
+        blurView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        blurView.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        blurView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        blurView.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(m_blurTemp.Get(), &blurView, blurSrv);
 
         m_commandList->OMSetRenderTargets(1, &renderTarget, FALSE, nullptr);
     }
