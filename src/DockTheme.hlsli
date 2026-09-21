@@ -28,6 +28,8 @@
 // Glass effect toggles packed into scene1.x (float-stored bitmask, all
 // values < 256 exact). DockRenderState composes these from the DockConfig
 // bools; GlassPS decodes with FxEnabled(). All on = current look.
+// High bits of the same word carry the live icon count for icon-calm
+// halos (count << 8 | mask); total stays far below 2^24 (exactly kept).
 #define DOCK_FX_RIM 1
 #define DOCK_FX_LENS 2
 #define DOCK_FX_DISPERSION 4

@@ -7,7 +7,7 @@
 cbuffer FrameData : register(b0)
 {
     float4 scene0; // output width, output height, glass alpha, dock scale
-    float4 scene1; // rim light switch, DPI scale, dev bounds, backdrop valid
+    float4 scene1; // fx bitmask | icon count, DPI scale, dev bounds, backdrop valid
 };
 
 struct IconInstance
@@ -76,7 +76,8 @@ float BevelSlopeN(float oneMinusX, float oneMinusX4)
 
 // Glass effect toggles packed in scene1.x (DOCK_FX_* bits, DockTheme.hlsli).
 // All values < 256 survive the float trip exactly; callers add 0.5 to guard
-// truncation at bit boundaries.
+// truncation at bit boundaries. High bits (value >> 8) carry the live icon
+// count for icon-calm halos; total stays far below 2^24 (exactly kept).
 float FxEnabled(float packed, float bit)
 {
     return fmod(floor(packed / bit), 2.0);
@@ -261,7 +262,30 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
     const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
     // True surface slope dH/dDist = (B/bevel) * f'(x), B = 0.65*bevel.
-    const float slopeMag = 0.65 * slopeN;
+    float slopeMag = 0.65 * slopeN;
+    // ---- Icon-calm halos --------------------------------------------------
+    // Lensing excludes icons: within a feather of any icon rect the slab
+    // relaxes toward flat, so refraction peaks in the background gaps
+    // instead of crowding glyphs. (Icons are opaque and drawn undisplaced
+    // on top regardless; this stills the glass around them.) Tint and frost
+    // are untouched - only the visible warp calms. Live count rides the high
+    // bits of scene1.x; lookups capped at 64.
+    const uint haloCount = min((uint)floor(fxBits / 256.0), 64u);
+    float minIconDist = 1e9;
+    for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
+    {
+        if (haloIndex >= haloCount)
+        {
+            break;
+        }
+        const float4 haloRect = iconInstances[haloIndex].iconRect; // l,t,w,h px
+        const float2 haloCenter = haloRect.xy + haloRect.zw * 0.5;
+        const float2 haloQ = abs(pixel - haloCenter) - haloRect.zw * 0.5;
+        minIconDist = min(minIconDist, length(max(haloQ, 0.0)));
+    }
+    const float haloCalm = 1.0 - smoothstep(0.0, 10.0 * dpi, minIconDist);
+    const float haloDamp = 1.0 - haloCalm * 0.9;
+    slopeMag *= haloDamp;
     // Slab thickness T(x) = T0 + B*f(x), T0 = 0.35*bevel, B = 0.65*bevel.
     const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
@@ -371,7 +395,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // top of the faint broad veil below; final saturate keeps LDR range.
     // Narrowed (rim^1.5) so the border never reads as a milky frame: the
     // crisp caustic line underneath carries the edge instead.
-    color += fresnel * float3(0.90, 0.95, 1.0) * 0.45 * pow(rim, 1.5) * rimGain;
+    color += fresnel * float3(0.90, 0.95, 1.0) * 0.45 * pow(rim, 1.5) * rimGain * haloDamp;
     color += specular * float3(1.0, 1.0, 1.0) * 0.55 * specOn;
     color += fillSpec * float3(0.75, 0.85, 1.0) * 0.18 * specOn;
 
@@ -384,10 +408,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // grounded edge. True outer shadow is drawn outside the mask below.
     const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
     color *= lerp(1.0, thicknessShade, thickOn);
-    color += glassTint * rim * 0.05 * rimGain;
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.34 * (0.55 + 0.45 * ndl) * rimGain;
+    color += glassTint * rim * 0.05 * rimGain * haloDamp;
+    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.34 * (0.55 + 0.45 * ndl) * rimGain * haloDamp;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
-    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08 * rimGain;
+    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08 * rimGain * haloDamp;
 
     if (scene1.z > 0.5)
     {

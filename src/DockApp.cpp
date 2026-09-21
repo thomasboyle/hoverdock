@@ -5626,7 +5626,9 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     if (m_config.DepthShade()) {
         glassFx |= DOCK_FX_THICKNESS;
     }
-    state.fxFlags = glassFx;
+    // Pack the live icon count into the high bits so the glass pass can
+    // calm lensing near icons (halos). Low 8 bits stay the toggle mask.
+    state.fxFlags = (static_cast<UINT>(m_iconRenderData.size()) << 8) | glassFx;
     state.dockScale = m_dockScale;
     state.showDevBounds = m_config.ShowDevBounds();
     state.skipIfGpuBusy = m_dropPresentPending || (IsDragActive() && !m_dragSnapAnimating);
