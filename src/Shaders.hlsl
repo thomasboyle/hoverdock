@@ -74,6 +74,14 @@ float BevelSlopeN(float oneMinusX, float oneMinusX4)
     return min(numer / max(denom, 1e-3), 3.5);
 }
 
+// Glass effect toggles packed in scene1.x (DOCK_FX_* bits, DockTheme.hlsli).
+// All values < 256 survive the float trip exactly; callers add 0.5 to guard
+// truncation at bit boundaries.
+float FxEnabled(float packed, float bit)
+{
+    return fmod(floor(packed / bit), 2.0);
+}
+
 VertexOutput FullscreenVS(uint vertexId : SV_VertexID)
 {
     const float2 positions[3] = {
@@ -188,8 +196,24 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // SDF gradient = 2D surface direction (CASDFLayer-style). ddx/ddy gives
     // screen-space analytic derivatives of the SDF field.
     const float2 gradient = float2(ddx(distance), ddy(distance));
+    // Per-effect master switches (dock settings, default all on). Decoded
+    // from the scene1.x bitmask; each gates exactly one pipeline stage.
+    // Declared before the shadow early-out so every branch can use them.
+    const float fxBits = scene1.x + 0.5;
+    const float rimGain = FxEnabled(fxBits, 1.0);
+    const float lensOn = FxEnabled(fxBits, 2.0);
+    const float dispOn = FxEnabled(fxBits, 4.0);
+    const float blurOn = FxEnabled(fxBits, 8.0);
+    const float tintOn = FxEnabled(fxBits, 16.0);
+    const float specOn = FxEnabled(fxBits, 32.0);
+    const float shadowOn = FxEnabled(fxBits, 64.0);
+    const float thickOn = FxEnabled(fxBits, 128.0);
     if (mask <= 0.0)
     {
+        if (shadowOn < 0.5)
+        {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
         // Soft outer contact shadow: the pill SDF re-evaluated with a small
         // down-right offset (top-left key light), quadratic falloff over a
         // 14px band. Premultiplied black over the desktop = drop shade via
@@ -215,10 +239,6 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // softer, driven by shape rather than a hard glow.
     const float rim = pow(saturate(1.0 - insideDistance / max(8.0 * dpi, 2.0)), 2.8);
     const bool hasBackdrop = scene1.w > 0.5;
-    // Rim-light master switch (dock.ini RimLight=, default on). Gates every
-    // rim-falloff-driven term below: Fresnel veil, gray veil, caustic, top
-    // sheen. Refraction, tint, speculars and shadow are unaffected.
-    const float rimGain = scene1.x > 0.5 ? 1.0 : 0.0;
     // Gray tint token shared with the Quick Settings popup; the dock face
     // itself runs adaptive transmission (section 1 below), so no fixed mix
     // applies here.
@@ -278,15 +298,18 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // with no straight edges to bend. This is the edge-lensing signature:
         // background visibly warps and magnifies through the bevel.
         const float lensGain = 3.5;
-        float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain;
-        float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain;
-        float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain;
+        float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain * lensOn;
+        float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain * lensOn;
+        float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain * lensOn;
         // Exaggerate the physical fringe ~24x around green for visibility;
         // ratios stay physical (blue bends most). Lands ~1.3px R-B split on
         // contrast boundaries: saturated edge color like the reference.
         const float fringeBoost = 24.0;
         dR = dG + (dR - dG) * fringeBoost;
         dB = dG + (dB - dG) * fringeBoost;
+        // Dispersion off collapses all channels onto green (no split).
+        dR = lerp(dG, dR, dispOn);
+        dB = lerp(dG, dB, dispOn);
 
         const float2 lo = texel * 0.5;
         const float2 hi = 1.0 - texel * 0.5;
@@ -311,7 +334,14 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // readable; frosted mush hides it. Icon legibility still comes from
         // the tint backing, not the blur.
         const float blurPx = (0.5 + height01 * 1.0) * dpi; // 0.5 rim .. 1.5 center
-        frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
+        // Frost off samples each channel once at its (possibly refracted)
+        // UV instead of the 9-tap ring: same result as a zero-radius blur
+        // with a ninth of the fetches.
+        frostedBackground = blurOn > 0.5
+            ? SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel)
+            : float3(backdropTexture.Sample(linearClamp, clamp(uvR, lo, hi)).r,
+                backdropTexture.Sample(linearClamp, clamp(uvG, lo, hi)).g,
+                backdropTexture.Sample(linearClamp, clamp(uvB, lo, hi)).b);
     }
 
     // ---- 1. Fixed transmission tint -------------------------------------
@@ -319,9 +349,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // adaptation. Nearly clear at the rim (refraction + caustic carry the
     // edge), light veil over the flat field where icons need backing.
     // tintAmount = 0.08 rim .. 0.25 center.
-    const float tintAmount = lerp(0.08, 0.25, height01);
+    const float tintAmount = lerp(0.08, 0.25, height01) * tintOn;
     float3 color = lerp(frostedBackground, frostedBackground * glassTint, tintAmount);
-    color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22);
+    color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22 * tintOn);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
     // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on
@@ -342,8 +372,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Narrowed (rim^1.5) so the border never reads as a milky frame: the
     // crisp caustic line underneath carries the edge instead.
     color += fresnel * float3(0.90, 0.95, 1.0) * 0.45 * pow(rim, 1.5) * rimGain;
-    color += specular * float3(1.0, 1.0, 1.0) * 0.55;
-    color += fillSpec * float3(0.75, 0.85, 1.0) * 0.18;
+    color += specular * float3(1.0, 1.0, 1.0) * 0.55 * specOn;
+    color += fillSpec * float3(0.75, 0.85, 1.0) * 0.18 * specOn;
 
     // Established edge treatment: faint thickness shading, bright rim
     // caustic (the focused edge-lensing highlight, following the key light
@@ -353,7 +383,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // the rim, gone by 0.6 bevel) so the bright caustic sits against a
     // grounded edge. True outer shadow is drawn outside the mask below.
     const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
-    color *= thicknessShade;
+    color *= lerp(1.0, thicknessShade, thickOn);
     color += glassTint * rim * 0.05 * rimGain;
     color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.34 * (0.55 + 0.45 * ndl) * rimGain;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));

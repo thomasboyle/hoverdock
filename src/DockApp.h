@@ -168,6 +168,13 @@ private:
         Startup,
         Updates,
         RimLight,
+        Lensing,
+        Dispersion,
+        FrostBlur,
+        Tint,
+        Specular,
+        DropShadow,
+        DepthShade,
         CheckNow,
         Close,
     };

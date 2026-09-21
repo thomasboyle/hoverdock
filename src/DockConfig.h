@@ -31,6 +31,20 @@ public:
     void SetCheckForUpdates(bool enabled) noexcept;
     [[nodiscard]] bool RimLight() const noexcept;
     void SetRimLight(bool enabled) noexcept;
+    [[nodiscard]] bool Lensing() const noexcept;
+    void SetLensing(bool enabled) noexcept;
+    [[nodiscard]] bool Dispersion() const noexcept;
+    void SetDispersion(bool enabled) noexcept;
+    [[nodiscard]] bool FrostBlur() const noexcept;
+    void SetFrostBlur(bool enabled) noexcept;
+    [[nodiscard]] bool Tint() const noexcept;
+    void SetTint(bool enabled) noexcept;
+    [[nodiscard]] bool Specular() const noexcept;
+    void SetSpecular(bool enabled) noexcept;
+    [[nodiscard]] bool DropShadow() const noexcept;
+    void SetDropShadow(bool enabled) noexcept;
+    [[nodiscard]] bool DepthShade() const noexcept;
+    void SetDepthShade(bool enabled) noexcept;
     // Remembers the last version whose installer/mover was actually launched,
     // with the wall-clock time of the attempt (unix seconds, 0 = none). Used
     // to break reinstall loops: if the install did not take effect (wrong
@@ -58,6 +72,13 @@ private:
     bool m_launchAtStartup = false;
     bool m_checkForUpdates = true;
     bool m_rimLight = true;
+    bool m_lensing = true;
+    bool m_dispersion = true;
+    bool m_frostBlur = true;
+    bool m_tint = true;
+    bool m_specular = true;
+    bool m_dropShadow = true;
+    bool m_depthShade = true;
     std::wstring m_lastInstalledVersion;
     long long m_lastInstalledTime = 0;
     int m_lastInstalledAttempts = 0;

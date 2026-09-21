@@ -4042,6 +4042,62 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         QueueRenderFrame();
         break;
     }
+    case SettingsHitKind::Lensing: {
+        const bool enabled = !m_config.Lensing();
+        m_config.SetLensing(enabled);
+        ScheduleConfigSave();
+        PaintSettingsPopup();
+        QueueRenderFrame();
+        break;
+    }
+    case SettingsHitKind::Dispersion: {
+        const bool enabled = !m_config.Dispersion();
+        m_config.SetDispersion(enabled);
+        ScheduleConfigSave();
+        PaintSettingsPopup();
+        QueueRenderFrame();
+        break;
+    }
+    case SettingsHitKind::FrostBlur: {
+        const bool enabled = !m_config.FrostBlur();
+        m_config.SetFrostBlur(enabled);
+        ScheduleConfigSave();
+        PaintSettingsPopup();
+        QueueRenderFrame();
+        break;
+    }
+    case SettingsHitKind::Tint: {
+        const bool enabled = !m_config.Tint();
+        m_config.SetTint(enabled);
+        ScheduleConfigSave();
+        PaintSettingsPopup();
+        QueueRenderFrame();
+        break;
+    }
+    case SettingsHitKind::Specular: {
+        const bool enabled = !m_config.Specular();
+        m_config.SetSpecular(enabled);
+        ScheduleConfigSave();
+        PaintSettingsPopup();
+        QueueRenderFrame();
+        break;
+    }
+    case SettingsHitKind::DropShadow: {
+        const bool enabled = !m_config.DropShadow();
+        m_config.SetDropShadow(enabled);
+        ScheduleConfigSave();
+        PaintSettingsPopup();
+        QueueRenderFrame();
+        break;
+    }
+    case SettingsHitKind::DepthShade: {
+        const bool enabled = !m_config.DepthShade();
+        m_config.SetDepthShade(enabled);
+        ScheduleConfigSave();
+        PaintSettingsPopup();
+        QueueRenderFrame();
+        break;
+    }
     case SettingsHitKind::CheckNow:
         if (!m_updateInFlight.load() && !m_updateInstalling.load()) {
             CheckForUpdatesAsync(true);
@@ -4396,6 +4452,20 @@ void DockApp::PaintSettingsPopup() {
             m_config.CheckForUpdates()},
         {SettingsHitKind::RimLight, L"Rim light", L"Edge glow and caustic on the glass",
             m_config.RimLight()},
+        {SettingsHitKind::Lensing, L"Lensing", L"Refraction warp through the bevel",
+            m_config.Lensing()},
+        {SettingsHitKind::Dispersion, L"Dispersion", L"Spectral fringe at glass edges",
+            m_config.Dispersion()},
+        {SettingsHitKind::FrostBlur, L"Frost blur", L"Softens the backdrop inside the glass",
+            m_config.FrostBlur()},
+        {SettingsHitKind::Tint, L"Tint", L"Warm veil over the backdrop",
+            m_config.Tint()},
+        {SettingsHitKind::Specular, L"Speculars", L"Key and fill glints on the surface",
+            m_config.Specular()},
+        {SettingsHitKind::DropShadow, L"Drop shadow", L"Soft contact shade under the dock",
+            m_config.DropShadow()},
+        {SettingsHitKind::DepthShade, L"Depth shade", L"Inner shading at the glass edge",
+            m_config.DepthShade()},
     };
     const LONG labelHeight = std::max(16L, std::lround(18.0F * scale));
     const LONG subHeight = std::max(14L, std::lround(16.0F * scale));
@@ -5529,7 +5599,32 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     state.width = m_dockWidth;
     state.height = m_dockHeight;
     state.glassAlpha = DOCK_GLASS_ALPHA;
-    state.rimLight = m_config.RimLight() ? 1.0F : 0.0F;
+    UINT glassFx = 0;
+    if (m_config.RimLight()) {
+        glassFx |= DOCK_FX_RIM;
+    }
+    if (m_config.Lensing()) {
+        glassFx |= DOCK_FX_LENS;
+    }
+    if (m_config.Dispersion()) {
+        glassFx |= DOCK_FX_DISPERSION;
+    }
+    if (m_config.FrostBlur()) {
+        glassFx |= DOCK_FX_BLUR;
+    }
+    if (m_config.Tint()) {
+        glassFx |= DOCK_FX_TINT;
+    }
+    if (m_config.Specular()) {
+        glassFx |= DOCK_FX_SPECULAR;
+    }
+    if (m_config.DropShadow()) {
+        glassFx |= DOCK_FX_SHADOW;
+    }
+    if (m_config.DepthShade()) {
+        glassFx |= DOCK_FX_THICKNESS;
+    }
+    state.fxFlags = glassFx;
     state.dockScale = m_dockScale;
     state.showDevBounds = m_config.ShowDevBounds();
     state.skipIfGpuBusy = m_dropPresentPending || (IsDragActive() && !m_dragSnapAnimating);

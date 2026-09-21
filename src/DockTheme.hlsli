@@ -24,3 +24,16 @@
 // inflation, input-region inset, popup anchors) and the glass shader (pill
 // inset, shadow band). Device px at 1x; both sides scale by display DPI.
 #define DOCK_SHADOW_MARGIN_PT 18.0f
+
+// Glass effect toggles packed into scene1.x (float-stored bitmask, all
+// values < 256 exact). DockRenderState composes these from the DockConfig
+// bools; GlassPS decodes with FxEnabled(). All on = current look.
+#define DOCK_FX_RIM 1
+#define DOCK_FX_LENS 2
+#define DOCK_FX_DISPERSION 4
+#define DOCK_FX_BLUR 8
+#define DOCK_FX_TINT 16
+#define DOCK_FX_SPECULAR 32
+#define DOCK_FX_SHADOW 64
+#define DOCK_FX_THICKNESS 128
+#define DOCK_FX_ALL 255

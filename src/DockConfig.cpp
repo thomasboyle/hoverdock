@@ -948,6 +948,13 @@ bool DockConfig::Load() {
     m_launchAtStartup = false;
     m_checkForUpdates = true;
     m_rimLight = true;
+    m_lensing = true;
+    m_dispersion = true;
+    m_frostBlur = true;
+    m_tint = true;
+    m_specular = true;
+    m_dropShadow = true;
+    m_depthShade = true;
     m_lastInstalledVersion.clear();
     m_lastInstalledTime = 0;
     m_lastInstalledAttempts = 0;
@@ -980,6 +987,34 @@ bool DockConfig::Load() {
         const auto rimLight = dockSection->second.find(L"rimlight");
         if (rimLight != dockSection->second.end()) {
             m_rimLight = ParseBoolean(rimLight->second);
+        }
+        const auto lensing = dockSection->second.find(L"lensing");
+        if (lensing != dockSection->second.end()) {
+            m_lensing = ParseBoolean(lensing->second);
+        }
+        const auto dispersion = dockSection->second.find(L"dispersion");
+        if (dispersion != dockSection->second.end()) {
+            m_dispersion = ParseBoolean(dispersion->second);
+        }
+        const auto frostBlur = dockSection->second.find(L"frostblur");
+        if (frostBlur != dockSection->second.end()) {
+            m_frostBlur = ParseBoolean(frostBlur->second);
+        }
+        const auto tint = dockSection->second.find(L"tint");
+        if (tint != dockSection->second.end()) {
+            m_tint = ParseBoolean(tint->second);
+        }
+        const auto specular = dockSection->second.find(L"specular");
+        if (specular != dockSection->second.end()) {
+            m_specular = ParseBoolean(specular->second);
+        }
+        const auto dropShadow = dockSection->second.find(L"dropshadow");
+        if (dropShadow != dockSection->second.end()) {
+            m_dropShadow = ParseBoolean(dropShadow->second);
+        }
+        const auto depthShade = dockSection->second.find(L"depthshade");
+        if (depthShade != dockSection->second.end()) {
+            m_depthShade = ParseBoolean(depthShade->second);
         }
         const auto lastInstalledVersion =
             dockSection->second.find(L"lastinstalledversion");
@@ -1049,6 +1084,13 @@ bool DockConfig::Save() const {
     contents << L"LaunchAtStartup=" << (m_launchAtStartup ? L"1" : L"0") << L"\n";
     contents << L"CheckForUpdates=" << (m_checkForUpdates ? L"1" : L"0") << L"\n";
     contents << L"RimLight=" << (m_rimLight ? L"1" : L"0") << L"\n";
+    contents << L"Lensing=" << (m_lensing ? L"1" : L"0") << L"\n";
+    contents << L"Dispersion=" << (m_dispersion ? L"1" : L"0") << L"\n";
+    contents << L"FrostBlur=" << (m_frostBlur ? L"1" : L"0") << L"\n";
+    contents << L"Tint=" << (m_tint ? L"1" : L"0") << L"\n";
+    contents << L"Specular=" << (m_specular ? L"1" : L"0") << L"\n";
+    contents << L"DropShadow=" << (m_dropShadow ? L"1" : L"0") << L"\n";
+    contents << L"DepthShade=" << (m_depthShade ? L"1" : L"0") << L"\n";
     if (!m_lastInstalledVersion.empty()) {
         contents << L"LastInstalledVersion=" << m_lastInstalledVersion << L"\n";
         contents << L"LastInstalledTime=" << m_lastInstalledTime << L"\n";
@@ -1130,6 +1172,62 @@ void DockConfig::SetRimLight(bool enabled) noexcept {
     m_rimLight = enabled;
 }
 
+bool DockConfig::Lensing() const noexcept {
+    return m_lensing;
+}
+
+void DockConfig::SetLensing(bool enabled) noexcept {
+    m_lensing = enabled;
+}
+
+bool DockConfig::Dispersion() const noexcept {
+    return m_dispersion;
+}
+
+void DockConfig::SetDispersion(bool enabled) noexcept {
+    m_dispersion = enabled;
+}
+
+bool DockConfig::FrostBlur() const noexcept {
+    return m_frostBlur;
+}
+
+void DockConfig::SetFrostBlur(bool enabled) noexcept {
+    m_frostBlur = enabled;
+}
+
+bool DockConfig::Tint() const noexcept {
+    return m_tint;
+}
+
+void DockConfig::SetTint(bool enabled) noexcept {
+    m_tint = enabled;
+}
+
+bool DockConfig::Specular() const noexcept {
+    return m_specular;
+}
+
+void DockConfig::SetSpecular(bool enabled) noexcept {
+    m_specular = enabled;
+}
+
+bool DockConfig::DropShadow() const noexcept {
+    return m_dropShadow;
+}
+
+void DockConfig::SetDropShadow(bool enabled) noexcept {
+    m_dropShadow = enabled;
+}
+
+bool DockConfig::DepthShade() const noexcept {
+    return m_depthShade;
+}
+
+void DockConfig::SetDepthShade(bool enabled) noexcept {
+    m_depthShade = enabled;
+}
+
 std::wstring DockConfig::LastInstalledVersion() const {
     return m_lastInstalledVersion;
 }
@@ -1174,4 +1272,11 @@ void DockConfig::SetDefaults() {
     m_launchAtStartup = false;
     m_checkForUpdates = true;
     m_rimLight = true;
+    m_lensing = true;
+    m_dispersion = true;
+    m_frostBlur = true;
+    m_tint = true;
+    m_specular = true;
+    m_dropShadow = true;
+    m_depthShade = true;
 }
