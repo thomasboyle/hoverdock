@@ -245,17 +245,14 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // applies here.
     const float3 glassTint = DOCK_GLASS_TINT;
 
-    // ---- Bevel geometry ---------------------------------------------------
-    // Optical bevel ~20pt, SCALED by the dock content scale (scene0.w) so it
-    // stays proportional to the layout: layout padding is 24pt, giving a
-    // fixed 1.2x clearance so icons never enter the lensing band at any
-    // dock scale. (An absolute 24px bevel overlapped the 20pt padding, worst
-    // at small scales where padding shrinks but the bevel did not.) The flat
-    // field is preserved because SdSquircleBox returns TRUE interior depth:
-    // x = saturate(depth/bevel) still reaches 1 wherever depth > bevel.
-    const float dockScale = clamp(scene0.w, 0.5, 2.0);
-    float bevelWidth = clamp(20.0 * dpi * dockScale, 8.0 * dpi,
-        max(min(halfSize.x, halfSize.y) * 0.9, 1.0));
+    // ---- Bevel geometry: one slab -----------------------------------------
+    // The bevel spans the short half-axis so the whole face refracts as one
+    // convex lens: gentle magnification in the field, steep warp at the rim,
+    // exact calm only at the center point. minHalf already carries dpi and
+    // dock scale via the layout, so the lens stays proportional at every
+    // size. x = saturate(depth/bevel) still reaches 1 at the center because
+    // the SDF returns true interior depth.
+    float bevelWidth = max(min(halfSize.x, halfSize.y) * 0.95, 8.0 * dpi);
     const float x = saturate(insideDistance / max(bevelWidth, 1e-3)); // 0 rim -> 1 flat
     const float oneMinusX = 1.0 - x;
     const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
@@ -316,12 +313,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float thetaRG = asin(sinRG);
         const float thetaRB = asin(sinRB);
         // Artistic gain on the physical shape. Rim displacement is
-        // T_rim*tan(dtheta)*gain ~= 0.45*bevel*0.6*gain: with the 20pt bevel
-        // and gain 3.5 the silhouette pulls ~19px, decaying to 0 across the
-        // band - an unmistakable liquid suck-in even on photographic content
-        // with no straight edges to bend. This is the edge-lensing signature:
-        // background visibly warps and magnifies through the bevel.
-        const float lensGain = 3.5;
+        // T_rim*tan(dtheta)*gain ~= 0.35*bevel*0.56*gain: with the full-span
+        // bevel (~35px here) gain 2.3 lands ~16px at the silhouette, decaying
+        // smoothly to a calm center - one continuous slab, not edge trim.
+        const float lensGain = 2.3;
         float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain * lensOn;
         float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain * lensOn;
         float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain * lensOn;

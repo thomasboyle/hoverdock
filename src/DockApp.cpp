@@ -2427,10 +2427,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     const LONG dotSize = std::max(2L, std::lround(5.0F * layoutScale));
     const LONG dotGap = std::max(1L, std::lround(2.0F * layoutScale));
     const LONG iconSlotHeight = iconSize + dotGap + dotSize;
-    // Padding clears the glass bevel: the shader's lensing band runs
-    // ~20*dockScale device px, so 24pt keeps icons (and their running dots)
-    // out of the refraction zone on all sides at every scale. (20pt left
-    // icon tops/bottoms inside the band, smearing background over them.)
+    // Padding sets icon breathing room. The full-span bevel means the whole
+    // face refracts gently, but glyphs are drawn undisplaced on top and the
+    // icon-calm halos still the glass around them: only background warps.
     const LONG padding = std::lround(24.0F * layoutScale);
     const LONG gap = std::lround(10.0F * layoutScale);
     const LONG dividerSlotWidth = std::lround(10.0F * layoutScale);
