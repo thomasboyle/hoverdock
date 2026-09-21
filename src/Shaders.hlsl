@@ -133,10 +133,13 @@ float InterleavedGradientNoise(float2 pixel)
 
 // ---------------------------------------------------------------------------
 // 5. Frosted / scattering blur AFTER refraction, per chromatic channel.
-//    9 taps per channel (center + 8 rotated ring) = 27 backdrop fetches.
+//    Gaussian two-ring kernel: 13 taps per channel (center + 8 inner ring
+//    + 4 far axis at 2x radius) = 39 backdrop fetches, center-heavy weights
+//    approximating a Gaussian lobe instead of a flat disk.
 //    Radius is modulated by slab height f: thin rim ~0.5px, thick center
-//    ~1.5px (near-clear; blur must not hide the warp). Rotation by IGN
-//    hides ring banding.
+//    ~1.5px (near-clear; blur must not hide the warp). Per-tap radius jitter
+//    plus IGN rotation break ring/iso-blur banding; triangular dither at the
+//    output breaks quantization banding.
 //    Each channel is blurred around its own Snell-displaced UV so dispersion
 //    survives the frosted lobe instead of being averaged away.
 // ---------------------------------------------------------------------------
@@ -149,14 +152,19 @@ float3 SampleChromaticGlass(float2 uvR, float2 uvG, float2 uvB, float2 texel,
     sincos(noise * 6.2831853, sine, cosine);
     const float2x2 rot = float2x2(cosine, -sine, sine, cosine);
 
-    const float2 dirs[8] = {
+    const float2 dirs[12] = {
         float2(1.0, 0.0), float2(-1.0, 0.0), float2(0.0, 1.0), float2(0.0, -1.0),
         float2(0.70710678, 0.70710678), float2(-0.70710678, 0.70710678),
-        float2(0.70710678, -0.70710678), float2(-0.70710678, -0.70710678)
+        float2(0.70710678, -0.70710678), float2(-0.70710678, -0.70710678),
+        float2(2.0, 0.0), float2(-2.0, 0.0), float2(0.0, 2.0), float2(0.0, -2.0)
     };
+    // Gaussian-ish falloff: 0.22 + 8*0.075 + 4*0.045 = 1.0.
+    const float ringW[8] = {
+        0.075, 0.075, 0.075, 0.075, 0.075, 0.075, 0.075, 0.075
+    };
+    const float farW[4] = { 0.045, 0.045, 0.045, 0.045 };
 
-    const float wCenter = 0.18;
-    const float wRing = 0.1025; // 0.18 + 8*0.1025 = 1.0
+    const float wCenter = 0.22;
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
 
@@ -166,17 +174,18 @@ float3 SampleChromaticGlass(float2 uvR, float2 uvG, float2 uvB, float2 texel,
     float3 acc = float3(centerR.r, centerG.g, centerB.b) * wCenter;
 
     [unroll]
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 12; ++i)
     {
-        // Per-tap radius jitter: without it the fixed ring plus the radius
+        // Per-tap radius jitter: without it the fixed rings plus the radius
         // gradient across the face prints iso-blur contour bands on curved
         // background gradients. Jittered radii turn that structure into
         // high-frequency noise the eye reads as smooth. Mean stays ~1.0.
         const float jit = 0.65 + 0.7 * frac(noise * 7.31 + float(i) * 0.61803);
+        const float w = i < 8 ? ringW[i] : farW[i - 8];
         const float2 offset = mul(dirs[i], rot) * (blurPx * jit) * texel;
-        acc.r += backdropTexture.Sample(linearClamp, clamp(uvR + offset, lo, hi)).r * wRing;
-        acc.g += backdropTexture.Sample(linearClamp, clamp(uvG + offset, lo, hi)).g * wRing;
-        acc.b += backdropTexture.Sample(linearClamp, clamp(uvB + offset, lo, hi)).b * wRing;
+        acc.r += backdropTexture.Sample(linearClamp, clamp(uvR + offset, lo, hi)).r * w;
+        acc.g += backdropTexture.Sample(linearClamp, clamp(uvG + offset, lo, hi)).g * w;
+        acc.b += backdropTexture.Sample(linearClamp, clamp(uvB + offset, lo, hi)).b * w;
     }
     return acc;
 }
