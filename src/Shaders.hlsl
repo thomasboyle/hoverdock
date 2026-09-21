@@ -218,6 +218,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float rimGain = FxEnabled(fxBits, 1.0);
     const float lensOn = FxEnabled(fxBits, 2.0);
     const float dispOn = FxEnabled(fxBits, 4.0);
+    const float frostOn = FxEnabled(fxBits, 8.0);
     const float tintOn = FxEnabled(fxBits, 16.0);
     const float specOn = FxEnabled(fxBits, 32.0);
     const float shadowOn = FxEnabled(fxBits, 64.0);
@@ -283,7 +284,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const uint fxU = (uint)fxBits;
     const uint haloCount = min((fxU >> 8) & 63u, 64u);
     // Frost notches ride bits 17-18: 0 clear, 1 balanced, 2 full frost.
-    const uint frostLevel = min((fxU >> 17) & 3u, 2u);
+    // (Frost-notch decoding retired with the 3-notch slider; frost is back
+    // to boolean DOCK_FX_BLUR.)
     float minIconDist = 1e9;
     for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
     {
@@ -303,33 +305,26 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
 
-    // Frost notch presets (settings slider, bits 17-18): blur radii in px
-    // at 1x plus multiplicative veil endpoints. Function scope: both the
-    // backdrop branch and the tint section below consume them.
+    // Frost presets: off = pure optics, on = mica (heavy blur + veil).
+    // Function scope: both the backdrop branch and the tint section below
+    // consume them.
     float frostRim;
     float frostCore;
     float frostTintLo;
     float frostTintHi;
-    if (frostLevel == 0u)
+    if (frostOn < 0.5)
     {
         frostRim = 0.0;
         frostCore = 0.0;
         frostTintLo = 0.0;
         frostTintHi = 0.0;
     }
-    else if (frostLevel == 1u)
-    {
-        frostRim = 2.0;
-        frostCore = 6.0;
-        frostTintLo = 0.5;
-        frostTintHi = 0.85;
-    }
     else
     {
-        frostRim = 8.0;
-        frostCore = 18.0;
-        frostTintLo = 0.8;
-        frostTintHi = 0.95;
+        frostRim = 6.0;
+        frostCore = 16.0;
+        frostTintLo = 0.7;
+        frostTintHi = 0.9;
     }
 
     float3 frostedBackground;
@@ -402,8 +397,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // Frost off samples each channel once at its (possibly refracted)
         // UV instead of the 9-tap ring: same result as a zero-radius blur
         // with a ninth of the fetches.
-        // Notch 0 samples each channel once (no frost); 1-2 run the ring.
-        if (frostLevel == 0u)
+        // Frost off samples each channel once (no frost); on runs the ring.
+        if (frostOn < 0.5)
         {
             frostedBackground = float3(backdropTexture.Sample(linearClamp, clamp(uvR, lo, hi)).r,
                 backdropTexture.Sample(linearClamp, clamp(uvG, lo, hi)).g,
@@ -422,7 +417,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // veil amounts come from the frost ladder above.
     const float tintAmount = lerp(frostTintLo, frostTintHi, height01) * tintOn;
     float3 color = lerp(frostedBackground, frostedBackground * glassTint, tintAmount);
-    color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22 * tintOn);
+    color = lerp(color, color * float3(0.98, 0.985, 0.99) + glassTint * 0.08, 0.22 * tintOn * frostOn);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
     // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on

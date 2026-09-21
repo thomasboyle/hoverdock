@@ -4057,13 +4057,9 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         QueueRenderFrame();
         break;
     }
-    case SettingsHitKind::FrostLevel:
-        break;
-    case SettingsHitKind::Frost0:
-    case SettingsHitKind::Frost1:
-    case SettingsHitKind::Frost2: {
-        m_config.SetFrostLevel(
-            static_cast<int>(hit.kind) - static_cast<int>(SettingsHitKind::Frost0));
+    case SettingsHitKind::Frost: {
+        const bool enabled = !m_config.Frost();
+        m_config.SetFrost(enabled);
         ScheduleConfigSave();
         PaintSettingsPopup();
         QueueRenderFrame();
@@ -4190,13 +4186,6 @@ void DockApp::PaintSettingsPopup() {
         const wchar_t* sublabel;
         bool enabled;
     };
-    const int frostLevelUi = std::clamp(m_config.FrostLevel(), 0, 2);
-    const wchar_t* frostSub = L"Clear — no frost";
-    if (frostLevelUi == 1) {
-        frostSub = L"Balanced — #e1e1e1 over white";
-    } else if (frostLevelUi == 2) {
-        frostSub = L"Full frost";
-    }
     const SettingsRow rows[] = {
         {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows",
             m_config.LaunchAtStartup()},
@@ -4208,7 +4197,8 @@ void DockApp::PaintSettingsPopup() {
             m_config.Lensing()},
         {SettingsHitKind::Dispersion, L"Dispersion", L"Spectral fringe at glass edges",
             m_config.Dispersion()},
-        {SettingsHitKind::FrostLevel, L"Frost", frostSub, true},
+        {SettingsHitKind::Frost, L"Frost", L"Mica frost with glass effects",
+            m_config.Frost()},
         {SettingsHitKind::Tint, L"Tint", L"Warm veil over the backdrop",
             m_config.Tint()},
         {SettingsHitKind::Specular, L"Speculars", L"Key and fill glints on the surface",
@@ -4456,36 +4446,6 @@ void DockApp::PaintSettingsPopup() {
         FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
     };
 
-    auto drawFrostSegments = [&](LONG centerY, LONG right, int level) {
-        // 3-notch slider sharing the switch slot language: amber active
-        // segment, dim white rest, per-segment hover. Hits pushed per notch.
-        const LONG totalW = switchWidth + 36L;
-        const LONG segGap = 4L;
-        const LONG segW = (totalW - segGap * 2L) / 3L;
-        const LONG segH = switchHeight;
-        const LONG segTop = centerY - segH / 2L;
-        const float segRadius = static_cast<float>(segH) * 0.5F;
-        const float segCy = static_cast<float>(segTop) + segRadius;
-        const SettingsHitKind segKinds[3] = {
-            SettingsHitKind::Frost0, SettingsHitKind::Frost1, SettingsHitKind::Frost2};
-        for (int s = 0; s < 3; ++s) {
-            const LONG segLeft = right - totalW + s * (segW + segGap);
-            const float segCxL = static_cast<float>(segLeft) + segRadius;
-            const float segCxR = static_cast<float>(segLeft + segW) - segRadius;
-            const bool active = (s == level);
-            const bool segHover = hoveredKind(segKinds[s]);
-            const float wash = active ? (segHover ? 0.75F : 0.62F) : (segHover ? 0.30F : 0.16F);
-            if (active) {
-                FillPillColorPremul(pixels, width, height, segCxL, segCxR, segCy, segRadius,
-                    wash, kAmberB, kAmberG, kAmberR);
-            } else {
-                FillPillColorPremul(pixels, width, height, segCxL, segCxR, segCy, segRadius,
-                    wash, 255, 255, 255);
-            }
-            pushHit(segKinds[s], {segLeft, segTop, segLeft + segW, segTop + segH});
-        }
-    };
-
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
     DrawFlyoutText(pixels, width, height, titleBounds, titleFont, L"Dock Settings",
@@ -4515,9 +4475,7 @@ void DockApp::PaintSettingsPopup() {
         if (hoveredKind(row.kind)) {
             FillRectPremul(pixels, width, height, rowBounds, 0.10F);
         }
-        const LONG controlW =
-            row.kind == SettingsHitKind::FrostLevel ? switchWidth + 36L : switchWidth;
-        const LONG textRight = panelWidth - padding - controlW - 12L;
+        const LONG textRight = panelWidth - padding - switchWidth - 12L;
         RECT labelBounds{padding + 4, y + (rowHeight - labelHeight - subHeight) / 2L, textRight,
             y + (rowHeight - labelHeight - subHeight) / 2L + labelHeight};
         RECT subBounds{labelBounds.left, labelBounds.bottom, textRight,
@@ -4526,14 +4484,9 @@ void DockApp::PaintSettingsPopup() {
             DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
         DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
-        if (row.kind == SettingsHitKind::FrostLevel) {
-            drawFrostSegments(y + rowHeight / 2L, panelWidth - padding - 4L,
-                std::clamp(m_config.FrostLevel(), 0, 2));
-        } else {
-            drawSwitch(y + rowHeight / 2L, panelWidth - padding - 4L, row.enabled,
-                hoveredKind(row.kind));
-            pushHit(row.kind, rowBounds);
-        }
+        drawSwitch(y + rowHeight / 2L, panelWidth - padding - 4L, row.enabled,
+            hoveredKind(row.kind));
+        pushHit(row.kind, rowBounds);
         y += rowHeight + rowGap;
     }
 
@@ -5657,12 +5610,8 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     if (m_config.Dispersion()) {
         glassFx |= DOCK_FX_DISPERSION;
     }
-    const UINT frostNotch = static_cast<UINT>(std::clamp(m_config.FrostLevel(), 0, 2));
-    if ((frostNotch & 1u) != 0u) {
-        glassFx |= DOCK_FX_FROSTB0;
-    }
-    if ((frostNotch & 2u) != 0u) {
-        glassFx |= DOCK_FX_FROSTB1;
+    if (m_config.Frost()) {
+        glassFx |= DOCK_FX_BLUR;
     }
     if (m_config.Tint()) {
         glassFx |= DOCK_FX_TINT;
