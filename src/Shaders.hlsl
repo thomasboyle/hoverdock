@@ -199,7 +199,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
         if (shadowSdf < shadowWidth)
         {
             float s = 1.0 - max(shadowSdf, 0.0) / shadowWidth;
-            const float shadowAlpha = s * s * 0.30;
+            const float shadowAlpha = s * s * 0.22;
             return float4(0.0, 0.0, 0.0, shadowAlpha);
         }
         return float4(0.0, 0.0, 0.0, 0.0);
@@ -408,12 +408,12 @@ float4 IconPS(VertexOutput input) : SV_Target
     if (icon.iconMeta.x > 0.5 && contentHeightRatio < 0.98 && input.uv.y > contentHeightRatio) {
         const float stripHeightPx = icon.iconRect.w * (1.0 - contentHeightRatio);
         const float dotCenterY = contentHeightRatio + (1.0 - contentHeightRatio) * 0.8;
-        const float dotRadiusPx = min(stripHeightPx * 0.294, icon.iconRect.z * 0.042);
+        const float dotRadiusPx = max(min(stripHeightPx * 0.294, icon.iconRect.z * 0.042), 2.25);
         float2 dotOffset;
         dotOffset.x = (input.uv.x - 0.5) * icon.iconRect.z;
         dotOffset.y = (input.uv.y - dotCenterY) * icon.iconRect.w;
         const float dist = length(dotOffset);
-        const float edgeSoftness = max(0.75, dotRadiusPx * 0.3);
+        const float edgeSoftness = max(0.6, dotRadiusPx * 0.22);
         const float dotAlpha = 1.0 - smoothstep(dotRadiusPx, dotRadiusPx + edgeSoftness, dist);
         const float3 runningDot = float3(1.0, 191.0 / 255.0, 0.0);
         color = color * (1.0 - dotAlpha) + runningDot * dotAlpha;
