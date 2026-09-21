@@ -125,8 +125,9 @@ float InterleavedGradientNoise(float2 pixel)
 // ---------------------------------------------------------------------------
 // 5. Frosted / scattering blur AFTER refraction, per chromatic channel.
 //    9 taps per channel (center + 8 rotated ring) = 27 backdrop fetches.
-//    Radius is modulated by slab height f: thin rim ~0.75px, thick center
-//    ~2px (Clear end of the range; the frosted look hid all detail). Rotation by IGN hides ring banding.
+//    Radius is modulated by slab height f: thin rim ~0.5px, thick center
+//    ~1.5px (near-clear; blur must not hide the warp). Rotation by IGN
+//    hides ring banding.
 //    Each channel is blurred around its own Snell-displaced UV so dispersion
 //    survives the frosted lobe instead of being averaged away.
 // ---------------------------------------------------------------------------
@@ -276,10 +277,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
         float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain;
         float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain;
         float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain;
-        // Exaggerate the physical fringe ~18x around green for visibility;
-        // ratios stay physical (blue bends most). Lands ~0.7px R-B split on
-        // contrast boundaries: a faint spectral edge, not a rainbow overlay.
-        const float fringeBoost = 18.0;
+        // Exaggerate the physical fringe ~24x around green for visibility;
+        // ratios stay physical (blue bends most). Lands ~1.3px R-B split on
+        // contrast boundaries: saturated edge color like the reference.
+        const float fringeBoost = 24.0;
         dR = dG + (dR - dG) * fringeBoost;
         dB = dG + (dB - dG) * fringeBoost;
 
@@ -305,7 +306,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // thick center. A sharp refracted image is what makes the warp
         // readable; frosted mush hides it. Icon legibility still comes from
         // the tint backing, not the blur.
-        const float blurPx = (0.75 + height01 * 1.25) * dpi; // 0.75 rim .. 2 center
+        const float blurPx = (0.5 + height01 * 1.0) * dpi; // 0.5 rim .. 1.5 center
         frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
     }
 
@@ -313,12 +314,12 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Content-aware compressive transmission: luminance of the frosted
     // backdrop drives how much light the glass passes, so the face stays
     // luminous on dark content and near-clear on bright content instead of
-    // wearing a fixed gray veil. transmission 0.78 (dark) .. 0.93 (bright),
+    // wearing a fixed gray veil. transmission 0.88 (dark) .. 0.97 (bright),
     // dimmed toward the rim where lensing takes over. Tint is near-white
     // with a whisper of backdrop hue.
     const float backLuma = dot(frostedBackground, float3(0.2126, 0.7152, 0.0722));
     const float adapt = pow(saturate((backLuma - 0.22) / 0.58), 0.85);
-    const float transmission = lerp(0.80, 0.955, adapt) * (1.0 - 0.18 * bevelFactor);
+    const float transmission = lerp(0.88, 0.97, adapt) * (1.0 - 0.18 * bevelFactor);
     const float3 tintCol = lerp(float3(0.97, 0.98, 1.0), frostedBackground, 0.08);
     float3 color = frostedBackground * transmission * tintCol;
 
@@ -352,7 +353,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
     color *= thicknessShade;
     color += glassTint * rim * 0.12;
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.26 * (0.35 + 0.65 * ndl);
+    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.34 * (0.35 + 0.65 * ndl);
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
     color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08;
 
