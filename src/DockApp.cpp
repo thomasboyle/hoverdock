@@ -2060,12 +2060,11 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         } else if (wParam == kCursorWatchTimerId) {
             PumpCursorWatch();
         } else if (wParam == kBackdropTimerId) {
-            // Paused while Quick Settings or the context menu is open: the 8ms
-            // capture + upload budget stays available for input and hover
-            // paints instead. The blur refreshes on the next tick after the
-            // popup closes.
-            if (m_visibility == VisibilityState::Visible && !IsDragActive() && !IsOverflowOpen() &&
-                !IsContextMenuOpen() &&
+            // The dock glass stays live while popups are open: the capture is
+            // SRCCOPY without CAPTUREBLT, so layered popups and hover bubbles
+            // never bake into the backdrop (no feedback loop). Pausing here
+            // froze the dock background behind Quick Settings.
+            if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
                 QpcSeconds() >= m_suppressBackdropUntil && CaptureLiveBackdrop()) {
                 QueueRenderFrame(false);
             }
@@ -2183,6 +2182,10 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
     case WM_LBUTTONDOWN: {
         const POINT point = ScreenPointFromClient(window, lParam);
         ClearPressState();
+        // Dismiss the tooltip on press, not just on the deferred click: the
+        // Quick Settings popup captures its glass right after, and a still-
+        // visible bubble would bake into (or show through) that glass.
+        HideHoverLabel();
         const int divider = DividerAtScreenPoint(point);
         if (divider >= 0) {
             m_scalingDivider = true;
@@ -2676,6 +2679,14 @@ void DockApp::UpdateHoverLabel() {
     }
 
     if (m_hoveredIcon == m_hoverLabelIcon) {
+        // The bubble overlaps the dock window, so any dock move to HWND_TOPMOST
+        // (layout, animation tick) sinks it behind the glass where it stays
+        // visible through the transparency. Re-assert topmost without
+        // re-rasterizing so it never renders from behind.
+        if (m_hoverLabelWindow != nullptr && IsWindowVisible(m_hoverLabelWindow) != FALSE) {
+            SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_NOREDRAW);
+        }
         return;
     }
 

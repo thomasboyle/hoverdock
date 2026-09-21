@@ -96,10 +96,6 @@ private:
     static constexpr UINT kIconTextureDescriptor = 0;
     static constexpr UINT kBackdropTextureDescriptor = 1;
     static constexpr UINT kTempBlurDescriptor = 2;
-    // Ghost-scrub dilation around icon footprints (device px). Covers the
-    // blur span plus fringe-shifted sample reach; halo damping keeps the
-    // effective shift small near icons, so this stays tight.
-    static constexpr LONG kIconGhostDilatePx = 24;
 
     struct alignas(256) FrameConstants {
         float scene0[4]{};
@@ -129,7 +125,6 @@ private:
     void CreateBackdropResources();
     void ReleaseBackdropResources() noexcept;
     [[nodiscard]] bool UploadBackdropPixels();
-    void InpaintIconRects() noexcept;
     [[nodiscard]] uint64_t HashBackdropPixels() const noexcept;
     [[nodiscard]] bool WaitForBackdropCopy(DWORD timeoutMs = INFINITE);
     [[nodiscard]] bool WaitForFrame(FrameResource& frame, DWORD timeoutMs = INFINITE);
@@ -173,9 +168,6 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_blurTemp;
     // Tracks the temp target state across frames (starts as render target).
     bool m_blurTempIsShaderResource = false;
-    // Last rendered icon footprints (window-local), for backdrop ghost
-    // inpainting on the capture thread (same UI thread; no sync needed).
-    std::vector<RECT> m_lastIconRects;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_backdropUpload;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_backdropCopyAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_backdropCopyCommandList;
