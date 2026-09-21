@@ -947,6 +947,7 @@ bool DockConfig::Load() {
     m_typeSafeApiKey.clear();
     m_launchAtStartup = false;
     m_checkForUpdates = true;
+    m_rimLight = true;
     m_lastInstalledVersion.clear();
     m_lastInstalledTime = 0;
     m_lastInstalledAttempts = 0;
@@ -975,6 +976,10 @@ bool DockConfig::Load() {
         const auto checkForUpdates = dockSection->second.find(L"checkforupdates");
         if (checkForUpdates != dockSection->second.end()) {
             m_checkForUpdates = ParseBoolean(checkForUpdates->second);
+        }
+        const auto rimLight = dockSection->second.find(L"rimlight");
+        if (rimLight != dockSection->second.end()) {
+            m_rimLight = ParseBoolean(rimLight->second);
         }
         const auto lastInstalledVersion =
             dockSection->second.find(L"lastinstalledversion");
@@ -1043,6 +1048,7 @@ bool DockConfig::Save() const {
     contents << L"Scale=" << m_dockScale << L"\n";
     contents << L"LaunchAtStartup=" << (m_launchAtStartup ? L"1" : L"0") << L"\n";
     contents << L"CheckForUpdates=" << (m_checkForUpdates ? L"1" : L"0") << L"\n";
+    contents << L"RimLight=" << (m_rimLight ? L"1" : L"0") << L"\n";
     if (!m_lastInstalledVersion.empty()) {
         contents << L"LastInstalledVersion=" << m_lastInstalledVersion << L"\n";
         contents << L"LastInstalledTime=" << m_lastInstalledTime << L"\n";
@@ -1116,6 +1122,14 @@ void DockConfig::SetCheckForUpdates(bool enabled) noexcept {
     m_checkForUpdates = enabled;
 }
 
+bool DockConfig::RimLight() const noexcept {
+    return m_rimLight;
+}
+
+void DockConfig::SetRimLight(bool enabled) noexcept {
+    m_rimLight = enabled;
+}
+
 std::wstring DockConfig::LastInstalledVersion() const {
     return m_lastInstalledVersion;
 }
@@ -1159,4 +1173,5 @@ void DockConfig::SetDefaults() {
     m_dockScale = 1.0F;
     m_launchAtStartup = false;
     m_checkForUpdates = true;
+    m_rimLight = true;
 }

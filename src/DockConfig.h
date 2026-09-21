@@ -29,6 +29,8 @@ public:
     void SetLaunchAtStartup(bool enabled) noexcept;
     [[nodiscard]] bool CheckForUpdates() const noexcept;
     void SetCheckForUpdates(bool enabled) noexcept;
+    [[nodiscard]] bool RimLight() const noexcept;
+    void SetRimLight(bool enabled) noexcept;
     // Remembers the last version whose installer/mover was actually launched,
     // with the wall-clock time of the attempt (unix seconds, 0 = none). Used
     // to break reinstall loops: if the install did not take effect (wrong
@@ -55,6 +57,7 @@ private:
     std::wstring m_typeSafeApiKey;
     bool m_launchAtStartup = false;
     bool m_checkForUpdates = true;
+    bool m_rimLight = true;
     std::wstring m_lastInstalledVersion;
     long long m_lastInstalledTime = 0;
     int m_lastInstalledAttempts = 0;

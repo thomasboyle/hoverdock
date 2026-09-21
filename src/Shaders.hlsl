@@ -7,7 +7,7 @@
 cbuffer FrameData : register(b0)
 {
     float4 scene0; // output width, output height, glass alpha, dock scale
-    float4 scene1; // slide progress, DPI scale, dev bounds, backdrop valid
+    float4 scene1; // rim light switch, DPI scale, dev bounds, backdrop valid
 };
 
 struct IconInstance
@@ -215,6 +215,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // softer, driven by shape rather than a hard glow.
     const float rim = pow(saturate(1.0 - insideDistance / max(8.0 * dpi, 2.0)), 2.8);
     const bool hasBackdrop = scene1.w > 0.5;
+    // Rim-light master switch (dock.ini RimLight=, default on). Gates every
+    // rim-falloff-driven term below: Fresnel veil, gray veil, caustic, top
+    // sheen. Refraction, tint, speculars and shadow are unaffected.
+    const float rimGain = scene1.x > 0.5 ? 1.0 : 0.0;
     // Gray tint token shared with the Quick Settings popup; the dock face
     // itself runs adaptive transmission (section 1 below), so no fixed mix
     // applies here.
@@ -337,7 +341,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // top of the faint broad veil below; final saturate keeps LDR range.
     // Narrowed (rim^1.5) so the border never reads as a milky frame: the
     // crisp caustic line underneath carries the edge instead.
-    color += fresnel * float3(0.90, 0.95, 1.0) * 0.45 * pow(rim, 1.5);
+    color += fresnel * float3(0.90, 0.95, 1.0) * 0.45 * pow(rim, 1.5) * rimGain;
     color += specular * float3(1.0, 1.0, 1.0) * 0.55;
     color += fillSpec * float3(0.75, 0.85, 1.0) * 0.18;
 
@@ -350,10 +354,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // grounded edge. True outer shadow is drawn outside the mask below.
     const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
     color *= thicknessShade;
-    color += glassTint * rim * 0.05;
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.34 * (0.55 + 0.45 * ndl);
+    color += glassTint * rim * 0.05 * rimGain;
+    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.34 * (0.55 + 0.45 * ndl) * rimGain;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
-    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08;
+    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08 * rimGain;
 
     if (scene1.z > 0.5)
     {

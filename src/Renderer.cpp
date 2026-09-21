@@ -1182,7 +1182,7 @@ bool Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene0[1] = static_cast<float>(state.height);
     frame.mappedConstants->scene0[2] = state.glassAlpha;
     frame.mappedConstants->scene0[3] = state.dockScale;
-    frame.mappedConstants->scene1[0] = state.slideProgress;
+    frame.mappedConstants->scene1[0] = state.rimLight;
     frame.mappedConstants->scene1[1] = m_dpiScale;
     frame.mappedConstants->scene1[2] = state.showDevBounds ? 1.0F : 0.0F;
     frame.mappedConstants->scene1[3] = m_backdropValid ? 1.0F : 0.0F;

@@ -41,7 +41,9 @@ struct DockRenderState {
     UINT width = 1;
     UINT height = 1;
     float glassAlpha = DOCK_GLASS_ALPHA;
-    float slideProgress = 0.0F;
+    // Rim-light master switch (1 = on): written to scene1.x, a channel no
+    // shader consumed until now (ex slide-progress).
+    float rimLight = 1.0F;
     // Dock content scale (1.0 = default). Drives the shader's optical bevel
     // width so icons always clear the lensing band (see Shaders.hlsl).
     // (Previously wall-clock seconds; the shader never consumed it.)
