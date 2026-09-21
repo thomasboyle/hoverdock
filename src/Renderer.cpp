@@ -1044,6 +1044,32 @@ bool Renderer::NeedsBackdropBitBlt(const RECT& screenRectangle) const noexcept {
     return true;
 }
 
+namespace {
+
+// Reads the desktop into a memory DC while hiding one window from legacy GDI
+// capture. POD-only so __try is legal here (C2712): __finally restores the
+// affinity even on fault, so an exception can never leave the dock stuck
+// invisible to Snipping Tool / Game Bar (which a naive toggle did before).
+BOOL BitBltDesktopExcluding(HWND exclude, HDC destDc, LONG width, LONG height, HDC screen,
+    LONG left, LONG top) noexcept {
+    DWORD previousAffinity = WDA_NONE;
+    const BOOL affinityRead = GetWindowDisplayAffinity(exclude, &previousAffinity) != FALSE;
+    BOOL copied = FALSE;
+    __try {
+        if (affinityRead != FALSE) {
+            SetWindowDisplayAffinity(exclude, WDA_EXCLUDEFROMCAPTURE);
+        }
+        copied = BitBlt(destDc, 0, 0, width, height, screen, left, top, SRCCOPY);
+    } __finally {
+        if (affinityRead != FALSE) {
+            SetWindowDisplayAffinity(exclude, previousAffinity);
+        }
+    }
+    return copied;
+}
+
+}  // namespace
+
 bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     ProfileScope scope("Renderer::CaptureBackdrop");
     const LONG width = screenRectangle.right - screenRectangle.left;
@@ -1098,12 +1124,14 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         return false;
     }
 
-    // SRCCOPY only: CaptureLiveBackdrop temporarily sets WDA_EXCLUDEFROMCAPTURE
-    // around this BitBlt so the dock is omitted without a ShowWindow hide (which
-    // flickered). CAPTUREBLT forces sync composition of layered windows and
-    // measured 2-10 ms per 8 ms tick; layered content under the dock is rare.
-    const BOOL copied = BitBlt(m_backdropDc, 0, 0, width, height, screen, screenRectangle.left,
-        screenRectangle.top, SRCCOPY);
+    // SRCCOPY only (CAPTUREBLT forces sync composition of layered windows and
+    // measured 2-10 ms per 8 ms tick; layered content under the dock is rare).
+    // The render window is excluded for exactly this BitBlt: despite
+    // WS_EX_NOREDIRECTIONBITMAP its swapchain otherwise leaks into the legacy
+    // GDI surface, and captured icons refract back through the glass as
+    // ghost smears. Affinity is restored in __finally (see helper above).
+    const BOOL copied = BitBltDesktopExcluding(m_window, m_backdropDc, width, height, screen,
+        screenRectangle.left, screenRectangle.top);
     const int released = ReleaseDC(nullptr, screen);
     if (copied == FALSE || released == 0) {
         return false;
