@@ -168,7 +168,12 @@ float3 SampleChromaticGlass(float2 uvR, float2 uvG, float2 uvB, float2 texel,
     [unroll]
     for (int i = 0; i < 8; ++i)
     {
-        const float2 offset = mul(dirs[i], rot) * blurPx * texel;
+        // Per-tap radius jitter: without it the fixed ring plus the radius
+        // gradient across the face prints iso-blur contour bands on curved
+        // background gradients. Jittered radii turn that structure into
+        // high-frequency noise the eye reads as smooth. Mean stays ~1.0.
+        const float jit = 0.65 + 0.7 * frac(noise * 7.31 + float(i) * 0.61803);
+        const float2 offset = mul(dirs[i], rot) * (blurPx * jit) * texel;
         acc.r += backdropTexture.Sample(linearClamp, clamp(uvR + offset, lo, hi)).r * wRing;
         acc.g += backdropTexture.Sample(linearClamp, clamp(uvG + offset, lo, hi)).g * wRing;
         acc.b += backdropTexture.Sample(linearClamp, clamp(uvB + offset, lo, hi)).b * wRing;
@@ -452,7 +457,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
         color = lerp(color, float3(1.0, 0.18, 0.58), outline);
     }
 
-    const float dither = (InterleavedGradientNoise(pixel) - 0.5) / 255.0;
+    // Triangular-PDF dither (~+/-1 LSB from two IGN taps): decorrelates the
+    // 8-bit quantization steps so heavy frost can't posterize smooth
+    // gradients back into bands after blurring them away in float.
+    const float dither = (InterleavedGradientNoise(pixel) +
+        InterleavedGradientNoise(pixel + 19.19) - 1.0) / 255.0;
     color = saturate(color + dither);
     const float alpha = saturate(mask * scene0.z * (hasBackdrop ? scene1.w : 1.0) + dither);
     return float4(color * alpha, alpha);
