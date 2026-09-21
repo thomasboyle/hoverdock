@@ -334,8 +334,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float3 fillDir = normalize(float3(0.55, 0.6, 0.45));
     const float fillSpec = pow(saturate(dot(surfN, fillDir)), 24.0) * bevelFactor;
     // Tight Fresnel veil at the rim (sharper optical edge definition) on
-    // top of the broad gray veil below; final saturate keeps LDR range.
-    color += fresnel * float3(0.90, 0.95, 1.0) * 0.55 * rim;
+    // top of the faint broad veil below; final saturate keeps LDR range.
+    // Narrowed (rim^1.5) so the border never reads as a milky frame: the
+    // crisp caustic line underneath carries the edge instead.
+    color += fresnel * float3(0.90, 0.95, 1.0) * 0.45 * pow(rim, 1.5);
     color += specular * float3(1.0, 1.0, 1.0) * 0.55;
     color += fillSpec * float3(0.75, 0.85, 1.0) * 0.18;
 
@@ -348,8 +350,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // grounded edge. True outer shadow is drawn outside the mask below.
     const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
     color *= thicknessShade;
-    color += glassTint * rim * 0.12;
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.34 * (0.35 + 0.65 * ndl);
+    color += glassTint * rim * 0.05;
+    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.34 * (0.55 + 0.45 * ndl);
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
     color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08;
 
