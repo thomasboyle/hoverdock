@@ -137,20 +137,16 @@ float InterleavedGradientNoise(float2 pixel)
 //    + 4 far axis at 2x radius) = 39 backdrop fetches, center-heavy weights
 //    approximating a Gaussian lobe instead of a flat disk.
 //    Radius is modulated by slab height f: thin rim ~0.5px, thick center
-//    ~1.5px (near-clear; blur must not hide the warp). Per-tap radius jitter
-//    plus IGN rotation break ring/iso-blur banding; triangular dither at the
-//    output breaks quantization banding.
+//    ~1.5px (near-clear; blur must not hide the warp). Fixed orientation,
+//    fixed radii: the Gaussian weights alone carry the smoothness.
 //    Each channel is blurred around its own Snell-displaced UV so dispersion
 //    survives the frosted lobe instead of being averaged away.
 // ---------------------------------------------------------------------------
 float3 SampleChromaticGlass(float2 uvR, float2 uvG, float2 uvB, float2 texel,
     float blurPx, float2 pixel)
 {
-    const float noise = InterleavedGradientNoise(pixel);
-    float sine;
-    float cosine;
-    sincos(noise * 6.2831853, sine, cosine);
-    const float2x2 rot = float2x2(cosine, -sine, sine, cosine);
+    // Fixed kernel: identical taps at every pixel. No rotation, no radius
+    // jitter, no dither - a plain Gaussian blur adds no grain of its own.
 
     const float2 dirs[12] = {
         float2(1.0, 0.0), float2(-1.0, 0.0), float2(0.0, 1.0), float2(0.0, -1.0),
@@ -176,13 +172,10 @@ float3 SampleChromaticGlass(float2 uvR, float2 uvG, float2 uvB, float2 texel,
     [unroll]
     for (int i = 0; i < 12; ++i)
     {
-        // Per-tap radius jitter: without it the fixed rings plus the radius
-        // gradient across the face prints iso-blur contour bands on curved
-        // background gradients. Jittered radii turn that structure into
-        // high-frequency noise the eye reads as smooth, without visible grain.
-        const float jit = 0.85 + 0.3 * frac(noise * 7.31 + float(i) * 0.61803);
+        // Fixed Gaussian taps: same offsets and weights at every pixel, so
+        // the blur itself contributes zero grain or shimmer.
         const float w = i < 8 ? ringW[i] : farW[i - 8];
-        const float2 offset = mul(dirs[i], rot) * (blurPx * jit) * texel;
+        const float2 offset = dirs[i] * blurPx * texel;
         acc.r += backdropTexture.Sample(linearClamp, clamp(uvR + offset, lo, hi)).r * w;
         acc.g += backdropTexture.Sample(linearClamp, clamp(uvG + offset, lo, hi)).g * w;
         acc.b += backdropTexture.Sample(linearClamp, clamp(uvB + offset, lo, hi)).b * w;
@@ -461,13 +454,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
         color = lerp(color, float3(1.0, 0.18, 0.58), outline);
     }
 
-    // Triangular-PDF dither at half amplitude (~+/-0.5 LSB from two IGN
-    // taps): enough to decorrelate 8-bit quantization steps on smooth
-    // gradients, too subtle to read as grain.
-    const float dither = (InterleavedGradientNoise(pixel) +
-        InterleavedGradientNoise(pixel + 19.19) - 1.0) / 510.0;
-    color = saturate(color + dither);
-    const float alpha = saturate(mask * scene0.z * (hasBackdrop ? scene1.w : 1.0) + dither);
+    color = saturate(color);
+    const float alpha = saturate(mask * scene0.z * (hasBackdrop ? scene1.w : 1.0));
     return float4(color * alpha, alpha);
 }
 
