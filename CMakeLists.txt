@@ -138,10 +138,12 @@ endfunction()
 
 add_dxc_header(glass_vs_60.h gGlassVs60 vs_6_0 FullscreenVS)
 add_dxc_header(glass_ps_60.h gGlassPs60 ps_6_0 GlassPS)
+add_dxc_header(blur_ps_60.h gBlurPs60 ps_6_0 BlurHPS)
 add_dxc_header(icon_vs_60.h gIconVs60 vs_6_0 IconVS)
 add_dxc_header(icon_ps_60.h gIconPs60 ps_6_0 IconPS)
 add_dxc_header(glass_vs_66.h gGlassVs66 vs_6_6 FullscreenVS)
 add_dxc_header(glass_ps_66.h gGlassPs66 ps_6_6 GlassPS)
+add_dxc_header(blur_ps_66.h gBlurPs66 ps_6_6 BlurHPS)
 add_dxc_header(icon_vs_66.h gIconVs66 vs_6_6 IconVS)
 add_dxc_header(icon_ps_66.h gIconPs66 ps_6_6 IconPS)
 

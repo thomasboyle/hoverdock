@@ -26,6 +26,8 @@
 #include "icon_ps_66.h"
 #include "icon_vs_60.h"
 #include "icon_vs_66.h"
+#include "blur_ps_60.h"
+#include "blur_ps_66.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -1243,6 +1245,41 @@ bool Renderer::Render(const DockRenderState& state) {
         m_srvHeap->GetGPUDescriptorHandleForHeapStart());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
+    // Separable frost: pass 1 blurs horizontally into the temp target when
+    // frost is on and the backdrop is live; the glass pass below finishes
+    // vertically from temp. Skipped otherwise (stale temp is never sampled:
+    // GlassPS takes the direct path when frost is off or invalid).
+    const bool frostPass =
+        (state.fxFlags & DOCK_FX_BLUR) != 0 && m_backdropValid && m_blurTemp != nullptr;
+    if (frostPass) {
+        if (m_blurTempIsShaderResource) {
+            D3D12_RESOURCE_BARRIER toRender{};
+            toRender.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toRender.Transition.pResource = m_blurTemp.Get();
+            toRender.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            toRender.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toRender.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            m_commandList->ResourceBarrier(1, &toRender);
+            m_blurTempIsShaderResource = false;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE blurTarget = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        blurTarget.ptr += static_cast<SIZE_T>(kBufferCount) * m_rtvDescriptorSize;
+        m_commandList->OMSetRenderTargets(1, &blurTarget, FALSE, nullptr);
+        m_commandList->SetPipelineState(m_blurPipeline.Get());
+        m_commandList->DrawInstanced(3, 1, 0, 0);
+
+        D3D12_RESOURCE_BARRIER toShader{};
+        toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toShader.Transition.pResource = m_blurTemp.Get();
+        toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        m_commandList->ResourceBarrier(1, &toShader);
+        m_blurTempIsShaderResource = true;
+
+        m_commandList->OMSetRenderTargets(1, &renderTarget, FALSE, nullptr);
+    }
+
     m_commandList->SetPipelineState(m_glassPipeline.Get());
     m_commandList->DrawInstanced(3, 1, 0, 0);
 
@@ -1436,7 +1473,7 @@ void Renderer::CreateFrameResources() {
 void Renderer::CreateRootSignatureAndPipelines() {
     D3D12_DESCRIPTOR_RANGE1 range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 2;
+    range.NumDescriptors = 3;
     range.BaseShaderRegister = 1;
     range.RegisterSpace = 0;
     range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
@@ -1525,6 +1562,21 @@ void Renderer::CreateRootSignatureAndPipelines() {
     Check(m_device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&m_glassPipeline)),
         "Create glass pipeline");
 
+    // Separable frost pass 1: horizontal Gaussian into the temp target.
+    // Blending disabled (full overdraw each frame); same root signature.
+    pipeline.BlendState = D3D12_BLEND_DESC{};
+    pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    if (m_shaderModel == D3D_SHADER_MODEL_6_6) {
+        pipeline.VS = Shader(gGlassVs66, sizeof(gGlassVs66));
+        pipeline.PS = Shader(gBlurPs66, sizeof(gBlurPs66));
+    } else {
+        pipeline.VS = Shader(gGlassVs60, sizeof(gGlassVs60));
+        pipeline.PS = Shader(gBlurPs60, sizeof(gBlurPs60));
+    }
+    Check(m_device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&m_blurPipeline)),
+        "Create blur pipeline");
+    pipeline.BlendState = PremultipliedBlendDescription();
+
     if (m_shaderModel == D3D_SHADER_MODEL_6_6) {
         pipeline.VS = Shader(gIconVs66, sizeof(gIconVs66));
         pipeline.PS = Shader(gIconPs66, sizeof(gIconPs66));
@@ -1537,7 +1589,7 @@ void Renderer::CreateRootSignatureAndPipelines() {
 
     D3D12_DESCRIPTOR_HEAP_DESC descriptors{};
     descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    descriptors.NumDescriptors = 2;
+    descriptors.NumDescriptors = 3;
     descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     Check(m_device->CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(&m_srvHeap)),
         "Create shader resource descriptor heap");
@@ -1548,7 +1600,7 @@ void Renderer::CreateRenderTargets() {
     if (m_rtvHeap == nullptr) {
         D3D12_DESCRIPTOR_HEAP_DESC descriptors{};
         descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        descriptors.NumDescriptors = kBufferCount;
+        descriptors.NumDescriptors = kBufferCount + 1;
         descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         Check(m_device->CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(&m_rtvHeap)),
             "Create render target descriptor heap");
@@ -1638,6 +1690,32 @@ void Renderer::CreateBackdropResources() {
             m_srvDescriptorSize;
         m_device->CreateShaderResourceView(m_backdropTexture.Get(), &view, backdropDescriptor);
 
+        // Separable-frost temp target (pass 1 horizontal blur lands here).
+        // Same size/format as the backdrop; recreated on every resize. Starts
+        // life as a render target (see m_blurTempIsShaderResource).
+        D3D12_RESOURCE_DESC blurDesc = TextureDescription(m_width, m_height);
+        blurDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        const D3D12_HEAP_PROPERTIES blurHeapProps = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+        Check(m_device->CreateCommittedResource(&blurHeapProps, D3D12_HEAP_FLAG_NONE, &blurDesc,
+                  D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&m_blurTemp)),
+            "Create frost blur temp texture");
+
+        D3D12_CPU_DESCRIPTOR_HANDLE blurRtv =
+            m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        blurRtv.ptr += static_cast<SIZE_T>(kBufferCount) * m_rtvDescriptorSize;
+        m_device->CreateRenderTargetView(m_blurTemp.Get(), nullptr, blurRtv);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC blurView{};
+        blurView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        blurView.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        blurView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        blurView.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE blurSrv =
+            m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        blurSrv.ptr += static_cast<SIZE_T>(kTempBlurDescriptor) * m_srvDescriptorSize;
+        m_device->CreateShaderResourceView(m_blurTemp.Get(), &blurView, blurSrv);
+        m_blurTempIsShaderResource = false;
+
         // Best effort: under GPU saturation the upload defers to the first
         // capture tick instead of stalling setup.
         static_cast<void>(UploadBackdropPixels());
@@ -1656,6 +1734,8 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropCopyAllocator.Reset();
     m_backdropUpload.Reset();
     m_backdropTexture.Reset();
+    m_blurTemp.Reset();
+    m_blurTempIsShaderResource = false;
     m_backdropFootprint = {};
     m_backdropRowCount = 0;
     m_backdropInitialized = false;

@@ -19,6 +19,7 @@ struct IconInstance
 StructuredBuffer<IconInstance> iconInstances : register(t0);
 Texture2DArray iconTexture : register(t1);
 Texture2D backdropTexture : register(t2);
+Texture2D blurTemp : register(t3);
 SamplerState linearClamp : register(s0);
 
 struct VertexOutput
@@ -132,53 +133,41 @@ float InterleavedGradientNoise(float2 pixel)
 }
 
 // ---------------------------------------------------------------------------
-// 5. Frosted / scattering blur AFTER refraction, per chromatic channel.
-//    Gaussian two-ring kernel: 13 taps per channel (center + 8 inner ring
-//    + 4 far axis at 2x radius) = 39 backdrop fetches, center-heavy weights
-//    approximating a Gaussian lobe instead of a flat disk.
-//    Radius is modulated by slab height f: thin rim ~0.5px, thick center
-//    ~1.5px (near-clear; blur must not hide the warp). Fixed orientation,
-//    fixed radii: the Gaussian weights alone carry the smoothness.
-//    Each channel is blurred around its own Snell-displaced UV so dispersion
-//    survives the frosted lobe instead of being averaged away.
+// 5. Separable Gaussian frost, split across two passes (smooth by
+//    construction: dense axis coverage, fixed taps, no rotation, no radius
+//    jitter, no dither - nothing in the blur can add grain or bands).
+//    True 1D Gaussian, sigma = blurPx/2 over taps -4..+4 (see kGaussW).
+//    Radius is modulated by slab height f. Each channel is blurred around
+//    its own Snell-displaced UV so dispersion survives both axes.
 // ---------------------------------------------------------------------------
-float3 SampleChromaticGlass(float2 uvR, float2 uvG, float2 uvB, float2 texel,
-    float blurPx, float2 pixel)
+// Optical constants shared by both separable passes (GlassPS + BlurHPS).
+// Both passes must compute identical UVs or the split is invalid.
+static const float kLensGain = 2.3;
+static const float kFringeBoost = 24.0;
+static const float kMicaBlurRim = 6.0;
+static const float kMicaBlurCore = 16.0;
+static const float kGaussW[5] = { 0.2042, 0.1802, 0.1238, 0.0663, 0.0276 };
+
+float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
+    float2 texel, float blurPx, float2 axis)
 {
-    // Fixed kernel: identical taps at every pixel. No rotation, no radius
-    // jitter, no dither - a plain Gaussian blur adds no grain of its own.
-
-    const float2 dirs[12] = {
-        float2(1.0, 0.0), float2(-1.0, 0.0), float2(0.0, 1.0), float2(0.0, -1.0),
-        float2(0.70710678, 0.70710678), float2(-0.70710678, 0.70710678),
-        float2(0.70710678, -0.70710678), float2(-0.70710678, -0.70710678),
-        float2(2.0, 0.0), float2(-2.0, 0.0), float2(0.0, 2.0), float2(0.0, -2.0)
-    };
-    // Gaussian-ish falloff: 0.22 + 8*0.075 + 4*0.045 = 1.0.
-    const float ringW[8] = {
-        0.075, 0.075, 0.075, 0.075, 0.075, 0.075, 0.075, 0.075
-    };
-    const float farW[4] = { 0.045, 0.045, 0.045, 0.045 };
-
-    const float wCenter = 0.22;
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
-
-    float3 centerR = backdropTexture.Sample(linearClamp, clamp(uvR, lo, hi)).rgb;
-    float3 centerG = backdropTexture.Sample(linearClamp, clamp(uvG, lo, hi)).rgb;
-    float3 centerB = backdropTexture.Sample(linearClamp, clamp(uvB, lo, hi)).rgb;
-    float3 acc = float3(centerR.r, centerG.g, centerB.b) * wCenter;
-
+    const float step = blurPx * 0.25;
+    float3 acc = float3(tex.Sample(linearClamp, clamp(uvR, lo, hi)).r,
+        tex.Sample(linearClamp, clamp(uvG, lo, hi)).g,
+        tex.Sample(linearClamp, clamp(uvB, lo, hi)).b) * kGaussW[0];
     [unroll]
-    for (int i = 0; i < 12; ++i)
+    for (int k = 1; k <= 4; ++k)
     {
-        // Fixed Gaussian taps: same offsets and weights at every pixel, so
-        // the blur itself contributes zero grain or shimmer.
-        const float w = i < 8 ? ringW[i] : farW[i - 8];
-        const float2 offset = dirs[i] * blurPx * texel;
-        acc.r += backdropTexture.Sample(linearClamp, clamp(uvR + offset, lo, hi)).r * w;
-        acc.g += backdropTexture.Sample(linearClamp, clamp(uvG + offset, lo, hi)).g * w;
-        acc.b += backdropTexture.Sample(linearClamp, clamp(uvB + offset, lo, hi)).b * w;
+        const float2 off = axis * (float(k) * step) * texel;
+        const float w = kGaussW[k];
+        acc.r += (tex.Sample(linearClamp, clamp(uvR + off, lo, hi)).r +
+            tex.Sample(linearClamp, clamp(uvR - off, lo, hi)).r) * w;
+        acc.g += (tex.Sample(linearClamp, clamp(uvG + off, lo, hi)).g +
+            tex.Sample(linearClamp, clamp(uvG - off, lo, hi)).g) * w;
+        acc.b += (tex.Sample(linearClamp, clamp(uvB + off, lo, hi)).b +
+            tex.Sample(linearClamp, clamp(uvB - off, lo, hi)).b) * w;
     }
     return acc;
 }
@@ -314,8 +303,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     }
     else
     {
-        frostRim = 6.0;
-        frostCore = 16.0;
+            frostRim = kMicaBlurRim;
+            frostCore = kMicaBlurCore;
         frostTintLo = 0.7;
         frostTintHi = 0.9;
     }
@@ -345,20 +334,14 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float thetaRR = asin(sinRR);
         const float thetaRG = asin(sinRG);
         const float thetaRB = asin(sinRB);
-        // Artistic gain on the physical shape. Rim displacement is
-        // T_rim*tan(dtheta)*gain ~= 0.35*bevel*0.56*gain: with the full-span
-        // bevel (~35px here) gain 2.3 lands ~16px at the silhouette, decaying
-        // smoothly to a calm center - one continuous slab, not edge trim.
-        const float lensGain = 2.3;
-        float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lensGain * lensOn;
-        float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lensGain * lensOn;
-        float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lensGain * lensOn;
-        // Exaggerate the physical fringe ~24x around green for visibility;
-        // ratios stay physical (blue bends most). Lands ~1.3px R-B split on
-        // contrast boundaries: saturated edge color like the reference.
-        const float fringeBoost = 24.0;
-        dR = dG + (dR - dG) * fringeBoost;
-        dB = dG + (dB - dG) * fringeBoost;
+        // Gain lives in kLensGain above (shared with the horizontal pass):
+        // ~16px rim pull, calm center, one continuous slab.
+        float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * kLensGain * lensOn;
+        float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * kLensGain * lensOn;
+        float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * kLensGain * lensOn;
+        // Chromatic split (ratios physical, blue bends most); shared boost.
+        dR = dG + (dR - dG) * kFringeBoost;
+        dB = dG + (dB - dG) * kFringeBoost;
         // Dispersion off collapses all channels onto green (no split).
         dR = lerp(dG, dR, dispOn);
         dB = lerp(dG, dB, dispOn);
@@ -399,7 +382,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
         }
         else
         {
-            frostedBackground = SampleChromaticGlass(uvR, uvG, uvB, texel, blurPx, pixel);
+            // Frost on: vertical separable axis from the temp target (pass 1
+            // blurred horizontal). True Gaussian finish, zero stochastic
+            // elements anywhere in the frost.
+            frostedBackground = SampleGlassAxis(blurTemp, uvR, uvG, uvB, texel, blurPx, float2(0.0, 1.0));
         }
     }
 
@@ -457,6 +443,79 @@ float4 GlassPS(VertexOutput input) : SV_Target
     color = saturate(color);
     const float alpha = saturate(mask * scene0.z * (hasBackdrop ? scene1.w : 1.0));
     return float4(color * alpha, alpha);
+}
+
+// ---------------------------------------------------------------------------
+// Separable frost pass 1: horizontal Gaussian axis into the temp target.
+// Recomputes the identical lens UVs as GlassPS (same SDF, bevel, halos,
+// Snell, fringe, shared constants above): equal inputs yield equal UVs, and
+// that equality is what makes the split valid. Runs only when frost is on
+// and the backdrop is live (C++ skips it otherwise), so the mica recipe
+// below is unconditional. GlassPS finishes the vertical axis from temp.
+// ---------------------------------------------------------------------------
+float4 BlurHPS(VertexOutput input) : SV_Target
+{
+    const float2 outputSize = scene0.xy;
+    const float2 pixel = input.position.xy;
+    const float dpi = max(scene1.y, 1.0);
+    const float marginDev = DOCK_SHADOW_MARGIN_PT * dpi;
+    const float2 halfSize = outputSize * 0.5 - marginDev - 1.5 * dpi;
+    const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
+    const float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
+    const float2 gradient = float2(ddx(distance), ddy(distance));
+    const float2 texel = 1.0 / outputSize;
+    const float2 uv = pixel * texel;
+    const float2 outward = gradient / max(length(gradient), 0.0001);
+    const float insideDistance = max(-distance, 0.0);
+    float bevelWidth = max(min(halfSize.x, halfSize.y) * 0.95, 8.0 * dpi);
+    const float x = saturate(insideDistance / max(bevelWidth, 1e-3)); // 0 rim -> 1 flat
+    const float oneMinusX = 1.0 - x;
+    const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
+    const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
+    const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
+    float slopeMag = 0.65 * slopeN;
+    const float fxBits = scene1.x + 0.5;
+    const float lensOn = FxEnabled(fxBits, 2.0);
+    const float dispOn = FxEnabled(fxBits, 4.0);
+    const uint haloCount = min(((uint)fxBits >> 8) & 63u, 64u);
+    float minIconDist = 1e9;
+    for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
+    {
+        if (haloIndex >= haloCount)
+        {
+            break;
+        }
+        const float4 haloRect = iconInstances[haloIndex].iconRect; // l,t,w,h px
+        const float2 haloCenter = haloRect.xy + haloRect.zw * 0.5;
+        const float2 haloQ = abs(pixel - haloCenter) - haloRect.zw * 0.5;
+        minIconDist = min(minIconDist, length(max(haloQ, 0.0)));
+    }
+    const float haloCalm = 1.0 - smoothstep(0.0, 10.0 * dpi, minIconDist);
+    slopeMag *= 1.0 - haloCalm * 0.9;
+    const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
+    const float thetaS = atan(slopeMag);
+    const float sinS = sin(thetaS);
+    const float sinRR = clamp(sinS / 1.5143, 0.0, 0.999);
+    const float sinRG = clamp(sinS / 1.5168, 0.0, 0.999);
+    const float sinRB = clamp(sinS / 1.5224, 0.0, 0.999);
+    const float thetaRR = asin(sinRR);
+    const float thetaRG = asin(sinRG);
+    const float thetaRB = asin(sinRB);
+    float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * kLensGain * lensOn;
+    float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * kLensGain * lensOn;
+    float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * kLensGain * lensOn;
+    dR = dG + (dR - dG) * kFringeBoost;
+    dB = dG + (dB - dG) * kFringeBoost;
+    dR = lerp(dG, dR, dispOn);
+    dB = lerp(dG, dB, dispOn);
+    const float2 lo = texel * 0.5;
+    const float2 hi = 1.0 - texel * 0.5;
+    const float2 uvR = clamp(uv - outward * dR * texel, lo, hi);
+    const float2 uvG = clamp(uv - outward * dG * texel, lo, hi);
+    const float2 uvB = clamp(uv - outward * dB * texel, lo, hi);
+    const float blurPx = lerp(kMicaBlurRim, kMicaBlurCore, height01) * dpi;
+    const float3 h = SampleGlassAxis(backdropTexture, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
+    return float4(h, 1.0);
 }
 
 float4 IconPS(VertexOutput input) : SV_Target

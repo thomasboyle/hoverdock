@@ -95,6 +95,7 @@ private:
     static constexpr UINT kBackdropForcedCaptureSkips = 120;
     static constexpr UINT kIconTextureDescriptor = 0;
     static constexpr UINT kBackdropTextureDescriptor = 1;
+    static constexpr UINT kTempBlurDescriptor = 2;
 
     struct alignas(256) FrameConstants {
         float scene0[4]{};
@@ -157,12 +158,16 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_glassPipeline;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_iconPipeline;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_blurPipeline;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_commandList;
     Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kBufferCount> m_backBuffers;
     std::array<FrameResource, kBufferCount> m_frames;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_iconAtlas;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_backdropTexture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_blurTemp;
+    // Tracks the temp target state across frames (starts as render target).
+    bool m_blurTempIsShaderResource = false;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_backdropUpload;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_backdropCopyAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_backdropCopyCommandList;
