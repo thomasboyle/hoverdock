@@ -87,6 +87,11 @@ public:
 private:
     static constexpr UINT kBufferCount = 3;
     static constexpr UINT kMaximumIcons = 512;
+    // Idle BitBlt skips before a forced live re-capture (~1 s at the
+    // 8 ms/120 Hz backdrop cadence). Bounds the DWM fast path so a stale
+    // cache (e.g. black frames validated before first composition at
+    // logon/resume) always heals while a static desktop still skips ~99%.
+    static constexpr UINT kBackdropForcedCaptureSkips = 120;
     static constexpr UINT kIconTextureDescriptor = 0;
     static constexpr UINT kBackdropTextureDescriptor = 1;
 
@@ -181,6 +186,9 @@ private:
     // pixels cannot have changed and the BitBlt is skipped (timer still fires).
     uint64_t m_backdropDwmFrame = 0;
     bool m_backdropDwmFrameValid = false;
+    // Consecutive idle skips since the last live BitBlt (see
+    // kBackdropForcedCaptureSkips). Reset on every capture attempt.
+    UINT m_backdropIdleSkips = 0;
     UINT64 m_backdropCopyFenceValue = 0;
     HANDLE m_fenceEvent = nullptr;
     HANDLE m_frameLatencyWaitableObject = nullptr;

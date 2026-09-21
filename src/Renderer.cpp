@@ -1060,15 +1060,20 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     // cost one DWM query (~0.01 ms) instead of a screen readback (measured 2-10 ms).
     // When content moves or video plays, cFrame advances every vsync and captures
     // continue at the full rate, so the glass stays pixel-identical to always-capture.
+    // Bound: cFrame can also stay frozen while the cache is stale (black frames
+    // validated before first composition at logon/resume, then a static desktop),
+    // so at most kBackdropForcedCaptureSkips ticks pass before a live BitBlt.
     if (m_backdropValid) {
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
         if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
             if (m_backdropDwmFrameValid && timing.cFrame == m_backdropDwmFrame) {
-                if (changed != nullptr) {
-                    *changed = false;
+                if (++m_backdropIdleSkips < kBackdropForcedCaptureSkips) {
+                    if (changed != nullptr) {
+                        *changed = false;
+                    }
+                    return true;
                 }
-                return true;
             }
             m_backdropDwmFrame = timing.cFrame;
             m_backdropDwmFrameValid = true;
@@ -1082,6 +1087,11 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
             m_backdropDwmFrameValid = true;
         }
     }
+
+    // Any BitBlt attempt (forced or regular) resets the idle-skip budget,
+    // whether the readback succeeds or not: persistent failure retries at
+    // the forced cadence instead of every tick.
+    m_backdropIdleSkips = 0;
 
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
@@ -1625,6 +1635,7 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropHash = 0;
     m_backdropDwmFrame = 0;
     m_backdropDwmFrameValid = false;
+    m_backdropIdleSkips = 0;
 
     if (m_backdropDc != nullptr && m_backdropPreviousBitmap != nullptr &&
         m_backdropPreviousBitmap != HGDI_ERROR) {
