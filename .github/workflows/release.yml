@@ -99,6 +99,47 @@ jobs:
           cmake --build out --config Release --target installer
           dir out\Hoverdock-Setup-*.exe
 
+
+      - name: Code sign Dock.exe and installer
+        shell: powershell
+        env:
+          CODE_SIGNING_PFX_BASE64: ${{ secrets.CODE_SIGNING_PFX_BASE64 }}
+          CODE_SIGNING_PASSWORD: ${{ secrets.CODE_SIGNING_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:CODE_SIGNING_PFX_BASE64)) {
+            Write-Host "CODE_SIGNING_PFX_BASE64 not set; skipping Authenticode (Defender will keep ML-flagging releases)."
+            exit 0
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODE_SIGNING_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object FullName -match '\\x64\\signtool.exe
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          Copy-Item "out\bin\Release\Dock.exe" "release-assets\Dock.exe"
+          Copy-Item "out\Hoverdock-Setup-*.exe" "release-assets\"
+          Get-ChildItem release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: release-assets/*
+ |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe not found" }
+          $targets = @("out\bin\Release\Dock.exe") + @(Get-ChildItem "out\Hoverdock-Setup-*.exe" | ForEach-Object FullName)
+          foreach ($t in $targets) {
+            & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfxPath /p $env:CODE_SIGNING_PASSWORD $t
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed for $t" }
+            Write-Host "Signed $t"
+          }
+          Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
       - name: Stage release assets
         shell: powershell
         run: |
