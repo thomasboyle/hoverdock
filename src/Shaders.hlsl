@@ -149,6 +149,16 @@ float InterleavedGradientNoise(float2 pixel)
 // Both passes must compute identical UVs or the split is invalid.
 static const float kLensGain = 2.3;
 static const float kFringeBoost = 24.0;
+// Max refraction pull (px at 1x, scaled by dpi). Without a cap the full-span
+// slab drags content from 20-40px away to the opposite rim, so a white window
+// overlapping only the top paints a white fringe along the bottom edge that
+// sits over a dark backdrop. 10px keeps the magnified look without the drag.
+static const float kLensMaxPx = 10.0;
+// Refraction fades to zero across this rim band (px at 1x, scaled by dpi) so
+// the AA edge (mask < 1) samples the true backdrop behind instead of a
+// refracted sample from the interior. Otherwise the blended fringe reads as
+// a bright line over dark content.
+static const float kLensRimFadePx = 3.0;
 // Per-pass mica radius 16 with a 33-tap (k=0..16) unit-pixel Gaussian
 // (sigma = 8). Step capped at 1 px so the frost stays pixel-accurate;
 // C++ iterates many H/V passes so text behind the dock dissolves the
@@ -341,7 +351,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float thetaRG = asin(sinRG);
         const float thetaRB = asin(sinRB);
         // Gain lives in kLensGain above (shared with the horizontal pass):
-        // ~16px rim pull, calm center, one continuous slab.
+        // calm center, one continuous slab; pull clamped to kLensMaxPx with
+        // a rim fade so a high-contrast edge above the dock cannot paint the
+        // opposite (dark) rim.
         float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * kLensGain * lensOn;
         float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * kLensGain * lensOn;
         float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * kLensGain * lensOn;
@@ -351,6 +363,15 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // Dispersion off collapses all channels onto green (no split).
         dR = lerp(dG, dR, dispOn);
         dB = lerp(dG, dB, dispOn);
+        // Cap the drag and release the extreme rim (see kLensMaxPx).
+        const float lensMax = kLensMaxPx * dpi;
+        dR = clamp(dR, 0.0, lensMax);
+        dG = clamp(dG, 0.0, lensMax);
+        dB = clamp(dB, 0.0, lensMax);
+        const float lensRimFade = smoothstep(0.0, kLensRimFadePx * dpi, insideDistance);
+        dR *= lensRimFade;
+        dG *= lensRimFade;
+        dB *= lensRimFade;
 
         const float2 lo = texel * 0.5;
         const float2 hi = 1.0 - texel * 0.5;
@@ -515,6 +536,17 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     dB = dG + (dB - dG) * kFringeBoost;
     dR = lerp(dG, dR, dispOn);
     dB = lerp(dG, dB, dispOn);
+    // Must stay identical to GlassPS above (see kLensMaxPx): cap the drag and
+    // release the extreme rim so the separable frost cannot carry a bright
+    // edge to the opposite dark rim.
+    const float lensMaxFrost = kLensMaxPx * dpi;
+    dR = clamp(dR, 0.0, lensMaxFrost);
+    dG = clamp(dG, 0.0, lensMaxFrost);
+    dB = clamp(dB, 0.0, lensMaxFrost);
+    const float lensRimFadeFrost = smoothstep(0.0, kLensRimFadePx * dpi, insideDistance);
+    dR *= lensRimFadeFrost;
+    dG *= lensRimFadeFrost;
+    dB *= lensRimFadeFrost;
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
     uvR = clamp(uv - outward * dR * texel, lo, hi);

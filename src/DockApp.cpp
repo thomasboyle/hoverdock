@@ -896,6 +896,66 @@ bool IsStartLauncherVisible() {
     return IsVisibleUncloakedWindow(FindWindowW(L"XamlExplorerHostIslandWindow", L"Start"));
 }
 
+BOOL CALLBACK FindNotificationCenterWindow(HWND window, LPARAM data) {
+    // Win+N calendar/notifications live in ShellExperienceHost (Win10 action
+    // center lineage) as a top-level Windows.UI.Core.CoreWindow; newer builds
+    // may host it in Explorer instead. Titles localize, so match class +
+    // owning process, never the title. UWP app windows are
+    // ApplicationFrameWindow at top level, so a top-level CoreWindow is
+    // effectively a shell flyout. "Windows Input Experience" is cloaked and
+    // never reaches the process check below.
+    if (IsVisibleUncloakedWindow(window) == false) {
+        return TRUE;
+    }
+    wchar_t className[64]{};
+    if (GetClassNameW(window, className, static_cast<int>(std::size(className))) == 0 ||
+        std::wstring_view(className) != L"Windows.UI.Core.CoreWindow") {
+        return TRUE;
+    }
+    DWORD processId = 0;
+    GetWindowThreadProcessId(window, &processId);
+    if (processId == 0 || processId == GetCurrentProcessId()) {
+        return TRUE;
+    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == nullptr) {
+        return TRUE;
+    }
+    wchar_t imagePath[MAX_PATH]{};
+    DWORD pathSize = static_cast<DWORD>(std::size(imagePath));
+    const BOOL queried = QueryFullProcessImageNameW(process, 0, imagePath, &pathSize);
+    CloseHandle(process);
+    if (queried == FALSE) {
+        return TRUE;
+    }
+    std::wstring_view image(imagePath, pathSize);
+    const size_t slash = image.find_last_of(L"\\/");
+    const std::wstring_view fileName =
+        slash == std::wstring_view::npos ? image : image.substr(slash + 1);
+    // Case-insensitive compare without EqualInsensitiveWide (defined below).
+    const auto matches = [](std::wstring_view name, std::wstring_view want) {
+        return name.size() == want.size() &&
+            std::equal(name.begin(), name.end(), want.begin(), [](wchar_t lhs, wchar_t rhs) {
+                   return std::towlower(lhs) == std::towlower(rhs);
+               });
+    };
+    if (matches(fileName, L"ShellExperienceHost.exe") || matches(fileName, L"explorer.exe")) {
+        *reinterpret_cast<bool*>(data) = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+bool IsNotificationCenterVisible() {
+    bool found = false;
+    EnumWindows(&FindNotificationCenterWindow, reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+bool IsAnyShellFlyoutVisible() {
+    return IsStartLauncherVisible() || IsNotificationCenterVisible();
+}
+
 std::wstring TrimWide(std::wstring value) {
     const auto first = std::find_if_not(value.begin(), value.end(), [](wchar_t character) {
         return std::iswspace(character) != 0;
@@ -1870,9 +1930,11 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
     case kCursorWatchSyncMessage: {
         EnsureMouseHook();
         SyncCursorWatchInterval();
-        // If we just promoted to the fast poll (elevated FG / hook loss), sample once
-        // so a hot-zone show is not delayed until the first timer tick.
-        if (DesiredCursorWatchIntervalMs() == kCursorWatchIntervalMs && !IsDragActive()) {
+        // Foreground changes (e.g. the notification panel closing) must
+        // resample even when Hidden: with a healthy hook the cursor timer is
+        // off and the hook only posts on movement, so a stationary hot-zone
+        // cursor would otherwise never reveal until the next wiggle.
+        if (!IsDragActive()) {
             POINT cursor{};
             if (GetCursorPos(&cursor) != FALSE) {
                 HandlePointer(cursor);
@@ -3227,6 +3289,9 @@ void DockApp::OpenTraySlot(TraySlot slot) {
         opened = SystemTray::OpenPowerSettings();
     } else if (slot == TraySlot::Clock) {
         PrepareShellForStartMenu();
+        // Same fullscreen-claim refusal as the Start menu (see
+        // OpenStartMenuFromDock): unmark first or Explorer can swallow Win+N.
+        UnmarkFullscreenClaims();
         opened = SystemTray::OpenNotificationCenter();
         if (opened) {
             m_shellFlyoutIsSearch = false;
@@ -4939,6 +5004,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::NotificationCenter:
         CloseOverflowPopup();
         PrepareShellForStartMenu();
+        UnmarkFullscreenClaims();
         if (!SystemTray::OpenNotificationCenter()) {
             ReleaseShellFlyoutHold();
             Log(L"Notification Center did not open.");
@@ -8274,6 +8340,7 @@ void DockApp::HideTaskbar() {
 void DockApp::RestoreTaskbar() {
     m_shellFlyoutHold = false;
     m_shellFlyoutHoldUntil = 0.0;
+    m_shellFlyoutSeen = false;
     StopTaskbarMonitor();
     DestroyFullscreenClaimWindows();
     if (m_taskbarStateSaved) {
@@ -8668,11 +8735,27 @@ bool DockApp::MaintainNativeTaskbarSuppression() {
                 HideTaskbarWindow(taskbar);
             }
         }
-        if (IsStartLauncherVisible()) {
+        // Adaptive hold for the Win+N calendar/notifications panel (plus the
+        // Start island, same as before). The old code held a blind 2.5 s from
+        // click and only tracked Start, so a quickly-dismissed panel — or one
+        // Explorer refused — kept the dock hidden for seconds after it was
+        // gone. Instead: wait briefly for the panel to appear, hold while it
+        // is visible, then release after a short slide-out grace.
+        static constexpr double kFlyoutCloseGraceSeconds = 0.35;
+        if (IsAnyShellFlyoutVisible()) {
+            m_shellFlyoutSeen = true;
             m_shellFlyoutHoldUntil = 0.0;
             return true;
         }
-        if (m_shellFlyoutHoldUntil > 0.0 && QpcSeconds() < m_shellFlyoutHoldUntil) {
+        const double now = QpcSeconds();
+        if (m_shellFlyoutSeen) {
+            if (m_shellFlyoutHoldUntil == 0.0) {
+                m_shellFlyoutHoldUntil = now + kFlyoutCloseGraceSeconds;
+            }
+            if (now < m_shellFlyoutHoldUntil) {
+                return true;
+            }
+        } else if (m_shellFlyoutHoldUntil > 0.0 && now < m_shellFlyoutHoldUntil) {
             return true;
         }
         ReleaseShellFlyoutHold();
@@ -8929,6 +9012,16 @@ bool DockApp::OpenStartMenuFromDock() {
     if (GetCapture() != nullptr) {
         ReleaseCapture();
     }
+    UnmarkFullscreenClaims();
+    static_cast<void>(GrantExplorerForeground());
+    if (!SendWinKey()) {
+        Log(L"Start menu did not accept input.");
+        return false;
+    }
+    return true;
+}
+
+void DockApp::UnmarkFullscreenClaims() {
     EnsureTaskbarList();
     if (m_taskbarList2 != nullptr) {
         for (FullscreenClaim& claim : m_fullscreenClaims) {
@@ -8937,12 +9030,6 @@ bool DockApp::OpenStartMenuFromDock() {
             }
         }
     }
-    static_cast<void>(GrantExplorerForeground());
-    if (!SendWinKey()) {
-        Log(L"Start menu did not accept input.");
-        return false;
-    }
-    return true;
 }
 
 void DockApp::PrepareShellForStartMenu() {
@@ -8952,7 +9039,18 @@ void DockApp::PrepareShellForStartMenu() {
     m_shellFlyoutHold = true;
     m_shellFlyoutIsSearch = false;
     m_shellFlyoutIsTray = false;
-    m_shellFlyoutHoldUntil = QpcSeconds() + 2.5;
+    // Wait budget for the panel to appear (adaptive hold takes over from
+    // there); keeps a refused/missed panel to a sub-second hide.
+    m_shellFlyoutHoldUntil = QpcSeconds() + 0.8;
+    m_shellFlyoutSeen = false;
+    // The taskbar monitor idles at a 5 s cadence when steady; without an
+    // immediate promotion the hold release would wait up to 5 s for the next
+    // tick.
+    m_taskbarMonitorQuietPasses = 0;
+    if (!m_taskbarMonitorFast && m_window != nullptr) {
+        m_taskbarMonitorFast = true;
+        SetTimer(m_window, kTaskbarMonitorTimerId, kTaskbarMonitorIntervalMs, nullptr);
+    }
     HideOverlayForShellFlyout();
 }
 
@@ -8993,8 +9091,20 @@ void DockApp::ReleaseShellFlyoutHold() {
     }
     m_shellFlyoutHold = false;
     m_shellFlyoutHoldUntil = 0.0;
+    m_shellFlyoutSeen = false;
     RestoreOverlayAfterShellFlyout();
     SuppressNativeTaskbar();
+    // The panel just closed: sample now so a cursor already sitting in the
+    // hot zone reveals instantly instead of waiting for the next mouse move
+    // (when Hidden the cursor timer is off and the hook only posts on
+    // movement) or the next foreground event.
+    if (!IsDragActive() && m_window != nullptr) {
+        POINT cursor{};
+        if (GetCursorPos(&cursor) != FALSE) {
+            HandlePointer(cursor);
+        }
+    }
+    SyncCursorWatchInterval();
 }
 
 void DockApp::StopShellFlyoutWatch() noexcept {

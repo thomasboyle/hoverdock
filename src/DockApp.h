@@ -396,6 +396,7 @@ private:
     [[nodiscard]] static int DividerIndexFromDisplayApps(const std::vector<DisplayApp>& displayApps);
     bool OpenStartMenuFromDock();
     void PrepareShellForStartMenu();
+    void UnmarkFullscreenClaims();
     void HideOverlayForShellFlyout();
     void RestoreOverlayAfterShellFlyout();
     void ReleaseShellFlyoutHold();
@@ -575,6 +576,10 @@ private:
     bool m_overlayHiddenForFlyout = false;
     HWND m_shellFlyoutWindow = nullptr;
     double m_shellFlyoutHoldUntil = 0.0;
+    // Adaptive hold phase for the Win+N panel: false while waiting for it to
+    // appear after the click, true once seen (hold then lasts until it closes
+    // plus a short slide-out grace).
+    bool m_shellFlyoutSeen = false;
     double m_suppressBackdropUntil = 0.0;
     bool m_dropPresentPending = false;
     std::atomic<bool> m_refreshInFlight{false};
