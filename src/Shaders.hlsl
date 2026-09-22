@@ -256,9 +256,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // softer, driven by shape rather than a hard glow.
     const float rim = pow(saturate(1.0 - insideDistance / max(8.0 * dpi, 2.0)), 2.8);
     const bool hasBackdrop = scene1.w > 0.5;
-    // Face plate color #e1e1e1 (DOCK_FROST_OVER_WHITE), always mixed in below.
+    // Face accents use the over-white plate; the tone map below sets the body.
     // Rim/specular accents still reference this as the glass body color.
-    const float3 glassTint = DOCK_FROST_OVER_WHITE;
+    const float3 glassTint = DOCK_FACE_OVER_WHITE;
 
     // ---- Bevel geometry: one slab -----------------------------------------
     // The bevel spans the short half-axis so the whole face refracts as one
@@ -307,7 +307,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
 
     // Frost presets: off = pure optics, on = heavy mica blur. Tint plate
-    // is uniform (DOCK_FROST_OVER_WHITE) so white meters #e1e1e1 flat.
+    // radii scale with frostAmount; face level comes from the tone map below.
     float frostRim;
     float frostCore;
     frostRim = kMicaBlurRim * frostAmount;
@@ -391,13 +391,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
         }
     }
 
-    // ---- 1. Permanent #e1e1e1 face plate ---------------------------------
-    // Always lerp the (blurred) backdrop toward DOCK_FROST_OVER_WHITE so the
-    // dock stays visible on white wallpapers and still reads as a light mica
-    // plate on every other backdrop. Frost amount only deepens the plate a
-    // little and drives blur; the tint itself is not optional.
-    const float plateMix = lerp(0.82, 0.94, frostAmount);
-    float3 color = lerp(frostedBackground, glassTint, plateMix);
+    // ---- 1. Calibrated face tone map ------------------------------------
+    // Linear lift fitted to solid swatches (see DockTheme.hlsli):
+    // #000->#3a3a3a, #1f1f1f->#4e4e4e, #fff->#e1e1e1.
+    // Applied after blur so frost softens detail; the map sets the face level.
+    float3 color = lerp(DOCK_FACE_OVER_BLACK, DOCK_FACE_OVER_WHITE, saturate(frostedBackground));
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
     // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on

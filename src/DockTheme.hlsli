@@ -12,10 +12,15 @@
 #define DOCK_INK_G 34
 #define DOCK_INK_B 36
 
-// Dock face frost plate: with frost+tint on, a fully blurred solid-white
-// backdrop must meter #e1e1e1 (225/255). Multiplicative so colored
-// backdrops keep hue. Used by GlassPS; popup compositor keeps its own mix.
-#define DOCK_FROST_OVER_WHITE (225.0f / 255.0f)
+// Dock face tone map (linear lift), calibrated from solid swatches:
+//   backdrop #000000 -> face #3a3a3a
+//   backdrop #1f1f1f -> face #4e4e4e   (fit err < 0.5 LSB)
+//   backdrop #ffffff -> face #e1e1e1
+// face = lerp(OVER_BLACK, OVER_WHITE, blurredBackdrop). Popup keeps its own mix.
+#define DOCK_FACE_OVER_BLACK (58.0f / 255.0f)
+#define DOCK_FACE_OVER_WHITE (225.0f / 255.0f)
+// Alias used by rim/specular accents (highlight body = over-white plate).
+#define DOCK_FROST_OVER_WHITE DOCK_FACE_OVER_WHITE
 
 // Glass tint/alpha for the Quick Settings popup CPU compositor. Calibrated
 // so the popup face meters #e1e1e1 over white with DOCK_GLASS_MIX/ALPHA.
