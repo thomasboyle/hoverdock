@@ -68,14 +68,14 @@ jobs:
             Write-Host "Auto-incremented version: $version"
           }
           # Safety net: never reuse an existing tag (e.g. the fallback version
-          # already shipped) — keep bumping the patch until it is fresh.
+          # already shipped) â€” keep bumping the patch until it is fresh.
           while ($version -match '^\d+\.\d+\.\d+$' -and
               (git rev-parse --verify --quiet "refs/tags/v$version")) {
             $parts = $version.Split(".") | ForEach-Object { [int]$_ }
             $version = "$($parts[0]).$($parts[1]).$($parts[2] + 1)"
             Write-Host "Tag exists, trying: $version"
           }
-          # A missing tag makes rev-parse exit 1 — the expected path, not a
+          # A missing tag makes rev-parse exit 1 â€” the expected path, not a
           # failure. The runner exits this step with a stale $LASTEXITCODE, so
           # reset it explicitly (verified: plain assignment works on PS 5.1).
           $LASTEXITCODE = 0
@@ -98,8 +98,6 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
           cmake --build out --config Release --target installer
           dir out\Hoverdock-Setup-*.exe
-
-
       - name: Code sign Dock.exe and installer
         shell: powershell
         env:
@@ -108,38 +106,25 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           if ([string]::IsNullOrWhiteSpace($env:CODE_SIGNING_PFX_BASE64)) {
-            Write-Host "CODE_SIGNING_PFX_BASE64 not set; skipping Authenticode (Defender will keep ML-flagging releases)."
+            Write-Host "CODE_SIGNING_PFX_BASE64 not set; skipping Authenticode."
             exit 0
           }
           $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODE_SIGNING_PFX_BASE64))
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
-            Where-Object FullName -match '\\x64\\signtool.exe
-        shell: powershell
-        run: |
-          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
-          Copy-Item "out\bin\Release\Dock.exe" "release-assets\Dock.exe"
-          Copy-Item "out\Hoverdock-Setup-*.exe" "release-assets\"
-          Get-ChildItem release-assets
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          generate_release_notes: true
-          files: release-assets/*
- |
+            Where-Object { $_.FullName -like '*\x64\signtool.exe' } |
             Sort-Object FullName -Descending |
             Select-Object -First 1 -ExpandProperty FullName
           if (-not $signtool) { throw "signtool.exe not found" }
-          $targets = @("out\bin\Release\Dock.exe") + @(Get-ChildItem "out\Hoverdock-Setup-*.exe" | ForEach-Object FullName)
+          $targets = @("out\bin\Release\Dock.exe")
+          $targets += @(Get-ChildItem "out\Hoverdock-Setup-*.exe" | ForEach-Object FullName)
           foreach ($t in $targets) {
             & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfxPath /p $env:CODE_SIGNING_PASSWORD $t
             if ($LASTEXITCODE -ne 0) { throw "signtool failed for $t" }
             Write-Host "Signed $t"
           }
           Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+
       - name: Stage release assets
         shell: powershell
         run: |
