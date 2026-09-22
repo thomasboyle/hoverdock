@@ -256,7 +256,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // softer, driven by shape rather than a hard glow.
     const float rim = pow(saturate(1.0 - insideDistance / max(8.0 * dpi, 2.0)), 2.8);
     const bool hasBackdrop = scene1.w > 0.5;
-    // Face plate: DOCK_FROST_OVER_WHITE so blurred white meters #e1e1e1.
+    // Face plate color #e1e1e1 (DOCK_FROST_OVER_WHITE), always mixed in below.
     // Rim/specular accents still reference this as the glass body color.
     const float3 glassTint = DOCK_FROST_OVER_WHITE;
 
@@ -391,15 +391,13 @@ float4 GlassPS(VertexOutput input) : SV_Target
         }
     }
 
-    // ---- 1. Frost plate + liquid-glass wash (white -> #e1e1e1) ------------
-    // Multiply first so blurred white meters #e1e1e1. Then wash toward the
-    // plate so leftover mid-frequency detail (readable text) dies — Apple
-    // liquid glass does not leave glyphs legible through the dock.
-    // Wash does not shift pure white (plated white == glassTint already).
-    const float plateMix = tintOn * lerp(0.35, 1.0, frostAmount);
-    float3 plated = frostedBackground * lerp(1.0, glassTint, plateMix);
-    const float wash = 0.82 * frostAmount * tintOn;
-    float3 color = lerp(plated, glassTint, wash);
+    // ---- 1. Permanent #e1e1e1 face plate ---------------------------------
+    // Always lerp the (blurred) backdrop toward DOCK_FROST_OVER_WHITE so the
+    // dock stays visible on white wallpapers and still reads as a light mica
+    // plate on every other backdrop. Frost amount only deepens the plate a
+    // little and drives blur; the tint itself is not optional.
+    const float plateMix = lerp(0.82, 0.94, frostAmount);
+    float3 color = lerp(frostedBackground, glassTint, plateMix);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
     // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on
