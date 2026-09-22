@@ -312,6 +312,16 @@ void BoxBlurFloatPlane(std::vector<float>& pixels, int width, int height, int ra
 // Matches GlassPS: heavy blur is done by the caller; this maps each blurred
 // backdrop sample through the calibrated lift (#000->#3a, #fff->#e1) and
 // finishes with the same rim polish / dither / shape alpha as before.
+int PopupFrostRadiusPx(float frostAmount, float scale) noexcept
+{
+    // Cap radius: 3 stacked box blurs already approximate a wide Gaussian.
+    // The old (2+22*frost)*scale formula hit ~36px at 150% DPI and froze the
+    // UI thread when the frost slider rebaked on every mouse move.
+    const float amt = std::clamp(frostAmount, 0.0F, 1.0F);
+    const int radius = static_cast<int>(std::lround((1.5F + 10.0F * amt) * scale));
+    return std::clamp(radius, 1, 16);
+}
+
 void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
     const std::vector<float>& coverage, const std::vector<float>& blurredCoverage,
     float frostAmount)
@@ -4058,6 +4068,7 @@ void DockApp::InvalidateSettingsGlass() noexcept {
     std::vector<uint8_t>().swap(m_settingsGlass);
     m_settingsGlassSize = {};
     m_settingsGlassOrigin = {};
+    m_settingsGlassFrost = -1.0F;
 }
 
 bool DockApp::SettingsGlassValid(POINT origin) const noexcept {
@@ -4065,7 +4076,8 @@ bool DockApp::SettingsGlassValid(POINT origin) const noexcept {
         m_settingsGlassSize.cy == m_settingsSize.cy && m_settingsGlassOrigin.x == origin.x &&
         m_settingsGlassOrigin.y == origin.y &&
         m_settingsGlass.size() ==
-            static_cast<size_t>(m_settingsSize.cx) * static_cast<size_t>(m_settingsSize.cy) * 4U;
+            static_cast<size_t>(m_settingsSize.cx) * static_cast<size_t>(m_settingsSize.cy) * 4U &&
+        std::abs(m_settingsGlassFrost - m_config.FrostAmount()) < 0.001F;
 }
 
 void DockApp::QueueSettingsPaint() {
@@ -4093,7 +4105,25 @@ void DockApp::ApplyFrostSliderAt(LONG clientX) {
         return;
     }
     m_config.SetFrostAmount(amount);
+    if (m_frostSliderDragging) {
+        // Drag preview: coalesce chrome repaint over the cached glass plate and
+        // throttle dock frames. A full glass rebake here used to stall/crash.
+        QueueSettingsPaint();
+        const ULONGLONG now = GetTickCount64();
+        if (now - m_frostSliderLastRenderMs >= 33ULL) {
+            m_frostSliderLastRenderMs = now;
+            QueueRenderFrame();
+        }
+        return;
+    }
+    // Slider released: rebake popup glass once at the committed frost amount.
+    InvalidateSettingsGlass();
+    InvalidateOverflowGlass();
+    InvalidateContextGlass();
     PaintSettingsPopup();
+    if (m_overflowWindow != nullptr && IsWindowVisible(m_overflowWindow)) {
+        PaintOverflowPopup();
+    }
     QueueRenderFrame();
 }
 void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
@@ -4385,10 +4415,7 @@ void DockApp::PaintSettingsPopup() {
         // Same frosted recipe as Quick Settings: stacked box blurs approximate
         // the dock shader's wide kernel at the same texel scale.
         const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
-            // Scale with FrostAmount so clear stays sharp and full frost matches
-            // the dock's heavy mica (CPU 3x box blur ~ dock Gaussian strength).
-            const int frostRadius =
-                std::max(1, static_cast<int>(std::lround((2.0F + 22.0F * frostAmt) * scale)));
+        const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         BoxBlurRgb(pixels, SaturatedInt(m_settingsSize.cx), SaturatedInt(m_settingsSize.cy),
             frostRadius);
         BoxBlurRgb(pixels, SaturatedInt(m_settingsSize.cx), SaturatedInt(m_settingsSize.cy),
@@ -4464,6 +4491,7 @@ void DockApp::PaintSettingsPopup() {
         m_settingsGlass.assign(pixels, pixels + pixelCount * 4U);
         m_settingsGlassSize = m_settingsSize;
         m_settingsGlassOrigin = origin;
+        m_settingsGlassFrost = m_config.FrostAmount();
     }
 
     const int width = SaturatedInt(m_settingsSize.cx);
@@ -4837,6 +4865,7 @@ void DockApp::InvalidateOverflowGlass() noexcept {
     m_overflowGlassSize = {};
     m_overflowGlassOrigin = {};
     m_overflowGlassCaretX = 0;
+    m_overflowGlassFrost = -1.0F;
 }
 
 bool DockApp::OverflowGlassValid(POINT origin) const noexcept {
@@ -4847,7 +4876,8 @@ bool DockApp::OverflowGlassValid(POINT origin) const noexcept {
         && m_overflowGlassOrigin.y == origin.y
         && m_overflowGlassCaretX == m_overflowCaretX
         && m_overflowGlass.size()
-            == static_cast<size_t>(m_overflowSize.cx) * static_cast<size_t>(m_overflowSize.cy) * 4U;
+            == static_cast<size_t>(m_overflowSize.cx) * static_cast<size_t>(m_overflowSize.cy) * 4U
+        && std::abs(m_overflowGlassFrost - m_config.FrostAmount()) < 0.001F;
 }
 
 void DockApp::DestroyOverflowFonts() noexcept {
@@ -5071,10 +5101,7 @@ void DockApp::PaintOverflowPopup() {
         // 17-tap kernel at the same texel scale; sliding-window passes stay
         // O(pixels) regardless of radius.
         const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
-            // Scale with FrostAmount so clear stays sharp and full frost matches
-            // the dock's heavy mica (CPU 3x box blur ~ dock Gaussian strength).
-            const int frostRadius =
-                std::max(1, static_cast<int>(std::lround((2.0F + 22.0F * frostAmt) * scale)));
+        const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         BoxBlurRgb(pixels, SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy),
             frostRadius);
         BoxBlurRgb(pixels, SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy),
@@ -5167,6 +5194,7 @@ void DockApp::PaintOverflowPopup() {
         m_overflowGlassSize = m_overflowSize;
         m_overflowGlassOrigin = origin;
         m_overflowGlassCaretX = m_overflowCaretX;
+        m_overflowGlassFrost = m_config.FrostAmount();
     }
     const int width = SaturatedInt(m_overflowSize.cx);
     const int height = SaturatedInt(m_overflowSize.cy);
@@ -6033,6 +6061,7 @@ void DockApp::InvalidateContextGlass() noexcept {
     std::vector<uint8_t>().swap(m_contextGlass);
     m_contextGlassSize = {};
     m_contextGlassOrigin = {};
+    m_contextGlassFrost = -1.0F;
 }
 
 bool DockApp::ContextGlassValid(POINT origin) const noexcept {
@@ -6040,7 +6069,8 @@ bool DockApp::ContextGlassValid(POINT origin) const noexcept {
         m_contextGlassSize.cy == m_contextSize.cy && m_contextGlassOrigin.x == origin.x &&
         m_contextGlassOrigin.y == origin.y &&
         m_contextGlass.size() ==
-            static_cast<size_t>(m_contextSize.cx) * static_cast<size_t>(m_contextSize.cy) * 4U;
+            static_cast<size_t>(m_contextSize.cx) * static_cast<size_t>(m_contextSize.cy) * 4U &&
+        std::abs(m_contextGlassFrost - m_config.FrostAmount()) < 0.001F;
 }
 
 void DockApp::EnsureContextFonts(float scale) {
@@ -6302,10 +6332,7 @@ void DockApp::PaintContextMenu() {
             SaturatedInt(origin.x), SaturatedInt(origin.y), SRCCOPY);
         ReleaseDC(nullptr, screen);
         const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
-            // Scale with FrostAmount so clear stays sharp and full frost matches
-            // the dock's heavy mica (CPU 3x box blur ~ dock Gaussian strength).
-            const int frostRadius =
-                std::max(1, static_cast<int>(std::lround((2.0F + 22.0F * frostAmt) * scale)));
+        const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         const int width = SaturatedInt(m_contextSize.cx);
         const int height = SaturatedInt(m_contextSize.cy);
         BoxBlurRgb(pixels, width, height, frostRadius);
@@ -6374,6 +6401,7 @@ void DockApp::PaintContextMenu() {
         m_contextGlass.assign(pixels, pixels + pixelCount * 4U);
         m_contextGlassSize = m_contextSize;
         m_contextGlassOrigin = origin;
+        m_contextGlassFrost = m_config.FrostAmount();
     }
 
     const int width = SaturatedInt(m_contextSize.cx);

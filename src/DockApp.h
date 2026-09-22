@@ -606,11 +606,13 @@ private:
     int m_settingsHover = -1;
     bool m_settingsPaintQueued = false;
     bool m_frostSliderDragging = false;
+    ULONGLONG m_frostSliderLastRenderMs = 0;
     RECT m_frostSliderTrack{};
     SIZE m_settingsSize{};
     std::vector<uint8_t> m_settingsGlass;
     SIZE m_settingsGlassSize{};
     POINT m_settingsGlassOrigin{};
+    float m_settingsGlassFrost = -1.0F;
     std::wstring m_updateStatus = L"Checking for updates...";
     std::atomic<bool> m_updateInFlight{false};
     std::atomic<bool> m_updateInstalling{false};
@@ -638,6 +640,7 @@ private:
     SIZE m_overflowGlassSize{};
     POINT m_overflowGlassOrigin{};
     LONG m_overflowGlassCaretX = 0;
+    float m_overflowGlassFrost = -1.0F;
     float m_overflowFontScale = 0.0F;
     HFONT m_overflowTitleFont = nullptr;
     HFONT m_overflowSectionFont = nullptr;
@@ -658,6 +661,7 @@ private:
     std::vector<uint8_t> m_contextGlass;
     SIZE m_contextGlassSize{};
     POINT m_contextGlassOrigin{};
+    float m_contextGlassFrost = -1.0F;
     std::vector<uint8_t> m_contextBaseBits;
     std::vector<uint8_t> m_contextPresentBits;
     SIZE m_contextPresentSize{};
