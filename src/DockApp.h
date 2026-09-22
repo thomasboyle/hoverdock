@@ -171,7 +171,6 @@ private:
         Lensing,
         Dispersion,
         Frost,
-        Tint,
         Specular,
         DropShadow,
         DepthShade,

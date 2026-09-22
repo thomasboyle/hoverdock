@@ -4114,14 +4114,6 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         // within the track (0 = clear glass, 1 = full mica).
         break;
     }
-    case SettingsHitKind::Tint: {
-        const bool enabled = !m_config.Tint();
-        m_config.SetTint(enabled);
-        ScheduleConfigSave();
-        PaintSettingsPopup();
-        QueueRenderFrame();
-        break;
-    }
     case SettingsHitKind::Specular: {
         const bool enabled = !m_config.Specular();
         m_config.SetSpecular(enabled);
@@ -4250,8 +4242,6 @@ void DockApp::PaintSettingsPopup() {
             m_config.Dispersion(), 0.0F},
         {SettingsHitKind::Frost, L"Frost", L"Clear glass to full mica frost", true, false,
             m_config.FrostAmount()},
-        {SettingsHitKind::Tint, L"Tint", L"Warm veil over the backdrop", false, m_config.Tint(),
-            0.0F},
         {SettingsHitKind::Specular, L"Speculars", L"Key and fill glints on the surface", false,
             m_config.Specular(), 0.0F},
         {SettingsHitKind::DropShadow, L"Drop shadow", L"Soft contact shade under the dock", false,
@@ -5711,9 +5701,9 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     if (frostAmount > 0.001f) {
         glassFx |= DOCK_FX_BLUR;
     }
-    if (m_config.Tint()) {
-        glassFx |= DOCK_FX_TINT;
-    }
+    // Tint is no longer a settings toggle — the calibrated face tone map is
+    // always applied; keep the FX bit set so older shader paths stay armed.
+    glassFx |= DOCK_FX_TINT;
     if (m_config.Specular()) {
         glassFx |= DOCK_FX_SPECULAR;
     }
