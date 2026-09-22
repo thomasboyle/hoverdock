@@ -16,14 +16,15 @@
 //   backdrop #000000 -> face #3a3a3a
 //   backdrop #1f1f1f -> face #4e4e4e   (fit err < 0.5 LSB)
 //   backdrop #ffffff -> face #e1e1e1
-// face = lerp(OVER_BLACK, OVER_WHITE, blurredBackdrop). Popup keeps its own mix.
+// face = lerp(OVER_BLACK, OVER_WHITE, blurredBackdrop). Shared by GlassPS and
+// the CPU popup baker (Quick Settings / Dock Settings / context).
 #define DOCK_FACE_OVER_BLACK (58.0f / 255.0f)
 #define DOCK_FACE_OVER_WHITE (225.0f / 255.0f)
 // Alias used by rim/specular accents (highlight body = over-white plate).
 #define DOCK_FROST_OVER_WHITE DOCK_FACE_OVER_WHITE
 
-// Glass tint/alpha for the Quick Settings popup CPU compositor. Calibrated
-// so the popup face meters #e1e1e1 over white with DOCK_GLASS_MIX/ALPHA.
+// Legacy popup alpha floor. FrostAmount lerps toward 1 so the plate is opaque
+// at full frost (same rule as the dock). Tint/mix kept for any residual refs.
 #define DOCK_GLASS_TINT 0.829f
 #define DOCK_GLASS_MIX 0.85f
 #define DOCK_GLASS_ALPHA 0.88f

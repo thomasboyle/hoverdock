@@ -1,11 +1,11 @@
-﻿#pragma once
+#pragma once
 
 // Single source of truth for the dock version and update feed.
 // CMake injects DOCK_VERSION_STRING / DOCK_REPO_OWNER / DOCK_REPO_NAME via
 // compile definitions; the fallbacks below keep IDE-only builds working.
 
 #ifndef DOCK_VERSION_STRING
-#define DOCK_VERSION_STRING "1.1.9"
+#define DOCK_VERSION_STRING "1.1.10"
 #endif
 
 #ifndef DOCK_REPO_OWNER

@@ -307,6 +307,51 @@ void BoxBlurFloatPlane(std::vector<float>& pixels, int width, int height, int ra
     }
 }
 
+
+// Liquid-glass face for CPU popups (Quick Settings, Dock Settings, context).
+// Matches GlassPS: heavy blur is done by the caller; this maps each blurred
+// backdrop sample through the calibrated lift (#000->#3a, #fff->#e1) and
+// finishes with the same rim polish / dither / shape alpha as before.
+void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
+    const std::vector<float>& coverage, const std::vector<float>& blurredCoverage,
+    float frostAmount)
+{
+    if (pixels == nullptr || width <= 0 || height <= 0) {
+        return;
+    }
+    const float overBlack = DOCK_FACE_OVER_BLACK * 255.0F;
+    const float overWhite = DOCK_FACE_OVER_WHITE * 255.0F;
+    // FrostAmount 0 keeps the old translucent popup alpha; 1 is opaque plate
+    // so sharp desktop cannot leak through (same rule as the dock face).
+    const float alpha =
+        DOCK_GLASS_ALPHA + (1.0F - DOCK_GLASS_ALPHA) * std::clamp(frostAmount, 0.0F, 1.0F);
+    constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F}; // DIB B,G,R
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const size_t flat = static_cast<size_t>(y) * static_cast<size_t>(width) + x;
+            const float shape = coverage[flat];
+            const float rim =
+                std::clamp((blurredCoverage[flat] - shape) * 2.0F, 0.0F, 1.0F);
+            const float rim4 = rim * rim * rim * rim;
+            float noise = static_cast<float>(x) * 0.06711056F + static_cast<float>(y) * 0.00583715F;
+            noise = noise - std::floor(noise);
+            noise = 52.9829189F * noise;
+            noise = (noise - std::floor(noise)) - 0.5F;
+            uint8_t* pixel = pixels + flat * 4U;
+            for (int channel = 0; channel < 3; ++channel) {
+                const float frosted = static_cast<float>(pixel[channel]);
+                // Calibrated face tone map (same as GlassPS).
+                float mapped = overBlack + (overWhite - overBlack) * (frosted / 255.0F);
+                const float target = mapped * kChannelK[channel] + overWhite * 0.08F;
+                float shaded = mapped + 0.22F * (target - mapped);
+                shaded += overWhite * rim * 0.12F + 255.0F * rim4 * 0.18F;
+                shaded = std::clamp(shaded + noise, 0.0F, 255.0F);
+                pixel[channel] = static_cast<uint8_t>(std::lround(shaded * shape * alpha));
+            }
+            pixel[3] = static_cast<uint8_t>(std::lround(255.0F * shape * alpha));
+        }
+    }
+}
 HFONT CreateFlyoutFont(int pixelHeight, int weight) {
     return CreateFontW(-pixelHeight, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
@@ -4339,7 +4384,11 @@ void DockApp::PaintSettingsPopup() {
         ReleaseDC(nullptr, screen);
         // Same frosted recipe as Quick Settings: stacked box blurs approximate
         // the dock shader's wide kernel at the same texel scale.
-        const int frostRadius = std::max(4, static_cast<int>(std::lround(12.0F * scale)));
+        const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
+            // Scale with FrostAmount so clear stays sharp and full frost matches
+            // the dock's heavy mica (CPU 3x box blur ~ dock Gaussian strength).
+            const int frostRadius =
+                std::max(1, static_cast<int>(std::lround((2.0F + 22.0F * frostAmt) * scale)));
         BoxBlurRgb(pixels, SaturatedInt(m_settingsSize.cx), SaturatedInt(m_settingsSize.cy),
             frostRadius);
         BoxBlurRgb(pixels, SaturatedInt(m_settingsSize.cx), SaturatedInt(m_settingsSize.cy),
@@ -4404,35 +4453,9 @@ void DockApp::PaintSettingsPopup() {
             std::vector<float> blurredCoverage = coverage;
             BoxBlurFloatPlane(blurredCoverage, SaturatedInt(glassW), SaturatedInt(glassH),
                 std::max(1, static_cast<int>(std::lround(2.6F * scale))));
-            const float tint = DOCK_GLASS_TINT * 255.0F;
-            const float mix = DOCK_GLASS_MIX;
-            const float alpha = DOCK_GLASS_ALPHA;
-            constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F};
-            for (LONG y = 0; y < glassH; ++y) {
-                for (LONG x = 0; x < glassW; ++x) {
-                    const size_t flat = static_cast<size_t>(y) * glassW + x;
-                    const float shape = coverage[flat];
-                    const float rim = std::clamp((blurredCoverage[flat] - shape) * 2.0F, 0.0F, 1.0F);
-                    const float rim4 = rim * rim * rim * rim;
-                    float noise = static_cast<float>(x) * 0.06711056F +
-                        static_cast<float>(y) * 0.00583715F;
-                    noise = noise - std::floor(noise);
-                    noise = 52.9829189F * noise;
-                    noise = (noise - std::floor(noise)) - 0.5F;
-                    uint8_t* pixel = pixels + flat * 4U;
-                    for (int channel = 0; channel < 3; ++channel) {
-                        const float frosted = static_cast<float>(pixel[channel]);
-                        const float base = frosted * (1.0F - mix) + tint * mix;
-                        const float target = base * kChannelK[channel] + tint * 0.08F;
-                        float shaded = base + 0.22F * (target - base);
-                        shaded += tint * rim * 0.12F + 255.0F * rim4 * 0.18F;
-                        shaded = std::clamp(shaded + noise, 0.0F, 255.0F);
-                        pixel[channel] =
-                            static_cast<uint8_t>(std::lround(shaded * shape * alpha));
-                    }
-                    pixel[3] = static_cast<uint8_t>(std::lround(255.0F * shape * alpha));
-                }
-            }
+            // Same liquid-glass face as the dock (calibrated tone map + rim).
+            ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
+                blurredCoverage, m_config.FrostAmount());
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
@@ -5047,7 +5070,11 @@ void DockApp::PaintOverflowPopup() {
         // Frosted backdrop: stacked box blurs approximate the dock shader's wide
         // 17-tap kernel at the same texel scale; sliding-window passes stay
         // O(pixels) regardless of radius.
-        const int frostRadius = std::max(4, static_cast<int>(std::lround(12.0F * scale)));
+        const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
+            // Scale with FrostAmount so clear stays sharp and full frost matches
+            // the dock's heavy mica (CPU 3x box blur ~ dock Gaussian strength).
+            const int frostRadius =
+                std::max(1, static_cast<int>(std::lround((2.0F + 22.0F * frostAmt) * scale)));
         BoxBlurRgb(pixels, SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy),
             frostRadius);
         BoxBlurRgb(pixels, SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy),
@@ -5128,35 +5155,9 @@ void DockApp::PaintOverflowPopup() {
             // 3. Dock glass recipe per pixel: tint mix, polish lerp, rim light,
             // gradient-noise dither, shape mask, premultiplied alpha. Constants
             // shared with GlassPS via DockTheme.hlsli.
-            const float tint = DOCK_GLASS_TINT * 255.0F;
-            const float mix = DOCK_GLASS_MIX;
-            const float alpha = DOCK_GLASS_ALPHA;
-            constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F};  // DIB order: B, G, R.
-            for (LONG y = 0; y < glassH; ++y) {
-                for (LONG x = 0; x < glassW; ++x) {
-                    const size_t flat = static_cast<size_t>(y) * glassW + x;
-                    const float shape = coverage[flat];
-                    const float rim = std::clamp((blurredCoverage[flat] - shape) * 2.0F, 0.0F, 1.0F);
-                    const float rim4 = rim * rim * rim * rim;
-                    float noise = static_cast<float>(x) * 0.06711056F +
-                        static_cast<float>(y) * 0.00583715F;
-                    noise = noise - std::floor(noise);
-                    noise = 52.9829189F * noise;
-                    noise = (noise - std::floor(noise)) - 0.5F;
-                    uint8_t* pixel = pixels + flat * 4U;
-                    for (int channel = 0; channel < 3; ++channel) {
-                        const float frosted = static_cast<float>(pixel[channel]);
-                        const float base = frosted * (1.0F - mix) + tint * mix;
-                        const float target = base * kChannelK[channel] + tint * 0.08F;
-                        float shaded = base + 0.22F * (target - base);
-                        shaded += tint * rim * 0.12F + 255.0F * rim4 * 0.18F;
-                        shaded = std::clamp(shaded + noise, 0.0F, 255.0F);
-                        pixel[channel] =
-                            static_cast<uint8_t>(std::lround(shaded * shape * alpha));
-                    }
-                    pixel[3] = static_cast<uint8_t>(std::lround(255.0F * shape * alpha));
-                }
-            }
+            // Same liquid-glass face as the dock (calibrated tone map + rim).
+            ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
+                blurredCoverage, m_config.FrostAmount());
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
@@ -6300,7 +6301,11 @@ void DockApp::PaintContextMenu() {
         BitBlt(memory, 0, 0, SaturatedInt(m_contextSize.cx), SaturatedInt(m_contextSize.cy), screen,
             SaturatedInt(origin.x), SaturatedInt(origin.y), SRCCOPY);
         ReleaseDC(nullptr, screen);
-        const int frostRadius = std::max(4, static_cast<int>(std::lround(12.0F * scale)));
+        const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
+            // Scale with FrostAmount so clear stays sharp and full frost matches
+            // the dock's heavy mica (CPU 3x box blur ~ dock Gaussian strength).
+            const int frostRadius =
+                std::max(1, static_cast<int>(std::lround((2.0F + 22.0F * frostAmt) * scale)));
         const int width = SaturatedInt(m_contextSize.cx);
         const int height = SaturatedInt(m_contextSize.cy);
         BoxBlurRgb(pixels, width, height, frostRadius);
@@ -6359,35 +6364,9 @@ void DockApp::PaintContextMenu() {
             std::vector<float> blurredCoverage = coverage;
             BoxBlurFloatPlane(blurredCoverage, SaturatedInt(glassW), SaturatedInt(glassH),
                 std::max(1, static_cast<int>(std::lround(2.6F * scale))));
-            const float tint = DOCK_GLASS_TINT * 255.0F;
-            const float mix = DOCK_GLASS_MIX;
-            const float alpha = DOCK_GLASS_ALPHA;
-            constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F};
-            for (LONG y = 0; y < glassH; ++y) {
-                for (LONG x = 0; x < glassW; ++x) {
-                    const size_t flat = static_cast<size_t>(y) * glassW + x;
-                    const float shape = coverage[flat];
-                    const float rim = std::clamp((blurredCoverage[flat] - shape) * 2.0F, 0.0F, 1.0F);
-                    const float rim4 = rim * rim * rim * rim;
-                    float noise = static_cast<float>(x) * 0.06711056F +
-                        static_cast<float>(y) * 0.00583715F;
-                    noise = noise - std::floor(noise);
-                    noise = 52.9829189F * noise;
-                    noise = (noise - std::floor(noise)) - 0.5F;
-                    uint8_t* pixel = pixels + flat * 4U;
-                    for (int channel = 0; channel < 3; ++channel) {
-                        const float frosted = static_cast<float>(pixel[channel]);
-                        const float base = frosted * (1.0F - mix) + tint * mix;
-                        const float target = base * kChannelK[channel] + tint * 0.08F;
-                        float shaded = base + 0.22F * (target - base);
-                        shaded += tint * rim * 0.12F + 255.0F * rim4 * 0.18F;
-                        shaded = std::clamp(shaded + noise, 0.0F, 255.0F);
-                        pixel[channel] =
-                            static_cast<uint8_t>(std::lround(shaded * shape * alpha));
-                    }
-                    pixel[3] = static_cast<uint8_t>(std::lround(255.0F * shape * alpha));
-                }
-            }
+            // Same liquid-glass face as the dock (calibrated tone map + rim).
+            ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
+                blurredCoverage, m_config.FrostAmount());
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
