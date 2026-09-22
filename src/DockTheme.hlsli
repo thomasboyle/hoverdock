@@ -12,6 +12,14 @@
 #define DOCK_INK_G 34
 #define DOCK_INK_B 36
 
+// Dock-face chrome (Start/Search/clock/tray glyphs) is baked LIGHT and remapped
+// in IconPS from wallpaper luma so it stays readable on dark glass. Quick /
+// Dock Settings flyout text uses the same AdaptiveChromeInk cut via
+// Renderer::SampleAdaptiveChromeInk.
+#define DOCK_CHROME_INK_R 245
+#define DOCK_CHROME_INK_G 245
+#define DOCK_CHROME_INK_B 247
+
 // Dock face tone map (linear lift), calibrated from solid swatches:
 //   backdrop #000000 -> face #3a3a3a
 //   backdrop #1f1f1f -> face #4e4e4e   (fit err < 0.5 LSB)

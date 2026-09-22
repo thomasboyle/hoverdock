@@ -461,9 +461,9 @@ void SetGlyphPixel(std::vector<uint8_t>& pixels, UINT extent, int x, int y) {
     }
     // Icon atlas buffers are RGB-ordered: byte0=R, byte1=G, byte2=B.
     const size_t offset = (static_cast<size_t>(y) * extent + static_cast<UINT>(x)) * 4U;
-    pixels[offset] = DOCK_INK_R;
-    pixels[offset + 1] = DOCK_INK_G;
-    pixels[offset + 2] = DOCK_INK_B;
+    pixels[offset] = DOCK_CHROME_INK_R;
+    pixels[offset + 1] = DOCK_CHROME_INK_G;
+    pixels[offset + 2] = DOCK_CHROME_INK_B;
     pixels[offset + 3] = 255;
 }
 
@@ -1375,7 +1375,8 @@ bool Renderer::Render(const DockRenderState& state) {
             break;
         }
         instance.iconMeta[1] = mode;
-        instance.iconMeta[2] = icon.dragged ? 1.0F : 0.0F;
+        // z: bit0 = dragged, bit1 = adaptive chrome ink (tonemap-scaled).
+        instance.iconMeta[2] = (icon.dragged ? 1.0F : 0.0F) + (icon.adaptiveInk ? 2.0F : 0.0F);
         const UINT safeIconCount = std::max(m_iconCount, 1U);
         instance.iconMeta[3] = static_cast<float>(std::min(icon.textureIndex, safeIconCount - 1));
     }
@@ -2158,6 +2159,34 @@ bool Renderer::EnsurePanelGlassResources(UINT width, UINT height)
     } catch (...) {
         ReleasePanelGlassResources();
         return false;
+    }
+}
+
+void Renderer::SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const noexcept {
+    // Mirror AdaptiveChromeInk: invalid backdrop -> light chrome; else hard cut
+    // on average wallpaper luma across three mid-row samples.
+    r = DOCK_CHROME_INK_R;
+    g = DOCK_CHROME_INK_G;
+    b = DOCK_CHROME_INK_B;
+    if (!m_backdropValid || m_backdropDibPixels == nullptr || m_width < 2 || m_height < 2) {
+        return;
+    }
+    auto sampleLuma = [this](float u, float v) -> float {
+        const UINT x = (std::min)(m_width - 1U, static_cast<UINT>(u * static_cast<float>(m_width - 1U)));
+        const UINT y = (std::min)(m_height - 1U, static_cast<UINT>(v * static_cast<float>(m_height - 1U)));
+        const uint8_t* p =
+            m_backdropDibPixels + (static_cast<size_t>(y) * m_width + x) * 4U;
+        // DIB is BGRA; Rec.709 luma matches the shader's rgb dot.
+        return (0.0722F * static_cast<float>(p[0]) + 0.7152F * static_cast<float>(p[1]) +
+                   0.2126F * static_cast<float>(p[2])) /
+            255.0F;
+    };
+    const float wallpaperLuma =
+        (sampleLuma(0.20F, 0.50F) + sampleLuma(0.50F, 0.50F) + sampleLuma(0.80F, 0.50F)) / 3.0F;
+    if (wallpaperLuma >= 0.50F) {
+        r = DOCK_INK_R;
+        g = DOCK_INK_G;
+        b = DOCK_INK_B;
     }
 }
 

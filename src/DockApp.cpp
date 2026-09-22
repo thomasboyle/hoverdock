@@ -368,6 +368,29 @@ HFONT CreateFlyoutFont(int pixelHeight, int weight) {
         L"Segoe UI");
 }
 
+// Active flyout chrome ink (mirrors AdaptiveChromeInk). Set once per menu paint.
+uint8_t g_flyoutInkR = DOCK_INK_R;
+uint8_t g_flyoutInkG = DOCK_INK_G;
+uint8_t g_flyoutInkB = DOCK_INK_B;
+
+void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept {
+    g_flyoutInkR = r;
+    g_flyoutInkG = g;
+    g_flyoutInkB = b;
+}
+
+void RemapPremulInkColor(std::vector<uint8_t>& pixels, uint8_t r, uint8_t g, uint8_t b) {
+    for (size_t index = 0; index + 3 < pixels.size(); index += 4) {
+        const unsigned alpha = pixels[index + 3];
+        if (alpha == 0U) {
+            continue;
+        }
+        pixels[index] = static_cast<uint8_t>((b * alpha + 127U) / 255U);
+        pixels[index + 1] = static_cast<uint8_t>((g * alpha + 127U) / 255U);
+        pixels[index + 2] = static_cast<uint8_t>((r * alpha + 127U) / 255U);
+    }
+}
+
 void CoverageToPremulInk(uint8_t* pixels, size_t byteCount, uint8_t gray) {
     // Popup DIBs are BGR-ordered: byte0=B, byte1=G, byte2=R.
     for (size_t index = 0; index + 3 < byteCount; index += 4) {
@@ -378,9 +401,9 @@ void CoverageToPremulInk(uint8_t* pixels, size_t byteCount, uint8_t gray) {
             8U;
         // The gray level becomes opacity so text hierarchy is preserved.
         const unsigned alpha = (coverage * gray + 127U) / 255U;
-        pixels[index] = static_cast<uint8_t>((DOCK_INK_B * alpha + 127U) / 255U);
-        pixels[index + 1] = static_cast<uint8_t>((DOCK_INK_G * alpha + 127U) / 255U);
-        pixels[index + 2] = static_cast<uint8_t>((DOCK_INK_R * alpha + 127U) / 255U);
+        pixels[index] = static_cast<uint8_t>((g_flyoutInkB * alpha + 127U) / 255U);
+        pixels[index + 1] = static_cast<uint8_t>((g_flyoutInkG * alpha + 127U) / 255U);
+        pixels[index + 2] = static_cast<uint8_t>((g_flyoutInkR * alpha + 127U) / 255U);
         pixels[index + 3] = static_cast<uint8_t>(alpha);
     }
 }
@@ -1302,8 +1325,8 @@ int DockApp::Run() {
         std::string current = Updater::CurrentVersion();
         std::wstring wide(current.begin(), current.end());
         m_updateStatus = m_config.CheckForUpdates()
-            ? L"Version " + wide + L" — checking for updates..."
-            : L"Version " + wide + L" — automatic updates off.";
+            ? L"Version " + wide + L" â€” checking for updates..."
+            : L"Version " + wide + L" â€” automatic updates off.";
     }
     // Clear a fulfilled install record, or reclaim one retry when the last
     // launched install never took effect on this copy.
@@ -2123,28 +2146,11 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 QpcSeconds() >= m_suppressBackdropUntil && CaptureLiveBackdrop()) {
                 QueueRenderFrame(false);
             }
-            // Menu plates are one-shot GlassPS bakes. While any menu is open,
-            // rebake on a slower cadence so the desktop behind them stays live
-            // without full-rate GPU readbacks on every 8 ms dock tick.
-            if (IsOverflowOpen() || IsDockSettingsOpen() || IsContextMenuOpen()) {
-                constexpr ULONGLONG kPopupGlassRefreshMs = 100ULL;
-                const ULONGLONG now = GetTickCount64();
-                if (now - m_lastPopupGlassRefreshMs >= kPopupGlassRefreshMs) {
-                    m_lastPopupGlassRefreshMs = now;
-                    if (IsDockSettingsOpen()) {
-                        InvalidateSettingsGlass();
-                        QueueSettingsPaint();
-                    }
-                    if (IsOverflowOpen()) {
-                        InvalidateOverflowGlass();
-                        QueueOverflowPaint();
-                    }
-                    if (IsContextMenuOpen()) {
-                        InvalidateContextGlass();
-                        QueueContextPaint();
-                    }
-                }
-            }
+            // Do NOT rebake layered menu glass on the 8 ms dock timer.
+            // BakeGlassPanel waits on a GPU fence + readback on this UI
+            // thread; doing that every tick makes the cursor hitch while
+            // Quick Settings is open. Menus keep their GlassPS plate from
+            // open / frost / explicit repaint; the dock itself stays live.
         } else if (wParam == kTaskbarMonitorTimerId) {
             // Adaptive cadence: poll fast while suppression is actively fighting
             // Explorer, then back off 10x when steady. Suppression latency in the
@@ -2588,10 +2594,12 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         if (IsLayoutOnlyTarget(m_displayApps[index].app.target)) {
             data.bounds = {left, top, left + dividerSlotWidth, top + iconSize};
             data.kind = DockIconKind::Divider;
+            data.adaptiveInk = true;
             left += dividerSlotWidth + gap;
         } else {
             data.bounds = {left, top, left + iconSize, top + iconSlotHeight};
             data.running = m_displayApps[index].runningWindow != nullptr;
+            data.adaptiveInk = IsSpecialDockTarget(m_displayApps[index].app.target);
             left += iconSize + gap;
         }
         m_iconRenderData.push_back(data);
@@ -2599,6 +2607,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
 
     DockIconRenderData trayDivider;
     trayDivider.kind = DockIconKind::TrayDivider;
+    trayDivider.adaptiveInk = true;
     trayDivider.bounds = {left, top, left + trayDividerWidth, top + iconSize};
     m_iconRenderData.push_back(trayDivider);
     left += trayDividerWidth + trayLeadGap;
@@ -2611,6 +2620,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         DockIconRenderData data;
         data.kind = DockIconKind::Tray;
         data.traySlot = slot;
+        data.adaptiveInk = true;
         data.bounds = {left, trayTop, left + trayGlyph, trayTop + trayGlyph};
         m_iconRenderData.push_back(data);
         left += trayGlyph + trayGap;
@@ -2620,6 +2630,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     DockIconRenderData clock;
     clock.kind = DockIconKind::Clock;
     clock.traySlot = TraySlot::Clock;
+    clock.adaptiveInk = true;
     clock.bounds = {left, clockTop, left + clockWidth, clockTop + clockHeight};
     m_iconRenderData.push_back(clock);
 
@@ -3462,7 +3473,9 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notify
     std::wstring key = std::to_wstring(gearExtent) + L"|" + std::to_wstring(tileExtent) + L"|" +
         std::to_wstring(notifyExtent) + L"|" + std::to_wstring(static_cast<int>(status.network)) +
         L"|" + std::to_wstring(status.wifiBars) + L"|" + (status.volumeMuted ? L"1" : L"0") + L"|" +
-        std::to_wstring(static_cast<int>(std::lround(status.volumeLevel * 100.0F)));
+        std::to_wstring(static_cast<int>(std::lround(status.volumeLevel * 100.0F))) + L"|" +
+        std::to_wstring(g_flyoutInkR) + L"|" + std::to_wstring(g_flyoutInkG) + L"|" +
+        std::to_wstring(g_flyoutInkB);
     if (key == m_overflowGlyphKey) {
         return;
     }
@@ -3477,6 +3490,15 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notify
     }
     // E945 is the Segoe MDL2 Assets lightning bolt: the Boost mark.
     m_overflowGlyphBoost = m_tray.RasterizeSymbol(L'\uE945', tileExtent);
+
+    // Tray rasterizer bakes DOCK_INK; remap to the live adaptive chrome ink so
+    // Quick Settings glyphs match Start/Search on the dock.
+    RemapPremulInkColor(m_overflowGlyphGear, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
+    RemapPremulInkColor(m_overflowGlyphWifi, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
+    RemapPremulInkColor(m_overflowGlyphSound, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
+    RemapPremulInkColor(m_overflowGlyphBrightness, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
+    RemapPremulInkColor(m_overflowGlyphBell, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
+    RemapPremulInkColor(m_overflowGlyphBoost, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
 }
 
 void DockApp::FinishOverflowHide() noexcept {
@@ -3723,7 +3745,7 @@ void DockApp::ReconcileLastUpdate() {
         m_config.SetLastInstalledVersion(record, 0);
         static_cast<void>(m_config.Save());
         m_updateStatus = L"Update v" + record + L" didn't take effect (still v" + wideCurrent +
-            L") — retrying...";
+            L") â€” retrying...";
         Log(L"Last update to v" + record + L" did not take effect; retry " +
             std::to_wstring(attempts + 1));
         return;
@@ -4121,6 +4143,9 @@ void DockApp::RebuildSettingsPopup() {
 
 UINT DockApp::PackPopupGlassFxFlags() const noexcept
 {
+    // Same packing as the dock frame (frost<<16 | halo<<8 | fx), plus PANEL so
+    // GlassPS fills the plate without the dock shadow margin. Halo slots stay 0
+    // (no icons on the menu plate).
     const float frostAmount = m_config.FrostAmount();
     UINT glassFx = DOCK_FX_PANEL | DOCK_FX_TINT;
     if (m_config.RimLight()) {
@@ -4144,9 +4169,10 @@ UINT DockApp::PackPopupGlassFxFlags() const noexcept
     if (m_config.DepthShade()) {
         glassFx |= DOCK_FX_THICKNESS;
     }
+    constexpr UINT haloSlots = 0u;
     const UINT frostByte =
         static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0f, 1.0f) * 255.0f));
-    return (frostByte << 16) | glassFx;
+    return (frostByte << 16) | (haloSlots << 8) | glassFx;
 }
 
 bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* pixels,
@@ -4185,8 +4211,6 @@ void DockApp::ApplyFrostSliderAt(LONG clientX) {
     }
     m_config.SetFrostAmount(amount);
     if (m_frostSliderDragging) {
-        // Drag preview: menus share the dock GlassPS bake, so invalidate their
-        // cached plates and coalesce paints with the dock frame (~30 Hz).
         const ULONGLONG now = GetTickCount64();
         if (now - m_frostSliderLastRenderMs >= 33ULL) {
             m_frostSliderLastRenderMs = now;
@@ -4201,7 +4225,7 @@ void DockApp::ApplyFrostSliderAt(LONG clientX) {
         }
         return;
     }
-    // Slider released: rebake popup glass once at the committed frost amount.
+    // Slider released: one full GPU GlassPS bake at the committed frost amount.
     InvalidateSettingsGlass();
     InvalidateOverflowGlass();
     InvalidateContextGlass();
@@ -4236,7 +4260,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         if (!enabled) {
             std::string current = Updater::CurrentVersion();
             std::wstring wide(current.begin(), current.end());
-            SetUpdateStatus(L"Version " + wide + L" — automatic updates off.");
+            SetUpdateStatus(L"Version " + wide + L" â€” automatic updates off.");
         } else {
             PaintSettingsPopup();
             if (!m_updateInFlight.load()) {
@@ -4612,7 +4636,7 @@ void DockApp::PaintSettingsPopup() {
         const float trackCxL = static_cast<float>(trackLeft) + trackRadius;
         const float trackCxR = static_cast<float>(right) - trackRadius;
         const float trackCy = static_cast<float>(trackTop) + trackRadius;
-        const float wash = enabled ? (hovered ? 0.62F : 0.52F) : (hovered ? 0.22F : 0.16F);
+        const float wash = enabled ? (hovered ? 0.96F : 0.90F) : (hovered ? 0.55F : 0.48F);
         if (enabled) {
             // On = amber accent, matching the dock's running-indicator dot.
             FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
@@ -4632,17 +4656,23 @@ void DockApp::PaintSettingsPopup() {
         const float trackCxL = static_cast<float>(left) + trackRadius;
         const float trackCxR = static_cast<float>(right) - trackRadius;
         FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
-            hovered ? 0.22F : 0.16F, 255, 255, 255);
+            hovered ? 0.55F : 0.48F, 255, 255, 255);
         const float filled = std::clamp(amount, 0.0F, 1.0F);
         const float fillRight = trackCxL + (trackCxR - trackCxL) * filled;
         if (fillRight > trackCxL + 0.5F) {
             FillPillColorPremul(pixels, width, height, trackCxL, fillRight, trackCy, trackRadius,
-                hovered ? 0.62F : 0.52F, kAmberB, kAmberG, kAmberR);
+                hovered ? 0.96F : 0.90F, kAmberB, kAmberG, kAmberR);
         }
         const float knobRadius = std::max(7.0F, 8.0F * scale);
         const float knobCx = trackCxL + (trackCxR - trackCxL) * filled;
         FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
     };
+
+    uint8_t inkR = DOCK_INK_R;
+    uint8_t inkG = DOCK_INK_G;
+    uint8_t inkB = DOCK_INK_B;
+    m_renderer.SampleAdaptiveChromeInk(inkR, inkG, inkB);
+    SetFlyoutChromeInk(inkR, inkG, inkB);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
@@ -4654,7 +4684,7 @@ void DockApp::PaintSettingsPopup() {
         FillCirclePremul(pixels, width, height,
             static_cast<float>(closeBounds.left + closeExtent / 2L),
             static_cast<float>(closeBounds.top + closeExtent / 2L),
-            static_cast<float>(closeExtent) * 0.62F, 0.18F);
+            static_cast<float>(closeExtent) * 0.62F, 0.55F);
     }
     DrawFlyoutText(pixels, width, height, closeBounds, titleFont, L"\u00D7",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, 250);
@@ -4681,9 +4711,9 @@ void DockApp::PaintSettingsPopup() {
             RECT subBounds{sliderLeft, labelBounds.bottom, sliderRight,
                 labelBounds.bottom + subHeight};
             DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
-                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
-                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
             const LONG sliderY = y + rowHeight - std::max(14L, std::lround(16.0F * scale));
             m_frostSliderTrack = {sliderLeft, sliderY - 10L, sliderRight, sliderY + 10L};
             drawSlider(sliderY, sliderLeft, sliderRight, row.amount, hoveredKind(row.kind) ||
@@ -4696,9 +4726,9 @@ void DockApp::PaintSettingsPopup() {
             RECT subBounds{labelBounds.left, labelBounds.bottom, textRight,
                 labelBounds.bottom + subHeight};
             DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
-                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
-                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
             drawSwitch(y + rowHeight / 2L, panelWidth - padding - 4L, row.enabled,
                 hoveredKind(row.kind));
             pushHit(row.kind, rowBounds);
@@ -4709,7 +4739,7 @@ void DockApp::PaintSettingsPopup() {
     const bool checking = m_updateInFlight.load() || m_updateInstalling.load();
     RECT buttonBounds{padding, y, panelWidth - padding, y + buttonHeight};
     FillRectPremul(pixels, width, height, buttonBounds, hoveredKind(SettingsHitKind::CheckNow) &&
-            !checking ? 0.28F : 0.16F);
+            !checking ? 0.88F : 0.72F);
     DrawFlyoutText(pixels, width, height, buttonBounds, labelFont,
         checking ? L"Checking..." : L"Check for updates now",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 170 : 245);
@@ -4722,7 +4752,7 @@ void DockApp::PaintSettingsPopup() {
     std::wstring wideVersion(current.begin(), current.end());
     RECT versionBounds{padding, y, panelWidth - padding, y + subHeight};
     DrawFlyoutText(pixels, width, height, versionBounds, statusFont,
-        L"Hoverdock v" + wideVersion, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
+        L"Hoverdock v" + wideVersion, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
     RECT statusBounds{padding, versionBounds.bottom + 2, panelWidth - padding,
         y + statusHeight};
     DrawFlyoutText(pixels, width, height, statusBounds, statusFont, m_updateStatus,
@@ -5024,7 +5054,7 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         const float cy = 0.5F * static_cast<float>(hit.bounds.top + hit.bounds.bottom);
         const float radius = 0.36F * static_cast<float>(
             std::max(1L, hit.bounds.right - hit.bounds.left));
-        FillCirclePremul(pixels, width, height, cx, cy, radius, 0.18F);
+        FillCirclePremul(pixels, width, height, cx, cy, radius, 0.85F);
         break;
     }
     case TrayFlyoutHitKind::Wifi:
@@ -5040,7 +5070,7 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         const float radius = circle * 0.5F;
         const float cx = 0.5F * static_cast<float>(hit.bounds.left + hit.bounds.right);
         const float cy = static_cast<float>(hit.bounds.top) + radius;
-        FillCircleColorPremul(pixels, width, height, cx, cy, radius, 0.20F, kAmberB, kAmberG,
+        FillCircleColorPremul(pixels, width, height, cx, cy, radius, 0.92F, kAmberB, kAmberG,
             kAmberR);
         break;
     }
@@ -5321,7 +5351,7 @@ void DockApp::PaintOverflowPopup() {
         FillCirclePremul(pixels, width, height,
             static_cast<float>(gearBounds.left + gearSize / 2L),
             static_cast<float>(gearBounds.top + gearSize / 2L),
-            static_cast<float>(gearSize) * 0.72F, 0.18F);
+            static_cast<float>(gearSize) * 0.72F, 0.55F);
     }
     const UINT gearExtent =
         static_cast<UINT>(std::max(1L, static_cast<LONG>(std::lround(static_cast<float>(gearSize) * 0.85F))));
@@ -5330,6 +5360,11 @@ void DockApp::PaintOverflowPopup() {
     const UINT notifyGlyph = static_cast<UINT>(std::max(18L, std::lround(19.0F * scale)));
     // Glyphs don't depend on hover; rasterize once per status/extent combination so
     // hover transitions only pay for compositing, not font rasterization.
+    uint8_t inkR = DOCK_INK_R;
+    uint8_t inkG = DOCK_INK_G;
+    uint8_t inkB = DOCK_INK_B;
+    m_renderer.SampleAdaptiveChromeInk(inkR, inkG, inkB);
+    SetFlyoutChromeInk(inkR, inkG, inkB);
     EnsureOverflowGlyphs(gearExtent, glyphExtent, notifyGlyph);
     if (!m_overflowGlyphGear.empty()) {
         CompositePremul(pixels, width, height, SaturatedInt(gearBounds.left),
@@ -5392,16 +5427,16 @@ void DockApp::PaintOverflowPopup() {
             // Dim base disc plus amber fill rising with progress, mirroring the
             // toggle's amber-on wash so volume/brightness read as levels.
             FillCirclePremul(pixels, width, height, cx, cy, tileRadius,
-                isHovered ? 0.28F : 0.16F);
+                isHovered ? 0.90F : 0.82F);
             FillCircleLevelColorPremul(pixels, width, height, cx, cy, tileRadius, level,
-                isHovered ? 0.62F : 0.52F, kAmberB, kAmberG, kAmberR);
+                isHovered ? 0.97F : 0.92F, kAmberB, kAmberG, kAmberR);
         } else if (isFullAmber) {
             // Full amber disc at the toggle's on-strength (0.52, 0.62 hovered).
             FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius,
-                isHovered ? 0.62F : 0.52F, kAmberB, kAmberG, kAmberR);
+                isHovered ? 0.97F : 0.92F, kAmberB, kAmberG, kAmberR);
         } else {
             FillCirclePremul(pixels, width, height, cx, cy, tileRadius,
-                isHovered ? 0.28F : 0.16F);
+                isHovered ? 0.90F : 0.82F);
         }
         // Glyph bitmaps are cached by EnsureOverflowGlyphs above; hover repaints only composite.
         const std::vector<uint8_t>* glyph = &m_overflowGlyphBrightness;
@@ -5420,10 +5455,10 @@ void DockApp::PaintOverflowPopup() {
         }
         RECT labelBounds{left, y + circle + 6, left + tileWidth, y + circle + 6 + labelHeight};
         DrawFlyoutText(pixels, width, height, labelBounds, labelFont, tiles[index].label,
-            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
+            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
         RECT statusBounds{left, labelBounds.bottom, left + tileWidth, labelBounds.bottom + statusHeight};
         DrawFlyoutText(pixels, width, height, statusBounds, statusFont, tiles[index].status,
-            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
+            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
         pushHit(tiles[index].kind, tileBounds);
     }
     y += tileBlock + dividerGap;
@@ -5432,7 +5467,7 @@ void DockApp::PaintOverflowPopup() {
 
     RECT notifyHeader{padding, y, panelWidth / 2L, y + sectionHeader};
     DrawFlyoutText(pixels, width, height, notifyHeader, sectionFont, L"Notifications",
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE, 248);
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
     RECT clearBounds{panelWidth / 2L, y, panelWidth - padding, y + sectionHeader};
     DrawFlyoutText(pixels, width, height, clearBounds, statusFont, L"Clear all",
         DT_RIGHT | DT_VCENTER | DT_SINGLELINE, hoveredKind(TrayFlyoutHitKind::ClearAll) ? 255 : 225);
@@ -5455,7 +5490,7 @@ void DockApp::PaintOverflowPopup() {
     DrawFlyoutText(pixels, width, height, notifyTitle, labelFont, L"Notification Center",
         DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
     DrawFlyoutText(pixels, width, height, notifyStatus, statusFont, L"Calendar, toasts, and alerts",
-        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
+        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
     pushHit(TrayFlyoutHitKind::NotificationCenter, notifyRow);
     y += notificationRow + dividerGap;
     FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
@@ -5463,12 +5498,12 @@ void DockApp::PaintOverflowPopup() {
 
     RECT otherHeader{padding, y, panelWidth - padding, y + sectionHeader};
     DrawFlyoutText(pixels, width, height, otherHeader, sectionFont, L"Other Icons",
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE, 248);
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
     y += sectionHeader;
     if (otherCount == 0) {
         RECT empty{padding, y, panelWidth - padding, y + otherIconHeight};
         DrawFlyoutText(pixels, width, height, empty, statusFont, L"No other icons",
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE, 210);
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE, 240);
     } else {
         const LONG cellWidth = (panelWidth - padding * 2L) / otherColumns;
         for (size_t index = 0; index < otherCount; ++index) {
@@ -5523,11 +5558,11 @@ void DockApp::PaintOverflowPopup() {
                 top + otherIconHeight - 4};
             DrawFlyoutText(pixels, width, height, nameBounds, labelFont,
                 NotifyIconTitle(m_overflowIcons[index]),
-                DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
+                DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             const std::wstring status = NotifyIconStatus(m_overflowIcons[index]);
             if (!status.empty()) {
                 DrawFlyoutText(pixels, width, height, statusBounds, statusFont, status,
-                    DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
+                    DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
             }
             pushHit(TrayFlyoutHitKind::NotifyIcon, cell, static_cast<int>(index));
         }
@@ -5820,7 +5855,7 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     if (frostAmount > 0.001f) {
         glassFx |= DOCK_FX_BLUR;
     }
-    // Tint is no longer a settings toggle — the calibrated face tone map is
+    // Tint is no longer a settings toggle â€” the calibrated face tone map is
     // always applied; keep the FX bit set so older shader paths stay armed.
     glassFx |= DOCK_FX_TINT;
     if (m_config.Specular()) {
@@ -7715,7 +7750,7 @@ void DockApp::ApplyPinUnpinLayoutChange() {
     ProfileScope scope("ApplyPinUnpinLayoutChange");
     // CRITICAL: do NOT call RebuildDisplayApps/BuildDisplayAppsSnapshot on the UI
     // thread. After a pin change, pin profiles are stale, so MatchesAnyPin misses and
-    // the ResolveLauncherProcessPath fallback walks every window × pin via COM/.lnk —
+    // the ResolveLauncherProcessPath fallback walks every window Ã— pin via COM/.lnk â€”
     // that stalls WH_MOUSE_LL (same thread) and freezes the system cursor.
     // Optimistically splice m_displayApps from the already-updated pin list instead.
     const std::wstring pressedTarget = m_pressedTarget;
@@ -8709,7 +8744,7 @@ void DockApp::EnsureMouseHook() noexcept {
 UINT DockApp::DesiredCursorWatchIntervalMs() const noexcept {
     // Fast poll while interacting, when the LL hook is missing, or when an elevated
     // foreground window may UIPI-block WH_MOUSE_LL. When Hidden with a healthy hook,
-    // return 0: no timer — hot-zone entry arrives via the hook; FG changes arrive via
+    // return 0: no timer â€” hot-zone entry arrives via the hook; FG changes arrive via
     // WinEvent. Visible + stationary pointer uses a calmer poll (hover still works;
     // leave/hide remains hook-assisted), unless the context menu is open where a
     // prompt leave-dismiss needs the fast cadence. Does not change kBackdropIntervalMs.

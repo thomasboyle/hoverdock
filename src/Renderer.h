@@ -35,6 +35,7 @@ struct DockIconRenderData {
     DockIconKind kind = DockIconKind::App;
     TraySlot traySlot = TraySlot::Overflow;
     UINT textureIndex = 0;
+    bool adaptiveInk = false;
 };
 
 struct DockRenderState {
@@ -86,6 +87,9 @@ public:
     [[nodiscard]] bool BakeGlassPanel(const RECT& screenRect, UINT width, UINT height,
         UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB,
         HWND excludeC, std::vector<uint8_t>& outBgra);
+    // Same wallpaper-luma cut as AdaptiveChromeInk in Shaders.hlsl so Quick /
+    // Dock Settings text matches Start/Search/clock chrome on the dock.
+    void SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const noexcept;
     void Flush();
 
     [[nodiscard]] HANDLE FrameLatencyWaitableObject() const noexcept;

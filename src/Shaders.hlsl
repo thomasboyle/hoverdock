@@ -567,9 +567,37 @@ float4 BlurHPS2(VertexOutput input) : SV_Target
     return float4(h, 1.0);
 }
 
+// Chrome ink on the same face tonemap domain as GlassPS:
+// face = lerp(OVER_BLACK, OVER_WHITE, backdropLuma); ink inverts that so glyphs
+// stay contrasted on both dark and light plates.
+float3 AdaptiveChromeInk(float2 outputSize)
+{
+    // Hard cut on wallpaper luma (ignore frosted plate — it sits mid-grey and
+    // wrongly pulled ink dark on black desks). Dark desk -> light chrome.
+    const float3 darkInk = float3(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B) / 255.0;
+    const float3 lightInk = float3(0.96, 0.96, 0.97);
+    if (scene1.w < 0.5)
+    {
+        return lightInk;
+    }
+    // Average a few samples across the dock window so one bright pixel cannot
+    // tip the whole chrome set dark.
+    float acc = 0.0;
+    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.20, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
+    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.50, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
+    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.80, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
+    const float wallpaperLuma = saturate(acc / 3.0);
+    return wallpaperLuma < 0.50 ? lightInk : darkInk;
+}
+
 float4 IconPS(VertexOutput input) : SV_Target
 {
     const IconInstance icon = iconInstances[input.instanceIndex];
+    const uint metaZ = (uint)(icon.iconMeta.z + 0.5);
+    const bool dragged = (metaZ & 1u) != 0u;
+    const bool adaptiveInk = (metaZ & 2u) != 0u;
+    const float2 outputSize = max(scene0.xy, float2(1.0, 1.0));
+
     if (icon.iconMeta.y > 1.5 && icon.iconMeta.y < 3.5)
     {
         const float2 size = max(icon.iconRect.zw, 1.0);
@@ -578,7 +606,9 @@ float4 IconPS(VertexOutput input) : SV_Target
         const float cap = 2.0;
         const float lineAlpha = smoothstep(halfThickness + 0.75, halfThickness, offset.x) *
             smoothstep(size.y * 0.5, max(size.y * 0.5 - cap, 0.0), offset.y) * 0.80;
-        return float4(float3(0.32, 0.32, 0.34) * lineAlpha, lineAlpha);
+        const float3 ink = adaptiveInk ? AdaptiveChromeInk(outputSize)
+                                       : float3(0.32, 0.32, 0.34);
+        return float4(ink * lineAlpha, lineAlpha);
     }
 
     if (icon.iconMeta.y > 3.5)
@@ -590,7 +620,16 @@ float4 IconPS(VertexOutput input) : SV_Target
             ? iconTexture.Load(int4(texel, (int)input.textureIndex, 0))
             : 0.0;
         const float clockBrightness = icon.iconMeta.y > 4.5 ? 0.5 : 1.0;
-        return float4(sampledClock.rgb * clockBrightness, sampledClock.a * clockBrightness);
+        float3 rgb = sampledClock.rgb;
+        float a = sampledClock.a;
+        if (adaptiveInk)
+        {
+            const float coverage = max(a, max(rgb.r, max(rgb.g, rgb.b)));
+            const float3 ink = AdaptiveChromeInk(outputSize);
+            rgb = ink * coverage;
+            a = coverage;
+        }
+        return float4(rgb * clockBrightness, a * clockBrightness);
     }
 
     const float contentHeightRatio = saturate(icon.iconRect.z / max(icon.iconRect.w, 1.0));
@@ -600,9 +639,17 @@ float4 IconPS(VertexOutput input) : SV_Target
         sampled = iconTexture.Sample(linearClamp, float3(saturate(iconUv), input.textureIndex));
     }
 
-    const float iconBrightness = icon.iconMeta.y > 0.5 && icon.iconMeta.z < 0.5 ? 0.5 : 1.0;
+    const float iconBrightness = icon.iconMeta.y > 0.5 && !dragged ? 0.5 : 1.0;
     float3 color = sampled.rgb * iconBrightness;
     float alpha = sampled.a;
+
+    if (adaptiveInk)
+    {
+        const float coverage = max(alpha, max(sampled.r, max(sampled.g, sampled.b)));
+        const float3 ink = AdaptiveChromeInk(outputSize);
+        color = ink * coverage * iconBrightness;
+        alpha = coverage * iconBrightness;
+    }
 
     if (icon.iconMeta.x > 0.5 && contentHeightRatio < 0.98 && input.uv.y > contentHeightRatio) {
         const float stripHeightPx = icon.iconRect.w * (1.0 - contentHeightRatio);
