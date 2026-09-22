@@ -197,8 +197,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Pill geometry: the window carries a shadow margin ring (shared
     // DOCK_SHADOW_MARGIN_PT); the glass sits inset, the shader draws the
     // drop shade into the margin outside the mask.
-    const float marginDev = DOCK_SHADOW_MARGIN_PT * dpi;
-    const float2 halfSize = outputSize * 0.5 - marginDev - 1.5 * dpi;
+    // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
+    const float panelOn = fmod(floor((scene1.x + 0.5) / 16777216.0), 2.0);
+    const float marginDev = (1.0 - panelOn) * DOCK_SHADOW_MARGIN_PT * dpi;
+    const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli). Squircle n=4 gives
     // Apple-like continuous curvature (slightly fuller corners than the true
     // circular arcs of GDI RoundRect used for the input region; the few-px
@@ -461,8 +463,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
 void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     out float2 uvR, out float2 uvG, out float2 uvB, out float blurPx)
 {
-    const float marginDev = DOCK_SHADOW_MARGIN_PT * dpi;
-    const float2 halfSize = outputSize * 0.5 - marginDev - 1.5 * dpi;
+    // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
+    const float panelOn = fmod(floor((scene1.x + 0.5) / 16777216.0), 2.0);
+    const float marginDev = (1.0 - panelOn) * DOCK_SHADOW_MARGIN_PT * dpi;
+    const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
     const float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
     const float2 gradient = float2(ddx(distance), ddy(distance));

@@ -4096,6 +4096,63 @@ void DockApp::RebuildSettingsPopup() {
     PaintSettingsPopup();
 }
 
+
+UINT DockApp::PackPopupGlassFxFlags() const noexcept
+{
+    const float frostAmount = m_config.FrostAmount();
+    UINT glassFx = DOCK_FX_PANEL | DOCK_FX_TINT;
+    if (m_config.RimLight()) {
+        glassFx |= DOCK_FX_RIM;
+    }
+    if (m_config.Lensing()) {
+        glassFx |= DOCK_FX_LENS;
+    }
+    if (m_config.Dispersion()) {
+        glassFx |= DOCK_FX_DISPERSION;
+    }
+    if (frostAmount > 0.001f) {
+        glassFx |= DOCK_FX_BLUR;
+    }
+    if (m_config.Specular()) {
+        glassFx |= DOCK_FX_SPECULAR;
+    }
+    if (m_config.DropShadow()) {
+        glassFx |= DOCK_FX_SHADOW;
+    }
+    if (m_config.DepthShade()) {
+        glassFx |= DOCK_FX_THICKNESS;
+    }
+    const UINT frostByte =
+        static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0f, 1.0f) * 255.0f));
+    return (frostByte << 16) | glassFx;
+}
+
+bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* pixels,
+    size_t byteCount)
+{
+    if (!m_rendererInitialized || pixels == nullptr || width <= 0 || height <= 0) {
+        return false;
+    }
+    if (byteCount < static_cast<size_t>(width) * static_cast<size_t>(height) * 4U) {
+        return false;
+    }
+    const RECT screenRect{origin.x, origin.y, origin.x + width, origin.y + height};
+    const float frostAmount = m_config.FrostAmount();
+    const float glassAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
+    const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
+    std::vector<uint8_t> glass;
+    if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(width), static_cast<UINT>(height),
+            PackPopupGlassFxFlags(), glassAlpha, dpiScale, m_settingsWindow, m_overflowWindow,
+            m_contextWindow, glass)) {
+        return false;
+    }
+    if (glass.size() != static_cast<size_t>(width) * static_cast<size_t>(height) * 4U) {
+        return false;
+    }
+    std::memcpy(pixels, glass.data(), glass.size());
+    return true;
+}
+
 void DockApp::ApplyFrostSliderAt(LONG clientX) {
     const LONG left = m_frostSliderTrack.left;
     const LONG right = m_frostSliderTrack.right;
@@ -4106,13 +4163,19 @@ void DockApp::ApplyFrostSliderAt(LONG clientX) {
     }
     m_config.SetFrostAmount(amount);
     if (m_frostSliderDragging) {
-        // Drag preview: coalesce chrome repaint over the cached glass plate and
-        // throttle dock frames. A full glass rebake here used to stall/crash.
-        QueueSettingsPaint();
+        // Drag preview: menus share the dock GlassPS bake, so invalidate their
+        // cached plates and coalesce paints with the dock frame (~30 Hz).
         const ULONGLONG now = GetTickCount64();
         if (now - m_frostSliderLastRenderMs >= 33ULL) {
             m_frostSliderLastRenderMs = now;
+            InvalidateSettingsGlass();
+            InvalidateOverflowGlass();
+            InvalidateContextGlass();
+            QueueSettingsPaint();
+            QueueOverflowPaint();
             QueueRenderFrame();
+        } else {
+            QueueSettingsPaint();
         }
         return;
     }
@@ -4402,6 +4465,9 @@ void DockApp::PaintSettingsPopup() {
         std::memcpy(pixels, m_settingsGlass.data(), m_settingsGlass.size());
     } else {
         std::memset(pixels, 0, pixelCount * 4U);
+        const bool gpuGlass = TryBakePopupGlass(origin, m_settingsSize.cx, m_settingsSize.cy, pixels,
+            pixelCount * 4U);
+        if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {
             SelectObject(memory, previousBitmap);
@@ -4412,8 +4478,7 @@ void DockApp::PaintSettingsPopup() {
         BitBlt(memory, 0, 0, SaturatedInt(m_settingsSize.cx), SaturatedInt(m_settingsSize.cy),
             screen, SaturatedInt(origin.x), SaturatedInt(origin.y), SRCCOPY);
         ReleaseDC(nullptr, screen);
-        // Same frosted recipe as Quick Settings: stacked box blurs approximate
-        // the dock shader's wide kernel at the same texel scale.
+        // CPU fallback when GlassPS bake is unavailable.
         const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
         const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         BoxBlurRgb(pixels, SaturatedInt(m_settingsSize.cx), SaturatedInt(m_settingsSize.cy),
@@ -4487,6 +4552,7 @@ void DockApp::PaintSettingsPopup() {
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
         }
+        } // !gpuGlass
 
         m_settingsGlass.assign(pixels, pixels + pixelCount * 4U);
         m_settingsGlassSize = m_settingsSize;
@@ -5087,6 +5153,9 @@ void DockApp::PaintOverflowPopup() {
         std::memcpy(pixels, m_overflowGlass.data(), m_overflowGlass.size());
     } else {
         std::memset(pixels, 0, pixelCount * 4U);
+        const bool gpuGlass = TryBakePopupGlass(origin, m_overflowSize.cx, m_overflowSize.cy, pixels,
+            pixelCount * 4U);
+        if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {
             SelectObject(memory, previousBitmap);
@@ -5097,9 +5166,7 @@ void DockApp::PaintOverflowPopup() {
         BitBlt(memory, 0, 0, SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy), screen,
             SaturatedInt(origin.x), SaturatedInt(origin.y), SRCCOPY);
         ReleaseDC(nullptr, screen);
-        // Frosted backdrop: stacked box blurs approximate the dock shader's wide
-        // 17-tap kernel at the same texel scale; sliding-window passes stay
-        // O(pixels) regardless of radius.
+        // CPU fallback when GlassPS bake is unavailable.
         const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
         const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         BoxBlurRgb(pixels, SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy),
@@ -5189,6 +5256,7 @@ void DockApp::PaintOverflowPopup() {
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
         }
+        } // !gpuGlass
 
         m_overflowGlass.assign(pixels, pixels + pixelCount * 4U);
         m_overflowGlassSize = m_overflowSize;
@@ -6321,6 +6389,9 @@ void DockApp::PaintContextMenu() {
         std::memcpy(pixels, m_contextGlass.data(), m_contextGlass.size());
     } else {
         std::memset(pixels, 0, pixelCount * 4U);
+        const bool gpuGlass = TryBakePopupGlass(origin, m_contextSize.cx, m_contextSize.cy, pixels,
+            pixelCount * 4U);
+        if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {
             SelectObject(memory, previousBitmap);
@@ -6398,6 +6469,7 @@ void DockApp::PaintContextMenu() {
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
         }
+        } // !gpuGlass
         m_contextGlass.assign(pixels, pixels + pixelCount * 4U);
         m_contextGlassSize = m_contextSize;
         m_contextGlassOrigin = origin;

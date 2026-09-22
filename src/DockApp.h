@@ -258,6 +258,9 @@ private:
     void PositionDockSettings();
     void PaintSettingsPopup();
     void QueueSettingsPaint();
+    [[nodiscard]] UINT PackPopupGlassFxFlags() const noexcept;
+    [[nodiscard]] bool TryBakePopupGlass(POINT origin, LONG width, LONG height,
+        uint8_t* pixels, size_t byteCount);
     void RebuildSettingsPopup();
     void HandleSettingsClick(const SettingsHit& hit, UINT message);
     void ApplyFrostSliderAt(LONG clientX);

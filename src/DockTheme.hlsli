@@ -48,3 +48,5 @@
 #define DOCK_FX_SHADOW 64
 #define DOCK_FX_THICKNESS 128
 #define DOCK_FX_ALL 255
+// Menu/popup plates: same GlassPS path, but no dock shadow margin ring.
+#define DOCK_FX_PANEL 0x01000000u

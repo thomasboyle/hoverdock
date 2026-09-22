@@ -730,6 +730,7 @@ Renderer::~Renderer() {
         Flush();
     } catch (...) {
     }
+    ReleasePanelGlassResources();
     ReleaseBackdropResources();
     if (m_frameLatencyWaitableObject != nullptr) {
         CloseHandle(m_frameLatencyWaitableObject);
@@ -2038,3 +2039,392 @@ void Renderer::SignalFrame(FrameResource& frame) {
     frame.fenceValue = ++m_fenceValue;
     Check(m_queue->Signal(m_fence.Get(), frame.fenceValue), "Signal frame fence");
 }
+
+
+void Renderer::ReleasePanelGlassResources() noexcept
+{
+    if (m_panelBackdropUpload != nullptr && m_panelBackdropUploadPixels != nullptr) {
+        m_panelBackdropUpload->Unmap(0, nullptr);
+        m_panelBackdropUploadPixels = nullptr;
+    }
+    m_panelReadback.Reset();
+    m_panelColor.Reset();
+    m_panelBlurTemp2.Reset();
+    m_panelBlurTemp.Reset();
+    m_panelBackdropUpload.Reset();
+    m_panelBackdrop.Reset();
+    m_panelSrvHeap.Reset();
+    m_panelRtvHeap.Reset();
+    m_panelWidth = 0;
+    m_panelHeight = 0;
+    m_panelBlurTempIsSrv = false;
+    m_panelBlurTemp2IsSrv = false;
+}
+
+bool Renderer::EnsurePanelGlassResources(UINT width, UINT height)
+{
+    if (m_device == nullptr || width == 0 || height == 0) {
+        return false;
+    }
+    if (m_panelWidth == width && m_panelHeight == height && m_panelColor && m_panelBackdrop &&
+        m_panelBlurTemp && m_panelBlurTemp2 && m_panelReadback && m_panelSrvHeap && m_panelRtvHeap &&
+        m_panelBackdropUploadPixels != nullptr) {
+        return true;
+    }
+
+    WaitForAllFrames();
+    ReleasePanelGlassResources();
+    m_panelWidth = width;
+    m_panelHeight = height;
+
+    try {
+        const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+        const D3D12_HEAP_PROPERTIES uploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        const D3D12_HEAP_PROPERTIES readbackHeap = HeapProperties(D3D12_HEAP_TYPE_READBACK);
+
+        const D3D12_RESOURCE_DESC tex = TextureDescription(width, height);
+        Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &tex,
+                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_panelBackdrop)),
+            "Create panel backdrop texture");
+
+        UINT64 uploadBytes = 0;
+        m_device->GetCopyableFootprints(&tex, 0, 1, 0, &m_panelBackdropFootprint,
+            &m_panelBackdropRowCount, nullptr, &uploadBytes);
+        const D3D12_RESOURCE_DESC uploadDesc = BufferDescription(uploadBytes);
+        Check(m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_panelBackdropUpload)),
+            "Create panel backdrop upload");
+        Check(m_panelBackdropUpload->Map(0, nullptr,
+                  reinterpret_cast<void**>(&m_panelBackdropUploadPixels)),
+            "Map panel backdrop upload");
+
+        D3D12_RESOURCE_DESC rt = TextureDescription(width, height);
+        rt.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE clear{};
+        clear.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &rt,
+                  D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&m_panelBlurTemp)),
+            "Create panel blur temp");
+        Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &rt,
+                  D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&m_panelBlurTemp2)),
+            "Create panel blur temp2");
+        Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &rt,
+                  D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&m_panelColor)),
+            "Create panel color target");
+
+        Check(m_device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_panelReadback)),
+            "Create panel readback");
+
+        D3D12_DESCRIPTOR_HEAP_DESC srvHeap{};
+        srvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        srvHeap.NumDescriptors = 4;
+        srvHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        Check(m_device->CreateDescriptorHeap(&srvHeap, IID_PPV_ARGS(&m_panelSrvHeap)),
+            "Create panel SRV heap");
+
+        D3D12_DESCRIPTOR_HEAP_DESC rtvHeap{};
+        rtvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rtvHeap.NumDescriptors = 3;
+        Check(m_device->CreateDescriptorHeap(&rtvHeap, IID_PPV_ARGS(&m_panelRtvHeap)),
+            "Create panel RTV heap");
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE srvStart =
+            m_panelSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        m_device->CreateShaderResourceView(nullptr, &srv, srvStart);
+        D3D12_CPU_DESCRIPTOR_HANDLE backdropSrv = srvStart;
+        backdropSrv.ptr += m_srvDescriptorSize;
+        m_device->CreateShaderResourceView(m_panelBackdrop.Get(), &srv, backdropSrv);
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtvStart =
+            m_panelRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        m_device->CreateRenderTargetView(m_panelBlurTemp.Get(), nullptr, rtvStart);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv1 = rtvStart;
+        rtv1.ptr += m_rtvDescriptorSize;
+        m_device->CreateRenderTargetView(m_panelBlurTemp2.Get(), nullptr, rtv1);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv2 = rtvStart;
+        rtv2.ptr += m_rtvDescriptorSize * 2ULL;
+        m_device->CreateRenderTargetView(m_panelColor.Get(), nullptr, rtv2);
+
+        m_panelBlurTempIsSrv = false;
+        m_panelBlurTemp2IsSrv = false;
+        return true;
+    } catch (...) {
+        ReleasePanelGlassResources();
+        return false;
+    }
+}
+
+bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, UINT fxFlags,
+    float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC,
+    std::vector<uint8_t>& outBgra)
+{
+    outBgra.clear();
+    if (m_device == nullptr || m_queue == nullptr || m_commandList == nullptr ||
+        m_glassPipeline == nullptr || m_blurPipeline == nullptr || m_blurVPipeline == nullptr ||
+        m_blurH2Pipeline == nullptr || m_rootSignature == nullptr || width == 0 || height == 0) {
+        return false;
+    }
+    if ((screenRect.right - screenRect.left) != static_cast<LONG>(width) ||
+        (screenRect.bottom - screenRect.top) != static_cast<LONG>(height)) {
+        return false;
+    }
+
+    try {
+        if (!EnsurePanelGlassResources(width, height)) {
+            return false;
+        }
+
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+        auto pushAffinity = [](HWND window, DWORD* previous, bool* armed) {
+            *armed = false;
+            if (window == nullptr) {
+                return;
+            }
+            if (GetWindowDisplayAffinity(window, previous) != FALSE) {
+                SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE);
+                *armed = true;
+            }
+        };
+        auto popAffinity = [](HWND window, DWORD previous, bool armed) {
+            if (armed && window != nullptr) {
+                SetWindowDisplayAffinity(window, previous);
+            }
+        };
+
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = static_cast<LONG>(width);
+        bmi.bmiHeader.biHeight = -static_cast<LONG>(height);
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* dibPixels = nullptr;
+        HDC screen = GetDC(nullptr);
+        if (screen == nullptr) {
+            return false;
+        }
+        HDC memory = CreateCompatibleDC(screen);
+        HBITMAP dib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &dibPixels, nullptr, 0);
+        if (memory == nullptr || dib == nullptr || dibPixels == nullptr) {
+            if (dib != nullptr) {
+                DeleteObject(dib);
+            }
+            if (memory != nullptr) {
+                DeleteDC(memory);
+            }
+            ReleaseDC(nullptr, screen);
+            return false;
+        }
+        const HGDIOBJ previous = SelectObject(memory, dib);
+        DWORD affA = 0, affB = 0, affC = 0, affDock = 0;
+        bool armA = false, armB = false, armC = false, armDock = false;
+        pushAffinity(excludeA, &affA, &armA);
+        pushAffinity(excludeB, &affB, &armB);
+        pushAffinity(excludeC, &affC, &armC);
+        pushAffinity(m_window, &affDock, &armDock);
+        const BOOL copied = BitBlt(memory, 0, 0, static_cast<int>(width), static_cast<int>(height),
+            screen, screenRect.left, screenRect.top, SRCCOPY);
+        popAffinity(m_window, affDock, armDock);
+        popAffinity(excludeC, affC, armC);
+        popAffinity(excludeB, affB, armB);
+        popAffinity(excludeA, affA, armA);
+        std::vector<uint8_t> capture;
+        if (copied != FALSE) {
+            capture.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
+            std::memcpy(capture.data(), dibPixels, capture.size());
+        }
+        SelectObject(memory, previous);
+        DeleteObject(dib);
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        if (capture.empty()) {
+            return false;
+        }
+
+        WaitForAllFrames();
+
+        for (UINT row = 0; row < height; ++row) {
+            std::memcpy(
+                m_panelBackdropUploadPixels + m_panelBackdropFootprint.Offset +
+                    static_cast<size_t>(row) * m_panelBackdropFootprint.Footprint.RowPitch,
+                capture.data() + static_cast<size_t>(row) * width * 4U,
+                static_cast<size_t>(width) * 4U);
+        }
+
+        FrameResource& frame = m_frames[0];
+        Check(frame.allocator->Reset(), "Reset panel frame allocator");
+        Check(m_commandList->Reset(frame.allocator.Get(), nullptr), "Reset panel command list");
+
+        frame.mappedConstants->scene0[0] = static_cast<float>(width);
+        frame.mappedConstants->scene0[1] = static_cast<float>(height);
+        frame.mappedConstants->scene0[2] = glassAlpha;
+        frame.mappedConstants->scene0[3] = 1.0F;
+        frame.mappedConstants->scene1[0] = static_cast<float>(fxFlags | DOCK_FX_PANEL);
+        frame.mappedConstants->scene1[1] = (std::max)(dpiScale, 1.0F);
+        frame.mappedConstants->scene1[2] = 0.0F;
+        frame.mappedConstants->scene1[3] = 1.0F;
+
+        D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+        srcLoc.pResource = m_panelBackdropUpload.Get();
+        srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcLoc.PlacedFootprint = m_panelBackdropFootprint;
+        D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+        dstLoc.pResource = m_panelBackdrop.Get();
+        dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dstLoc.SubresourceIndex = 0;
+        m_commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+        D3D12_RESOURCE_BARRIER toSrv{};
+        toSrv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toSrv.Transition.pResource = m_panelBackdrop.Get();
+        toSrv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toSrv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        toSrv.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        m_commandList->ResourceBarrier(1, &toSrv);
+
+        D3D12_VIEWPORT viewport{0.0F, 0.0F, static_cast<float>(width), static_cast<float>(height),
+            0.0F, 1.0F};
+        D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        m_commandList->RSSetViewports(1, &viewport);
+        m_commandList->RSSetScissorRects(1, &scissor);
+        m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+        m_commandList->SetGraphicsRootConstantBufferView(0, frame.constants->GetGPUVirtualAddress());
+        m_commandList->SetGraphicsRootShaderResourceView(1, frame.iconInstances->GetGPUVirtualAddress());
+        ID3D12DescriptorHeap* heaps[] = {m_panelSrvHeap.Get()};
+        m_commandList->SetDescriptorHeaps(1, heaps);
+        m_commandList->SetGraphicsRootDescriptorTable(2,
+            m_panelSrvHeap->GetGPUDescriptorHandleForHeapStart());
+        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtvStart =
+            m_panelRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        const D3D12_CPU_DESCRIPTOR_HANDLE srvStart =
+            m_panelSrvHeap->GetCPUDescriptorHandleForHeapStart();
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+        nullSrv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nullSrv.Texture2D.MipLevels = 1;
+        D3D12_SHADER_RESOURCE_VIEW_DESC blurView = nullSrv;
+
+        const auto blurPass = [&](ID3D12Resource* target, bool& isSrv, UINT rtvIndex, UINT srvIndex,
+                                  ID3D12PipelineState* pipeline) {
+            if (isSrv) {
+                D3D12_RESOURCE_BARRIER toRt{};
+                toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                toRt.Transition.pResource = target;
+                toRt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                toRt.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                m_commandList->ResourceBarrier(1, &toRt);
+                isSrv = false;
+            }
+            D3D12_CPU_DESCRIPTOR_HANDLE blurSrv = srvStart;
+            blurSrv.ptr += static_cast<SIZE_T>(srvIndex) * m_srvDescriptorSize;
+            m_device->CreateShaderResourceView(nullptr, &nullSrv, blurSrv);
+
+            D3D12_CPU_DESCRIPTOR_HANDLE blurRtv = rtvStart;
+            blurRtv.ptr += static_cast<SIZE_T>(rtvIndex) * m_rtvDescriptorSize;
+            m_commandList->OMSetRenderTargets(1, &blurRtv, FALSE, nullptr);
+            m_commandList->SetPipelineState(pipeline);
+            m_commandList->DrawInstanced(3, 1, 0, 0);
+
+            D3D12_RESOURCE_BARRIER toShader{};
+            toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toShader.Transition.pResource = target;
+            toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            m_commandList->ResourceBarrier(1, &toShader);
+            isSrv = true;
+            m_device->CreateShaderResourceView(target, &blurView, blurSrv);
+        };
+
+        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurPipeline.Get());
+        blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
+        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
+        blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
+        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
+        blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
+        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
+        blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
+        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
+
+        D3D12_CPU_DESCRIPTOR_HANDLE colorRtv = rtvStart;
+        colorRtv.ptr += m_rtvDescriptorSize * 2ULL;
+        const float clearColor[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+        m_commandList->OMSetRenderTargets(1, &colorRtv, FALSE, nullptr);
+        m_commandList->ClearRenderTargetView(colorRtv, clearColor, 0, nullptr);
+        m_commandList->SetPipelineState(m_glassPipeline.Get());
+        m_commandList->DrawInstanced(3, 1, 0, 0);
+
+        D3D12_RESOURCE_BARRIER toCopy{};
+        toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy.Transition.pResource = m_panelColor.Get();
+        toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        m_commandList->ResourceBarrier(1, &toCopy);
+
+        D3D12_TEXTURE_COPY_LOCATION colorSrc{};
+        colorSrc.pResource = m_panelColor.Get();
+        colorSrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        colorSrc.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION readDst{};
+        readDst.pResource = m_panelReadback.Get();
+        readDst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        readDst.PlacedFootprint = m_panelBackdropFootprint;
+        m_commandList->CopyTextureRegion(&readDst, 0, 0, 0, &colorSrc, nullptr);
+
+        D3D12_RESOURCE_BARRIER restore[2]{};
+        restore[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore[0].Transition.pResource = m_panelColor.Get();
+        restore[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        restore[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        restore[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        restore[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore[1].Transition.pResource = m_panelBackdrop.Get();
+        restore[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        restore[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        restore[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        m_commandList->ResourceBarrier(2, restore);
+
+        Check(m_commandList->Close(), "Close panel command list");
+        ID3D12CommandList* lists[] = {m_commandList.Get()};
+        m_queue->ExecuteCommandLists(1, lists);
+        const UINT64 fenceValue = ++m_fenceValue;
+        Check(m_queue->Signal(m_fence.Get(), fenceValue), "Signal panel fence");
+        if (m_fence->GetCompletedValue() < fenceValue) {
+            Check(m_fence->SetEventOnCompletion(fenceValue, m_fenceEvent), "Panel fence event");
+            WaitForSingleObject(m_fenceEvent, INFINITE);
+        }
+        frame.fenceValue = fenceValue;
+
+        uint8_t* mapped = nullptr;
+        Check(m_panelReadback->Map(0, nullptr, reinterpret_cast<void**>(&mapped)),
+            "Map panel readback");
+        outBgra.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
+        for (UINT row = 0; row < height; ++row) {
+            std::memcpy(outBgra.data() + static_cast<size_t>(row) * width * 4U,
+                mapped + m_panelBackdropFootprint.Offset +
+                    static_cast<size_t>(row) * m_panelBackdropFootprint.Footprint.RowPitch,
+                static_cast<size_t>(width) * 4U);
+        }
+        m_panelReadback->Unmap(0, nullptr);
+        return true;
+    } catch (...) {
+        outBgra.clear();
+        return false;
+    }
+}
+

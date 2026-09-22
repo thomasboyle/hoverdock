@@ -80,6 +80,12 @@ public:
     [[nodiscard]] bool BackdropValid() const noexcept;
     void InvalidateBackdrop() noexcept;
     [[nodiscard]] bool Render(const DockRenderState& state);
+    // Bake the dock GlassPS stack into a BGRA8 buffer for layered menus
+    // (Quick Settings / Dock Settings / context). Uses DOCK_FX_PANEL so the
+    // plate fills the surface (no dock shadow margin ring).
+    [[nodiscard]] bool BakeGlassPanel(const RECT& screenRect, UINT width, UINT height,
+        UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB,
+        HWND excludeC, std::vector<uint8_t>& outBgra);
     void Flush();
 
     [[nodiscard]] HANDLE FrameLatencyWaitableObject() const noexcept;
@@ -207,5 +213,25 @@ private:
     UINT m_backdropIdleSkips = 0;
     UINT64 m_backdropCopyFenceValue = 0;
     HANDLE m_fenceEvent = nullptr;
+
+    void ReleasePanelGlassResources() noexcept;
+    [[nodiscard]] bool EnsurePanelGlassResources(UINT width, UINT height);
+
+    UINT m_panelWidth = 0;
+    UINT m_panelHeight = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_panelBackdrop;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_panelBackdropUpload;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_panelBlurTemp;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_panelBlurTemp2;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_panelColor;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_panelReadback;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_panelSrvHeap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_panelRtvHeap;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_panelBackdropFootprint{};
+    UINT m_panelBackdropRowCount = 0;
+    uint8_t* m_panelBackdropUploadPixels = nullptr;
+    bool m_panelBlurTempIsSrv = false;
+    bool m_panelBlurTemp2IsSrv = false;
+
     HANDLE m_frameLatencyWaitableObject = nullptr;
 };
