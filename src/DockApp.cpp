@@ -2123,6 +2123,28 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 QpcSeconds() >= m_suppressBackdropUntil && CaptureLiveBackdrop()) {
                 QueueRenderFrame(false);
             }
+            // Menu plates are one-shot GlassPS bakes. While any menu is open,
+            // rebake on a slower cadence so the desktop behind them stays live
+            // without full-rate GPU readbacks on every 8 ms dock tick.
+            if (IsOverflowOpen() || IsDockSettingsOpen() || IsContextMenuOpen()) {
+                constexpr ULONGLONG kPopupGlassRefreshMs = 100ULL;
+                const ULONGLONG now = GetTickCount64();
+                if (now - m_lastPopupGlassRefreshMs >= kPopupGlassRefreshMs) {
+                    m_lastPopupGlassRefreshMs = now;
+                    if (IsDockSettingsOpen()) {
+                        InvalidateSettingsGlass();
+                        QueueSettingsPaint();
+                    }
+                    if (IsOverflowOpen()) {
+                        InvalidateOverflowGlass();
+                        QueueOverflowPaint();
+                    }
+                    if (IsContextMenuOpen()) {
+                        InvalidateContextGlass();
+                        QueueContextPaint();
+                    }
+                }
+            }
         } else if (wParam == kTaskbarMonitorTimerId) {
             // Adaptive cadence: poll fast while suppression is actively fighting
             // Explorer, then back off 10x when steady. Suppression latency in the

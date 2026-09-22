@@ -610,6 +610,8 @@ private:
     bool m_settingsPaintQueued = false;
     bool m_frostSliderDragging = false;
     ULONGLONG m_frostSliderLastRenderMs = 0;
+    // Last live rebake of open menu glass (Quick Settings / Dock Settings / context).
+    ULONGLONG m_lastPopupGlassRefreshMs = 0;
     RECT m_frostSliderTrack{};
     SIZE m_settingsSize{};
     std::vector<uint8_t> m_settingsGlass;
