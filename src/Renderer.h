@@ -24,6 +24,7 @@ enum class DockIconKind : uint8_t {
     TrayDivider = 2,
     Tray = 3,
     Clock = 4,
+    Trash = 5,
 };
 
 struct DockIconRenderData {

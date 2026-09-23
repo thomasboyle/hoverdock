@@ -455,11 +455,14 @@ std::vector<uint8_t> RasterizeBitmap(HBITMAP sourceBitmap, UINT extent) {
     return ScalePremultipliedPixels(source, width, height, extent);
 }
 
-// Two-tone Start/Search tiles matching the supplied artwork: charcoal rounded
-// fill + solid white rim + soft white outer glow. Buffers are premultiplied for
-// the (ONE, INV_SRC_ALPHA) icon blend; grays stay neutral so the atlas byte
-// order is moot. Full color is intentional: DockApp leaves these two icons
-// non-adaptive so the white halo keeps them contrasted on any wallpaper.
+// Start/Search tiles: Start is the authentic Windows 11 logo (four flat panes,
+// narrow cross gap, rounded outer silhouette, blue gradient) with no rim or
+// glow - pure mark on transparency; Search is a charcoal two-tone magnifier
+// with a solid white rim + soft outer glow. Buffers are premultiplied for the
+// (ONE, INV_SRC_ALPHA) icon blend. Search grays stay neutral so byte order is
+// moot there; Start writes explicit BGRA bytes (B first) to match the WIC
+// BGRA / B8G8R8A8 atlas. Full color is intentional: DockApp leaves these two
+// icons non-adaptive so they keep their own colors on any wallpaper.
 float GlyphClamp01(float value) {
     return value < 0.0F ? 0.0F : (value > 1.0F ? 1.0F : value);
 }
@@ -513,47 +516,55 @@ void CompositeGlyphPixel(std::vector<uint8_t>& pixels, UINT extent, int x, int y
 }
 
 std::vector<uint8_t> CreateStartGlyph(UINT extent) {
+    // Authentic Windows 11 Start button geometry (from the 400-unit official
+    // artwork): four flat panes, narrow cross gap, rounded outer silhouette
+    // with sharp inner corners, blue gradient, no rim or glow. Maximized to
+    // ~0.81 of the texture so it reads as large as a normal app icon.
     const float extentF = static_cast<float>(extent);
-    const float cell = extentF * 0.205F;
-    const float gap = extentF * 0.085F;
-    const float total = cell * 2.0F + gap;
+    const float total = extentF * 0.810F;
+    const float gap = total * 0.0275F;
+    const float cell = (total - gap) / 2.0F;
     const float gridLeft = (extentF - total) / 2.0F;
     const float gridTop = (extentF - total) / 2.0F;
-    const float corner = extentF * 0.052F;
-    const float stroke = std::max(1.5F, extentF * 0.022F);
-    const float glow = std::max(3.0F, extentF * 0.048F);
+    const float outerR = total * 0.0495F;
     const float aa = std::max(0.75F, extentF / 112.0F);
     const float half = cell / 2.0F;
+    const float centerX = gridLeft + total / 2.0F;
+    const float centerY = gridTop + total / 2.0F;
 
     std::vector<uint8_t> pixels(static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U, 0);
     for (int y = 0; y < static_cast<int>(extent); ++y) {
         for (int x = 0; x < static_cast<int>(extent); ++x) {
             const float px = static_cast<float>(x) + 0.5F;
             const float py = static_cast<float>(y) + 0.5F;
-            float nearest = 1e9F;
+            // Union of the four sharp panes, intersected with the rounded
+            // outer silhouette: sharp cross gap, rounded outer corners.
+            float panes = 1e9F;
             for (int row = 0; row < 2; ++row) {
                 for (int col = 0; col < 2; ++col) {
                     const float cx = gridLeft + col * (cell + gap) + half;
                     const float cy = gridTop + row * (cell + gap) + half;
-                    const float d = SdRoundedBox(px - cx, py - cy, half, half, corner);
-                    nearest = d < nearest ? d : nearest;
+                    const float d = SdRoundedBox(px - cx, py - cy, half, half, 0.0F);
+                    panes = d < panes ? d : panes;
                 }
             }
-            const float whiteDist = nearest - stroke;
-            const float darkCoverage = 1.0F - GlyphSmoothstep(-aa, aa, nearest);
-            float whiteSolid = 1.0F - GlyphSmoothstep(-aa, aa, whiteDist);
-            float glowAlpha = 0.0F;
-            if (whiteDist > 0.0F && whiteDist < glow) {
-                const float u = 1.0F - whiteDist / glow;
-                glowAlpha = u * u * 0.9F;
-            }
-            const float whiteCoverage = whiteSolid > glowAlpha ? whiteSolid : glowAlpha;
-            if (darkCoverage <= 0.003F && whiteCoverage <= 0.003F) {
+            const float outer = SdRoundedBox(px - centerX, py - centerY, total / 2.0F, total / 2.0F, outerR);
+            const float nearest = panes > outer ? panes : outer;
+            // No rim or glow: pure mark, AA only.
+            const float darkClamped = GlyphClamp01(1.0F - GlyphSmoothstep(-aa, aa, nearest));
+            if (darkClamped <= 0.003F) {
                 continue;
             }
+            // Official blue gradient: light icy top to #0078D3 bottom.
             const float shadeT = GlyphClamp01((py - gridTop) / total);
-            const float darkShade = 68.0F + (34.0F - 68.0F) * shadeT;
-            CompositeGlyphPixel(pixels, extent, x, y, darkShade, darkCoverage, whiteCoverage);
+            const float blueR = 77.0F + (0.0F - 77.0F) * shadeT;
+            const float blueG = 196.0F + (120.0F - 196.0F) * shadeT;
+            const float blueB = 238.0F + (211.0F - 238.0F) * shadeT;
+            const size_t offset = (static_cast<size_t>(y) * extent + static_cast<UINT>(x)) * 4U;
+            pixels[offset] = static_cast<unsigned char>(std::lround(GlyphClamp01(blueB * darkClamped / 255.0F) * 255.0F));
+            pixels[offset + 1] = static_cast<unsigned char>(std::lround(GlyphClamp01(blueG * darkClamped / 255.0F) * 255.0F));
+            pixels[offset + 2] = static_cast<unsigned char>(std::lround(GlyphClamp01(blueR * darkClamped / 255.0F) * 255.0F));
+            pixels[offset + 3] = static_cast<unsigned char>(std::lround(darkClamped * 255.0F));
         }
     }
     return pixels;
@@ -561,20 +572,23 @@ std::vector<uint8_t> CreateStartGlyph(UINT extent) {
 
 std::vector<uint8_t> CreateSearchGlyph(UINT extent) {
     const float extentF = static_cast<float>(extent);
-    const float cx = extentF * 0.42F;
-    const float cy = extentF * 0.42F;
-    const float outerR = extentF * 0.205F;
-    const float innerR = extentF * 0.162F;
+    // Maximized: lens+handle union spans ~0.82 of the texture (same visual
+    // weight as the Start tile and normal app icons). Center re-tuned to
+    // 0.405 so the larger union stays centered with glow margin intact.
+    const float cx = extentF * 0.405F;
+    const float cy = extentF * 0.405F;
+    const float outerR = extentF * 0.315F;
+    const float innerR = extentF * 0.249F;
     const float stroke = std::max(1.5F, extentF * 0.020F);
     const float glow = std::max(2.0F, extentF * 0.035F);
     const float aa = std::max(0.75F, extentF / 112.0F);
     static constexpr float kDiag = 0.70710678F;
-    const float handleOuterR = extentF * 0.050F;
+    const float handleOuterR = extentF * 0.077F;
     const float handleInnerR = std::max(1.0F, handleOuterR - stroke);
     const float hx0 = cx + kDiag * outerR * 0.30F;
     const float hy0 = cy + kDiag * outerR * 0.30F;
-    const float hx1 = cx + kDiag * (outerR + extentF * 0.190F);
-    const float hy1 = cy + kDiag * (outerR + extentF * 0.190F);
+    const float hx1 = cx + kDiag * (outerR + extentF * 0.292F);
+    const float hy1 = cy + kDiag * (outerR + extentF * 0.292F);
     const float ix0 = cx + kDiag * innerR * 0.20F;
     const float iy0 = cy + kDiag * innerR * 0.20F;
 

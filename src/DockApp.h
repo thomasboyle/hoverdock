@@ -18,6 +18,9 @@
 #include <vector>
 
 struct ITaskbarList2;
+struct IDropTarget;
+struct _ITEMIDLIST;
+using TrashPidl = _ITEMIDLIST*;
 
 class DockApp {
 public:
@@ -28,6 +31,8 @@ public:
     DockApp& operator=(const DockApp&) = delete;
 
     int Run();
+
+    friend class DockAppTrashDropTarget;
 
 private:
     enum class VisibilityState {
@@ -143,7 +148,13 @@ private:
     static constexpr UINT kContextPinForeground = 6;
     static constexpr UINT kContextToggleBounds = 7;
     static constexpr UINT kContextEndTask = 8;
+    static constexpr UINT kContextTrashOpen = 20;
+    static constexpr UINT kContextTrashEmpty = 21;
+    static constexpr UINT kContextTrashProperties = 22;
     static constexpr UINT kContextPaintMessage = WM_APP + 18;
+    static constexpr UINT kTrashNotifyMessage = WM_APP + 19;
+    static constexpr UINT kTrashRefreshMessage = WM_APP + 20;
+    static constexpr UINT kTrashDropMessage = WM_APP + 21;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -188,6 +199,7 @@ private:
         std::wstring label;
         wchar_t glyph = 0;
         bool separatorBefore = false;
+        bool disabled = false;
     };
 
     struct ContextHit {
@@ -257,7 +269,11 @@ private:
     void DestroyDockSettings() noexcept;
     void PositionDockSettings();
     void PaintSettingsPopup();
-    void QueueSettingsPaint();
+    void PaintSettingsHoverFast();
+    void ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height,
+        const SettingsHit& hit) const;
+    void PresentSettingsLayer() noexcept;
+    void QueueSettingsPaint(bool hoverOnly = false);
     [[nodiscard]] UINT PackPopupGlassFxFlags() const noexcept;
     [[nodiscard]] bool TryBakePopupGlass(POINT origin, LONG width, LONG height,
         uint8_t* pixels, size_t byteCount);
@@ -452,6 +468,26 @@ private:
     [[nodiscard]] static double QpcSeconds();
     [[nodiscard]] UINT IconPixelExtent() const noexcept;
     void ReloadIconsIfExtentChanged();
+    // --- Trash / Recycle Bin (macOS-style, left of Quick Settings) ---
+    [[nodiscard]] bool IsTrashRenderIndex(int icon) const noexcept;
+    [[nodiscard]] int TrashRenderIndex() const noexcept;
+    [[nodiscard]] bool IsPointOverTrash(POINT screen) const noexcept;
+    void RefreshTrash(bool forceLayout);
+    void EnsureTrashIcons();
+    void UpdateTrashIconState(bool full);
+    void OpenTrash();
+    void EmptyTrashWithConfirm();
+    void ShowTrashProperties();
+    void RegisterTrashNotify();
+    void UnregisterTrashNotify() noexcept;
+    void RegisterTrashDropTarget();
+    void RevokeTrashDropTarget() noexcept;
+    void OnTrashDragEnter();
+    void OnTrashDragOver(POINT screen);
+    void OnTrashDragLeave();
+    void OnTrashDrop(const std::vector<std::wstring>& paths);
+    void HandleTrashDropResult(const std::wstring& error, bool moved);
+    [[nodiscard]] std::wstring TrashHoverText() const;
 
     HINSTANCE m_instance = nullptr;
     HWND m_window = nullptr;
@@ -613,6 +649,10 @@ private:
     std::vector<SettingsHit> m_settingsHits;
     int m_settingsHover = -1;
     bool m_settingsPaintQueued = false;
+    bool m_settingsHoverPaintOnly = false;
+    std::vector<uint8_t> m_settingsBaseBits;
+    std::vector<uint8_t> m_settingsPresentBits;
+    SIZE m_settingsPresentSize{};
     bool m_frostSliderDragging = false;
     ULONGLONG m_frostSliderLastRenderMs = 0;
     // Last live rebake of open menu glass (Quick Settings / Dock Settings / context).
@@ -678,6 +718,22 @@ private:
     bool m_contextHoverPaintOnly = false;
     float m_contextFontScale = 0.0F;
     HFONT m_contextLabelFont = nullptr;
+    // --- Trash / Recycle Bin state (UI thread only unless noted) ---
+    struct TrashState {
+        ULONGLONG itemCount = 0;
+        ULONGLONG byteSize = 0;
+        bool isEmpty = true;
+    };
+    TrashState m_trashState;
+    bool m_trashFull = false;
+    int m_trashIndex = -1;
+    UINT m_loadedTrashExtent = 0;
+    bool m_trashDragOver = false;
+    bool m_trashDropInFlight = false;
+    ULONG m_trashNotifyCookie = 0;
+    TrashPidl m_trashNotifyPidl = nullptr;
+    IDropTarget* m_trashDropTarget = nullptr;
+    bool m_contextIsTrash = false;
 
     static DockApp* s_instance;
     bool m_shellFlyoutIsTray = false;

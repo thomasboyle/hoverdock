@@ -41,6 +41,7 @@ add_executable(Dock WIN32
     src/Updater.cpp
     src/WindowCatalog.cpp
     src/PerfBoost.cpp
+    src/RecycleBin.cpp
 )
 
 target_include_directories(Dock PRIVATE

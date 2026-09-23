@@ -126,10 +126,14 @@ bool SendWinChord(WORD key) {
         sizeof(INPUT)) == static_cast<UINT>(inputs.size());
 }
 
+const wchar_t* ResolveDockTextFontFace() noexcept {
+    return L"JetBrainsMono Nerd Font";
+}
+
 HFONT CreateTrayFont(int pixelHeight, int weight) {
     return CreateFontW(-pixelHeight, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-        L"Segoe UI");
+        ResolveDockTextFontFace());
 }
 
 int ClockTimePx(float layoutScale) {
@@ -912,6 +916,12 @@ void QueryClock(TrayStatus& status) {
 }
 
 }  // namespace
+
+// Dock text face: JetBrainsMono Nerd Font for labels and clock.
+// Icons stay on Segoe Fluent/MDL2; this is text only (clock, labels, flyouts).
+const wchar_t* DockTextFontFace() noexcept {
+    return ResolveDockTextFontFace();
+}
 
 TrayNotifyIcon::TrayNotifyIcon(TrayNotifyIcon&& other) noexcept
     : window(other.window),

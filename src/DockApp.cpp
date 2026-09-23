@@ -2,6 +2,7 @@
 #include "DockTheme.hlsli"
 #include "PerfBoost.h"
 #include "Profile.h"
+#include "RecycleBin.h"
 #include "Startup.h"
 #include "Updater.h"
 #include "Version.h"
@@ -14,6 +15,7 @@
 #include <CommCtrl.h>
 #include <dwmapi.h>
 #include <windowsx.h>
+#include <oleidl.h>
 
 #include <algorithm>
 #include <array>
@@ -365,7 +367,7 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
 HFONT CreateFlyoutFont(int pixelHeight, int weight) {
     return CreateFontW(-pixelHeight, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-        L"Segoe UI");
+        DockTextFontFace());
 }
 
 // Active flyout chrome ink (mirrors AdaptiveChromeInk). Set once per menu paint.
@@ -1318,12 +1320,136 @@ HBITMAP CreateDragGhostBitmap(const PinnedApp& app, HWND runningWindow, UINT ext
 
 }  // namespace
 
+// --- Trash OLE drop target (shell files -> Recycle Bin) ---------------------
+// Registered on the dock input window. Only the Trash icon accepts drops;
+// all other dock areas return DROPEFFECT_NONE so Explorer keeps its image.
+struct TrashDropReply {
+    std::wstring error;
+    bool moved = false;
+};
+
+class DockAppTrashDropTarget : public IDropTarget {
+public:
+    explicit DockAppTrashDropTarget(DockApp* app) : m_app(app) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) {
+            return E_POINTER;
+        }
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) {
+            *ppv = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG count = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (count == 0) {
+            delete this;
+        }
+        return count;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(
+        IDataObject* data, DWORD /*keys*/, POINTL pt, DWORD* effect) override {
+        if (effect == nullptr) {
+            return E_POINTER;
+        }
+        m_accepting = data != nullptr && RecycleBin::DataObjectHasFiles(data);
+        if (!m_accepting) {
+            *effect = DROPEFFECT_NONE;
+            return S_OK;
+        }
+        const POINT screen{pt.x, pt.y};
+        const bool overTrash =
+            m_app != nullptr && m_app->IsPointOverTrash(screen);
+        if (overTrash) {
+            m_app->OnTrashDragEnter();
+        }
+        *effect = overTrash ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD /*keys*/, POINTL pt, DWORD* effect) override {
+        if (effect == nullptr) {
+            return E_POINTER;
+        }
+        if (!m_accepting || m_app == nullptr) {
+            *effect = DROPEFFECT_NONE;
+            return S_OK;
+        }
+        const POINT screen{pt.x, pt.y};
+        const bool overTrash = m_app->IsPointOverTrash(screen);
+        if (overTrash) {
+            m_app->OnTrashDragOver(screen);
+            *effect = DROPEFFECT_MOVE;
+        } else {
+            m_app->OnTrashDragLeave();
+            *effect = DROPEFFECT_NONE;
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        m_accepting = false;
+        if (m_app != nullptr) {
+            m_app->OnTrashDragLeave();
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Drop(
+        IDataObject* data, DWORD /*keys*/, POINTL pt, DWORD* effect) override {
+        if (effect == nullptr) {
+            return E_POINTER;
+        }
+        const bool wasAccepting = m_accepting;
+        m_accepting = false;
+        if (!wasAccepting || m_app == nullptr || data == nullptr) {
+            *effect = DROPEFFECT_NONE;
+            if (m_app != nullptr) {
+                m_app->OnTrashDragLeave();
+            }
+            return S_OK;
+        }
+        const POINT screen{pt.x, pt.y};
+        if (!m_app->IsPointOverTrash(screen)) {
+            *effect = DROPEFFECT_NONE;
+            m_app->OnTrashDragLeave();
+            return S_OK;
+        }
+        // AddRef the data while extracting (GetData may re-enter).
+        data->AddRef();
+        std::vector<std::wstring> paths = RecycleBin::FilesFromDataObject(data);
+        data->Release();
+        m_app->OnTrashDragLeave();
+        if (paths.empty()) {
+            *effect = DROPEFFECT_NONE;
+            return S_OK;
+        }
+        m_app->OnTrashDrop(paths);
+        *effect = DROPEFFECT_MOVE;
+        return S_OK;
+    }
+
+private:
+    DockApp* m_app = nullptr;
+    LONG m_ref = 1;
+    bool m_accepting = false;
+};
+
 DockApp::DockApp(HINSTANCE instance)
     : m_instance(instance) {
-    m_comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // OleInitialize (superset of CoInitializeEx STA) is required for the Trash
+    // IDropTarget (RegisterDragDrop) while keeping the existing STA model.
+    m_comResult = OleInitialize(nullptr);
 }
 
 DockApp::~DockApp() {
+    RevokeTrashDropTarget();
+    UnregisterTrashNotify();
     CloseLaunchPrompt(false);
     DestroyDockSettings();
     DestroyOverflowPopup();
@@ -1346,7 +1472,7 @@ DockApp::~DockApp() {
         s_instance = nullptr;
     }
     if (m_comResult == S_OK) {
-        CoUninitialize();
+        OleUninitialize();
     }
 }
 
@@ -1424,6 +1550,10 @@ int DockApp::Run() {
     if (m_mouseHook == nullptr) {
         Log(L"Low-level mouse hook unavailable; the dock can still be shown by moving over its window.");
     }
+    RegisterTrashNotify();
+    RegisterTrashDropTarget();
+    EnsureTrashIcons();
+    RefreshTrash(true);
     RegisterForegroundWatch();
     StartCursorWatch();
 
@@ -1715,7 +1845,11 @@ LRESULT CALLBACK DockApp::ContextWindowProcedure(HWND window, UINT message, WPAR
             break;
         }
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        const int hover = app->ContextHitIndex(point);
+        int hover = app->ContextHitIndex(point);
+        if (hover >= 0 && static_cast<size_t>(hover) < app->m_contextItems.size() &&
+            app->m_contextItems[static_cast<size_t>(hover)].disabled) {
+            hover = -1;
+        }
         if (hover != app->m_contextHover) {
             app->m_contextHover = hover;
             app->QueueContextPaint(true);
@@ -1731,7 +1865,11 @@ LRESULT CALLBACK DockApp::ContextWindowProcedure(HWND window, UINT message, WPAR
         }
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const int hit = app->ContextHitIndex(point);
-        if (hit >= 0 && static_cast<size_t>(hit) < app->m_contextHits.size()) {
+        if (hit >= 0 && static_cast<size_t>(hit) < app->m_contextHits.size() &&
+            static_cast<size_t>(hit) < app->m_contextItems.size()) {
+            if (app->m_contextItems[static_cast<size_t>(hit)].disabled) {
+                return 0;
+            }
             const UINT command = app->m_contextHits[static_cast<size_t>(hit)].command;
             app->ExecuteContextCommand(command);
         } else {
@@ -2062,9 +2200,49 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         m_settingsPaintQueued = false;
         // Guarded: a paint queued before the panel closed must not re-show it.
         if (IsDockSettingsOpen()) {
-            PaintSettingsPopup();
+            const bool hoverOnly = m_settingsHoverPaintOnly;
+            m_settingsHoverPaintOnly = false;
+            if (hoverOnly && !m_settingsBaseBits.empty() &&
+                m_settingsBaseBits.size() == m_settingsPresentBits.size() &&
+                m_settingsPresentSize.cx == m_settingsSize.cx &&
+                m_settingsPresentSize.cy == m_settingsSize.cy) {
+                PaintSettingsHoverFast();
+            } else {
+                PaintSettingsPopup();
+            }
         }
         return 0;
+
+    case kTrashNotifyMessage: {
+        // SHCNRF_NewDelivery: lock, discard pidls, unlock, then refresh.
+        if (wParam != 0 && lParam != 0) {
+            PIDLIST_ABSOLUTE* pidls = nullptr;
+            LONG eventId = 0;
+            HANDLE lock = SHChangeNotification_Lock(reinterpret_cast<HANDLE>(wParam),
+                static_cast<DWORD>(lParam), &pidls, &eventId);
+            if (lock != nullptr) {
+                SHChangeNotification_Unlock(lock);
+            }
+        }
+        PostMessageW(m_window, kTrashRefreshMessage, 0, 0);
+        return 0;
+    }
+
+    case kTrashRefreshMessage:
+        RefreshTrash(false);
+        return 0;
+
+    case kTrashDropMessage: {
+        auto* reply = reinterpret_cast<TrashDropReply*>(lParam);
+        if (reply == nullptr) {
+            m_trashDropInFlight = false;
+            RefreshTrash(true);
+            return 0;
+        }
+        HandleTrashDropResult(reply->error, reply->moved);
+        delete reply;
+        return 0;
+    }
 
     case kContextPaintMessage:
         m_contextPaintQueued = false;
@@ -2535,7 +2713,7 @@ HFONT DockApp::HoverLabelFont() {
     const UINT dpi = m_window != nullptr ? GetDpiForWindow(m_window) : 96U;
     const float scale =
         static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F * std::max(0.75F, m_dockScale);
-    // Match the dock clock date face: Segoe UI / FW_NORMAL / ~17px at 96 DPI.
+    // Match the dock clock date face: JetBrainsMono Nerd Font / FW_NORMAL / ~17px at 96 DPI.
     const int pixelHeight = std::max(15, static_cast<int>(std::lround(17.0F * scale)));
     if (m_hoverLabelFont != nullptr && dpi == m_hoverLabelFontDpi &&
         pixelHeight == m_hoverLabelFontPx) {
@@ -2545,7 +2723,7 @@ HFONT DockApp::HoverLabelFont() {
     DestroyHoverLabelFont();
     m_hoverLabelFont = CreateFontW(-pixelHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        DEFAULT_PITCH | FF_DONTCARE, DockTextFontFace());
     m_hoverLabelFontDpi = dpi;
     m_hoverLabelFontPx = pixelHeight;
     return m_hoverLabelFont == nullptr
@@ -2597,7 +2775,8 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     constexpr TraySlot kTrayGlyphSlots[] = {
         TraySlot::Overflow, TraySlot::Power};
 
-    LONG trayWidth = trayDividerWidth + trayLeadGap;
+    // Trash sits immediately left of the Quick Settings caret (Overflow).
+    LONG trayWidth = trayDividerWidth + trayLeadGap + trayGlyph + trayGap;
     LONG visibleGlyphs = 0;
     for (const TraySlot slot : kTrayGlyphSlots) {
         if (!SystemTray::SlotVisible(slot, m_tray.Status())) {
@@ -2655,6 +2834,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         ((m_hostBounds.right - m_hostBounds.left) - static_cast<LONG>(m_dockWidth)) / 2;
 
     m_iconRenderData.clear();
+    m_trashIndex = -1;
     m_iconRenderData.reserve(displayCount + 8U);
     const LONG top = (static_cast<LONG>(m_dockHeight) - iconSlotHeight) / 2;
     LONG left = padding + shadowMargin;
@@ -2668,8 +2848,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         } else {
             data.bounds = {left, top, left + iconSize, top + iconSlotHeight};
             data.running = m_displayApps[index].runningWindow != nullptr;
-            // Start/Search carry their own two-tone artwork (charcoal fill +
-            // white halo), so they must not be remapped to flat adaptive ink.
+            // Start carries the Windows 11 logo artwork (blue gradient, no halo)
+            // and Search its own two-tone artwork (charcoal fill + white halo),
+            // so they must not be remapped to flat adaptive ink.
             data.adaptiveInk = false;
             left += iconSize + gap;
         }
@@ -2684,6 +2865,16 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     left += trayDividerWidth + trayLeadGap;
 
     const LONG trayTop = top + (iconSize - trayGlyph) / 2;
+    // Trash / Recycle Bin — immediately left of Quick Settings caret.
+    {
+        DockIconRenderData trash;
+        trash.kind = DockIconKind::Trash;
+        trash.adaptiveInk = false;
+        trash.bounds = {left, trayTop, left + trayGlyph, trayTop + trayGlyph};
+        m_trashIndex = static_cast<int>(m_iconRenderData.size());
+        m_iconRenderData.push_back(trash);
+        left += trayGlyph + trayGap;
+    }
     for (const TraySlot slot : kTrayGlyphSlots) {
         if (!SystemTray::SlotVisible(slot, m_tray.Status())) {
             continue;
@@ -2850,7 +3041,9 @@ void DockApp::UpdateHoverLabel() {
     }
 
     std::wstring text;
-    if (IsTrayRenderIndex(m_hoveredIcon)) {
+    if (IsTrashRenderIndex(m_hoveredIcon)) {
+        text = TrashHoverText();
+    } else if (IsTrayRenderIndex(m_hoveredIcon)) {
         text = SystemTray::LabelForSlot(m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].traySlot,
             m_tray.Status());
     } else if (static_cast<size_t>(m_hoveredIcon) < m_displayApps.size()) {
@@ -3142,6 +3335,8 @@ void DockApp::LoadIconTextures() {
     m_renderer.LoadIcons(cacheKeys, iconCandidates, m_loadedIconExtent);
     m_trayVisualKey.clear();
     EnsureTrayIcons();
+    EnsureTrashIcons();
+    RefreshTrash(true);
 }
 
 std::wstring DockApp::TrayIconsKey() const {
@@ -3190,6 +3385,11 @@ void DockApp::AssignIconTextureIndices() {
     }
     for (size_t index = appCount; index < m_iconRenderData.size(); ++index) {
         const DockIconRenderData& icon = m_iconRenderData[index];
+        if (icon.kind == DockIconKind::Trash) {
+            m_iconRenderData[index].textureIndex = m_renderer.TextureIndexForTarget(
+                RecycleBin::TargetForState(m_trashFull));
+            continue;
+        }
         if (icon.kind != DockIconKind::Tray && icon.kind != DockIconKind::Clock) {
             continue;
         }
@@ -3259,6 +3459,8 @@ void DockApp::RefreshTray(bool forceLayout) {
     const bool popupOpen = IsOverflowOpen();
     const bool changed =
         (popupOpen || forceLayout ? m_tray.Refresh() : m_tray.RefreshForDock()) || forceLayout;
+    // Trash polls on the same 1 Hz tick (SHQueryRecycleBin is one cheap syscall).
+    RefreshTrash(false);
     if (!changed) {
         return;
     }
@@ -3266,6 +3468,329 @@ void DockApp::RefreshTray(bool forceLayout) {
     if (IsOverflowOpen()) {
         PaintOverflowPopup();
     }
+    QueueRenderFrame();
+}
+
+// --- Trash / Recycle Bin ----------------------------------------------------
+
+bool DockApp::IsTrashRenderIndex(int icon) const noexcept {
+    return icon >= 0 && icon == m_trashIndex &&
+        static_cast<size_t>(icon) < m_iconRenderData.size() &&
+        m_iconRenderData[static_cast<size_t>(icon)].kind == DockIconKind::Trash;
+}
+
+int DockApp::TrashRenderIndex() const noexcept {
+    return m_trashIndex;
+}
+
+bool DockApp::IsPointOverTrash(POINT screen) const noexcept {
+    if (m_trashIndex < 0) {
+        return false;
+    }
+    return IconAtScreenPoint(screen) == m_trashIndex;
+}
+
+std::wstring DockApp::TrashHoverText() const {
+    RecycleBinState shell{};
+    shell.itemCount = m_trashState.itemCount;
+    shell.byteSize = m_trashState.byteSize;
+    shell.isEmpty = m_trashState.isEmpty;
+    return RecycleBin::HoverLabel(shell);
+}
+
+void DockApp::EnsureTrashIcons() {
+    if (!m_rendererInitialized) {
+        return;
+    }
+    const UINT atlas = m_renderer.IconAtlasPixelExtent();
+    const bool hasEmpty = m_renderer.HasIconForTarget(RecycleBin::kEmptyTarget);
+    const bool hasFull = m_renderer.HasIconForTarget(RecycleBin::kFullTarget);
+    if (hasEmpty && hasFull && atlas == m_loadedTrashExtent) {
+        return;
+    }
+    std::vector<std::wstring> targets;
+    targets.reserve(2);
+    targets.emplace_back(RecycleBin::kEmptyTarget);
+    targets.emplace_back(RecycleBin::kFullTarget);
+    std::vector<std::vector<uint8_t>> pixels;
+    pixels.reserve(2);
+    pixels.push_back(RecycleBin::IconPixels(false, atlas));
+    pixels.push_back(RecycleBin::IconPixels(true, atlas));
+    // If the stock icons fail (very old Windows / stripped SKU), fall back to
+    // the live Recycle Bin folder image for both states so the slot never blanks.
+    if (pixels[0].empty() || pixels[1].empty()) {
+        const std::vector<std::wstring> fallbackCandidates = {L"shell:RecycleBinFolder"};
+        const std::vector<uint8_t> fallback =
+            Renderer::ExtractIconPixels(fallbackCandidates, atlas);
+        if (pixels[0].empty()) {
+            pixels[0] = fallback;
+        }
+        if (pixels[1].empty()) {
+            pixels[1] = fallback;
+        }
+    }
+    if (pixels[0].empty() && pixels[1].empty()) {
+        return;
+    }
+    try {
+        m_renderer.UpdateCachedIcons(targets, pixels);
+    } catch (const std::exception&) {
+        Log(L"Trash icon upload failed.");
+        return;
+    }
+    m_loadedTrashExtent = atlas;
+    AssignIconTextureIndices();
+}
+
+void DockApp::UpdateTrashIconState(bool full) {
+    if (m_trashFull == full) {
+        return;
+    }
+    m_trashFull = full;
+    AssignIconTextureIndices();
+    QueueRenderFrame();
+    // Refresh the hover bubble immediately when it is showing for Trash.
+    if (m_hoveredIcon == m_trashIndex) {
+        UpdateHoverLabel();
+    }
+}
+
+void DockApp::RefreshTrash(bool forceLayout) {
+    RecycleBinState shell{};
+    if (!RecycleBin::QueryState(shell)) {
+        return;
+    }
+    const bool full = !shell.isEmpty;
+    const bool changed = (full != m_trashFull) ||
+        (shell.itemCount != m_trashState.itemCount) ||
+        (shell.byteSize != m_trashState.byteSize) || forceLayout;
+    m_trashState.itemCount = shell.itemCount;
+    m_trashState.byteSize = shell.byteSize;
+    m_trashState.isEmpty = shell.isEmpty;
+    if (!changed) {
+        // Still ensure icons exist after a full texture reload (extent change).
+        if (!m_renderer.HasIconForTarget(RecycleBin::kEmptyTarget) ||
+            !m_renderer.HasIconForTarget(RecycleBin::kFullTarget)) {
+            EnsureTrashIcons();
+            QueueRenderFrame();
+        }
+        return;
+    }
+    EnsureTrashIcons();
+    if (full != m_trashFull) {
+        m_trashFull = full;
+        AssignIconTextureIndices();
+    }
+    // Count/size changes update the hover label + context menu text.
+    if (m_hoveredIcon == m_trashIndex) {
+        UpdateHoverLabel();
+    }
+    if (IsContextMenuOpen() && m_contextIsTrash) {
+        // Rebuild the open Trash menu so Empty shows the fresh count.
+        POINT anchor = m_contextAnchor;
+        const int trash = m_trashIndex;
+        ShowContextMenu(anchor, trash);
+    }
+    QueueRenderFrame();
+}
+
+void DockApp::OpenTrash() {
+    if (!RecycleBin::Open()) {
+        Log(L"Recycle Bin did not open.");
+        MessageBoxW(m_window, L"The Recycle Bin could not be opened.",
+            L"Recycle Bin", MB_OK | MB_ICONWARNING);
+    }
+}
+
+void DockApp::EmptyTrashWithConfirm() {
+    RecycleBinState shell{};
+    if (!RecycleBin::QueryState(shell) || shell.isEmpty) {
+        return;
+    }
+    const std::wstring confirm = RecycleBin::EmptyConfirmText(shell);
+    const int answer = MessageBoxW(m_window, confirm.c_str(), L"Empty Recycle Bin",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (answer != IDYES) {
+        return;
+    }
+    // Custom confirmation already shown: suppress the shell's duplicate.
+    if (!RecycleBin::Empty(m_window, true)) {
+        Log(L"Empty Recycle Bin failed.");
+        MessageBoxW(m_window, L"The Recycle Bin could not be emptied.",
+            L"Recycle Bin", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    // Immediate empty-state feedback; the SHChangeNotify + poll confirms.
+    m_trashState = {};
+    m_trashState.isEmpty = true;
+    UpdateTrashIconState(false);
+    RefreshTrash(true);
+}
+
+void DockApp::ShowTrashProperties() {
+    if (!RecycleBin::ShowProperties(m_window)) {
+        Log(L"Recycle Bin properties did not open.");
+    }
+}
+
+void DockApp::RegisterTrashNotify() {
+    if (m_trashNotifyCookie != 0 || m_window == nullptr) {
+        return;
+    }
+    LPITEMIDLIST pidl = nullptr;
+    if (FAILED(SHGetSpecialFolderLocation(nullptr, CSIDL_BITBUCKET, &pidl)) ||
+        pidl == nullptr) {
+        return;
+    }
+    SHChangeNotifyEntry entry{};
+    entry.pidl = pidl;
+    entry.fRecursive = TRUE;
+    const LONG events = SHCNE_CREATE | SHCNE_DELETE | SHCNE_MKDIR | SHCNE_RMDIR |
+        SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER | SHCNE_UPDATEITEM | SHCNE_UPDATEDIR;
+    const ULONG cookie = SHChangeNotifyRegister(m_window,
+        SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
+        events, kTrashNotifyMessage, 1, &entry);
+    if (cookie == 0) {
+        CoTaskMemFree(pidl);
+        return;
+    }
+    m_trashNotifyCookie = cookie;
+    m_trashNotifyPidl = reinterpret_cast<TrashPidl>(pidl);
+}
+
+void DockApp::UnregisterTrashNotify() noexcept {
+    if (m_trashNotifyCookie != 0) {
+        (void)SHChangeNotifyDeregister(m_trashNotifyCookie);
+        m_trashNotifyCookie = 0;
+    }
+    if (m_trashNotifyPidl != nullptr) {
+        CoTaskMemFree(m_trashNotifyPidl);
+        m_trashNotifyPidl = nullptr;
+    }
+}
+
+void DockApp::RegisterTrashDropTarget() {
+    if (m_inputWindow == nullptr || m_trashDropTarget != nullptr) {
+        return;
+    }
+    auto* target = new (std::nothrow) DockAppTrashDropTarget(this);
+    if (target == nullptr) {
+        return;
+    }
+    const HRESULT registered = RegisterDragDrop(m_inputWindow, target);
+    if (FAILED(registered)) {
+        target->Release();
+        Log(L"Trash drop target registration failed.");
+        return;
+    }
+    // RegisterDragDrop holds its own reference; keep ours for Revoke.
+    m_trashDropTarget = target;
+}
+
+void DockApp::RevokeTrashDropTarget() noexcept {
+    if (m_trashDropTarget == nullptr) {
+        return;
+    }
+    if (m_inputWindow != nullptr) {
+        (void)RevokeDragDrop(m_inputWindow);
+    }
+    m_trashDropTarget->Release();
+    m_trashDropTarget = nullptr;
+}
+
+void DockApp::OnTrashDragEnter() {
+    m_trashDragOver = true;
+    if (m_trashIndex >= 0) {
+        m_hoveredIcon = m_trashIndex;
+        UpdateHoverLabel();
+        QueueRenderFrame(false);
+    }
+}
+
+void DockApp::OnTrashDragOver(POINT screen) {
+    const bool overTrash = IsPointOverTrash(screen);
+    if (overTrash) {
+        if (!m_trashDragOver || m_hoveredIcon != m_trashIndex) {
+            m_trashDragOver = true;
+            m_hoveredIcon = m_trashIndex;
+            UpdateHoverLabel();
+            QueueRenderFrame(false);
+        }
+    } else if (m_trashDragOver) {
+        OnTrashDragLeave();
+    }
+}
+
+void DockApp::OnTrashDragLeave() {
+    if (!m_trashDragOver) {
+        return;
+    }
+    m_trashDragOver = false;
+    if (m_hoveredIcon == m_trashIndex) {
+        m_hoveredIcon = -1;
+        HideHoverLabel();
+    }
+    QueueRenderFrame(false);
+}
+
+void DockApp::OnTrashDrop(const std::vector<std::wstring>& paths) {
+    if (paths.empty() || m_trashDropInFlight) {
+        return;
+    }
+    m_trashDropInFlight = true;
+    // Optimistic full-state: the bin will be non-empty the moment the shell
+    // accepts even one item. The worker confirms via notify + poll.
+    UpdateTrashIconState(true);
+    const HWND owner = m_window;
+    const HWND replyWindow = m_window;
+    std::thread([owner, replyWindow, paths, this]() {
+        const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        RecycleBin::MoveResult result{};
+        if (SUCCEEDED(comResult) || comResult == RPC_E_CHANGED_MODE) {
+            result = RecycleBin::MoveToRecycleBin(owner, paths);
+            if (comResult == S_OK) {
+                CoUninitialize();
+            }
+        } else {
+            result.error = L"The shell delete service is unavailable.";
+            result.failed = paths.size();
+        }
+        auto* reply = new (std::nothrow) TrashDropReply();
+        if (reply == nullptr) {
+            PostMessageW(replyWindow, kTrashDropMessage, 0, 0);
+            return;
+        }
+        if (result.aborted) {
+            reply->error.clear();
+            reply->moved = false;
+        } else if (result.moved > 0 && result.failed == 0) {
+            reply->moved = true;
+        } else if (result.moved > 0) {
+            reply->moved = true;
+            reply->error = result.error;
+        } else {
+            reply->moved = false;
+            reply->error = result.error.empty()
+                ? L"Windows could not move these items to the Recycle Bin."
+                : result.error;
+        }
+        if (PostMessageW(replyWindow, kTrashDropMessage, 0,
+                reinterpret_cast<LPARAM>(reply)) == FALSE) {
+            delete reply;
+        }
+    }).detach();
+}
+
+void DockApp::HandleTrashDropResult(const std::wstring& error, bool moved) {
+    m_trashDropInFlight = false;
+    m_trashDragOver = false;
+    if (!moved && !error.empty()) {
+        Log(L"Move to Recycle Bin failed: " + error);
+        MessageBoxW(m_window, error.c_str(), L"Recycle Bin",
+            MB_OK | MB_ICONWARNING);
+    }
+    // Authoritative refresh (covers partial success, locked files, etc.).
+    RefreshTrash(true);
     QueueRenderFrame();
 }
 
@@ -4066,7 +4591,7 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
         const int hover = app->SettingsHitIndex(point);
         if (hover != app->m_settingsHover) {
             app->m_settingsHover = hover;
-            app->QueueSettingsPaint();
+            app->QueueSettingsPaint(true);
         }
         TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
         TrackMouseEvent(&track);
@@ -4100,7 +4625,7 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
     case WM_MOUSELEAVE:
         if (app != nullptr && app->m_settingsHover >= 0) {
             app->m_settingsHover = -1;
-            app->QueueSettingsPaint();
+            app->QueueSettingsPaint(true);
         }
         return 0;
 
@@ -4198,18 +4723,148 @@ bool DockApp::SettingsGlassValid(POINT origin) const noexcept {
         std::abs(m_settingsGlassFrost - m_config.FrostAmount()) < 0.001F;
 }
 
-void DockApp::QueueSettingsPaint() {
+void DockApp::QueueSettingsPaint(bool hoverOnly) {
     // Coalesce rapid hover transitions into a single repaint, mirroring the
-    // Quick Settings popup path.
-    if (m_settingsPaintQueued || m_settingsWindow == nullptr) {
+    // Quick Settings popup path. Hover moves only need the cheap base-copy +
+    // highlight overlay; full repaints rebuild the cached base frame.
+    if (m_settingsWindow == nullptr) {
+        return;
+    }
+    if (!hoverOnly) {
+        m_settingsHoverPaintOnly = false;
+    } else if (!m_settingsPaintQueued) {
+        m_settingsHoverPaintOnly = true;
+    }
+    if (m_settingsPaintQueued) {
         return;
     }
     m_settingsPaintQueued = true;
     PostMessageW(m_window, kSettingsPaintMessage, 0, 0);
 }
 
+void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height,
+    const SettingsHit& hit) const {
+    if (pixels == nullptr || width <= 0 || height <= 0) {
+        return;
+    }
+    switch (hit.kind) {
+    case SettingsHitKind::Close: {
+        // Match the full paint's close bubble: centered on the X glyph area.
+        // The hit rect is wider than the glyph, so center on its right portion
+        // where the glyph lives rather than the whole hit.
+        const UINT dpi = HostDpi();
+        const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
+        const float closeExtent = static_cast<float>(std::max(22L, std::lround(24.0F * scale)));
+        const float cx = static_cast<float>(hit.bounds.right) - closeExtent * 0.5F - 4.0F;
+        const float cy = 0.5F * static_cast<float>(hit.bounds.top + hit.bounds.bottom);
+        FillCirclePremul(pixels, width, height, cx, cy, closeExtent * 0.62F, 0.55F);
+        break;
+    }
+    case SettingsHitKind::CheckNow:
+        // Base button is baked at 0.72 white; hover wants ~0.88. An extra
+        // translucent overlay brightens toward hover without redrawing text.
+        FillRectPremul(pixels, width, height, hit.bounds, 0.16F);
+        break;
+    case SettingsHitKind::Startup:
+    case SettingsHitKind::Updates:
+    case SettingsHitKind::RimLight:
+    case SettingsHitKind::Lensing:
+    case SettingsHitKind::Dispersion:
+    case SettingsHitKind::Frost:
+    case SettingsHitKind::Specular:
+    case SettingsHitKind::DropShadow:
+    case SettingsHitKind::DepthShade:
+        FillRectPremul(pixels, width, height, hit.bounds, 0.10F);
+        break;
+    case SettingsHitKind::None:
+        break;
+    }
+}
+
+void DockApp::PresentSettingsLayer() noexcept {
+    if (m_settingsWindow == nullptr || m_settingsPresentBits.empty() ||
+        m_settingsPresentSize.cx <= 0 || m_settingsPresentSize.cy <= 0) {
+        return;
+    }
+    POINT origin{};
+    if (!SettingsScreenOrigin(origin)) {
+        return;
+    }
+    const LONG width = m_settingsPresentSize.cx;
+    const LONG height = m_settingsPresentSize.cy;
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return;
+    }
+    HDC memory = CreateCompatibleDC(screen);
+    if (memory == nullptr) {
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = width;
+    header.bV5Height = -height;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
+    if (m_settingsPresentBits.size() >= bytes) {
+        std::memcpy(bits, m_settingsPresentBits.data(), bytes);
+    }
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    POINT source{0, 0};
+    POINT destination{origin.x, origin.y};
+    SIZE present{width, height};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(m_settingsWindow, nullptr, &destination, &present, memory, &source, 0,
+        &blend, ULW_ALPHA);
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+    ShowWindow(m_settingsWindow, SW_SHOWNA);
+    PositionDockSettings();
+}
+
+void DockApp::PaintSettingsHoverFast() {
+    POINT origin{};
+    if (m_settingsBaseBits.empty() || m_settingsWindow == nullptr ||
+        m_settingsPresentSize.cx <= 0 || m_settingsPresentSize.cy <= 0 ||
+        m_settingsPresentSize.cx != m_settingsSize.cx ||
+        m_settingsPresentSize.cy != m_settingsSize.cy ||
+        !SettingsScreenOrigin(origin) || !SettingsGlassValid(origin)) {
+        PaintSettingsPopup();
+        return;
+    }
+    m_settingsPresentBits = m_settingsBaseBits;
+    m_settingsPresentSize = m_settingsSize;
+    if (m_settingsHover >= 0 && static_cast<size_t>(m_settingsHover) < m_settingsHits.size()) {
+        ApplySettingsHoverHighlight(m_settingsPresentBits.data(),
+            SaturatedInt(m_settingsPresentSize.cx), SaturatedInt(m_settingsPresentSize.cy),
+            m_settingsHits[static_cast<size_t>(m_settingsHover)]);
+    }
+    PresentSettingsLayer();
+}
+
 void DockApp::RebuildSettingsPopup() {
     m_settingsHover = -1;
+    m_settingsHoverPaintOnly = false;
+    std::vector<uint8_t>().swap(m_settingsBaseBits);
+    std::vector<uint8_t>().swap(m_settingsPresentBits);
+    m_settingsPresentSize = {};
     InvalidateSettingsGlass();
     PaintSettingsPopup();
 }
@@ -4447,6 +5102,10 @@ void DockApp::CloseDockSettings() noexcept {
     if (m_settingsWindow != nullptr) {
         ShowWindow(m_settingsWindow, SW_HIDE);
     }
+    std::vector<uint8_t>().swap(m_settingsBaseBits);
+    std::vector<uint8_t>().swap(m_settingsPresentBits);
+    m_settingsPresentSize = {};
+    m_settingsHoverPaintOnly = false;
     InvalidateSettingsGlass();
 }
 
@@ -4454,6 +5113,10 @@ void DockApp::DestroyDockSettings() noexcept {
     CloseDockSettings();
     m_settingsPaintQueued = false;
     m_settingsHits.clear();
+    std::vector<uint8_t>().swap(m_settingsBaseBits);
+    std::vector<uint8_t>().swap(m_settingsPresentBits);
+    m_settingsPresentSize = {};
+    m_settingsHoverPaintOnly = false;
     InvalidateSettingsGlass();
     if (m_settingsWindow != nullptr) {
         DestroyWindow(m_settingsWindow);
@@ -4686,12 +5349,10 @@ void DockApp::PaintSettingsPopup() {
     HFONT titleFont = m_overflowTitleFont;
     HFONT labelFont = m_overflowLabelFont;
     HFONT statusFont = m_overflowStatusFont;
-    SettingsHit hoveredHit{};
-    const bool hasHover =
-        m_settingsHover >= 0 && static_cast<size_t>(m_settingsHover) < m_settingsHits.size();
-    if (hasHover) {
-        hoveredHit = m_settingsHits[static_cast<size_t>(m_settingsHover)];
-    }
+    // Hover chrome is applied after a base frame is cached so mouse moves can
+    // repaint with PaintSettingsHoverFast (no text / switch redraw, mirroring
+    // the Quick Settings and context menu fast paths).
+    const int pendingHover = m_settingsHover;
     m_settingsHits.clear();
 
     auto pushHit = [this](SettingsHitKind kind, RECT bounds) {
@@ -4699,9 +5360,6 @@ void DockApp::PaintSettingsPopup() {
         hit.kind = kind;
         hit.bounds = bounds;
         m_settingsHits.push_back(hit);
-    };
-    auto hoveredKind = [&hoveredHit, hasHover](SettingsHitKind kind) {
-        return hasHover && hoveredHit.kind == kind;
     };
     auto drawSwitch = [&](LONG centerY, LONG right, bool enabled, bool hovered) {
         const LONG trackLeft = right - switchWidth;
@@ -4754,12 +5412,6 @@ void DockApp::PaintSettingsPopup() {
         DT_LEFT | DT_VCENTER | DT_SINGLELINE, 250);
     RECT closeBounds{panelWidth - padding - closeExtent, y + (headerHeight - closeExtent) / 2L,
         panelWidth - padding, y + (headerHeight - closeExtent) / 2L + closeExtent};
-    if (hoveredKind(SettingsHitKind::Close)) {
-        FillCirclePremul(pixels, width, height,
-            static_cast<float>(closeBounds.left + closeExtent / 2L),
-            static_cast<float>(closeBounds.top + closeExtent / 2L),
-            static_cast<float>(closeExtent) * 0.62F, 0.55F);
-    }
     DrawFlyoutText(pixels, width, height, closeBounds, titleFont, L"\u00D7",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, 250);
     pushHit(SettingsHitKind::Close, {closeBounds.left - 6, y, panelWidth - padding + 4,
@@ -4774,9 +5426,6 @@ void DockApp::PaintSettingsPopup() {
     const LONG subHeight = std::max(14L, std::lround(16.0F * scale));
     for (const SettingsRow& row : rows) {
         const RECT rowBounds{padding, y, panelWidth - padding, y + rowHeight};
-        if (hoveredKind(row.kind)) {
-            FillRectPremul(pixels, width, height, rowBounds, 0.10F);
-        }
         if (row.slider) {
             const LONG sliderLeft = padding + 4L;
             const LONG sliderRight = panelWidth - padding - 4L;
@@ -4790,8 +5439,7 @@ void DockApp::PaintSettingsPopup() {
                 DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
             const LONG sliderY = y + rowHeight - std::max(14L, std::lround(16.0F * scale));
             m_frostSliderTrack = {sliderLeft, sliderY - 10L, sliderRight, sliderY + 10L};
-            drawSlider(sliderY, sliderLeft, sliderRight, row.amount, hoveredKind(row.kind) ||
-                m_frostSliderDragging);
+            drawSlider(sliderY, sliderLeft, sliderRight, row.amount, m_frostSliderDragging);
             pushHit(row.kind, rowBounds);
         } else {
             const LONG textRight = panelWidth - padding - switchWidth - 12L;
@@ -4803,8 +5451,7 @@ void DockApp::PaintSettingsPopup() {
                 DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
                 DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
-            drawSwitch(y + rowHeight / 2L, panelWidth - padding - 4L, row.enabled,
-                hoveredKind(row.kind));
+            drawSwitch(y + rowHeight / 2L, panelWidth - padding - 4L, row.enabled, false);
             pushHit(row.kind, rowBounds);
         }
         y += rowHeight + rowGap;
@@ -4812,8 +5459,7 @@ void DockApp::PaintSettingsPopup() {
 
     const bool checking = m_updateInFlight.load() || m_updateInstalling.load();
     RECT buttonBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    FillRectPremul(pixels, width, height, buttonBounds, hoveredKind(SettingsHitKind::CheckNow) &&
-            !checking ? 0.88F : 0.72F);
+    FillRectPremul(pixels, width, height, buttonBounds, 0.72F);
     DrawFlyoutText(pixels, width, height, buttonBounds, labelFont,
         checking ? L"Checking..." : L"Check for updates now",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 170 : 245);
@@ -4831,6 +5477,18 @@ void DockApp::PaintSettingsPopup() {
         y + statusHeight};
     DrawFlyoutText(pixels, width, height, statusBounds, statusFont, m_updateStatus,
         DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 225);
+
+    const size_t bytes = pixelCount * 4U;
+    m_settingsBaseBits.resize(bytes);
+    std::memcpy(m_settingsBaseBits.data(), pixels, bytes);
+    m_settingsPresentBits.resize(bytes);
+    std::memcpy(m_settingsPresentBits.data(), pixels, bytes);
+    m_settingsPresentSize = m_settingsSize;
+    if (pendingHover >= 0 && static_cast<size_t>(pendingHover) < m_settingsHits.size()) {
+        ApplySettingsHoverHighlight(pixels, width, height,
+            m_settingsHits[static_cast<size_t>(pendingHover)]);
+        std::memcpy(m_settingsPresentBits.data(), pixels, bytes);
+    }
 
     POINT source{0, 0};
     POINT destination = origin;
@@ -5649,8 +6307,6 @@ void DockApp::PaintOverflowPopup() {
         }
     }
 
-
-
     const size_t bytes = pixelCount * 4U;
     m_overflowBaseBits.resize(bytes);
     std::memcpy(m_overflowBaseBits.data(), pixels, bytes);
@@ -6058,9 +6714,29 @@ std::vector<DockApp::ContextItem> DockApp::BuildContextItems(int icon, DisplayAp
     outApp = {};
     outHasApp = icon >= 0 && static_cast<size_t>(icon) < m_displayApps.size() &&
         !IsLayoutOnlyTarget(m_displayApps[static_cast<size_t>(icon)].app.target) &&
-        !IsTrayRenderIndex(icon);
+        !IsTrayRenderIndex(icon) && !IsTrashRenderIndex(icon);
     outIsSpecial = outHasApp && IsSpecialDockTarget(m_displayApps[static_cast<size_t>(icon)].app.target);
     const bool showBounds = m_config.ShowDevBounds();
+    if (IsTrashRenderIndex(icon)) {
+        ContextItem open;
+        open.command = kContextTrashOpen;
+        open.label = L"Open";
+        open.glyph = L'\uE8A7';
+        items.push_back(std::move(open));
+        ContextItem empty;
+        empty.command = kContextTrashEmpty;
+        empty.label = L"Empty Recycle Bin";
+        empty.glyph = L'\uE74D';
+        empty.disabled = m_trashState.isEmpty || m_trashState.itemCount == 0;
+        items.push_back(std::move(empty));
+        ContextItem props;
+        props.command = kContextTrashProperties;
+        props.label = L"Properties";
+        props.glyph = L'\uE90F';
+        props.separatorBefore = true;
+        items.push_back(std::move(props));
+        return items;
+    }
     if (outHasApp) {
         outApp = m_displayApps[static_cast<size_t>(icon)];
         if (outIsSpecial) {
@@ -6153,6 +6829,7 @@ void DockApp::ShowContextMenu(POINT screenPoint, int icon) {
     m_contextApp = app;
     m_contextHasApp = hasApp;
     m_contextIsSpecial = isSpecial;
+    m_contextIsTrash = IsTrashRenderIndex(icon);
     m_contextAnchor = anchor;
     m_contextHover = -1;
     InvalidateContextGlass();
@@ -6163,6 +6840,7 @@ void DockApp::ShowContextMenu(POINT screenPoint, int icon) {
 
 void DockApp::CloseContextMenu() noexcept {
     m_contextHover = -1;
+    m_contextIsTrash = false;
     m_contextPaintQueued = false;
     m_contextHoverPaintOnly = false;
     if (m_contextWindow != nullptr) {
@@ -6672,8 +7350,9 @@ void DockApp::PaintContextMenu() {
         }
         RECT labelBounds{outerPad + iconBox + iconGap, rowTop, panelWidth - outerPad - 8,
             rowTop + rowHeight};
+        const BYTE labelAlpha = item.disabled ? static_cast<BYTE>(110) : static_cast<BYTE>(250);
         DrawFlyoutText(pixels, width, height, labelBounds, m_contextLabelFont, item.label,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, labelAlpha);
         y += rowHeight;
     }
     std::memcpy(m_contextBaseBits.data(), pixels, bytes);
@@ -6732,9 +7411,22 @@ void DockApp::ExecuteContextCommand(UINT command) {
     const DisplayApp app = m_contextApp;
     const bool hasApp = m_contextHasApp;
     const bool isSpecial = m_contextIsSpecial;
+    const bool isTrash = m_contextIsTrash;
     CloseContextMenu();
 
     if (command == 0) {
+        return;
+    }
+
+    if (isTrash || command == kContextTrashOpen || command == kContextTrashEmpty ||
+        command == kContextTrashProperties) {
+        if (command == kContextTrashOpen) {
+            OpenTrash();
+        } else if (command == kContextTrashEmpty) {
+            EmptyTrashWithConfirm();
+        } else if (command == kContextTrashProperties) {
+            ShowTrashProperties();
+        }
         return;
     }
 
@@ -6791,6 +7483,12 @@ void DockApp::ExecuteContextCommand(UINT command) {
 
 void DockApp::ActivatePressedApp() {
     if (m_pressedIcon < 0 || static_cast<size_t>(m_pressedIcon) >= m_iconRenderData.size()) {
+        return;
+    }
+    if (IsTrashRenderIndex(m_pressedIcon)) {
+        m_suppressDragUntilRelease = true;
+        ClearPressState();
+        OpenTrash();
         return;
     }
     if (IsTrayRenderIndex(m_pressedIcon)) {
@@ -9189,7 +9887,8 @@ int DockApp::IconAtScreenPoint(POINT cursor) const noexcept {
         }
         RECT hit = m_iconRenderData[index].bounds;
         if (m_iconRenderData[index].kind == DockIconKind::Tray ||
-            m_iconRenderData[index].kind == DockIconKind::Clock) {
+            m_iconRenderData[index].kind == DockIconKind::Clock ||
+            m_iconRenderData[index].kind == DockIconKind::Trash) {
             hit.top = 0;
             hit.bottom = static_cast<LONG>(m_dockHeight);
         }

@@ -62,6 +62,15 @@ bool IsPictureInPictureTitle(const std::wstring& title) {
 }
 
 bool IsSmallAuxiliaryWindow(HWND window, LONG_PTR style, LONG_PTR extendedStyle) {
+    // A minimized (iconic) window parks at (-32000,-32000) with a tiny
+    // GetWindowRect (e.g. Discord's 160x28), not its real size. The size test
+    // below would misclassify any minimized main window whose style lacks the
+    // full WS_OVERLAPPEDWINDOW/WS_EX_APPWINDOW bits (frameless Electron
+    // windows like Discord drop WS_SYSMENU). Exempt iconic windows outright:
+    // TryActivate already restores them via SW_RESTORE.
+    if (IsIconic(window) != FALSE) {
+        return false;
+    }
     if ((style & WS_OVERLAPPEDWINDOW) == WS_OVERLAPPEDWINDOW ||
         (extendedStyle & WS_EX_APPWINDOW) != 0) {
         return false;
