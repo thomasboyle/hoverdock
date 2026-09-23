@@ -2775,8 +2775,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     constexpr TraySlot kTrayGlyphSlots[] = {
         TraySlot::Overflow, TraySlot::Power};
 
-    // Trash sits immediately left of the Quick Settings caret (Overflow).
-    LONG trayWidth = trayDividerWidth + trayLeadGap + trayGlyph + trayGap;
+    // Trash sits immediately left of the Quick Settings caret (Overflow) at
+    // full dock app-icon size (not tray-glyph metrics).
+    LONG trayWidth = trayDividerWidth + trayLeadGap + iconSize + trayGap;
     LONG visibleGlyphs = 0;
     for (const TraySlot slot : kTrayGlyphSlots) {
         if (!SystemTray::SlotVisible(slot, m_tray.Status())) {
@@ -2865,15 +2866,15 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     left += trayDividerWidth + trayLeadGap;
 
     const LONG trayTop = top + (iconSize - trayGlyph) / 2;
-    // Trash / Recycle Bin — immediately left of Quick Settings caret.
+    // Trash / Recycle Bin: full dock icon cell, immediately left of Quick Settings.
     {
         DockIconRenderData trash;
         trash.kind = DockIconKind::Trash;
         trash.adaptiveInk = false;
-        trash.bounds = {left, trayTop, left + trayGlyph, trayTop + trayGlyph};
+        trash.bounds = {left, top, left + iconSize, top + iconSlotHeight};
         m_trashIndex = static_cast<int>(m_iconRenderData.size());
         m_iconRenderData.push_back(trash);
-        left += trayGlyph + trayGap;
+        left += iconSize + trayGap;
     }
     for (const TraySlot slot : kTrayGlyphSlots) {
         if (!SystemTray::SlotVisible(slot, m_tray.Status())) {
