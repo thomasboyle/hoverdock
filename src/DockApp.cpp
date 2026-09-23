@@ -2668,7 +2668,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         } else {
             data.bounds = {left, top, left + iconSize, top + iconSlotHeight};
             data.running = m_displayApps[index].runningWindow != nullptr;
-            data.adaptiveInk = IsSpecialDockTarget(m_displayApps[index].app.target);
+            // Start/Search carry their own two-tone artwork (charcoal fill +
+            // white halo), so they must not be remapped to flat adaptive ink.
+            data.adaptiveInk = false;
             left += iconSize + gap;
         }
         m_iconRenderData.push_back(data);

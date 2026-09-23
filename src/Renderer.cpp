@@ -455,65 +455,171 @@ std::vector<uint8_t> RasterizeBitmap(HBITMAP sourceBitmap, UINT extent) {
     return ScalePremultipliedPixels(source, width, height, extent);
 }
 
-void SetGlyphPixel(std::vector<uint8_t>& pixels, UINT extent, int x, int y) {
-    if (x < 0 || y < 0 || x >= static_cast<int>(extent) || y >= static_cast<int>(extent)) {
+// Two-tone Start/Search tiles matching the supplied artwork: charcoal rounded
+// fill + solid white rim + soft white outer glow. Buffers are premultiplied for
+// the (ONE, INV_SRC_ALPHA) icon blend; grays stay neutral so the atlas byte
+// order is moot. Full color is intentional: DockApp leaves these two icons
+// non-adaptive so the white halo keeps them contrasted on any wallpaper.
+float GlyphClamp01(float value) {
+    return value < 0.0F ? 0.0F : (value > 1.0F ? 1.0F : value);
+}
+
+float GlyphSmoothstep(float edge0, float edge1, float value) {
+    const float t = GlyphClamp01((value - edge0) / (edge1 - edge0));
+    return t * t * (3.0F - 2.0F * t);
+}
+
+float SdRoundedBox(float px, float py, float halfX, float halfY, float radius) {
+    const float qx = std::fabs(px) - (halfX - radius);
+    const float qy = std::fabs(py) - (halfY - radius);
+    const float ax = qx > 0.0F ? qx : 0.0F;
+    const float ay = qy > 0.0F ? qy : 0.0F;
+    const float outside = std::sqrt(ax * ax + ay * ay);
+    const float maxQ = qx > qy ? qx : qy;
+    const float inside = maxQ < 0.0F ? maxQ : 0.0F;
+    return outside + inside - radius;
+}
+
+float SdCapsule(float px, float py, float ax, float ay, float bx, float by, float radius) {
+    const float pax = px - ax;
+    const float pay = py - ay;
+    const float bax = bx - ax;
+    const float bay = by - ay;
+    const float denom = bax * bax + bay * bay;
+    float h = denom > 0.0F ? (pax * bax + pay * bay) / denom : 0.0F;
+    h = GlyphClamp01(h);
+    const float dx = pax - bax * h;
+    const float dy = pay - bay * h;
+    return std::sqrt(dx * dx + dy * dy) - radius;
+}
+
+void CompositeGlyphPixel(std::vector<uint8_t>& pixels, UINT extent, int x, int y, float darkShade,
+    float darkCoverage, float whiteCoverage) {
+    darkCoverage = GlyphClamp01(darkCoverage);
+    whiteCoverage = GlyphClamp01(whiteCoverage);
+    const float uncovered = 1.0F - darkCoverage;
+    const float alpha = darkCoverage + whiteCoverage * uncovered;
+    if (alpha <= 0.003F) {
         return;
     }
-    // Icon atlas buffers are RGB-ordered: byte0=R, byte1=G, byte2=B.
+    const float premul = darkShade * darkCoverage + 255.0F * whiteCoverage * uncovered;
     const size_t offset = (static_cast<size_t>(y) * extent + static_cast<UINT>(x)) * 4U;
-    pixels[offset] = DOCK_CHROME_INK_R;
-    pixels[offset + 1] = DOCK_CHROME_INK_G;
-    pixels[offset + 2] = DOCK_CHROME_INK_B;
-    pixels[offset + 3] = 255;
+    const unsigned char channel = static_cast<unsigned char>(std::lround(GlyphClamp01(premul / 255.0F) * 255.0F));
+    // Neutral gray: identical in every channel so RGB/BGRA order cannot shift hue.
+    pixels[offset] = channel;
+    pixels[offset + 1] = channel;
+    pixels[offset + 2] = channel;
+    pixels[offset + 3] = static_cast<unsigned char>(std::lround(GlyphClamp01(alpha) * 255.0F));
 }
 
-void FillGlyphRectangle(std::vector<uint8_t>& pixels, UINT extent, int left, int top, int width,
-    int height) {
-    for (int y = top; y < top + height; ++y) {
-        for (int x = left; x < left + width; ++x) {
-            SetGlyphPixel(pixels, extent, x, y);
-        }
-    }
-}
-
-std::vector<uint8_t> CreateDockGlyph(const std::wstring& target, UINT extent) {
-    if (target != kStartTarget && target != kSearchTarget) {
-        return {};
-    }
+std::vector<uint8_t> CreateStartGlyph(UINT extent) {
+    const float extentF = static_cast<float>(extent);
+    const float cell = extentF * 0.205F;
+    const float gap = extentF * 0.085F;
+    const float total = cell * 2.0F + gap;
+    const float gridLeft = (extentF - total) / 2.0F;
+    const float gridTop = (extentF - total) / 2.0F;
+    const float corner = extentF * 0.052F;
+    const float stroke = std::max(1.5F, extentF * 0.022F);
+    const float glow = std::max(3.0F, extentF * 0.048F);
+    const float aa = std::max(0.75F, extentF / 112.0F);
+    const float half = cell / 2.0F;
 
     std::vector<uint8_t> pixels(static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U, 0);
-    if (target == kStartTarget) {
-        const int cell = std::max(2, static_cast<int>(extent) * 20 / 100);
-        const int gap = std::max(1, static_cast<int>(extent) * 6 / 100);
-        const int total = cell * 2 + gap;
-        const int left = (static_cast<int>(extent) - total) / 2;
-        const int top = (static_cast<int>(extent) - total) / 2;
-        FillGlyphRectangle(pixels, extent, left, top, cell, cell);
-        FillGlyphRectangle(pixels, extent, left + cell + gap, top, cell, cell);
-        FillGlyphRectangle(pixels, extent, left, top + cell + gap, cell, cell);
-        FillGlyphRectangle(pixels, extent, left + cell + gap, top + cell + gap, cell, cell);
-        return pixels;
-    }
-
-    const float center = static_cast<float>(extent) * 0.42F;
-    const float radius = static_cast<float>(extent) * 0.20F;
-    const float ringWidth = std::max(1.0F, static_cast<float>(extent) * 0.045F);
-    const float handleStart = radius * 0.62F;
-    const float handleEnd = radius + static_cast<float>(extent) * 0.19F;
     for (int y = 0; y < static_cast<int>(extent); ++y) {
         for (int x = 0; x < static_cast<int>(extent); ++x) {
-            const float horizontal = static_cast<float>(x) - center;
-            const float vertical = static_cast<float>(y) - center;
-            const float distance = std::sqrt(horizontal * horizontal + vertical * vertical);
-            const float alongHandle = (horizontal + vertical) * 0.70710678F;
-            const float acrossHandle = std::abs(horizontal - vertical) * 0.70710678F;
-            if (std::abs(distance - radius) <= ringWidth ||
-                (alongHandle >= handleStart && alongHandle <= handleEnd && acrossHandle <= ringWidth)) {
-                SetGlyphPixel(pixels, extent, x, y);
+            const float px = static_cast<float>(x) + 0.5F;
+            const float py = static_cast<float>(y) + 0.5F;
+            float nearest = 1e9F;
+            for (int row = 0; row < 2; ++row) {
+                for (int col = 0; col < 2; ++col) {
+                    const float cx = gridLeft + col * (cell + gap) + half;
+                    const float cy = gridTop + row * (cell + gap) + half;
+                    const float d = SdRoundedBox(px - cx, py - cy, half, half, corner);
+                    nearest = d < nearest ? d : nearest;
+                }
             }
+            const float whiteDist = nearest - stroke;
+            const float darkCoverage = 1.0F - GlyphSmoothstep(-aa, aa, nearest);
+            float whiteSolid = 1.0F - GlyphSmoothstep(-aa, aa, whiteDist);
+            float glowAlpha = 0.0F;
+            if (whiteDist > 0.0F && whiteDist < glow) {
+                const float u = 1.0F - whiteDist / glow;
+                glowAlpha = u * u * 0.9F;
+            }
+            const float whiteCoverage = whiteSolid > glowAlpha ? whiteSolid : glowAlpha;
+            if (darkCoverage <= 0.003F && whiteCoverage <= 0.003F) {
+                continue;
+            }
+            const float shadeT = GlyphClamp01((py - gridTop) / total);
+            const float darkShade = 68.0F + (34.0F - 68.0F) * shadeT;
+            CompositeGlyphPixel(pixels, extent, x, y, darkShade, darkCoverage, whiteCoverage);
         }
     }
     return pixels;
+}
+
+std::vector<uint8_t> CreateSearchGlyph(UINT extent) {
+    const float extentF = static_cast<float>(extent);
+    const float cx = extentF * 0.42F;
+    const float cy = extentF * 0.42F;
+    const float outerR = extentF * 0.205F;
+    const float innerR = extentF * 0.162F;
+    const float stroke = std::max(1.5F, extentF * 0.020F);
+    const float glow = std::max(2.0F, extentF * 0.035F);
+    const float aa = std::max(0.75F, extentF / 112.0F);
+    static constexpr float kDiag = 0.70710678F;
+    const float handleOuterR = extentF * 0.050F;
+    const float handleInnerR = std::max(1.0F, handleOuterR - stroke);
+    const float hx0 = cx + kDiag * outerR * 0.30F;
+    const float hy0 = cy + kDiag * outerR * 0.30F;
+    const float hx1 = cx + kDiag * (outerR + extentF * 0.190F);
+    const float hy1 = cy + kDiag * (outerR + extentF * 0.190F);
+    const float ix0 = cx + kDiag * innerR * 0.20F;
+    const float iy0 = cy + kDiag * innerR * 0.20F;
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U, 0);
+    for (int y = 0; y < static_cast<int>(extent); ++y) {
+        for (int x = 0; x < static_cast<int>(extent); ++x) {
+            const float px = static_cast<float>(x) + 0.5F;
+            const float py = static_cast<float>(y) + 0.5F;
+            const float dx = px - cx;
+            const float dy = py - cy;
+            const float lensOuter = std::sqrt(dx * dx + dy * dy) - outerR;
+            const float lensInner = std::sqrt(dx * dx + dy * dy) - innerR;
+            const float handleOuter =
+                SdCapsule(px, py, hx0, hy0, hx1, hy1, handleOuterR);
+            const float handleInner =
+                SdCapsule(px, py, ix0, iy0, hx1, hy1, handleInnerR);
+            const float whiteDist = lensOuter < handleOuter ? lensOuter : handleOuter;
+            const float darkDist = lensInner < handleInner ? lensInner : handleInner;
+            const float darkCoverage = 1.0F - GlyphSmoothstep(-aa, aa, darkDist);
+            float whiteSolid = 1.0F - GlyphSmoothstep(-aa, aa, whiteDist);
+            float glowAlpha = 0.0F;
+            if (whiteDist > 0.0F && whiteDist < glow) {
+                const float u = 1.0F - whiteDist / glow;
+                glowAlpha = u * u * 0.55F;
+            }
+            const float whiteCoverage = whiteSolid > glowAlpha ? whiteSolid : glowAlpha;
+            if (darkCoverage <= 0.003F && whiteCoverage <= 0.003F) {
+                continue;
+            }
+            const float shadeT = GlyphClamp01((py - (cy - innerR)) / (2.0F * innerR));
+            const float darkShade = 68.0F + (34.0F - 68.0F) * shadeT;
+            CompositeGlyphPixel(pixels, extent, x, y, darkShade, darkCoverage, whiteCoverage);
+        }
+    }
+    return pixels;
+}
+
+std::vector<uint8_t> CreateDockGlyph(const std::wstring& target, UINT extent) {
+    if (target == kStartTarget) {
+        return CreateStartGlyph(extent);
+    }
+    if (target == kSearchTarget) {
+        return CreateSearchGlyph(extent);
+    }
+    return {};
 }
 
 HBITMAP SafeShellImageBitmap(const wchar_t* target, UINT sourceExtent, SIIGBF flags) noexcept {
