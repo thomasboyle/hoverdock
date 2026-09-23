@@ -2633,7 +2633,14 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     const LONG shadowMargin = DockShadowMarginPx(scale);
     m_dockWidth = static_cast<UINT>(padding * 2 + contentWidth + shadowMargin * 2);
     m_dockHeight = static_cast<UINT>(padding * 2 + iconSlotHeight + shadowMargin * 2);
-    m_visibleY = m_hostBounds.bottom - static_cast<LONG>(m_dockHeight);
+    // The window carries a shadow ring around the pill; anchoring the window
+    // bottom to the screen bottom would leave the pill floating a full
+    // shadowMargin above the edge. Sink the window so only a small breathing
+    // gap remains between the pill and the screen edge (the bottom shadow
+    // clips off-screen, as with a native taskbar).
+    const LONG bottomGap = std::lround(4.0F * scale);
+    m_visibleY =
+        m_hostBounds.bottom - static_cast<LONG>(m_dockHeight) + shadowMargin - bottomGap;
     m_hiddenY = m_visibleY + static_cast<LONG>(m_dockHeight) + margin;
     if (m_visibility == VisibilityState::Hidden) {
         m_currentY = m_hiddenY;
@@ -4851,7 +4858,13 @@ bool DockApp::IsCursorOverOverflow(POINT cursor) const noexcept {
 bool DockApp::IsCursorWithinFlyoutZone(POINT cursor) const noexcept {
     // Union of the dock and the open Quick Settings popup, inflated by a margin
     // so travelling between the two (across the gap) does not dismiss anything.
-    // Leaving the zone dismisses the popup and hides the dock.
+    // Leaving the zone dismisses the popup and hides the dock. With no popup
+    // open there is no gap to bridge: return false so the dock hides the
+    // moment the cursor leaves the pill instead of lingering through the
+    // inflated dock halo.
+    if (!IsOverflowOpen() && !IsDockSettingsOpen() && !IsContextMenuOpen()) {
+        return false;
+    }
     const UINT dpi = HostDpi();
     const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
     const LONG margin = std::max(24L, static_cast<LONG>(std::lround(48.0F * scale)));
@@ -5994,7 +6007,7 @@ void DockApp::HandlePointer(POINT cursor) {
     if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
         !inHotZone && !IsLaunchPromptOpen() && !IsCursorOverDock(cursor) &&
         !IsCursorWithinFlyoutZone(cursor) &&
-        (cursor.y < m_visibleY ||
+        (cursor.y < m_visibleY + DockShadowMarginPx(static_cast<float>(HostDpi()) / 96.0F) ||
             MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) != m_hostMonitor)) {
         BeginHide();
         return;
@@ -6963,7 +6976,8 @@ void DockApp::CloseLaunchPrompt(bool hideDockIfAway) {
 
     POINT cursor{};
     GetCursorPos(&cursor);
-    if (cursor.y < m_visibleY && !IsCursorOverDock(cursor)) {
+    if (cursor.y < m_visibleY + DockShadowMarginPx(static_cast<float>(HostDpi()) / 96.0F) &&
+        !IsCursorOverDock(cursor)) {
         BeginHide();
     }
 }
@@ -9229,8 +9243,23 @@ int DockApp::InsertionIndexForDrag(POINT cursor) const noexcept {
 }
 
 bool DockApp::IsCursorOverDock(POINT cursor) const noexcept {
-    return cursor.x >= m_windowX && cursor.x < m_windowX + static_cast<LONG>(m_dockWidth) &&
-        cursor.y >= m_currentY && cursor.y < m_currentY + static_cast<LONG>(m_dockHeight);
+    // Hit-test the glass pill, not the full window: the window carries a
+    // transparent shadow ring (DOCK_SHADOW_MARGIN_PT) on every side. Counting
+    // that ring as "over dock" forced the cursor a full margin above the
+    // visible top before a leave/hide could trigger, and disagreed with the
+    // input region (already pill-only). The hook's ShouldPostPointerUpdate
+    // uses this too, so pill-testing also makes the leave post immediately.
+    const float scale = static_cast<float>(HostDpi()) / 96.0F;
+    const LONG inset = DockShadowMarginPx(scale);
+    const LONG left = m_windowX + inset;
+    const LONG top = m_currentY + inset;
+    const LONG right = m_windowX + static_cast<LONG>(m_dockWidth) - inset;
+    const LONG bottom = m_currentY + static_cast<LONG>(m_dockHeight) - inset;
+    if (right <= left || bottom <= top) {
+        return cursor.x >= m_windowX && cursor.x < m_windowX + static_cast<LONG>(m_dockWidth) &&
+            cursor.y >= m_currentY && cursor.y < m_currentY + static_cast<LONG>(m_dockHeight);
+    }
+    return cursor.x >= left && cursor.x < right && cursor.y >= top && cursor.y < bottom;
 }
 
 bool DockApp::ShouldPostPointerUpdate(POINT cursor) const noexcept {
