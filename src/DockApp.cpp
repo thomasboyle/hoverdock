@@ -546,6 +546,11 @@ constexpr uint8_t kAmberB = 0;
 constexpr uint8_t kAmberG = 191;
 constexpr uint8_t kAmberR = 255;
 
+// Quick Settings control circles (#1a91dc). DIB order: B, G, R.
+constexpr uint8_t kQuickAccentB = 0xDC;
+constexpr uint8_t kQuickAccentG = 0x91;
+constexpr uint8_t kQuickAccentR = 0x1A;
+
 void FillPillColorPremul(uint8_t* dest, int destWidth, int destHeight, float cxLeft,
     float cxRight, float cy, float radius, float alpha, uint8_t blue, uint8_t green,
     uint8_t red) {
@@ -613,6 +618,49 @@ void FillCircleColorPremul(uint8_t* dest, int destWidth, int destHeight, float c
             CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
         }
     }
+}
+
+void StrokeCircleColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
+    float radius, float halfWidth, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
+    // Thin anti-aliased ring; interior stays clear so glyphs remain readable on hover.
+    if (radius <= 0.0F || halfWidth <= 0.0F || alpha <= 0.0F) {
+        return;
+    }
+    const float pad = halfWidth + 2.0F;
+    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - pad)));
+    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - pad)));
+    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + pad)));
+    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + pad)));
+    const float aa = 1.15F;
+    for (int y = top; y < bottom; ++y) {
+        for (int x = left; x < right; ++x) {
+            const float dx = static_cast<float>(x) + 0.5F - cx;
+            const float dy = static_cast<float>(y) + 0.5F - cy;
+            const float ringDist = std::abs(std::sqrt(dx * dx + dy * dy) - radius);
+            const float coverage =
+                1.0F - std::clamp((ringDist - halfWidth) / aa + 0.5F, 0.0F, 1.0F);
+            if (coverage <= 0.0F) {
+                continue;
+            }
+            const float srcA = coverage * alpha;
+            uint8_t pixel[4] = {
+                static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
+                static_cast<uint8_t>(std::lround(255.0F * srcA)),
+            };
+            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+        }
+    }
+}
+
+void GlowRingColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
+    float radius, uint8_t blue, uint8_t green, uint8_t red) {
+    // Soft outer halo then a sharper core stroke — reads as edge glow, not a fill.
+    StrokeCircleColorPremul(dest, destWidth, destHeight, cx, cy, radius, 3.2F, 0.28F, blue, green,
+        red);
+    StrokeCircleColorPremul(dest, destWidth, destHeight, cx, cy, radius, 1.35F, 0.92F, blue, green,
+        red);
 }
 
 void FillCircleLevelColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
@@ -5859,24 +5907,26 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         const float cy = 0.5F * static_cast<float>(hit.bounds.top + hit.bounds.bottom);
         const float radius = 0.36F * static_cast<float>(
             std::max(1L, hit.bounds.right - hit.bounds.left));
-        FillCirclePremul(pixels, width, height, cx, cy, radius, 0.85F);
+        // Ring glow — keep the gear glyph readable (no solid fill over it).
+        GlowRingColorPremul(pixels, width, height, cx, cy, radius, kQuickAccentB, kQuickAccentG,
+            kQuickAccentR);
         break;
     }
     case TrayFlyoutHitKind::Wifi:
     case TrayFlyoutHitKind::Sound:
     case TrayFlyoutHitKind::Boost:
     case TrayFlyoutHitKind::Brightness: {
-        // Hover disc must match the base tile disc exactly: same center and
-        // same radius (circle * 0.5), in the toggle amber so hovering brightens
-        // the amber toward its hovered strength instead of washing it white.
+        // Edge ring glow at the tile disc radius. A solid hover fill used to
+        // paint over the cached glyph and wash it out; the ring leaves the
+        // interior clear so the icon stays crisp.
         const float scale = static_cast<float>(HostDpi()) / 96.0F;
         const float circle =
             static_cast<float>(std::max(44L, std::lround(52.0F * scale)));
         const float radius = circle * 0.5F;
         const float cx = 0.5F * static_cast<float>(hit.bounds.left + hit.bounds.right);
         const float cy = static_cast<float>(hit.bounds.top) + radius;
-        FillCircleColorPremul(pixels, width, height, cx, cy, radius, 0.92F, kAmberB, kAmberG,
-            kAmberR);
+        GlowRingColorPremul(pixels, width, height, cx, cy, radius, kQuickAccentB, kQuickAccentG,
+            kQuickAccentR);
         break;
     }
     case TrayFlyoutHitKind::ClearAll:
@@ -6153,10 +6203,10 @@ void DockApp::PaintOverflowPopup() {
     RECT gearBounds{panelWidth - padding - gearSize, y + (headerHeight - gearSize) / 2L,
         panelWidth - padding, y + (headerHeight - gearSize) / 2L + gearSize};
     if (hoveredKind(TrayFlyoutHitKind::Settings)) {
-        FillCirclePremul(pixels, width, height,
+        GlowRingColorPremul(pixels, width, height,
             static_cast<float>(gearBounds.left + gearSize / 2L),
             static_cast<float>(gearBounds.top + gearSize / 2L),
-            static_cast<float>(gearSize) * 0.72F, 0.55F);
+            static_cast<float>(gearSize) * 0.72F, kQuickAccentB, kQuickAccentG, kQuickAccentR);
     }
     const UINT gearExtent =
         static_cast<UINT>(std::max(1L, static_cast<LONG>(std::lround(static_cast<float>(gearSize) * 0.85F))));
@@ -6208,7 +6258,6 @@ void DockApp::PaintOverflowPopup() {
         const float cx = static_cast<float>(left) + static_cast<float>(tileWidth) * 0.5F;
         const float cy = static_cast<float>(y) + static_cast<float>(circle) * 0.5F;
         const float tileRadius = static_cast<float>(circle) * 0.5F;
-        const bool isHovered = hoveredKind(tiles[index].kind);
         const bool isSlider = tiles[index].kind == TrayFlyoutHitKind::Sound ||
             tiles[index].kind == TrayFlyoutHitKind::Brightness;
         // Level meter source of truth (also drives the amber state): muted
@@ -6229,19 +6278,19 @@ void DockApp::PaintOverflowPopup() {
             (tiles[index].kind == TrayFlyoutHitKind::Wifi &&
                 trayStatus.network != TrayNetworkKind::Disconnected);
         if (isSlider) {
-            // Dim base disc plus amber fill rising with progress, mirroring the
-            // toggle's amber-on wash so volume/brightness read as levels.
-            FillCirclePremul(pixels, width, height, cx, cy, tileRadius,
-                isHovered ? 0.90F : 0.82F);
-            FillCircleLevelColorPremul(pixels, width, height, cx, cy, tileRadius, level,
-                isHovered ? 0.97F : 0.92F, kAmberB, kAmberG, kAmberR);
+            // Dim accent disc plus stronger #1a91dc fill rising with progress.
+            // Hover ring is applied later in ApplyOverflowHoverHighlight.
+            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.48F,
+                kQuickAccentB, kQuickAccentG, kQuickAccentR);
+            FillCircleLevelColorPremul(pixels, width, height, cx, cy, tileRadius, level, 0.88F,
+                kQuickAccentB, kQuickAccentG, kQuickAccentR);
         } else if (isFullAmber) {
-            // Full amber disc at the toggle's on-strength (0.52, 0.62 hovered).
-            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius,
-                isHovered ? 0.97F : 0.92F, kAmberB, kAmberG, kAmberR);
+            // Full accent disc when the toggle is on (Wi-Fi connected / Boost).
+            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.82F,
+                kQuickAccentB, kQuickAccentG, kQuickAccentR);
         } else {
-            FillCirclePremul(pixels, width, height, cx, cy, tileRadius,
-                isHovered ? 0.90F : 0.82F);
+            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.48F,
+                kQuickAccentB, kQuickAccentG, kQuickAccentR);
         }
         // Glyph bitmaps are cached by EnsureOverflowGlyphs above; hover repaints only composite.
         const std::vector<uint8_t>* glyph = &m_overflowGlyphBrightness;
