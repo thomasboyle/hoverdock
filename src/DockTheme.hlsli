@@ -42,11 +42,11 @@
 // inset, shadow band). Device px at 1x; both sides scale by display DPI.
 #define DOCK_SHADOW_MARGIN_PT 18.0f
 
-// Glass effect toggles packed into scene1.x (float-stored bitmask, all
-// values < 256 exact). DockRenderState composes these from the DockConfig
-// bools; GlassPS decodes with FxEnabled(). All on = current look.
-// High bits of the same word carry the live icon count for icon-calm
-// halos (count << 8 | mask); total stays far below 2^24 (exactly kept).
+// Glass effect toggles packed into scene1.x (float-stored bitmask).
+// DockRenderState composes these from the DockConfig bools; GlassPS
+// decodes with FxEnabled(). All on = current look.
+// Layout: bits 0-7 FX toggles, 8-13 halo icon count, 14 PANEL, 16-23 frost.
+// Total stays below 2^24 so every bit survives the CPU float store exactly.
 #define DOCK_FX_RIM 1
 #define DOCK_FX_LENS 2
 #define DOCK_FX_DISPERSION 4
@@ -57,4 +57,6 @@
 #define DOCK_FX_THICKNESS 128
 #define DOCK_FX_ALL 255
 // Menu/popup plates: same GlassPS path, but no dock shadow margin ring.
-#define DOCK_FX_PANEL 0x01000000u
+// Bit 14 (not bit 24): bit 24 pushed the packed float into ULP=2 range and
+// destroyed rim/lens/specular flags on every popup bake.
+#define DOCK_FX_PANEL 0x4000u

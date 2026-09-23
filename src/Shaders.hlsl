@@ -77,12 +77,14 @@ float BevelSlopeN(float oneMinusX, float oneMinusX4)
 }
 
 // Glass effect toggles packed in scene1.x (DOCK_FX_* bits, DockTheme.hlsli).
-// All values < 256 survive the float trip exactly; callers add 0.5 to guard
-// truncation at bit boundaries. High bits (value >> 8) carry the live icon
-// count for icon-calm halos; total stays far below 2^24 (exactly kept).
+// scene1.x is an integer-valued float from a packed UINT that stays below
+// 2^24, so every bit survives the constant-buffer store exactly. Bit tests
+// go through uint — do not add 0.5 first: once frost occupies bits 16-23 the
+// magnitude can reach 2^23 (ULP=1) and +0.5 rounds away low FX bits (rim,
+// lens, etc.). High bits also carry halo count (8-13) and PANEL (14).
 float FxEnabled(float packed, float bit)
 {
-    return fmod(floor(packed / bit), 2.0);
+    return (((uint)packed) & (uint)bit) != 0u ? 1.0 : 0.0;
 }
 
 VertexOutput FullscreenVS(uint vertexId : SV_VertexID)
@@ -208,7 +210,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // DOCK_SHADOW_MARGIN_PT); the glass sits inset, the shader draws the
     // drop shade into the margin outside the mask.
     // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
-    const float panelOn = fmod(floor((scene1.x + 0.5) / 16777216.0), 2.0);
+    const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
     const float marginDev = (1.0 - panelOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli). Squircle n=4 gives
@@ -225,7 +227,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Per-effect master switches (dock settings, default all on). Decoded
     // from the scene1.x bitmask; each gates exactly one pipeline stage.
     // Declared before the shadow early-out so every branch can use them.
-    const float fxBits = scene1.x + 0.5;
+    const float fxBits = scene1.x;
     const float rimGain = FxEnabled(fxBits, 1.0);
     const float lensOn = FxEnabled(fxBits, 2.0);
     const float dispOn = FxEnabled(fxBits, 4.0);
@@ -485,7 +487,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     out float2 uvR, out float2 uvG, out float2 uvB, out float blurPx)
 {
     // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
-    const float panelOn = fmod(floor((scene1.x + 0.5) / 16777216.0), 2.0);
+    const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
     const float marginDev = (1.0 - panelOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
@@ -502,7 +504,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
     const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
     float slopeMag = 0.65 * slopeN;
-    const float fxBits = scene1.x + 0.5;
+    const float fxBits = scene1.x;
     const float lensOn = FxEnabled(fxBits, 2.0);
     const float dispOn = FxEnabled(fxBits, 4.0);
     const uint haloCount = min(((uint)fxBits >> 8) & 63u, 64u);
@@ -552,7 +554,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     uvR = clamp(uv - outward * dR * texel, lo, hi);
     uvG = clamp(uv - outward * dG * texel, lo, hi);
     uvB = clamp(uv - outward * dB * texel, lo, hi);
-    const float frostAmt = saturate(((uint)(scene1.x + 0.5) >> 16) / 255.0);
+    const float frostAmt = saturate(((uint)scene1.x >> 16) / 255.0);
     blurPx = lerp(kMicaBlurRim, kMicaBlurCore, height01) * dpi * frostAmt;
 }
 
