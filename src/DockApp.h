@@ -733,6 +733,8 @@ private:
     ULONG m_trashNotifyCookie = 0;
     TrashPidl m_trashNotifyPidl = nullptr;
     IDropTarget* m_trashDropTarget = nullptr;
+    bool m_trashDropOnRenderer = false;
+    bool m_trashDropOnInput = false;
     bool m_contextIsTrash = false;
 
     static DockApp* s_instance;

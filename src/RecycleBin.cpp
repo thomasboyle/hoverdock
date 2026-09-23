@@ -414,6 +414,35 @@ std::vector<std::wstring> RecycleBin::FilesFromDataObject(IDataObject* data) noe
     if (data == nullptr) {
         return paths;
     }
+
+    // Prefer IShellItemArray: covers CF_HDROP and CFSTR_SHELLIDLIST. Win11
+    // Explorer often advertises the shell ID list first; CF_HDROP alone can
+    // fail QueryGetData during DragEnter even when the drop is a real file.
+    {
+        ComPtr<IShellItemArray> items;
+        if (SUCCEEDED(SHCreateShellItemArrayFromDataObject(data, IID_PPV_ARGS(&items))) &&
+            items != nullptr) {
+            DWORD count = 0;
+            if (SUCCEEDED(items->GetCount(&count)) && count > 0) {
+                for (DWORD i = 0; i < count && paths.size() < 512; ++i) {
+                    ComPtr<IShellItem> item;
+                    if (FAILED(items->GetItemAt(i, &item)) || item == nullptr) {
+                        continue;
+                    }
+                    PWSTR name = nullptr;
+                    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &name)) || name == nullptr) {
+                        continue;
+                    }
+                    paths.emplace_back(name);
+                    CoTaskMemFree(name);
+                }
+                if (!paths.empty()) {
+                    return paths;
+                }
+            }
+        }
+    }
+
     {
         FORMATETC fmt{static_cast<CLIPFORMAT>(CF_HDROP), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
         STGMEDIUM medium{};
@@ -435,11 +464,11 @@ std::vector<std::wstring> RecycleBin::FilesFromDataObject(IDataObject* data) noe
             if (needed == 0) {
                 continue;
             }
-            std::wstring path(needed + 1, L'\0');
-            const UINT copied = DragQueryFileW(drop, i, path.data(), needed + 1);
+            std::wstring filePath(needed + 1, L'\0');
+            const UINT copied = DragQueryFileW(drop, i, filePath.data(), needed + 1);
             if (copied > 0) {
-                path.resize(copied);
-                paths.push_back(std::move(path));
+                filePath.resize(copied);
+                paths.push_back(std::move(filePath));
             }
             if (paths.size() >= 512) {
                 break;
@@ -455,12 +484,18 @@ bool RecycleBin::DataObjectHasFiles(IDataObject* data) noexcept {
     if (data == nullptr) {
         return false;
     }
-    __try {
-        FORMATETC fmt{static_cast<CLIPFORMAT>(CF_HDROP), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-        return SUCCEEDED(data->QueryGetData(&fmt));
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+    {
+        ComPtr<IShellItemArray> items;
+        if (SUCCEEDED(SHCreateShellItemArrayFromDataObject(data, IID_PPV_ARGS(&items))) &&
+            items != nullptr) {
+            DWORD count = 0;
+            if (SUCCEEDED(items->GetCount(&count)) && count > 0) {
+                return true;
+            }
+        }
     }
+    FORMATETC fmt{static_cast<CLIPFORMAT>(CF_HDROP), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    return SUCCEEDED(data->QueryGetData(&fmt));
 }
 
 std::wstring RecycleBin::FormatByteSize(ULONGLONG bytes) {

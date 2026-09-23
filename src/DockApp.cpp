@@ -1365,13 +1365,17 @@ public:
             *effect = DROPEFFECT_NONE;
             return S_OK;
         }
+        const DWORD allowed = *effect;
         const POINT screen{pt.x, pt.y};
         const bool overTrash =
             m_app != nullptr && m_app->IsPointOverTrash(screen);
         if (overTrash) {
             m_app->OnTrashDragEnter();
         }
-        *effect = overTrash ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
+        // Must AND with the source's allowed mask; assigning MOVE alone when
+        // the source omitted it makes Explorer refuse the drop.
+        *effect = (overTrash && (allowed & DROPEFFECT_MOVE)) ? DROPEFFECT_MOVE
+                                                            : DROPEFFECT_NONE;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE DragOver(DWORD /*keys*/, POINTL pt, DWORD* effect) override {
@@ -1382,9 +1386,10 @@ public:
             *effect = DROPEFFECT_NONE;
             return S_OK;
         }
+        const DWORD allowed = *effect;
         const POINT screen{pt.x, pt.y};
         const bool overTrash = m_app->IsPointOverTrash(screen);
-        if (overTrash) {
+        if (overTrash && (allowed & DROPEFFECT_MOVE)) {
             m_app->OnTrashDragOver(screen);
             *effect = DROPEFFECT_MOVE;
         } else {
@@ -1430,7 +1435,7 @@ public:
             return S_OK;
         }
         m_app->OnTrashDrop(paths);
-        *effect = DROPEFFECT_MOVE;
+        *effect = (*effect & DROPEFFECT_MOVE) ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
         return S_OK;
     }
 
@@ -2978,12 +2983,15 @@ void DockApp::PositionOverlayWindows() {
             SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOREDRAW | SWP_NOCOPYBITS;
         ProfileScope moveScope("PositionOverlayWindows::Move");
         bool positioned = false;
+        // Input HWND last + HWND_TOPMOST so it sits above the DComp renderer.
+        // OLE WindowFromPoint then resolves to the same window that owns mouse
+        // input and RegisterDragDrop (divider handling already lives on input).
         if (HDWP batch = BeginDeferWindowPos(m_inputWindow != nullptr ? 2 : 1)) {
             if (DeferWindowPos(batch, m_window, HWND_TOPMOST, m_windowX, m_currentY, width,
                     height, kMoveFlags) != nullptr &&
                 (m_inputWindow == nullptr ||
-                    DeferWindowPos(batch, m_inputWindow, m_window, m_windowX, m_currentY, width,
-                        height, kMoveFlags) != nullptr) &&
+                    DeferWindowPos(batch, m_inputWindow, HWND_TOPMOST, m_windowX, m_currentY,
+                        width, height, kMoveFlags) != nullptr) &&
                 EndDeferWindowPos(batch) != FALSE) {
                 positioned = true;
             }
@@ -2994,7 +3002,7 @@ void DockApp::PositionOverlayWindows() {
                     kMoveFlags) == FALSE) {
                 Log(L"Could not position the renderer window.");
             } else if (m_inputWindow != nullptr &&
-                SetWindowPos(m_inputWindow, m_window, m_windowX, m_currentY, width, height,
+                SetWindowPos(m_inputWindow, HWND_TOPMOST, m_windowX, m_currentY, width, height,
                     kMoveFlags) == FALSE) {
                 Log(L"Could not position the dock input window.");
             }
@@ -3485,10 +3493,26 @@ int DockApp::TrashRenderIndex() const noexcept {
 }
 
 bool DockApp::IsPointOverTrash(POINT screen) const noexcept {
-    if (m_trashIndex < 0) {
+    if (m_trashIndex < 0 ||
+        static_cast<size_t>(m_trashIndex) >= m_iconRenderData.size()) {
         return false;
     }
-    return IconAtScreenPoint(screen) == m_trashIndex;
+    if (m_visibility != VisibilityState::Showing &&
+        m_visibility != VisibilityState::Visible) {
+        return false;
+    }
+    const DockIconRenderData& icon =
+        m_iconRenderData[static_cast<size_t>(m_trashIndex)];
+    if (icon.kind != DockIconKind::Trash) {
+        return false;
+    }
+    // Hit the full dock-height trash slot (same as IconAtScreenPoint), using
+    // live layout bounds rather than a stale or half-size glyph rect.
+    const POINT client = ClientFromDockOrigin(screen, m_windowX, m_currentY);
+    RECT hit = icon.bounds;
+    hit.top = 0;
+    hit.bottom = static_cast<LONG>(m_dockHeight);
+    return IsInside(hit, client.x, client.y);
 }
 
 std::wstring DockApp::TrashHoverText() const {
@@ -3671,50 +3695,84 @@ void DockApp::UnregisterTrashNotify() noexcept {
 }
 
 void DockApp::RegisterTrashDropTarget() {
-    if (m_inputWindow == nullptr || m_trashDropTarget != nullptr) {
+    if (m_trashDropTarget != nullptr) {
+        return;
+    }
+    if (m_window == nullptr && m_inputWindow == nullptr) {
         return;
     }
     auto* target = new (std::nothrow) DockAppTrashDropTarget(this);
     if (target == nullptr) {
         return;
     }
-    const HRESULT registered = RegisterDragDrop(m_inputWindow, target);
-    if (FAILED(registered)) {
+    // Register on the topmost DComp renderer AND the layered input window.
+    // OLE's drop-target walk uses WindowFromPoint then parents only: when the
+    // renderer sits above the input HWND (HWND_TOPMOST) and still reports as
+    // the hit window despite HTTRANSPARENT, the input-only registration never
+    // receives DragEnter/Drop. Dual registration covers both hit paths.
+    bool any = false;
+    if (m_window != nullptr) {
+        const HRESULT hr = RegisterDragDrop(m_window, target);
+        if (SUCCEEDED(hr)) {
+            m_trashDropOnRenderer = true;
+            any = true;
+        } else {
+            Log(L"Trash drop target registration failed on renderer HWND.");
+        }
+    }
+    if (m_inputWindow != nullptr) {
+        const HRESULT hr = RegisterDragDrop(m_inputWindow, target);
+        if (SUCCEEDED(hr)) {
+            m_trashDropOnInput = true;
+            any = true;
+        } else {
+            Log(L"Trash drop target registration failed on input HWND.");
+        }
+    }
+    if (!any) {
         target->Release();
         Log(L"Trash drop target registration failed.");
         return;
     }
-    // RegisterDragDrop holds its own reference; keep ours for Revoke.
+    // RegisterDragDrop AddRefs per HWND; keep ours for Revoke.
     m_trashDropTarget = target;
+    Log(L"Trash drop target registered (renderer=" +
+        std::wstring(m_trashDropOnRenderer ? L"yes" : L"no") + L", input=" +
+        std::wstring(m_trashDropOnInput ? L"yes" : L"no") + L").");
 }
 
 void DockApp::RevokeTrashDropTarget() noexcept {
     if (m_trashDropTarget == nullptr) {
         return;
     }
-    if (m_inputWindow != nullptr) {
+    if (m_trashDropOnInput && m_inputWindow != nullptr) {
         (void)RevokeDragDrop(m_inputWindow);
     }
+    if (m_trashDropOnRenderer && m_window != nullptr) {
+        (void)RevokeDragDrop(m_window);
+    }
+    m_trashDropOnInput = false;
+    m_trashDropOnRenderer = false;
     m_trashDropTarget->Release();
     m_trashDropTarget = nullptr;
 }
 
 void DockApp::OnTrashDragEnter() {
-    m_trashDragOver = true;
-    if (m_trashIndex >= 0) {
-        m_hoveredIcon = m_trashIndex;
-        UpdateHoverLabel();
-        QueueRenderFrame(false);
+    if (m_trashDragOver) {
+        return;
     }
+    m_trashDragOver = true;
+    // Pressed-path darken (~50%); skip hover bubble so it cannot steal OLE hits.
+    HideHoverLabel();
+    QueueRenderFrame(false);
 }
 
 void DockApp::OnTrashDragOver(POINT screen) {
     const bool overTrash = IsPointOverTrash(screen);
     if (overTrash) {
-        if (!m_trashDragOver || m_hoveredIcon != m_trashIndex) {
+        if (!m_trashDragOver) {
             m_trashDragOver = true;
-            m_hoveredIcon = m_trashIndex;
-            UpdateHoverLabel();
+            HideHoverLabel();
             QueueRenderFrame(false);
         }
     } else if (m_trashDragOver) {
@@ -3727,10 +3785,6 @@ void DockApp::OnTrashDragLeave() {
         return;
     }
     m_trashDragOver = false;
-    if (m_hoveredIcon == m_trashIndex) {
-        m_hoveredIcon = -1;
-        HideHoverLabel();
-    }
     QueueRenderFrame(false);
 }
 
@@ -6569,7 +6623,10 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
         DockIconRenderData& icon = m_iconRenderData[index];
         icon.hovered = m_draggedIcon < 0 && static_cast<int>(index) == m_hoveredIcon;
         icon.dragged = static_cast<int>(index) == m_draggedIcon;
-        icon.pressed = m_draggedIcon < 0 && static_cast<int>(index) == m_pressedIcon;
+        // Reuse the pressed 50% darken path for Trash OLE drag-over feedback.
+        icon.pressed = m_draggedIcon < 0 &&
+            (static_cast<int>(index) == m_pressedIcon ||
+                (m_trashDragOver && static_cast<int>(index) == m_trashIndex));
     }
 
     DockRenderState state;
