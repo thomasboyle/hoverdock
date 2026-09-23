@@ -409,6 +409,123 @@ RecycleBin::MoveResult RecycleBin::MoveToRecycleBin(
     }
 }
 
+
+namespace {
+
+bool SetDataHglobal(IDataObject* data, CLIPFORMAT cf, HGLOBAL mem) noexcept {
+    if (data == nullptr || mem == nullptr) {
+        if (mem != nullptr) {
+            GlobalFree(mem);
+        }
+        return false;
+    }
+    FORMATETC format{cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM medium{};
+    medium.tymed = TYMED_HGLOBAL;
+    medium.hGlobal = mem;
+    medium.pUnkForRelease = nullptr;
+    // fRelease=TRUE: IDataObject owns the HGLOBAL on success.
+    const HRESULT hr = data->SetData(&format, &medium, TRUE);
+    if (FAILED(hr)) {
+        GlobalFree(mem);
+        return false;
+    }
+    return true;
+}
+
+bool SetDataDword(IDataObject* data, CLIPFORMAT cf, DWORD value) noexcept {
+    HGLOBAL mem = GlobalAlloc(GHND, sizeof(DWORD));
+    if (mem == nullptr) {
+        return false;
+    }
+    void* locked = GlobalLock(mem);
+    if (locked == nullptr) {
+        GlobalFree(mem);
+        return false;
+    }
+    *static_cast<DWORD*>(locked) = value;
+    GlobalUnlock(mem);
+    return SetDataHglobal(data, cf, mem);
+}
+
+}  // namespace
+
+DWORD RecycleBin::ChooseTrashDropEffect(DWORD allowed) noexcept {
+    // Prefer MOVE so Explorer/desktop sources drop the item from their view.
+    if ((allowed & DROPEFFECT_MOVE) != 0) {
+        return DROPEFFECT_MOVE;
+    }
+    // Cross-volume / COPY-only sources: COPY is the only legal OLE effect.
+    // SignalOptimizedRecycle + NotifyPathsDeleted still clear the source view.
+    if ((allowed & DROPEFFECT_COPY) != 0) {
+        return DROPEFFECT_COPY;
+    }
+    return DROPEFFECT_NONE;
+}
+
+void RecycleBin::SignalOptimizedRecycle(IDataObject* data) noexcept {
+    if (data == nullptr) {
+        return;
+    }
+    // Tell Explorer-family sources this was a Recycle Bin drop so they remove
+    // the items even when *pdwEffect is COPY (see CFSTR_TARGETCLSID docs).
+    {
+        HGLOBAL mem = GlobalAlloc(GHND, sizeof(CLSID));
+        if (mem != nullptr) {
+            void* locked = GlobalLock(mem);
+            if (locked != nullptr) {
+                *static_cast<CLSID*>(locked) = CLSID_RecycleBin;
+                GlobalUnlock(mem);
+                const CLIPFORMAT cf = static_cast<CLIPFORMAT>(
+                    RegisterClipboardFormatW(CFSTR_TARGETCLSID));
+                if (cf != 0) {
+                    (void)SetDataHglobal(data, cf, mem);
+                } else {
+                    GlobalFree(mem);
+                }
+            } else {
+                GlobalFree(mem);
+            }
+        }
+    }
+    // Optimized move protocol (MSDN "Handling Optimized Move Operations"):
+    // we already DeleteItem'd with ALLOWUNDO. PERFORMED=NONE => source must
+    // NOT delete again. LOGICAL=MOVE => user-visible "moved to bin".
+    const CLIPFORMAT performed = static_cast<CLIPFORMAT>(
+        RegisterClipboardFormatW(CFSTR_PERFORMEDDROPEFFECT));
+    const CLIPFORMAT logical = static_cast<CLIPFORMAT>(
+        RegisterClipboardFormatW(CFSTR_LOGICALPERFORMEDDROPEFFECT));
+    if (performed != 0) {
+        (void)SetDataDword(data, performed, DROPEFFECT_NONE);
+    }
+    if (logical != 0) {
+        (void)SetDataDword(data, logical, DROPEFFECT_MOVE);
+    }
+}
+
+void RecycleBin::NotifyPathsDeleted(const std::vector<std::wstring>& paths) noexcept {
+    for (const std::wstring& path : paths) {
+        if (path.empty()) {
+            continue;
+        }
+        SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+            path.c_str(), nullptr);
+        const size_t slash = path.find_last_of(L"\\/");
+        if (slash == std::wstring::npos || slash == 0) {
+            continue;
+        }
+        std::wstring parent = path.substr(0, slash);
+        // Drive root must keep the trailing backslash ("C:\").
+        if (parent.size() == 2 && parent[1] == L':') {
+            parent.push_back(L'\\');
+        }
+        if (!parent.empty()) {
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                parent.c_str(), nullptr);
+        }
+    }
+}
+
 std::vector<std::wstring> RecycleBin::FilesFromDataObject(IDataObject* data) noexcept {
     std::vector<std::wstring> paths;
     if (data == nullptr) {

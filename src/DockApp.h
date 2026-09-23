@@ -485,7 +485,7 @@ private:
     void OnTrashDragEnter();
     void OnTrashDragOver(POINT screen);
     void OnTrashDragLeave();
-    void OnTrashDrop(const std::vector<std::wstring>& paths);
+    [[nodiscard]] bool OnTrashDrop(const std::vector<std::wstring>& paths);
     void HandleTrashDropResult(const std::wstring& error, bool moved);
     [[nodiscard]] std::wstring TrashHoverText() const;
 

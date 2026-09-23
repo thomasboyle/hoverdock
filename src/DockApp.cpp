@@ -1372,10 +1372,10 @@ public:
         if (overTrash) {
             m_app->OnTrashDragEnter();
         }
-        // Must AND with the source's allowed mask; assigning MOVE alone when
-        // the source omitted it makes Explorer refuse the drop.
-        *effect = (overTrash && (allowed & DROPEFFECT_MOVE)) ? DROPEFFECT_MOVE
-                                                            : DROPEFFECT_NONE;
+        // AND with the source's allowed mask. Prefer MOVE; accept COPY when
+        // that is all the source offers (cross-volume) so the drop still fires.
+        *effect = overTrash ? RecycleBin::ChooseTrashDropEffect(allowed)
+                            : DROPEFFECT_NONE;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE DragOver(DWORD /*keys*/, POINTL pt, DWORD* effect) override {
@@ -1389,9 +1389,11 @@ public:
         const DWORD allowed = *effect;
         const POINT screen{pt.x, pt.y};
         const bool overTrash = m_app->IsPointOverTrash(screen);
-        if (overTrash && (allowed & DROPEFFECT_MOVE)) {
+        const DWORD chosen = overTrash ? RecycleBin::ChooseTrashDropEffect(allowed)
+                                       : DROPEFFECT_NONE;
+        if (chosen != DROPEFFECT_NONE) {
             m_app->OnTrashDragOver(screen);
-            *effect = DROPEFFECT_MOVE;
+            *effect = chosen;
         } else {
             m_app->OnTrashDragLeave();
             *effect = DROPEFFECT_NONE;
@@ -1410,6 +1412,8 @@ public:
         if (effect == nullptr) {
             return E_POINTER;
         }
+        // Capture source-allowed mask before any early exit overwrites *effect.
+        const DWORD allowed = *effect;
         const bool wasAccepting = m_accepting;
         m_accepting = false;
         if (!wasAccepting || m_app == nullptr || data == nullptr) {
@@ -1425,17 +1429,28 @@ public:
             m_app->OnTrashDragLeave();
             return S_OK;
         }
-        // AddRef the data while extracting (GetData may re-enter).
+        // Hold the data object through recycle + SetData (optimized-move signal).
         data->AddRef();
         std::vector<std::wstring> paths = RecycleBin::FilesFromDataObject(data);
-        data->Release();
         m_app->OnTrashDragLeave();
         if (paths.empty()) {
             *effect = DROPEFFECT_NONE;
+            data->Release();
             return S_OK;
         }
-        m_app->OnTrashDrop(paths);
-        *effect = (*effect & DROPEFFECT_MOVE) ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
+        // Recycle synchronously so *pdwEffect matches the real outcome. Returning
+        // MOVE before DeleteItem finished left Explorer/desktop views stale.
+        const bool recycled = m_app->OnTrashDrop(paths);
+        if (recycled) {
+            RecycleBin::SignalOptimizedRecycle(data);
+            RecycleBin::NotifyPathsDeleted(paths);
+            // Success: prefer MOVE (masked). COPY-only sources get COPY; the
+            // TARGETCLSID + SHChangeNotify above still clear their views.
+            *effect = RecycleBin::ChooseTrashDropEffect(allowed);
+        } else {
+            *effect = DROPEFFECT_NONE;
+        }
+        data->Release();
         return S_OK;
     }
 
@@ -3788,52 +3803,48 @@ void DockApp::OnTrashDragLeave() {
     QueueRenderFrame(false);
 }
 
-void DockApp::OnTrashDrop(const std::vector<std::wstring>& paths) {
+bool DockApp::OnTrashDrop(const std::vector<std::wstring>& paths) {
     if (paths.empty() || m_trashDropInFlight) {
-        return;
+        return false;
     }
     m_trashDropInFlight = true;
-    // Optimistic full-state: the bin will be non-empty the moment the shell
-    // accepts even one item. The worker confirms via notify + poll.
+    // Optimistic full-state; HandleTrashDropResult refreshes from the shell.
     UpdateTrashIconState(true);
-    const HWND owner = m_window;
-    const HWND replyWindow = m_window;
-    std::thread([owner, replyWindow, paths, this]() {
-        const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        RecycleBin::MoveResult result{};
-        if (SUCCEEDED(comResult) || comResult == RPC_E_CHANGED_MODE) {
-            result = RecycleBin::MoveToRecycleBin(owner, paths);
-            if (comResult == S_OK) {
-                CoUninitialize();
-            }
-        } else {
-            result.error = L"The shell delete service is unavailable.";
-            result.failed = paths.size();
-        }
-        auto* reply = new (std::nothrow) TrashDropReply();
-        if (reply == nullptr) {
-            PostMessageW(replyWindow, kTrashDropMessage, 0, 0);
-            return;
-        }
-        if (result.aborted) {
-            reply->error.clear();
-            reply->moved = false;
-        } else if (result.moved > 0 && result.failed == 0) {
-            reply->moved = true;
-        } else if (result.moved > 0) {
-            reply->moved = true;
-            reply->error = result.error;
-        } else {
-            reply->moved = false;
-            reply->error = result.error.empty()
-                ? L"Windows could not move these items to the Recycle Bin."
-                : result.error;
-        }
-        if (PostMessageW(replyWindow, kTrashDropMessage, 0,
-                reinterpret_cast<LPARAM>(reply)) == FALSE) {
-            delete reply;
-        }
-    }).detach();
+
+    // Run on the OLE/UI STA (OleInitialize). Must finish before IDropTarget::Drop
+    // returns so *pdwEffect and CFSTR_PERFORMEDDROPEFFECT match reality.
+    RecycleBin::MoveResult result = RecycleBin::MoveToRecycleBin(m_window, paths);
+
+    auto* reply = new (std::nothrow) TrashDropReply();
+    bool moved = false;
+    if (reply == nullptr) {
+        m_trashDropInFlight = false;
+        RefreshTrash(true);
+        return result.moved > 0 && !result.aborted;
+    }
+    if (result.aborted) {
+        reply->error.clear();
+        reply->moved = false;
+    } else if (result.moved > 0 && result.failed == 0) {
+        reply->moved = true;
+        moved = true;
+    } else if (result.moved > 0) {
+        reply->moved = true;
+        reply->error = result.error;
+        moved = true;
+    } else {
+        reply->moved = false;
+        reply->error = result.error.empty()
+            ? L"Windows could not move these items to the Recycle Bin."
+            : result.error;
+    }
+    // Defer MessageBox / icon refresh so we do not re-enter OLE during Drop.
+    if (PostMessageW(m_window, kTrashDropMessage, 0,
+            reinterpret_cast<LPARAM>(reply)) == FALSE) {
+        delete reply;
+        m_trashDropInFlight = false;
+    }
+    return moved;
 }
 
 void DockApp::HandleTrashDropResult(const std::wstring& error, bool moved) {

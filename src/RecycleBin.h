@@ -44,7 +44,16 @@ public:
     [[nodiscard]] static MoveResult MoveToRecycleBin(
         HWND owner, const std::vector<std::wstring>& paths) noexcept;
 
-    // Shell drag-drop helpers (CF_HDROP).
+    // Prefer MOVE, else COPY, else NONE (AND-masked with source-allowed effects).
+    [[nodiscard]] static DWORD ChooseTrashDropEffect(DWORD allowed) noexcept;
+    // Optimized-recycle OLE signal: CFSTR_TARGETCLSID=RecycleBin +
+    // PERFORMEDDROPEFFECT=NONE (source must not delete again) +
+    // LOGICALPERFORMEDDROPEFFECT=MOVE (user-visible outcome).
+    static void SignalOptimizedRecycle(IDataObject* data) noexcept;
+    // SHChangeNotify delete + parent UPDATEDIR so stubborn Explorer views refresh.
+    static void NotifyPathsDeleted(const std::vector<std::wstring>& paths) noexcept;
+
+    // Shell drag-drop helpers (CF_HDROP / shell ID list).
     [[nodiscard]] static std::vector<std::wstring> FilesFromDataObject(
         IDataObject* data) noexcept;
     [[nodiscard]] static bool DataObjectHasFiles(IDataObject* data) noexcept;
