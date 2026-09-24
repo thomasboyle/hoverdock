@@ -7,3 +7,6 @@ out/
 
 # Local profiling / analysis scratch
 .system-analysis/
+
+tools/_meteocons_build/
+

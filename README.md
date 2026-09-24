@@ -55,3 +55,8 @@ Stuck with a hidden taskbar after a crash? Just launch `Dock.exe` once and quit 
 
 - D3D12 Feature Level 12_0+ required
 - MIT licensed — see [LICENSE](LICENSE)
+
+## Credits
+
+- **Weather icons:** [Meteocons](https://meteocons.com) by Bas Milius (MIT). Fill-style static frames are vendored under `assets/meteocons/`.
+- **Weather data:** [Open-Meteo](https://open-meteo.com) forecast API (no API key).

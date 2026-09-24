@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "DockConfig.h"
 #include "InstalledApps.h"
@@ -6,6 +6,7 @@
 #include "TypeSafeClient.h"
 #include "WindowCatalog.h"
 #include "SystemTray.h"
+#include "Weather.h"
 
 #include <Windows.h>
 
@@ -117,6 +118,8 @@ private:
     static constexpr UINT kBeginShowDeferredMessage = WM_APP + 15;
     static constexpr UINT kLayoutApplyMessage = WM_APP + 16;
     static constexpr UINT kDeferredClickMessage = WM_APP + 17;
+    static constexpr UINT kWeatherMessage = WM_APP + 22;
+    static constexpr UINT_PTR kWeatherTimerId = 10;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
     static constexpr UINT_PTR kConfigSaveTimerId = 3;
@@ -253,6 +256,8 @@ private:
     void AssignIconTextureIndices();
     void EnsureTrayIcons();
     void RefreshTray(bool forceLayout);
+    void OnWeatherUpdated();
+    [[nodiscard]] bool IsWeatherRenderIndex(int index) const noexcept;
     void OpenTraySlot(TraySlot slot);
     void ToggleOverflowPopup();
     void CloseOverflowPopup() noexcept;
@@ -631,6 +636,7 @@ private:
     WNDPROC m_launchEditPrevious = nullptr;
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;
+    WeatherService m_weather;
     HWND m_overflowWindow = nullptr;
     VisibilityState m_overflowVisibility = VisibilityState::Hidden;
     std::vector<TrayNotifyIcon> m_overflowIcons;

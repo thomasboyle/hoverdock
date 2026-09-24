@@ -1631,6 +1631,8 @@ int DockApp::Run() {
     m_windows.RebuildPinProfiles(m_config.Pins());
     static_cast<void>(m_windows.Refresh());
     static_cast<void>(m_tray.Refresh());
+    m_weather.Start(m_window, kWeatherMessage);
+    SetTimer(m_window, kWeatherTimerId, WeatherService::kRefreshIntervalMs, nullptr);
     RebuildDisplayApps();
     RebuildLayout(false);
 
@@ -2435,6 +2437,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
     }
 
+    case kWeatherMessage:
+        OnWeatherUpdated();
+        return 0;
+
     case kOpenStartMenuMessage:
         // Legacy async entry: OpenStartMenuFromDock now sends synchronously.
         // Keep the handler as a no-broadcast fallback so any in-flight message
@@ -2515,6 +2521,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             RefreshTray(false);
             // Re-arm: overflow wants 1 Hz IPC; dock-face clock has no seconds.
             StartTrayTimer();
+        } else if (wParam == kWeatherTimerId) {
+            m_weather.RequestRefresh();
         } else if (wParam == kUpdateTimerId) {
             // First tick is the delayed startup check; re-arm for the steady
             // 6 h cadence afterwards.
@@ -2536,6 +2544,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
 
     case WM_DESTROY:
+        KillTimer(window, kWeatherTimerId);
+        m_weather.Stop();
         StopTaskbarMonitor();
         StopUpdateTimer();
         UnregisterSystemResumeNotifications();
@@ -2887,7 +2897,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         trayWidth += trayGlyph;
         ++visibleGlyphs;
     }
-    trayWidth += trayClockGap + clockWidth;
+    const LONG weatherReserve = std::max(18L, std::lround(22.0F * layoutScale)) +
+        std::max(4L, std::lround(6.0F * layoutScale));
+    trayWidth += trayClockGap + weatherReserve + clockWidth;
 
     LONG contentWidth = 0;
     for (size_t index = 0; index < displayCount; ++index) {
@@ -2987,6 +2999,18 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         left += trayGlyph + trayGap;
     }
     left += trayClockGap - trayGap;
+    const LONG weatherSize = std::max(18L, std::lround(22.0F * layoutScale));
+    {
+        // Always reserve the slot so the clock does not jump when the first
+        // Open-Meteo fetch lands; RasterizeIcon falls back to cloudy.
+        const LONG weatherTop = top + (iconSlotHeight - weatherSize) / 2;
+        DockIconRenderData weather;
+        weather.kind = DockIconKind::Weather;
+        weather.adaptiveInk = false;
+        weather.bounds = {left, weatherTop, left + weatherSize, weatherTop + weatherSize};
+        m_iconRenderData.push_back(weather);
+        left += weatherSize + std::max(4L, std::lround(6.0F * layoutScale));
+    }
     const LONG clockTop = top + (iconSlotHeight - clockHeight) / 2;
     DockIconRenderData clock;
     clock.kind = DockIconKind::Clock;
@@ -3145,6 +3169,9 @@ void DockApp::UpdateHoverLabel() {
     std::wstring text;
     if (IsTrashRenderIndex(m_hoveredIcon)) {
         text = TrashHoverText();
+    } else if (IsWeatherRenderIndex(m_hoveredIcon)) {
+        const WeatherService::Snapshot snap = m_weather.GetSnapshot();
+        text = snap.tip.empty() ? L"Weather" : snap.tip;
     } else if (IsTrayRenderIndex(m_hoveredIcon)) {
         text = SystemTray::LabelForSlot(m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].traySlot,
             m_tray.Status());
@@ -3457,10 +3484,15 @@ std::wstring DockApp::TrayIconsKey() const {
         ? static_cast<UINT>(clockBounds.bottom - clockBounds.top)
         : 48U;
     const TrayStatus& status = m_tray.Status();
+    const WeatherService::Snapshot weather = m_weather.GetSnapshot();
+    std::wstring weatherKey = weather.valid
+        ? (std::wstring(weather.slug.begin(), weather.slug.end()) + L"|" +
+            std::to_wstring(static_cast<int>(std::lround(weather.temperatureC))))
+        : L"none";
     return std::to_wstring(atlas) + L"|" + std::to_wstring(clockWidth) + L"x" +
         std::to_wstring(clockHeight) + L"|" + status.timeText + L"|" + status.dateText + L"|" +
         (status.hasBattery ? L"1" : L"0") + L"|" + (status.batteryCharging ? L"1" : L"0") + L"|" +
-        std::to_wstring(status.batteryPercent);
+        std::to_wstring(status.batteryPercent) + L"|" + weatherKey;
 }
 
 bool DockApp::TrayIconsNeedApply() const {
@@ -3490,6 +3522,11 @@ void DockApp::AssignIconTextureIndices() {
         if (icon.kind == DockIconKind::Trash) {
             m_iconRenderData[index].textureIndex = m_renderer.TextureIndexForTarget(
                 RecycleBin::TargetForState(m_trashFull));
+            continue;
+        }
+        if (icon.kind == DockIconKind::Weather) {
+            m_iconRenderData[index].textureIndex =
+                m_renderer.TextureIndexForTarget(WeatherService::Target());
             continue;
         }
         if (icon.kind != DockIconKind::Tray && icon.kind != DockIconKind::Clock) {
@@ -3544,6 +3581,16 @@ void DockApp::EnsureTrayIcons() {
             pixels.push_back(m_tray.RasterizeClock(atlas, clockWidth, clockHeight, layoutScale));
         } else {
             pixels.push_back(m_tray.RasterizeGlyph(slot, atlas));
+        }
+    }
+    {
+        // Colorful Meteocons fill glyph (not adaptive ink). Upload even when
+        // the last fetch failed so a prior/neutral cloudy frame can show.
+        const UINT weatherExtent = std::max(1U, atlas);
+        std::vector<uint8_t> weatherPixels = m_weather.RasterizeIcon(weatherExtent);
+        if (!weatherPixels.empty()) {
+            targets.push_back(WeatherService::Target());
+            pixels.push_back(std::move(weatherPixels));
         }
     }
     try {
@@ -5724,6 +5771,19 @@ bool DockApp::IsTrayRenderIndex(int index) const noexcept {
             m_iconRenderData[static_cast<size_t>(index)].kind == DockIconKind::Clock);
 }
 
+bool DockApp::IsWeatherRenderIndex(int index) const noexcept {
+    return index >= 0 && static_cast<size_t>(index) < m_iconRenderData.size() &&
+        m_iconRenderData[static_cast<size_t>(index)].kind == DockIconKind::Weather;
+}
+
+void DockApp::OnWeatherUpdated() {
+    // Snapshot changed on the worker; rebuild so the glyph appears/moves and
+    // re-upload the Meteocons atlas entry. Failures are soft — last icon stays.
+    RebuildLayout(false);
+    EnsureTrayIcons();
+    QueueRenderFrame();
+}
+
 int DockApp::AppSlotCount() const noexcept {
     return static_cast<int>(m_displayApps.size());
 }
@@ -7668,6 +7728,12 @@ void DockApp::ActivatePressedApp() {
         m_suppressDragUntilRelease = true;
         ClearPressState();
         OpenTrash();
+        return;
+    }
+    if (IsWeatherRenderIndex(m_pressedIcon)) {
+        m_suppressDragUntilRelease = true;
+        ClearPressState();
+        m_weather.RequestRefresh();
         return;
     }
     if (IsTrayRenderIndex(m_pressedIcon)) {
@@ -10067,6 +10133,7 @@ int DockApp::IconAtScreenPoint(POINT cursor) const noexcept {
         RECT hit = m_iconRenderData[index].bounds;
         if (m_iconRenderData[index].kind == DockIconKind::Tray ||
             m_iconRenderData[index].kind == DockIconKind::Clock ||
+            m_iconRenderData[index].kind == DockIconKind::Weather ||
             m_iconRenderData[index].kind == DockIconKind::Trash) {
             hit.top = 0;
             hit.bottom = static_cast<LONG>(m_dockHeight);

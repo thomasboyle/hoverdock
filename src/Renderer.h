@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <Windows.h>
 #include <d3d12.h>
@@ -25,6 +25,7 @@ enum class DockIconKind : uint8_t {
     Tray = 3,
     Clock = 4,
     Trash = 5,
+    Weather = 6,
 };
 
 struct DockIconRenderData {
