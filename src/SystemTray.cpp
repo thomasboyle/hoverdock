@@ -137,11 +137,11 @@ HFONT CreateTrayFont(int pixelHeight, int weight) {
 }
 
 int ClockTimePx(float layoutScale) {
-    return std::max(16, static_cast<int>(std::lround(20.0F * layoutScale)));
+    return std::max(18, static_cast<int>(std::lround(23.0F * layoutScale)));
 }
 
 int ClockDatePx(float layoutScale) {
-    return std::max(15, static_cast<int>(std::lround(17.0F * layoutScale)));
+    return std::max(17, static_cast<int>(std::lround(20.0F * layoutScale)));
 }
 
 LONG ClockGapPx(float layoutScale) {
@@ -1217,7 +1217,7 @@ std::vector<uint8_t> SystemTray::RasterizeClock(UINT atlasExtent, UINT displayWi
         &timeBounds, DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
 
     SelectObject(memory, dateFont);
-    SetTextColor(memory, RGB(210, 210, 214));
+    SetTextColor(memory, RGB(255, 255, 255));
     DrawTextW(memory, m_status.dateText.c_str(), static_cast<int>(m_status.dateText.size()),
         &dateBounds, DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
 
@@ -1253,12 +1253,12 @@ SIZE SystemTray::MeasureClock(float layoutScale) const {
     }
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
-        return {static_cast<LONG>(88 * layoutScale), static_cast<LONG>(40 * layoutScale)};
+        return {static_cast<LONG>(96 * layoutScale), static_cast<LONG>(44 * layoutScale)};
     }
     HDC memory = CreateCompatibleDC(screen);
     ReleaseDC(nullptr, screen);
     if (memory == nullptr) {
-        return {static_cast<LONG>(88 * layoutScale), static_cast<LONG>(40 * layoutScale)};
+        return {static_cast<LONG>(96 * layoutScale), static_cast<LONG>(44 * layoutScale)};
     }
 
     const int timeHeight = ClockTimePx(layoutScale);

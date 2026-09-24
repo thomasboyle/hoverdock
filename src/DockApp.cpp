@@ -2866,9 +2866,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     const SIZE clockSize = m_tray.MeasureClock(layoutScale);
     const LONG atlasExtent = std::min(256L, std::max(1L, static_cast<LONG>(IconPixelExtent()) * 2L));
     const LONG clockWidth = std::min(atlasExtent,
-        std::max(clockSize.cx, std::lround(72.0F * layoutScale)));
+        std::max(clockSize.cx, std::lround(80.0F * layoutScale)));
     const LONG clockHeight = std::min(atlasExtent,
-        std::min(iconSlotHeight, std::max(clockSize.cy, std::lround(36.0F * layoutScale))));
+        std::min(iconSlotHeight, std::max(clockSize.cy, std::lround(40.0F * layoutScale))));
     const size_t displayCount = m_displayApps.size();
     constexpr TraySlot kTrayGlyphSlots[] = {
         TraySlot::Overflow, TraySlot::Power};
