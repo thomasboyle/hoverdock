@@ -950,7 +950,7 @@ bool DockConfig::Load() {
     m_rimLight = true;
     m_lensing = true;
     m_dispersion = true;
-    m_frostAmount = 1.0F;
+    m_frostAmount = 0.0F;
     m_tint = true;
     m_specular = true;
     m_dropShadow = true;
@@ -1291,5 +1291,5 @@ void DockConfig::SetDefaults() {
     m_specular = true;
     m_dropShadow = true;
     m_depthShade = true;
-    m_frostAmount = 1.0F;
+    m_frostAmount = 0.0F;
 }

@@ -159,8 +159,8 @@ float InterleavedGradientNoise(float2 pixel)
 // ---------------------------------------------------------------------------
 // Optical constants shared by both separable passes (GlassPS + BlurHPS).
 // Both passes must compute identical UVs or the split is invalid.
-static const float kLensGain = 2.3;
-static const float kFringeBoost = 24.0;
+static const float kLensGain = 2.55;
+static const float kFringeBoost = 14.0;
 // Soft max refraction pull (px at 1x, scaled by dpi). Without a cap the
 // full-span slab drags content from 20-40px away to the opposite rim, so a
 // white window overlapping only the top paints a white fringe along the
@@ -172,12 +172,11 @@ static const float kLensMaxPx = 10.0;
 // refracted sample from the interior. Otherwise the blended fringe reads as
 // a bright line over dark content.
 static const float kLensRimFadePx = 3.0;
-// Per-pass mica radius 16 with a 33-tap (k=0..16) unit-pixel Gaussian
-// (sigma = 8). Step capped at 1 px so the frost stays pixel-accurate;
-// C++ iterates many H/V passes so text behind the dock dissolves the
-// way Apple liquid glass does — readable glyphs must not survive.
-static const float kMicaBlurRim = 16.0;
-static const float kMicaBlurCore = 16.0;
+// Light mica: small per-pass radius. Apple Liquid Glass is refraction-first
+// (clear face, rim lens), so frost is a soft veil - not a text-dissolving
+// acrylic slab. C++ runs a single H pass; GlassPS finishes the V axis.
+static const float kMicaBlurRim = 5.0;
+static const float kMicaBlurCore = 4.0;
 // Dense 33-tap Gaussian, sigma = 8, taps at 1-pixel multiples.
 // w(k) = exp(-k^2 / (2*sigma^2)), normalized with mirrors.
 static const float kGaussW[17] = {
@@ -260,13 +259,13 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // down-right offset (top-left key light), quadratic falloff over a
         // 14px band. Premultiplied black over the desktop = drop shade via
         // the DComp blend. Fits inside the layout margin (18px) with room.
-        const float2 shadowCenter = outputSize * 0.5 + float2(2.0, 5.0) * dpi;
+        const float2 shadowCenter = outputSize * 0.5 + float2(2.0, 6.0) * dpi;
         const float shadowSdf = SdSquircleBox(pixel - shadowCenter, halfSize, cornerRadius);
-        const float shadowWidth = 14.0 * dpi;
+        const float shadowWidth = 16.0 * dpi;
         if (shadowSdf < shadowWidth)
         {
             float s = 1.0 - max(shadowSdf, 0.0) / shadowWidth;
-            const float shadowAlpha = s * s * 0.22;
+            const float shadowAlpha = s * s * 0.30;
             return float4(0.0, 0.0, 0.0, shadowAlpha);
         }
         return float4(0.0, 0.0, 0.0, 0.0);
@@ -428,11 +427,15 @@ float4 GlassPS(VertexOutput input) : SV_Target
         }
     }
 
-    // ---- 1. Calibrated face tone map ------------------------------------
-    // Linear lift fitted to solid swatches (see DockTheme.hlsli):
-    // #000->#3a3a3a, #1f1f1f->#4e4e4e, #fff->#e1e1e1.
-    // Applied after blur so frost softens detail; the map sets the face level.
-    float3 color = lerp(DOCK_FACE_OVER_BLACK, DOCK_FACE_OVER_WHITE, saturate(frostedBackground));
+    // ---- 1. Clear lens face (Apple Liquid Glass) ------------------------
+    // Old path fully remapped the warped backdrop into the #3a..#e1 milky
+    // acrylic plate. Apple Liquid Glass is refraction-first: keep most of
+    // the lensed wallpaper, add only a light plate for icon legibility.
+    // frostAmount still scales plate milk via the Frost slider.
+    const float3 toneMapped = lerp(DOCK_FACE_OVER_BLACK, DOCK_FACE_OVER_WHITE,
+        saturate(frostedBackground));
+    const float plateMix = lerp(0.10, 0.42, frostAmount);
+    float3 color = lerp(frostedBackground, toneMapped, plateMix);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
     // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on
@@ -443,18 +446,16 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float fresnel = 0.04 + 0.96 * pow(1.0 - cosTheta, 5.0);
     const float3 lightDir = normalize(float3(-0.35, -0.6, 0.7));
     const float ndl = saturate(dot(surfN, lightDir));
-    const float specular = pow(ndl, 80.0) * (bevelFactor * 0.7 + rim * 0.5);
+    // Sharp key specular (Apple white rim lights): tighter lobe, rim-weighted.
+    const float specular = pow(ndl, 110.0) * (bevelFactor * 0.45 + rim * 0.85);
     // Cool bounce fill from the opposite side so highlights travel instead
     // of sitting in one static lobe.
     const float3 fillDir = normalize(float3(0.55, 0.6, 0.45));
-    const float fillSpec = pow(saturate(dot(surfN, fillDir)), 24.0) * bevelFactor;
-    // Tight Fresnel veil at the rim (sharper optical edge definition) on
-    // top of the faint broad veil below; final saturate keeps LDR range.
-    // Narrowed (rim^1.5) so the border never reads as a milky frame: the
-    // crisp caustic line underneath carries the edge instead.
-    color += fresnel * float3(0.90, 0.95, 1.0) * 0.45 * pow(rim, 1.5) * rimGain * haloDamp;
-    color += specular * float3(1.0, 1.0, 1.0) * 0.55 * specOn;
-    color += fillSpec * float3(0.75, 0.85, 1.0) * 0.18 * specOn;
+    const float fillSpec = pow(saturate(dot(surfN, fillDir)), 28.0) * bevelFactor;
+    // Narrow Fresnel veil + thin bright rim caustic (not a chalk outline).
+    color += fresnel * float3(0.92, 0.96, 1.0) * 0.32 * pow(rim, 2.2) * rimGain * haloDamp;
+    color += specular * float3(1.0, 1.0, 1.0) * 0.78 * specOn;
+    color += fillSpec * float3(0.75, 0.85, 1.0) * 0.12 * specOn;
 
     // Established edge treatment: faint thickness shading, bright rim
     // caustic (the focused edge-lensing highlight, following the key light
@@ -465,10 +466,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // grounded edge. True outer shadow is drawn outside the mask below.
     const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
     color *= lerp(1.0, thicknessShade, thickOn);
-    color += glassTint * rim * 0.05 * rimGain * haloDamp;
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 5.0) * 0.34 * (0.55 + 0.45 * ndl) * rimGain * haloDamp;
+    color += glassTint * rim * 0.03 * rimGain * haloDamp;
+    // Thin bright rim specular (Apple-style white edge light).
+    color += float3(1.0, 1.0, 1.0) * pow(rim, 10.0) * 0.58 * (0.30 + 0.70 * ndl) * rimGain * haloDamp;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
-    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.08 * rimGain * haloDamp;
+    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.06 * rimGain * haloDamp;
 
     if (scene1.z > 0.5)
     {

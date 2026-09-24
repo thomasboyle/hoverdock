@@ -35,7 +35,7 @@
 // at full frost (same rule as the dock). Tint/mix kept for any residual refs.
 #define DOCK_GLASS_TINT 0.829f
 #define DOCK_GLASS_MIX 0.85f
-#define DOCK_GLASS_ALPHA 0.88f
+#define DOCK_GLASS_ALPHA 0.97f
 
 // Drop-shadow margin around the dock pill, shared by layout (window
 // inflation, input-region inset, popup anchors) and the glass shader (pill

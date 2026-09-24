@@ -1441,28 +1441,11 @@ bool Renderer::Render(const DockRenderState& state) {
             m_device->CreateShaderResourceView(target, &blurView, blurSrv);
         };
 
-        // Dense liquid-glass stack: 5H + 5V effective (GlassPS finishes the
-        // last V). Each pass is a 33-tap unit-pixel Gaussian (radius 16) so
-        // text behind the dock dissolves instead of staying readable.
-        // H (backdrop->temp), V, H, V, H, V, H, V, H; GlassPS final V.
+        // Clear-glass frost: one horizontal pass into temp; GlassPS finishes
+        // the vertical axis. Keeps a soft veil when Frost > 0 without the
+        // old 5H+5V mica stack that read as milky acrylic.
         blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
             kTempBlurDescriptor, m_blurPipeline.Get());
-        blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
-            kTempBlurDescriptor2, m_blurVPipeline.Get());
-        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
-            kTempBlurDescriptor, m_blurH2Pipeline.Get());
-        blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
-            kTempBlurDescriptor2, m_blurVPipeline.Get());
-        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
-            kTempBlurDescriptor, m_blurH2Pipeline.Get());
-        blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
-            kTempBlurDescriptor2, m_blurVPipeline.Get());
-        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
-            kTempBlurDescriptor, m_blurH2Pipeline.Get());
-        blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
-            kTempBlurDescriptor2, m_blurVPipeline.Get());
-        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
-            kTempBlurDescriptor, m_blurH2Pipeline.Get());
 
         m_commandList->OMSetRenderTargets(1, &renderTarget, FALSE, nullptr);
     }
