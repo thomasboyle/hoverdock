@@ -40,7 +40,7 @@ That's it — no vcpkg, NuGet, or extra SDKs. Just the Windows SDK.
 
 ## Use it
 
-- **Show:** touch the bottom edge of your primary monitor
+- **Show:** touch the bottom edge of your monitor
 - **Launch / focus:** click an icon
 - **Pin / close / locate:** right-click an icon
 - **Pin current app:** right-click empty glass
@@ -53,6 +53,5 @@ Stuck with a hidden taskbar after a crash? Just launch `Dock.exe` once and quit 
 
 ## Notes
 
-- Primary monitor only (v1)
 - D3D12 Feature Level 12_0+ required
 - MIT licensed — see [LICENSE](LICENSE)
