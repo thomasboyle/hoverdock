@@ -334,6 +334,10 @@ private:
     [[nodiscard]] UINT HostDpi() const noexcept;
     void BeginShow();
     [[nodiscard]] bool CaptureLiveBackdrop();
+    void TickLivePopupGlass();
+    void ApplyLivePopupGlass(std::vector<uint8_t>& glassBits, SIZE size,
+        std::vector<uint8_t>& cachedGlass, std::vector<uint8_t>& baseBits,
+        std::vector<uint8_t>& presentBits, SIZE& presentSize);
     void BeginHide();
     void AdvanceAnimation();
     bool RenderFrame(bool allowBlockingGpuWait = true);
@@ -663,6 +667,9 @@ private:
     ULONGLONG m_frostSliderLastRenderMs = 0;
     // Last live rebake of open menu glass (Quick Settings / Dock Settings / context).
     ULONGLONG m_lastPopupGlassRefreshMs = 0;
+    // Round-robin target for async menu glass rebakes (0=settings,1=overflow,2=context).
+    int m_livePopupGlassTarget = 0;
+    int m_livePopupGlassPending = -1;
     RECT m_frostSliderTrack{};
     SIZE m_settingsSize{};
     std::vector<uint8_t> m_settingsGlass;

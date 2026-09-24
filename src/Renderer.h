@@ -89,6 +89,16 @@ public:
     [[nodiscard]] bool BakeGlassPanel(const RECT& screenRect, UINT width, UINT height,
         UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB,
         HWND excludeC, std::vector<uint8_t>& outBgra);
+    // Non-blocking GlassPS bake for open menus (Quick/Dock Settings / context).
+    // Begin submits BitBlt + GPU work without waiting; Take copies readback when
+    // the fence is signaled. Dedicated panel command list so this never races the
+    // dock swap-chain Present path (the old shared-list rebake hitched the cursor).
+    [[nodiscard]] bool BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT height,
+        UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB,
+        HWND excludeC);
+    [[nodiscard]] bool TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra);
+    [[nodiscard]] bool IsLiveGlassPanelPending() const noexcept;
+    void CancelLiveGlassPanelBake() noexcept;
     // Same wallpaper-luma cut as AdaptiveChromeInk in Shaders.hlsl so Quick /
     // Dock Settings text matches Start/Search/clock chrome on the dock.
     void SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const noexcept;
@@ -238,6 +248,15 @@ private:
     uint8_t* m_panelBackdropUploadPixels = nullptr;
     bool m_panelBlurTempIsSrv = false;
     bool m_panelBlurTemp2IsSrv = false;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_panelAllocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_panelCommandList;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_panelConstants;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_panelIconInstances;
+    FrameConstants* m_panelMappedConstants = nullptr;
+    UINT64 m_panelFenceValue = 0;
+    bool m_panelBakePending = false;
+    UINT m_panelBakeWidth = 0;
+    UINT m_panelBakeHeight = 0;
 
     HANDLE m_frameLatencyWaitableObject = nullptr;
 };

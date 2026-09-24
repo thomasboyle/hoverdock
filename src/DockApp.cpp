@@ -2490,11 +2490,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 QpcSeconds() >= m_suppressBackdropUntil && CaptureLiveBackdrop()) {
                 QueueRenderFrame(false);
             }
-            // Do NOT rebake layered menu glass on the 8 ms dock timer.
-            // BakeGlassPanel waits on a GPU fence + readback on this UI
-            // thread; doing that every tick makes the cursor hitch while
-            // Quick Settings is open. Menus keep their GlassPS plate from
-            // open / frost / explicit repaint; the dock itself stays live.
+            // Open menus get a dedicated non-blocking GlassPS rebake (~120 Hz
+            // cadence via this timer). BeginLiveGlassPanelBake never waits on
+            // the GPU fence; TakeLiveGlassPanelResult applies when ready.
+            TickLivePopupGlass();
         } else if (wParam == kTaskbarMonitorTimerId) {
             // Adaptive cadence: poll fast while suppression is actively fighting
             // Explorer, then back off 10x when steady. Suppression latency in the
@@ -5097,6 +5096,132 @@ UINT DockApp::PackPopupGlassFxFlags() const noexcept
     const UINT frostByte =
         static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0f, 1.0f) * 255.0f));
     return (frostByte << 16) | (haloSlots << 8) | glassFx;
+}
+
+
+void DockApp::ApplyLivePopupGlass(std::vector<uint8_t>& glassBits, SIZE size,
+    std::vector<uint8_t>& cachedGlass, std::vector<uint8_t>& baseBits,
+    std::vector<uint8_t>& presentBits, SIZE& presentSize)
+{
+    const size_t bytes = static_cast<size_t>(size.cx) * static_cast<size_t>(size.cy) * 4U;
+    if (glassBits.size() != bytes || cachedGlass.size() != bytes || baseBits.size() != bytes) {
+        return;
+    }
+    auto* oldGlass = reinterpret_cast<uint32_t*>(cachedGlass.data());
+    auto* newGlass = reinterpret_cast<uint32_t*>(glassBits.data());
+    auto* base = reinterpret_cast<uint32_t*>(baseBits.data());
+    for (size_t i = 0, n = bytes / 4U; i < n; ++i) {
+        if (base[i] == oldGlass[i]) {
+            base[i] = newGlass[i];
+        }
+    }
+    cachedGlass.swap(glassBits);
+    presentBits = baseBits;
+    presentSize = size;
+}
+
+void DockApp::TickLivePopupGlass()
+{
+    if (!m_rendererInitialized || m_frostSliderDragging) {
+        return;
+    }
+
+    const bool settingsOpen = IsDockSettingsOpen();
+    const bool overflowOpen = IsOverflowOpen();
+    const bool contextOpen = IsContextMenuOpen();
+    if (!settingsOpen && !overflowOpen && !contextOpen) {
+        if (m_livePopupGlassPending >= 0) {
+            m_renderer.CancelLiveGlassPanelBake();
+            m_livePopupGlassPending = -1;
+        }
+        return;
+    }
+
+    // 1) Complete a prior bake without blocking.
+    std::vector<uint8_t> glass;
+    if (m_renderer.TakeLiveGlassPanelResult(glass)) {
+        const int done = m_livePopupGlassPending;
+        m_livePopupGlassPending = -1;
+        if (done == 0 && settingsOpen && !m_settingsBaseBits.empty()) {
+            POINT origin{};
+            if (SettingsScreenOrigin(origin) &&
+                glass.size() == m_settingsGlass.size() &&
+                m_settingsGlassSize.cx == m_settingsSize.cx &&
+                m_settingsGlassSize.cy == m_settingsSize.cy) {
+                ApplyLivePopupGlass(glass, m_settingsSize, m_settingsGlass, m_settingsBaseBits,
+                    m_settingsPresentBits, m_settingsPresentSize);
+                PaintSettingsHoverFast();
+            }
+        } else if (done == 1 && overflowOpen && !m_overflowBaseBits.empty()) {
+            if (glass.size() == m_overflowGlass.size() &&
+                m_overflowGlassSize.cx == m_overflowSize.cx &&
+                m_overflowGlassSize.cy == m_overflowSize.cy) {
+                ApplyLivePopupGlass(glass, m_overflowSize, m_overflowGlass, m_overflowBaseBits,
+                    m_overflowPresentBits, m_overflowPresentSize);
+                PaintOverflowHoverFast();
+            }
+        } else if (done == 2 && contextOpen && !m_contextBaseBits.empty()) {
+            if (glass.size() == m_contextGlass.size() &&
+                m_contextGlassSize.cx == m_contextSize.cx &&
+                m_contextGlassSize.cy == m_contextSize.cy) {
+                ApplyLivePopupGlass(glass, m_contextSize, m_contextGlass, m_contextBaseBits,
+                    m_contextPresentBits, m_contextPresentSize);
+                PaintContextHoverFast();
+            }
+        }
+    }
+
+    if (m_renderer.IsLiveGlassPanelPending()) {
+        return;
+    }
+
+    // 2) Kick the next open menu (round-robin) — BitBlt + GPU submit only.
+    const float frostAmount = m_config.FrostAmount();
+    const float glassAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
+    const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
+    const UINT fxFlags = PackPopupGlassFxFlags();
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const int target = (m_livePopupGlassTarget + attempt) % 3;
+        POINT origin{};
+        LONG width = 0;
+        LONG height = 0;
+        bool ready = false;
+        if (target == 0 && settingsOpen && !m_settingsGlass.empty() && !m_settingsBaseBits.empty()) {
+            if (SettingsScreenOrigin(origin) && SettingsGlassValid(origin)) {
+                width = m_settingsSize.cx;
+                height = m_settingsSize.cy;
+                ready = width > 0 && height > 0;
+            }
+        } else if (target == 1 && overflowOpen && !m_overflowGlass.empty() &&
+            !m_overflowBaseBits.empty()) {
+            LONG caret = 0;
+            if (OverflowScreenOrigin(origin, caret) && OverflowGlassValid(origin)) {
+                width = m_overflowSize.cx;
+                height = m_overflowSize.cy;
+                ready = width > 0 && height > 0;
+            }
+        } else if (target == 2 && contextOpen && !m_contextGlass.empty() &&
+            !m_contextBaseBits.empty()) {
+            if (ContextScreenOrigin(origin) && ContextGlassValid(origin)) {
+                width = m_contextSize.cx;
+                height = m_contextSize.cy;
+                ready = width > 0 && height > 0;
+            }
+        }
+        if (!ready) {
+            continue;
+        }
+        const RECT screenRect{origin.x, origin.y, origin.x + width, origin.y + height};
+        if (m_renderer.BeginLiveGlassPanelBake(screenRect, static_cast<UINT>(width),
+                static_cast<UINT>(height), fxFlags, glassAlpha, dpiScale, m_settingsWindow,
+                m_overflowWindow, m_contextWindow)) {
+            m_livePopupGlassPending = target;
+            m_livePopupGlassTarget = (target + 1) % 3;
+            m_lastPopupGlassRefreshMs = GetTickCount64();
+            break;
+        }
+    }
 }
 
 bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* pixels,
