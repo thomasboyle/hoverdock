@@ -1,6 +1,6 @@
 # Hoverdock ✨
 
-A macOS-style dock for Windows — with real liquid glass.
+A macOS-style dock for Windows, with real liquid glass.
 <img width="910" height="112" alt="image" src="https://github.com/user-attachments/assets/5a1e06a1-a306-4b05-844b-031db09cf969" />
 
 Hoverdock hides the taskbar and replaces it with a centered, floating dock rendered in native C++ / Direct3D 12. No Electron, no WebView, no Acrylic. Just one fast `Dock.exe`.
