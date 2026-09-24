@@ -172,11 +172,35 @@ static const float kLensMaxPx = 10.0;
 // refracted sample from the interior. Otherwise the blended fringe reads as
 // a bright line over dark content.
 static const float kLensRimFadePx = 3.0;
-// Light mica: small per-pass radius. Apple Liquid Glass is refraction-first
-// (clear face, rim lens), so frost is a soft veil - not a text-dissolving
-// acrylic slab. C++ runs a single H pass; GlassPS finishes the V axis.
-static const float kMicaBlurRim = 5.0;
-static const float kMicaBlurCore = 4.0;
+// Frost mica radii: clear-glass veil (left/mid) vs full dissolve (right).
+// FrostAmount lerps between these; C++ also ramps H/V pass count above mid.
+static const float kMicaClearRim = 5.0;
+static const float kMicaClearCore = 4.0;
+static const float kMicaFullRim = 16.0;
+static const float kMicaFullCore = 16.0;
+// Legacy aliases (ComputeFrostUVs / SampleGlassAxis call sites).
+static const float kMicaBlurRim = kMicaFullRim;
+static const float kMicaBlurCore = kMicaFullCore;
+
+// Map frostAmount to per-axis mica radii.
+// 0: none; ~0.5: clear-glass veil (5/4); 1: full frost (16/16).
+void FrostMicaRadii(float frostAmount, out float rim, out float core)
+{
+    const float t = saturate(frostAmount);
+    const float upper = saturate((t - 0.5) * 2.0); // 0 at mid, 1 at full
+    const float maxRim = lerp(kMicaClearRim, kMicaFullRim, upper);
+    const float maxCore = lerp(kMicaClearCore, kMicaFullCore, upper);
+    const float reach = saturate(t * 2.0); // 0 at 0, 1 at >=0.5
+    rim = maxRim * reach;
+    core = maxCore * reach;
+}
+
+// Face plate milk: clear Apple mix at 0, full #3a..#e1 tone-map at mid+.
+float FrostPlateMix(float frostAmount)
+{
+    const float t = saturate(frostAmount);
+    return t <= 0.5 ? lerp(0.10, 1.0, t * 2.0) : 1.0;
+}
 // Dense 33-tap Gaussian, sigma = 8, taps at 1-pixel multiples.
 // w(k) = exp(-k^2 / (2*sigma^2)), normalized with mirrors.
 static const float kGaussW[17] = {
@@ -330,12 +354,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
 
-    // Frost presets: off = pure optics, on = heavy mica blur. Tint plate
-    // radii scale with frostAmount; face level comes from the tone map below.
+    // Frost radii: clear veil through mid, full mica on the right half.
     float frostRim;
     float frostCore;
-    frostRim = kMicaBlurRim * frostAmount;
-    frostCore = kMicaBlurCore * frostAmount;
+    FrostMicaRadii(frostAmount, frostRim, frostCore);
 
     float3 frostedBackground;
     if (!hasBackdrop)
@@ -427,14 +449,13 @@ float4 GlassPS(VertexOutput input) : SV_Target
         }
     }
 
-    // ---- 1. Clear lens face (Apple Liquid Glass) ------------------------
-    // Old path fully remapped the warped backdrop into the #3a..#e1 milky
-    // acrylic plate. Apple Liquid Glass is refraction-first: keep most of
-    // the lensed wallpaper, add only a light plate for icon legibility.
-    // frostAmount still scales plate milk via the Frost slider.
+    // ---- 1. Face plate (Frost slider) -----------------------------------
+    // Left (0): Apple clear lens — light plate over lensed wallpaper.
+    // Mid (0.5): full milky tone-map (#000->#3a .. #fff->#e1).
+    // Right (1): same milky plate + heavy mica (radii/passes ramp above).
     const float3 toneMapped = lerp(DOCK_FACE_OVER_BLACK, DOCK_FACE_OVER_WHITE,
         saturate(frostedBackground));
-    const float plateMix = lerp(0.10, 0.42, frostAmount);
+    const float plateMix = FrostPlateMix(frostAmount);
     float3 color = lerp(frostedBackground, toneMapped, plateMix);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
@@ -567,7 +588,10 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     uvG = clamp(uv - outward * dG * texel, lo, hi);
     uvB = clamp(uv - outward * dB * texel, lo, hi);
     const float frostAmt = saturate(((uint)scene1.x >> 16) / 255.0);
-    blurPx = lerp(kMicaBlurRim, kMicaBlurCore, height01) * dpi * frostAmt;
+    float micaRim;
+    float micaCore;
+    FrostMicaRadii(frostAmt, micaRim, micaCore);
+    blurPx = lerp(micaRim, micaCore, height01) * dpi;
 }
 
 // Pass 1: horizontal Gaussian axis from the live backdrop into temp.

@@ -333,10 +333,13 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
     }
     const float overBlack = DOCK_FACE_OVER_BLACK * 255.0F;
     const float overWhite = DOCK_FACE_OVER_WHITE * 255.0F;
+    const float frost = std::clamp(frostAmount, 0.0F, 1.0F);
+    // Match GlassPS FrostPlateMix: clear Apple mix at 0, full milky map at mid+.
+    const float plateMix = frost <= 0.5F ? (0.10F + 0.90F * (frost * 2.0F)) : 1.0F;
     // FrostAmount 0 keeps the old translucent popup alpha; 1 is opaque plate
     // so sharp desktop cannot leak through (same rule as the dock face).
     const float alpha =
-        DOCK_GLASS_ALPHA + (1.0F - DOCK_GLASS_ALPHA) * std::clamp(frostAmount, 0.0F, 1.0F);
+        DOCK_GLASS_ALPHA + (1.0F - DOCK_GLASS_ALPHA) * frost;
     constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F}; // DIB B,G,R
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
@@ -352,8 +355,10 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
             uint8_t* pixel = pixels + flat * 4U;
             for (int channel = 0; channel < 3; ++channel) {
                 const float frosted = static_cast<float>(pixel[channel]);
-                // Calibrated face tone map (same as GlassPS).
-                float mapped = overBlack + (overWhite - overBlack) * (frosted / 255.0F);
+                // Calibrated face tone map (same as GlassPS), blended by plateMix.
+                const float toneMapped =
+                    overBlack + (overWhite - overBlack) * (frosted / 255.0F);
+                float mapped = frosted + (toneMapped - frosted) * plateMix;
                 const float target = mapped * kChannelK[channel] + overWhite * 0.08F;
                 float shaded = mapped + 0.22F * (target - mapped);
                 shaded += overWhite * rim * 0.12F + 255.0F * rim4 * 0.18F;
@@ -5048,21 +5053,31 @@ void DockApp::ApplyFrostSliderAt(LONG clientX) {
     const LONG left = m_frostSliderTrack.left;
     const LONG right = m_frostSliderTrack.right;
     const LONG span = std::max(1L, right - left);
-    const float amount = std::clamp(static_cast<float>(clientX - left) / static_cast<float>(span), 0.0F, 1.0F);
+    float amount = std::clamp(static_cast<float>(clientX - left) / static_cast<float>(span), 0.0F, 1.0F);
+    // Magnetic snap to clear (0), milky plate (0.5), full frost (1).
+    constexpr float kFrostSnapThreshold = 0.06F;
+    constexpr float kFrostSnaps[3] = {0.0F, 0.5F, 1.0F};
+    for (float snap : kFrostSnaps) {
+        if (std::abs(amount - snap) < kFrostSnapThreshold) {
+            amount = snap;
+            break;
+        }
+    }
     if (std::abs(amount - m_config.FrostAmount()) < 0.001F && !m_frostSliderDragging) {
         return;
     }
     m_config.SetFrostAmount(amount);
     if (m_frostSliderDragging) {
         const ULONGLONG now = GetTickCount64();
-        if (now - m_frostSliderLastRenderMs >= 33ULL) {
+        // ~8ms cadence with non-blocking GPU waits (skipIfGpuBusy on busy frames).
+        if (now - m_frostSliderLastRenderMs >= 8ULL) {
             m_frostSliderLastRenderMs = now;
             InvalidateSettingsGlass();
             InvalidateOverflowGlass();
             InvalidateContextGlass();
             QueueSettingsPaint();
             QueueOverflowPaint();
-            QueueRenderFrame();
+            QueueRenderFrame(false);
         } else {
             QueueSettingsPaint();
         }
@@ -5275,7 +5290,7 @@ void DockApp::PaintSettingsPopup() {
             m_config.Lensing(), 0.0F},
         {SettingsHitKind::Dispersion, L"Dispersion", L"Spectral fringe at glass edges", false,
             m_config.Dispersion(), 0.0F},
-        {SettingsHitKind::Frost, L"Frost", L"Clear glass to full mica frost", true, false,
+        {SettingsHitKind::Frost, L"Frost", L"Clear / milky plate / full frost", true, false,
             m_config.FrostAmount()},
         {SettingsHitKind::Specular, L"Speculars", L"Key and fill glints on the surface", false,
             m_config.Specular(), 0.0F},

@@ -1441,11 +1441,21 @@ bool Renderer::Render(const DockRenderState& state) {
             m_device->CreateShaderResourceView(target, &blurView, blurSrv);
         };
 
-        // Clear-glass frost: one horizontal pass into temp; GlassPS finishes
-        // the vertical axis. Keeps a soft veil when Frost > 0 without the
-        // old 5H+5V mica stack that read as milky acrylic.
+        // Frost pass stack scales with FrostAmount (bits 16-23):
+        //   0..0.5  -> 1H (+ GlassPS V): clear/milky veil
+        //   0.5..1  -> ramp to 5H+5V: full pre-1.1.28 mica dissolve
+        const float frostAmt =
+            static_cast<float>((state.fxFlags >> 16) & 0xFFu) / 255.0F;
         blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
             kTempBlurDescriptor, m_blurPipeline.Get());
+        const int extraPairs = static_cast<int>(std::lround(
+            std::clamp((frostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
+        for (int pair = 0; pair < extraPairs; ++pair) {
+            blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
+                kTempBlurDescriptor2, m_blurVPipeline.Get());
+            blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
+                kTempBlurDescriptor, m_blurH2Pipeline.Get());
+        }
 
         m_commandList->OMSetRenderTargets(1, &renderTarget, FALSE, nullptr);
     }
@@ -2482,15 +2492,17 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
             m_device->CreateShaderResourceView(target, &blurView, blurSrv);
         };
 
+        // Same frost-scaled stack as the live dock (1H at clear/mid, up to
+        // 5H+4V here + GlassPS final V at full frost).
+        const float panelFrostAmt =
+            static_cast<float>((fxFlags >> 16) & 0xFFu) / 255.0F;
         blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurPipeline.Get());
-        blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
-        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
-        blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
-        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
-        blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
-        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
-        blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
-        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
+        const int panelExtraPairs = static_cast<int>(std::lround(
+            std::clamp((panelFrostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
+        for (int pair = 0; pair < panelExtraPairs; ++pair) {
+            blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
+            blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
+        }
 
         D3D12_CPU_DESCRIPTOR_HANDLE colorRtv = rtvStart;
         colorRtv.ptr += m_rtvDescriptorSize * 2ULL;
