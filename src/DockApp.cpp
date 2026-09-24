@@ -2897,8 +2897,11 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         trayWidth += trayGlyph;
         ++visibleGlyphs;
     }
-    const LONG weatherReserve = std::max(18L, std::lround(22.0F * layoutScale)) +
-        std::max(4L, std::lround(6.0F * layoutScale));
+    // Weather glyph sits on the time row (not spanning time+date); size tracks
+    // roughly time-glyph height or larger so it reads clearly beside the clock.
+    const LONG weatherSize = std::max(28L, std::lround(34.0F * layoutScale));
+    const LONG weatherGap = std::max(4L, std::lround(6.0F * layoutScale));
+    const LONG weatherReserve = weatherSize + weatherGap;
     trayWidth += trayClockGap + weatherReserve + clockWidth;
 
     LONG contentWidth = 0;
@@ -2999,19 +3002,26 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         left += trayGlyph + trayGap;
     }
     left += trayClockGap - trayGap;
-    const LONG weatherSize = std::max(18L, std::lround(22.0F * layoutScale));
+    const LONG clockTop = top + (iconSlotHeight - clockHeight) / 2;
     {
         // Always reserve the slot so the clock does not jump when the first
         // Open-Meteo fetch lands; RasterizeIcon falls back to cloudy.
-        const LONG weatherTop = top + (iconSlotHeight - weatherSize) / 2;
+        // Align the glyph with the clock's time row (upper line of the
+        // time+date stack), matching SystemTray::RasterizeClock centering.
+        const LONG timePx = std::max(18L, std::lround(23.0F * layoutScale));
+        const LONG datePx = std::max(17L, std::lround(20.0F * layoutScale));
+        const LONG clockInnerGap = std::max(1L, std::lround(2.0F * layoutScale));
+        const LONG textBlockH = timePx + clockInnerGap + datePx;
+        const LONG timeOriginY = clockTop + std::max(0L, (clockHeight - textBlockH) / 2);
+        LONG weatherTop = timeOriginY + (timePx - weatherSize) / 2;
+        weatherTop = std::max(top, std::min(weatherTop, top + iconSlotHeight - weatherSize));
         DockIconRenderData weather;
         weather.kind = DockIconKind::Weather;
         weather.adaptiveInk = false;
         weather.bounds = {left, weatherTop, left + weatherSize, weatherTop + weatherSize};
         m_iconRenderData.push_back(weather);
-        left += weatherSize + std::max(4L, std::lround(6.0F * layoutScale));
+        left += weatherSize + weatherGap;
     }
-    const LONG clockTop = top + (iconSlotHeight - clockHeight) / 2;
     DockIconRenderData clock;
     clock.kind = DockIconKind::Clock;
     clock.traySlot = TraySlot::Clock;
