@@ -669,6 +669,10 @@ private:
     double m_lastUpdateCheck = 0.0;
     std::wstring m_overflowGlyphKey;
     std::vector<uint8_t> m_overflowGlyphGear;
+    // Idle gear blit rect (top-left + extent). Hover scales about this center.
+    int m_overflowGearX = 0;
+    int m_overflowGearY = 0;
+    UINT m_overflowGearExtent = 0;
     std::vector<uint8_t> m_overflowGlyphWifi;
     std::vector<uint8_t> m_overflowGlyphSound;
     std::vector<uint8_t> m_overflowGlyphBrightness;

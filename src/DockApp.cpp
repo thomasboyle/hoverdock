@@ -218,6 +218,31 @@ void CompositePremul(uint8_t* dest, int destWidth, int destHeight, int destX, in
     }
 }
 
+
+std::vector<uint8_t> ScalePremultipliedNearest(const std::vector<uint8_t>& source, int sourceWidth,
+    int sourceHeight, int destWidth, int destHeight) {
+    std::vector<uint8_t> dest(static_cast<size_t>(destWidth) * static_cast<size_t>(destHeight) * 4U, 0);
+    if (sourceWidth <= 0 || sourceHeight <= 0 || destWidth <= 0 || destHeight <= 0 ||
+        source.size() < static_cast<size_t>(sourceWidth) * static_cast<size_t>(sourceHeight) * 4U) {
+        return dest;
+    }
+    for (int y = 0; y < destHeight; ++y) {
+        const int srcY = y * sourceHeight / destHeight;
+        for (int x = 0; x < destWidth; ++x) {
+            const int srcX = x * sourceWidth / destWidth;
+            const size_t srcOffset = (static_cast<size_t>(srcY) * static_cast<size_t>(sourceWidth) +
+                static_cast<size_t>(srcX)) * 4U;
+            const size_t dstOffset = (static_cast<size_t>(y) * static_cast<size_t>(destWidth) +
+                static_cast<size_t>(x)) * 4U;
+            dest[dstOffset] = source[srcOffset];
+            dest[dstOffset + 1] = source[srcOffset + 1];
+            dest[dstOffset + 2] = source[srcOffset + 2];
+            dest[dstOffset + 3] = source[srcOffset + 3];
+        }
+    }
+    return dest;
+}
+
 void BoxBlurRgb(uint8_t* pixels, int width, int height, int radius) {
     if (pixels == nullptr || width <= 0 || height <= 0 || radius <= 0) {
         return;
@@ -5918,13 +5943,34 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     }
     switch (hit.kind) {
     case TrayFlyoutHitKind::Settings: {
-        const float cx = 0.5F * static_cast<float>(hit.bounds.left + hit.bounds.right);
-        const float cy = 0.5F * static_cast<float>(hit.bounds.top + hit.bounds.bottom);
-        const float radius = 0.36F * static_cast<float>(
-            std::max(1L, hit.bounds.right - hit.bounds.left));
-        // Ring glow — keep the gear glyph readable (no solid fill over it).
-        GlowRingColorPremul(pixels, width, height, cx, cy, radius, kQuickAccentB, kQuickAccentG,
-            kQuickAccentR);
+        // Enlarge the cog ~30%; no accent ring glow (tiles keep the ring).
+        constexpr float kGearHoverScale = 1.30F;
+        if (m_overflowGlyphGear.empty() || m_overflowGearExtent == 0U ||
+            m_overflowGlass.empty() || m_overflowGlassSize.cx != width ||
+            m_overflowGlassSize.cy != height) {
+            break;
+        }
+        const int idle = static_cast<int>(m_overflowGearExtent);
+        const int hoverExt = std::max(1, static_cast<int>(std::lround(
+            static_cast<float>(idle) * kGearHoverScale)));
+        const int centerX = m_overflowGearX + idle / 2;
+        const int centerY = m_overflowGearY + idle / 2;
+        // Wipe the idle glyph (and room for the larger one) back to glass.
+        const int half = (std::max)(idle, hoverExt) / 2 + 1;
+        const int left = (std::max)(0, centerX - half);
+        const int top = (std::max)(0, centerY - half);
+        const int right = (std::min)(width, centerX + half + 1);
+        const int bottom = (std::min)(height, centerY + half + 1);
+        for (int y = top; y < bottom; ++y) {
+            const size_t row = static_cast<size_t>(y) * static_cast<size_t>(width) * 4U;
+            std::memcpy(pixels + row + static_cast<size_t>(left) * 4U,
+                m_overflowGlass.data() + row + static_cast<size_t>(left) * 4U,
+                static_cast<size_t>(right - left) * 4U);
+        }
+        const std::vector<uint8_t> scaled = ScalePremultipliedNearest(
+            m_overflowGlyphGear, idle, idle, hoverExt, hoverExt);
+        CompositePremul(pixels, width, height, centerX - hoverExt / 2, centerY - hoverExt / 2,
+            scaled.data(), hoverExt, hoverExt);
         break;
     }
     case TrayFlyoutHitKind::Wifi:
@@ -6211,18 +6257,21 @@ void DockApp::PaintOverflowPopup() {
         return hasHover && hoveredHit.kind == kind && hoveredHit.index == index;
     };
 
+    // Sample adaptive chrome ink before any flyout text so the Quick Settings
+    // title matches Start/Search and the rest of this panel (was drawn against
+    // stale g_flyoutInk* and read as the opposite polarity).
+    uint8_t inkR = DOCK_INK_R;
+    uint8_t inkG = DOCK_INK_G;
+    uint8_t inkB = DOCK_INK_B;
+    m_renderer.SampleAdaptiveChromeInk(inkR, inkG, inkB);
+    SetFlyoutChromeInk(inkR, inkG, inkB);
+
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - gearSize - 8, y + headerHeight};
     DrawFlyoutText(pixels, width, height, titleBounds, titleFont, L"Quick Settings",
         DT_LEFT | DT_VCENTER | DT_SINGLELINE, 250);
     RECT gearBounds{panelWidth - padding - gearSize, y + (headerHeight - gearSize) / 2L,
         panelWidth - padding, y + (headerHeight - gearSize) / 2L + gearSize};
-    if (hoveredKind(TrayFlyoutHitKind::Settings)) {
-        GlowRingColorPremul(pixels, width, height,
-            static_cast<float>(gearBounds.left + gearSize / 2L),
-            static_cast<float>(gearBounds.top + gearSize / 2L),
-            static_cast<float>(gearSize) * 0.72F, kQuickAccentB, kQuickAccentG, kQuickAccentR);
-    }
     const UINT gearExtent =
         static_cast<UINT>(std::max(1L, static_cast<LONG>(std::lround(static_cast<float>(gearSize) * 0.85F))));
     const UINT glyphExtent =
@@ -6230,16 +6279,13 @@ void DockApp::PaintOverflowPopup() {
     const UINT notifyGlyph = static_cast<UINT>(std::max(18L, std::lround(19.0F * scale)));
     // Glyphs don't depend on hover; rasterize once per status/extent combination so
     // hover transitions only pay for compositing, not font rasterization.
-    uint8_t inkR = DOCK_INK_R;
-    uint8_t inkG = DOCK_INK_G;
-    uint8_t inkB = DOCK_INK_B;
-    m_renderer.SampleAdaptiveChromeInk(inkR, inkG, inkB);
-    SetFlyoutChromeInk(inkR, inkG, inkB);
     EnsureOverflowGlyphs(gearExtent, glyphExtent, notifyGlyph);
+    m_overflowGearX = SaturatedInt(gearBounds.left);
+    m_overflowGearY = SaturatedInt(gearBounds.top);
+    m_overflowGearExtent = gearExtent;
     if (!m_overflowGlyphGear.empty()) {
-        CompositePremul(pixels, width, height, SaturatedInt(gearBounds.left),
-            SaturatedInt(gearBounds.top), m_overflowGlyphGear.data(), SaturatedInt(gearExtent),
-            SaturatedInt(gearExtent));
+        CompositePremul(pixels, width, height, m_overflowGearX, m_overflowGearY,
+            m_overflowGlyphGear.data(), SaturatedInt(gearExtent), SaturatedInt(gearExtent));
     }
     pushHit(TrayFlyoutHitKind::Settings, {gearBounds.left - 6, y, panelWidth - padding + 4,
         y + headerHeight});
