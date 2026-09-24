@@ -76,6 +76,16 @@ float BevelSlopeN(float oneMinusX, float oneMinusX4)
     return min(numer / max(denom, 1e-3), 3.5);
 }
 
+// Soft asymptotic cap for refraction pull. Replaces hard clamp(d,0,lensMax)
+// which left a C1 kink (visible contour) where the outer plateau met the
+// natural falloff toward the dock center. Approaches lensMax as d grows so
+// opposite-rim white fringe stays suppressed, without a hard edge.
+float SoftLensCap(float d, float lensMax)
+{
+    const float m = max(lensMax, 1e-3);
+    return d * rsqrt(1.0 + (d * d) / (m * m));
+}
+
 // Glass effect toggles packed in scene1.x (DOCK_FX_* bits, DockTheme.hlsli).
 // scene1.x is an integer-valued float from a packed UINT that stays below
 // 2^24, so every bit survives the constant-buffer store exactly. Bit tests
@@ -151,10 +161,11 @@ float InterleavedGradientNoise(float2 pixel)
 // Both passes must compute identical UVs or the split is invalid.
 static const float kLensGain = 2.3;
 static const float kFringeBoost = 24.0;
-// Max refraction pull (px at 1x, scaled by dpi). Without a cap the full-span
-// slab drags content from 20-40px away to the opposite rim, so a white window
-// overlapping only the top paints a white fringe along the bottom edge that
-// sits over a dark backdrop. 10px keeps the magnified look without the drag.
+// Soft max refraction pull (px at 1x, scaled by dpi). Without a cap the
+// full-span slab drags content from 20-40px away to the opposite rim, so a
+// white window overlapping only the top paints a white fringe along the
+// bottom edge over a dark backdrop. SoftLensCap approaches this limit
+// without a hard clamp kink (which read as a cutoff line toward center).
 static const float kLensMaxPx = 10.0;
 // Refraction fades to zero across this rim band (px at 1x, scaled by dpi) so
 // the AA edge (mask < 1) samples the true backdrop behind instead of a
@@ -353,7 +364,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
         const float thetaRG = asin(sinRG);
         const float thetaRB = asin(sinRB);
         // Gain lives in kLensGain above (shared with the horizontal pass):
-        // calm center, one continuous slab; pull clamped to kLensMaxPx with
+        // calm center, one continuous slab; pull soft-capped to kLensMaxPx with
         // a rim fade so a high-contrast edge above the dock cannot paint the
         // opposite (dark) rim.
         float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * kLensGain * lensOn;
@@ -365,11 +376,12 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // Dispersion off collapses all channels onto green (no split).
         dR = lerp(dG, dR, dispOn);
         dB = lerp(dG, dB, dispOn);
-        // Cap the drag and release the extreme rim (see kLensMaxPx).
+        // Soft-cap the drag (see SoftLensCap / kLensMaxPx): keep white-fringe
+        // protection without a hard plateau kink toward the dock center.
         const float lensMax = kLensMaxPx * dpi;
-        dR = clamp(dR, 0.0, lensMax);
-        dG = clamp(dG, 0.0, lensMax);
-        dB = clamp(dB, 0.0, lensMax);
+        dR = SoftLensCap(dR, lensMax);
+        dG = SoftLensCap(dG, lensMax);
+        dB = SoftLensCap(dB, lensMax);
         const float lensRimFade = smoothstep(0.0, kLensRimFadePx * dpi, insideDistance);
         dR *= lensRimFade;
         dG *= lensRimFade;
@@ -538,13 +550,11 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     dB = dG + (dB - dG) * kFringeBoost;
     dR = lerp(dG, dR, dispOn);
     dB = lerp(dG, dB, dispOn);
-    // Must stay identical to GlassPS above (see kLensMaxPx): cap the drag and
-    // release the extreme rim so the separable frost cannot carry a bright
-    // edge to the opposite dark rim.
+    // Must stay identical to GlassPS above (see SoftLensCap / kLensMaxPx).
     const float lensMaxFrost = kLensMaxPx * dpi;
-    dR = clamp(dR, 0.0, lensMaxFrost);
-    dG = clamp(dG, 0.0, lensMaxFrost);
-    dB = clamp(dB, 0.0, lensMaxFrost);
+    dR = SoftLensCap(dR, lensMaxFrost);
+    dG = SoftLensCap(dG, lensMaxFrost);
+    dB = SoftLensCap(dB, lensMaxFrost);
     const float lensRimFadeFrost = smoothstep(0.0, kLensRimFadePx * dpi, insideDistance);
     dR *= lensRimFadeFrost;
     dG *= lensRimFadeFrost;
