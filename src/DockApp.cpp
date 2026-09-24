@@ -2897,9 +2897,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         trayWidth += trayGlyph;
         ++visibleGlyphs;
     }
-    // Weather glyph sits on the time row (not spanning time+date); size tracks
-    // roughly time-glyph height or larger so it reads clearly beside the clock.
-    const LONG weatherSize = std::max(28L, std::lround(34.0F * layoutScale));
+    // Weather glyph uses full pin metrics (iconSize) and shares the pin baseline
+    // (top), while still sitting beside the clock chronologically.
+    const LONG weatherSize = iconSize;
     const LONG weatherGap = std::max(4L, std::lround(6.0F * layoutScale));
     const LONG weatherReserve = weatherSize + weatherGap;
     trayWidth += trayClockGap + weatherReserve + clockWidth;
@@ -3006,15 +3006,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     {
         // Always reserve the slot so the clock does not jump when the first
         // Open-Meteo fetch lands; RasterizeIcon falls back to cloudy.
-        // Align the glyph with the clock's time row (upper line of the
-        // time+date stack), matching SystemTray::RasterizeClock centering.
-        const LONG timePx = std::max(18L, std::lround(23.0F * layoutScale));
-        const LONG datePx = std::max(17L, std::lround(20.0F * layoutScale));
-        const LONG clockInnerGap = std::max(1L, std::lround(2.0F * layoutScale));
-        const LONG textBlockH = timePx + clockInnerGap + datePx;
-        const LONG timeOriginY = clockTop + std::max(0L, (clockHeight - textBlockH) / 2);
-        LONG weatherTop = timeOriginY + (timePx - weatherSize) / 2;
-        weatherTop = std::max(top, std::min(weatherTop, top + iconSlotHeight - weatherSize));
+        // Full pin size at the same top/baseline as dock app icons (not the
+        // smaller time-row alignment from 1.1.33).
+        const LONG weatherTop = top;
         DockIconRenderData weather;
         weather.kind = DockIconKind::Weather;
         weather.adaptiveInk = false;
