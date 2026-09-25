@@ -395,9 +395,8 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
     }
 }
 HFONT CreateFlyoutFont(int pixelHeight, int weight) {
-    // Grayscale AA only: DrawFlyoutText -> CoverageToPremulInk treats luminance as
-    // coverage. ClearType's asymmetric RGB fringes become a ghosted second layer
-    // and look pixelated when remapped to premul ink on live glass.
+    // Grayscale AA only (ClearType RGB fringes remap to a ghost layer via coverage).
+    // DrawFlyoutText also 2x-supersamples and linearizes coverage for clean glass ink.
     return CreateFontW(-pixelHeight, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
         DockTextFontFace());
@@ -426,15 +425,22 @@ void RemapPremulInkColor(std::vector<uint8_t>& pixels, uint8_t r, uint8_t g, uin
     }
 }
 
+float Srgb8ToLinear(uint8_t value) noexcept {
+    const float c = static_cast<float>(value) / 255.0F;
+    return c <= 0.04045F ? c / 12.92F : std::pow((c + 0.055F) / 1.055F, 2.4F);
+}
+
 void CoverageToPremulInk(uint8_t* pixels, size_t byteCount, uint8_t gray) {
     // Popup DIBs are BGR-ordered: byte0=B, byte1=G, byte2=R.
+    // GDI writes sRGB-ish AA; convert to linear coverage before alpha so edges
+    // do not look like a second dark halo over premul glass.
     for (size_t index = 0; index + 3 < byteCount; index += 4) {
+        const float linear =
+            Srgb8ToLinear(pixels[index]) * (19.0F / 256.0F) +
+            Srgb8ToLinear(pixels[index + 1]) * (183.0F / 256.0F) +
+            Srgb8ToLinear(pixels[index + 2]) * (54.0F / 256.0F);
         const unsigned coverage =
-            (static_cast<unsigned>(pixels[index]) * 19U +
-                static_cast<unsigned>(pixels[index + 1]) * 183U +
-                static_cast<unsigned>(pixels[index + 2]) * 54U) >>
-            8U;
-        // The gray level becomes opacity so text hierarchy is preserved.
+            static_cast<unsigned>(std::lround(std::clamp(linear, 0.0F, 1.0F) * 255.0F));
         const unsigned alpha = (coverage * gray + 127U) / 255U;
         pixels[index] = static_cast<uint8_t>((g_flyoutInkB * alpha + 127U) / 255U);
         pixels[index + 1] = static_cast<uint8_t>((g_flyoutInkG * alpha + 127U) / 255U);
@@ -450,6 +456,13 @@ void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, H
     }
     const int width = std::max(1L, bounds.right - bounds.left);
     const int height = std::max(1L, bounds.bottom - bounds.top);
+    // 2x supersample + box downsample: ANTIALIASED_QUALITY at 1x is too sparse
+    // for CoverageToPremulInk over live glass (chunky stems / halo that reads as
+    // ghost text). ClearType cannot be used - RGB fringes remap to a second layer.
+    constexpr int kScale = 2;
+    const int hiWidth = width * kScale;
+    const int hiHeight = height * kScale;
+
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
         return;
@@ -459,10 +472,25 @@ void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, H
     if (memory == nullptr) {
         return;
     }
+
+    LOGFONTW logFont{};
+    if (GetObjectW(font, sizeof(logFont), &logFont) == 0) {
+        DeleteDC(memory);
+        return;
+    }
+    logFont.lfHeight =
+        logFont.lfHeight > 0 ? logFont.lfHeight * kScale : logFont.lfHeight * kScale;
+    logFont.lfQuality = ANTIALIASED_QUALITY;
+    HFONT hiFont = CreateFontIndirectW(&logFont);
+    if (hiFont == nullptr) {
+        DeleteDC(memory);
+        return;
+    }
+
     BITMAPV5HEADER header{};
     header.bV5Size = sizeof(header);
-    header.bV5Width = width;
-    header.bV5Height = -height;
+    header.bV5Width = hiWidth;
+    header.bV5Height = -hiHeight;
     header.bV5Planes = 1;
     header.bV5BitCount = 32;
     header.bV5Compression = BI_BITFIELDS;
@@ -474,24 +502,64 @@ void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, H
     HBITMAP bitmap = CreateDIBSection(memory, reinterpret_cast<const BITMAPINFO*>(&header),
         DIB_RGB_COLORS, &bits, nullptr, 0);
     if (bitmap == nullptr || bits == nullptr) {
+        DeleteObject(hiFont);
         DeleteDC(memory);
         return;
     }
     HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
-    HGDIOBJ previousFont = SelectObject(memory, font);
-    std::memset(bits, 0, static_cast<size_t>(width) * height * 4U);
-    SetBkMode(memory, TRANSPARENT);
+    HGDIOBJ previousFont = SelectObject(memory, hiFont);
+    // Opaque black backing: GDI grayscale AA blends against this RGB. A=255 avoids
+    // undefined alpha in the coverage DIB before we remap.
+    {
+        auto* px = static_cast<uint8_t*>(bits);
+        const size_t count = static_cast<size_t>(hiWidth) * static_cast<size_t>(hiHeight);
+        for (size_t i = 0; i < count; ++i) {
+            px[i * 4U + 0] = 0;
+            px[i * 4U + 1] = 0;
+            px[i * 4U + 2] = 0;
+            px[i * 4U + 3] = 255;
+        }
+    }
+    SetBkColor(memory, RGB(0, 0, 0));
+    SetBkMode(memory, OPAQUE);
     SetTextColor(memory, RGB(255, 255, 255));
-    RECT local{0, 0, width, height};
+    RECT local{0, 0, hiWidth, hiHeight};
     DrawTextW(memory, text.c_str(), static_cast<int>(text.size()), &local,
         format | DT_NOPREFIX);
-    CoverageToPremulInk(static_cast<uint8_t*>(bits),
-        static_cast<size_t>(width) * height * 4U, gray);
-    CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top,
-        static_cast<uint8_t*>(bits), width, height);
+
+    std::vector<uint8_t> lo(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U, 0);
+    const auto* src = static_cast<const uint8_t*>(bits);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            float linearSum = 0.0F;
+            for (int oy = 0; oy < kScale; ++oy) {
+                for (int ox = 0; ox < kScale; ++ox) {
+                    const size_t si =
+                        (static_cast<size_t>(y * kScale + oy) * static_cast<size_t>(hiWidth) +
+                            static_cast<size_t>(x * kScale + ox)) *
+                        4U;
+                    linearSum += Srgb8ToLinear(src[si]) * (19.0F / 256.0F) +
+                        Srgb8ToLinear(src[si + 1]) * (183.0F / 256.0F) +
+                        Srgb8ToLinear(src[si + 2]) * (54.0F / 256.0F);
+                }
+            }
+            const float linear = std::clamp(linearSum / static_cast<float>(kScale * kScale), 0.0F, 1.0F);
+            const unsigned coverage = static_cast<unsigned>(std::lround(linear * 255.0F));
+            const unsigned alpha = (coverage * gray + 127U) / 255U;
+            const size_t di =
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 4U;
+            lo[di] = static_cast<uint8_t>((g_flyoutInkB * alpha + 127U) / 255U);
+            lo[di + 1] = static_cast<uint8_t>((g_flyoutInkG * alpha + 127U) / 255U);
+            lo[di + 2] = static_cast<uint8_t>((g_flyoutInkR * alpha + 127U) / 255U);
+            lo[di + 3] = static_cast<uint8_t>(alpha);
+        }
+    }
+
+    CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, lo.data(), width, height);
     SelectObject(memory, previousFont);
     SelectObject(memory, previousBitmap);
     DeleteObject(bitmap);
+    DeleteObject(hiFont);
     DeleteDC(memory);
 }
 
@@ -1612,8 +1680,8 @@ int DockApp::Run() {
         std::string current = Updater::CurrentVersion();
         std::wstring wide(current.begin(), current.end());
         m_updateStatus = m_config.CheckForUpdates()
-            ? L"Version " + wide + L" â€” checking for updates..."
-            : L"Version " + wide + L" â€” automatic updates off.";
+            ? L"Version " + wide + L" - checking for updates..."
+            : L"Version " + wide + L" - automatic updates off.";
     }
     // Clear a fulfilled install record, or reclaim one retry when the last
     // launched install never took effect on this copy.
@@ -4563,7 +4631,7 @@ void DockApp::ReconcileLastUpdate() {
         m_config.SetLastInstalledVersion(record, 0);
         static_cast<void>(m_config.Save());
         m_updateStatus = L"Update v" + record + L" didn't take effect (still v" + wideCurrent +
-            L") â€” retrying...";
+            L") - retrying...";
         Log(L"Last update to v" + record + L" did not take effect; retry " +
             std::to_wstring(attempts + 1));
         return;
@@ -5344,7 +5412,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         if (!enabled) {
             std::string current = Updater::CurrentVersion();
             std::wstring wide(current.begin(), current.end());
-            SetUpdateStatus(L"Version " + wide + L" â€” automatic updates off.");
+            SetUpdateStatus(L"Version " + wide + L" - automatic updates off.");
         } else {
             PaintSettingsPopup();
             if (!m_updateInFlight.load()) {
