@@ -2817,7 +2817,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 } else if (m_backdropCaptureWasIdle) {
                     ++m_backdropIdleStreak;
                 } else {
-                    // Capture failed (elevated FG, GPU busy, etc.): keep fast.
+                    // Capture failed (GPU busy, etc.): keep fast so we retry soon.
                     wantFast = true;
                     m_backdropIdleStreak = 0;
                 }
@@ -7122,11 +7122,12 @@ bool DockApp::CaptureLiveBackdrop() {
     if (m_shellFlyoutHold || !m_rendererInitialized || m_visibility == VisibilityState::Hidden) {
         return false;
     }
-    // Elevated FG can make desktop BitBlt / DwmFlush stall the hook thread.
-    if (IsElevatedForeground()) {
-        return false;
-    }
-
+    // Always BitBlt while visible: GetDC(nullptr)+SRCCOPY reads the composed
+    // desktop (wallpaper / windows behind the dock strip) and does not need
+    // UIPI access to an elevated foreground app. Skipping here when Task
+    // Manager was FG left frost/lensing blank or frozen for the whole session.
+    // Elevated-FG cursor lag is handled by the 33 ms watch + WinEvent sync, not
+    // by starving the glass timer.
     const RECT captureBounds{m_windowX, m_currentY,
         m_windowX + static_cast<LONG>(m_dockWidth),
         m_currentY + static_cast<LONG>(m_dockHeight)};
@@ -7154,10 +7155,10 @@ void DockApp::BeginShow() {
     // hot-path diet started the slide on the cached backdrop and let the timer
     // catch up, which left a few frames of stale frost after the user hid the
     // dock, scrolled, and revealed again. Capture while still SW_HIDE at the
-    // visible rect (~6ms typical). Elevated FG skips BitBlt (can stall the hook
-    // thread) and invalidates so we never reuse the previous reveal's texture.
+    // visible rect (~6ms typical), including when an elevated app (Task Manager)
+    // is FG - desktop BitBlt does not require UIPI into that process.
     m_renderer.InvalidateBackdrop();
-    if (m_rendererInitialized && !IsElevatedForeground()) {
+    if (m_rendererInitialized) {
         const RECT captureBounds{m_windowX, m_visibleY,
             m_windowX + static_cast<LONG>(m_dockWidth),
             m_visibleY + static_cast<LONG>(m_dockHeight)};
