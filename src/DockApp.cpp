@@ -14,6 +14,7 @@
 #include <WtsApi32.h>
 #include <CommCtrl.h>
 #include <dwmapi.h>
+#include <dwrite.h>
 #include <windowsx.h>
 #include <oleidl.h>
 
@@ -395,8 +396,8 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
     }
 }
 HFONT CreateFlyoutFont(int pixelHeight, int weight) {
-    // Grayscale AA only (ClearType RGB fringes remap to a ghost layer via coverage).
-    // DrawFlyoutText also 2x-supersamples and linearizes coverage for clean glass ink.
+    // LOGFONT metrics only - DrawFlyoutText rasterizes via DirectWrite grayscale
+    // (NATURAL_SYMMETRIC + FLAT) so GDI lfQuality is unused for flyout ink.
     return CreateFontW(-pixelHeight, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
         DockTextFontFace());
@@ -449,19 +450,281 @@ void CoverageToPremulInk(uint8_t* pixels, size_t byteCount, uint8_t gray) {
     }
 }
 
-void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, HFONT font,
-    const std::wstring& text, UINT format, uint8_t gray) {
-    if (dest == nullptr || font == nullptr || text.empty()) {
-        return;
+IDWriteFactory* FlyoutDWriteFactory() {
+    static IDWriteFactory* factory = nullptr;
+    if (factory == nullptr) {
+        if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                reinterpret_cast<IUnknown**>(&factory)))) {
+            factory = nullptr;
+        }
     }
+    return factory;
+}
+
+// Stack-resident COM renderer: refcount is a no-op (DrawFlyoutText owns lifetime).
+struct FlyoutTextRenderer final : IDWriteTextRenderer {
+    IDWriteBitmapRenderTarget* target = nullptr;
+    IDWriteRenderingParams* params = nullptr;
+    COLORREF color = RGB(255, 255, 255);
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
+        if (object == nullptr) {
+            return E_POINTER;
+        }
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDWritePixelSnapping) ||
+            riid == __uuidof(IDWriteTextRenderer)) {
+            *object = static_cast<IDWriteTextRenderer*>(this);
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+    HRESULT STDMETHODCALLTYPE IsPixelSnappingDisabled(void*, BOOL* isDisabled) override {
+        if (isDisabled == nullptr) {
+            return E_POINTER;
+        }
+        *isDisabled = FALSE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetCurrentTransform(void*, DWRITE_MATRIX* transform) override {
+        if (transform == nullptr || target == nullptr) {
+            return E_POINTER;
+        }
+        target->GetCurrentTransform(transform);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPixelsPerDip(void*, FLOAT* pixelsPerDip) override {
+        if (pixelsPerDip == nullptr || target == nullptr) {
+            return E_POINTER;
+        }
+        *pixelsPerDip = target->GetPixelsPerDip();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DrawGlyphRun(void*, FLOAT baselineOriginX, FLOAT baselineOriginY,
+        DWRITE_MEASURING_MODE measuringMode, DWRITE_GLYPH_RUN const* glyphRun,
+        DWRITE_GLYPH_RUN_DESCRIPTION const*, IUnknown*) override {
+        if (target == nullptr || params == nullptr || glyphRun == nullptr) {
+            return E_POINTER;
+        }
+        return target->DrawGlyphRun(baselineOriginX, baselineOriginY, measuringMode, glyphRun,
+            params, color, nullptr);
+    }
+    HRESULT STDMETHODCALLTYPE DrawUnderline(void*, FLOAT, FLOAT, DWRITE_UNDERLINE const*,
+        IUnknown*) override {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DrawStrikethrough(void*, FLOAT, FLOAT, DWRITE_STRIKETHROUGH const*,
+        IUnknown*) override {
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DrawInlineObject(void*, FLOAT, FLOAT, IDWriteInlineObject*, BOOL,
+        BOOL, IUnknown*) override {
+        return S_OK;
+    }
+};
+
+void LinearCoverageToPremulInk(uint8_t* pixels, int width, int height, int strideBytes,
+    uint8_t gray) {
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = pixels + static_cast<size_t>(y) * static_cast<size_t>(strideBytes);
+        for (int x = 0; x < width; ++x) {
+            uint8_t* px = row + static_cast<size_t>(x) * 4U;
+            // BitmapRenderTarget is BGRX; gamma=1.0 rendering params emit linear coverage.
+            const unsigned coverage =
+                (static_cast<unsigned>(px[0]) * 19U +
+                    static_cast<unsigned>(px[1]) * 183U +
+                    static_cast<unsigned>(px[2]) * 54U) >>
+                8U;
+            const unsigned alpha = (coverage * gray + 127U) / 255U;
+            px[0] = static_cast<uint8_t>((g_flyoutInkB * alpha + 127U) / 255U);
+            px[1] = static_cast<uint8_t>((g_flyoutInkG * alpha + 127U) / 255U);
+            px[2] = static_cast<uint8_t>((g_flyoutInkR * alpha + 127U) / 255U);
+            px[3] = static_cast<uint8_t>(alpha);
+        }
+    }
+}
+
+bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
+    HFONT font, const std::wstring& text, UINT format, uint8_t gray) {
+    IDWriteFactory* factory = FlyoutDWriteFactory();
+    if (factory == nullptr) {
+        return false;
+    }
+
+    LOGFONTW logFont{};
+    if (GetObjectW(font, sizeof(logFont), &logFont) == 0) {
+        return false;
+    }
+    const float fontEmSize = logFont.lfHeight < 0 ? static_cast<float>(-logFont.lfHeight)
+                                                  : static_cast<float>(logFont.lfHeight);
+    if (fontEmSize <= 0.0F) {
+        return false;
+    }
+
     const int width = std::max(1L, bounds.right - bounds.left);
     const int height = std::max(1L, bounds.bottom - bounds.top);
-    // 2x supersample + box downsample: ANTIALIASED_QUALITY at 1x is too sparse
-    // for CoverageToPremulInk over live glass (chunky stems / halo that reads as
-    // ghost text). ClearType cannot be used - RGB fringes remap to a second layer.
-    constexpr int kScale = 2;
-    const int hiWidth = width * kScale;
-    const int hiHeight = height * kScale;
+
+    DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+    if (logFont.lfWeight > 0) {
+        weight = static_cast<DWRITE_FONT_WEIGHT>(std::clamp(logFont.lfWeight, 1L, 999L));
+    }
+
+    const wchar_t* face =
+        logFont.lfFaceName[0] != L'\0' ? logFont.lfFaceName : DockTextFontFace();
+    IDWriteTextFormat* textFormat = nullptr;
+    if (FAILED(factory->CreateTextFormat(face, nullptr, weight,
+            logFont.lfItalic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, fontEmSize, L"en-us", &textFormat)) ||
+        textFormat == nullptr) {
+        return false;
+    }
+
+    if ((format & DT_CENTER) != 0U) {
+        textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    } else if ((format & DT_RIGHT) != 0U) {
+        textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+    } else {
+        textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+    if ((format & DT_VCENTER) != 0U) {
+        textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    } else if ((format & DT_BOTTOM) != 0U) {
+        textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR);
+    } else {
+        textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    }
+    textFormat->SetWordWrapping(
+        (format & DT_SINGLELINE) != 0U ? DWRITE_WORD_WRAPPING_NO_WRAP : DWRITE_WORD_WRAPPING_WRAP);
+
+    if ((format & DT_END_ELLIPSIS) != 0U) {
+        IDWriteInlineObject* ellipsis = nullptr;
+        if (SUCCEEDED(factory->CreateEllipsisTrimmingSign(textFormat, &ellipsis)) &&
+            ellipsis != nullptr) {
+            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+            textFormat->SetTrimming(&trimming, ellipsis);
+            ellipsis->Release();
+        }
+    }
+
+    IDWriteTextLayout* layout = nullptr;
+    if (FAILED(factory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), textFormat,
+            static_cast<FLOAT>(width), static_cast<FLOAT>(height), &layout)) ||
+        layout == nullptr) {
+        textFormat->Release();
+        return false;
+    }
+
+    IDWriteGdiInterop* interop = nullptr;
+    if (FAILED(factory->GetGdiInterop(&interop)) || interop == nullptr) {
+        layout->Release();
+        textFormat->Release();
+        return false;
+    }
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        interop->Release();
+        layout->Release();
+        textFormat->Release();
+        return false;
+    }
+    IDWriteBitmapRenderTarget* target = nullptr;
+    const HRESULT targetHr =
+        interop->CreateBitmapRenderTarget(screen, width, height, &target);
+    ReleaseDC(nullptr, screen);
+    if (FAILED(targetHr) || target == nullptr) {
+        interop->Release();
+        layout->Release();
+        textFormat->Release();
+        return false;
+    }
+    target->SetPixelsPerDip(1.0F);
+
+    // gamma=1 â†’ linear coverage in RGB; clearTypeLevel=0 + FLAT â†’ grayscale AA
+    // (no RGB fringes). enhancedContrast=0 avoids stem fattening that reads soft.
+    IDWriteRenderingParams* params = nullptr;
+    if (FAILED(factory->CreateCustomRenderingParams(1.0F, 0.0F, 0.0F, DWRITE_PIXEL_GEOMETRY_FLAT,
+            DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, &params)) ||
+        params == nullptr) {
+        target->Release();
+        interop->Release();
+        layout->Release();
+        textFormat->Release();
+        return false;
+    }
+
+    HDC memory = target->GetMemoryDC();
+    RECT fill{0, 0, width, height};
+    FillRect(memory, &fill, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    // Force opaque black in case FillRect left alpha=0 on the DIB.
+    {
+        HBITMAP dib = static_cast<HBITMAP>(GetCurrentObject(memory, OBJ_BITMAP));
+        BITMAP bm{};
+        if (dib != nullptr && GetObjectW(dib, sizeof(bm), &bm) != 0 && bm.bmBits != nullptr) {
+            auto* bits = static_cast<uint8_t*>(bm.bmBits);
+            for (int y = 0; y < height; ++y) {
+                uint8_t* row =
+                    bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes);
+                for (int x = 0; x < width; ++x) {
+                    uint8_t* px = row + static_cast<size_t>(x) * 4U;
+                    px[0] = 0;
+                    px[1] = 0;
+                    px[2] = 0;
+                    px[3] = 255;
+                }
+            }
+        }
+    }
+
+    FlyoutTextRenderer renderer;
+    renderer.target = target;
+    renderer.params = params;
+    renderer.color = RGB(255, 255, 255);
+    const HRESULT drawHr = layout->Draw(nullptr, &renderer, 0.0F, 0.0F);
+
+    bool ok = false;
+    if (SUCCEEDED(drawHr)) {
+        HBITMAP dib = static_cast<HBITMAP>(GetCurrentObject(memory, OBJ_BITMAP));
+        BITMAP bm{};
+        if (dib != nullptr && GetObjectW(dib, sizeof(bm), &bm) != 0 && bm.bmBits != nullptr &&
+            bm.bmBitsPixel == 32) {
+            auto* bits = static_cast<uint8_t*>(bm.bmBits);
+            LinearCoverageToPremulInk(bits, width, height, bm.bmWidthBytes, gray);
+            // CompositePremul expects tightly packed rows; copy if stride padded.
+            if (bm.bmWidthBytes == width * 4) {
+                CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, bits, width,
+                    height);
+            } else {
+                std::vector<uint8_t> packed(static_cast<size_t>(width) * static_cast<size_t>(height) *
+                    4U);
+                for (int y = 0; y < height; ++y) {
+                    std::memcpy(packed.data() + static_cast<size_t>(y) * width * 4U,
+                        bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes),
+                        static_cast<size_t>(width) * 4U);
+                }
+                CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, packed.data(),
+                    width, height);
+            }
+            ok = true;
+        }
+    }
+
+    params->Release();
+    target->Release();
+    interop->Release();
+    layout->Release();
+    textFormat->Release();
+    return ok;
+}
+
+void DrawFlyoutTextGdiFallback(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
+    HFONT font, const std::wstring& text, UINT format, uint8_t gray) {
+    // 1x ANTIALIASED + linear coverage (no box downsample). Used only if DWrite fails.
+    const int width = std::max(1L, bounds.right - bounds.left);
+    const int height = std::max(1L, bounds.bottom - bounds.top);
 
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
@@ -473,24 +736,10 @@ void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, H
         return;
     }
 
-    LOGFONTW logFont{};
-    if (GetObjectW(font, sizeof(logFont), &logFont) == 0) {
-        DeleteDC(memory);
-        return;
-    }
-    logFont.lfHeight =
-        logFont.lfHeight > 0 ? logFont.lfHeight * kScale : logFont.lfHeight * kScale;
-    logFont.lfQuality = ANTIALIASED_QUALITY;
-    HFONT hiFont = CreateFontIndirectW(&logFont);
-    if (hiFont == nullptr) {
-        DeleteDC(memory);
-        return;
-    }
-
     BITMAPV5HEADER header{};
     header.bV5Size = sizeof(header);
-    header.bV5Width = hiWidth;
-    header.bV5Height = -hiHeight;
+    header.bV5Width = width;
+    header.bV5Height = -height;
     header.bV5Planes = 1;
     header.bV5BitCount = 32;
     header.bV5Compression = BI_BITFIELDS;
@@ -502,17 +751,14 @@ void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, H
     HBITMAP bitmap = CreateDIBSection(memory, reinterpret_cast<const BITMAPINFO*>(&header),
         DIB_RGB_COLORS, &bits, nullptr, 0);
     if (bitmap == nullptr || bits == nullptr) {
-        DeleteObject(hiFont);
         DeleteDC(memory);
         return;
     }
     HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
-    HGDIOBJ previousFont = SelectObject(memory, hiFont);
-    // Opaque black backing: GDI grayscale AA blends against this RGB. A=255 avoids
-    // undefined alpha in the coverage DIB before we remap.
+    HGDIOBJ previousFont = SelectObject(memory, font);
     {
         auto* px = static_cast<uint8_t*>(bits);
-        const size_t count = static_cast<size_t>(hiWidth) * static_cast<size_t>(hiHeight);
+        const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
         for (size_t i = 0; i < count; ++i) {
             px[i * 4U + 0] = 0;
             px[i * 4U + 1] = 0;
@@ -523,44 +769,42 @@ void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, H
     SetBkColor(memory, RGB(0, 0, 0));
     SetBkMode(memory, OPAQUE);
     SetTextColor(memory, RGB(255, 255, 255));
-    RECT local{0, 0, hiWidth, hiHeight};
-    DrawTextW(memory, text.c_str(), static_cast<int>(text.size()), &local,
-        format | DT_NOPREFIX);
+    RECT local{0, 0, width, height};
+    DrawTextW(memory, text.c_str(), static_cast<int>(text.size()), &local, format | DT_NOPREFIX);
 
-    std::vector<uint8_t> lo(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U, 0);
-    const auto* src = static_cast<const uint8_t*>(bits);
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            float linearSum = 0.0F;
-            for (int oy = 0; oy < kScale; ++oy) {
-                for (int ox = 0; ox < kScale; ++ox) {
-                    const size_t si =
-                        (static_cast<size_t>(y * kScale + oy) * static_cast<size_t>(hiWidth) +
-                            static_cast<size_t>(x * kScale + ox)) *
-                        4U;
-                    linearSum += Srgb8ToLinear(src[si]) * (19.0F / 256.0F) +
-                        Srgb8ToLinear(src[si + 1]) * (183.0F / 256.0F) +
-                        Srgb8ToLinear(src[si + 2]) * (54.0F / 256.0F);
-                }
-            }
-            const float linear = std::clamp(linearSum / static_cast<float>(kScale * kScale), 0.0F, 1.0F);
-            const unsigned coverage = static_cast<unsigned>(std::lround(linear * 255.0F));
-            const unsigned alpha = (coverage * gray + 127U) / 255U;
-            const size_t di =
-                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 4U;
-            lo[di] = static_cast<uint8_t>((g_flyoutInkB * alpha + 127U) / 255U);
-            lo[di + 1] = static_cast<uint8_t>((g_flyoutInkG * alpha + 127U) / 255U);
-            lo[di + 2] = static_cast<uint8_t>((g_flyoutInkR * alpha + 127U) / 255U);
-            lo[di + 3] = static_cast<uint8_t>(alpha);
-        }
+    auto* src = static_cast<uint8_t*>(bits);
+    const size_t byteCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
+    for (size_t index = 0; index + 3 < byteCount; index += 4) {
+        const float linear =
+            Srgb8ToLinear(src[index]) * (19.0F / 256.0F) +
+            Srgb8ToLinear(src[index + 1]) * (183.0F / 256.0F) +
+            Srgb8ToLinear(src[index + 2]) * (54.0F / 256.0F);
+        const unsigned coverage =
+            static_cast<unsigned>(std::lround(std::clamp(linear, 0.0F, 1.0F) * 255.0F));
+        const unsigned alpha = (coverage * gray + 127U) / 255U;
+        src[index] = static_cast<uint8_t>((g_flyoutInkB * alpha + 127U) / 255U);
+        src[index + 1] = static_cast<uint8_t>((g_flyoutInkG * alpha + 127U) / 255U);
+        src[index + 2] = static_cast<uint8_t>((g_flyoutInkR * alpha + 127U) / 255U);
+        src[index + 3] = static_cast<uint8_t>(alpha);
     }
-
-    CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, lo.data(), width, height);
+    CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, src, width, height);
     SelectObject(memory, previousFont);
     SelectObject(memory, previousBitmap);
     DeleteObject(bitmap);
-    DeleteObject(hiFont);
     DeleteDC(memory);
+}
+
+void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, HFONT font,
+    const std::wstring& text, UINT format, uint8_t gray) {
+    if (dest == nullptr || font == nullptr || text.empty()) {
+        return;
+    }
+    // Device-pixel DirectWrite grayscale alpha mask: sharp at HostDpi without
+    // ClearType RGB fringes and without the soft 2x box-downsample of 1.1.38.
+    // Flyout HWND sizes already match the layered DIB (PerMonitorV2); no DIP stretch.
+    if (!DrawFlyoutTextDirectWrite(dest, destWidth, destHeight, bounds, font, text, format, gray)) {
+        DrawFlyoutTextGdiFallback(dest, destWidth, destHeight, bounds, font, text, format, gray);
+    }
 }
 
 void FillCirclePremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
@@ -757,7 +1001,7 @@ void StrokeCircleColorPremul(uint8_t* dest, int destWidth, int destHeight, float
 
 void GlowRingColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
     float radius, uint8_t blue, uint8_t green, uint8_t red) {
-    // Soft outer halo then a sharper core stroke — reads as edge glow, not a fill.
+    // Soft outer halo then a sharper core stroke â€” reads as edge glow, not a fill.
     StrokeCircleColorPremul(dest, destWidth, destHeight, cx, cy, radius, 3.2F, 0.28F, blue, green,
         red);
     StrokeCircleColorPremul(dest, destWidth, destHeight, cx, cy, radius, 1.35F, 0.92F, blue, green,
@@ -5268,7 +5512,7 @@ void DockApp::TickLivePopupGlass()
         return;
     }
 
-    // 2) Kick the next open menu (round-robin) — BitBlt + GPU submit only.
+    // 2) Kick the next open menu (round-robin) â€” BitBlt + GPU submit only.
     const float frostAmount = m_config.FrostAmount();
     const float glassAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
@@ -6000,7 +6244,7 @@ bool DockApp::IsWeatherRenderIndex(int index) const noexcept {
 
 void DockApp::OnWeatherUpdated() {
     // Snapshot changed on the worker; rebuild so the glyph appears/moves and
-    // re-upload the Meteocons atlas entry. Failures are soft — last icon stays.
+    // re-upload the Meteocons atlas entry. Failures are soft â€” last icon stays.
     RebuildLayout(false);
     EnsureTrayIcons();
     QueueRenderFrame();
@@ -7055,7 +7299,7 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     if (frostAmount > 0.001f) {
         glassFx |= DOCK_FX_BLUR;
     }
-    // Tint is no longer a settings toggle â€” the calibrated face tone map is
+    // Tint is no longer a settings toggle Ã¢â‚¬â€ the calibrated face tone map is
     // always applied; keep the FX bit set so older shader paths stay armed.
     glassFx |= DOCK_FX_TINT;
     if (m_config.Specular()) {
@@ -9013,7 +9257,7 @@ void DockApp::ApplyPinUnpinLayoutChange() {
     ProfileScope scope("ApplyPinUnpinLayoutChange");
     // CRITICAL: do NOT call RebuildDisplayApps/BuildDisplayAppsSnapshot on the UI
     // thread. After a pin change, pin profiles are stale, so MatchesAnyPin misses and
-    // the ResolveLauncherProcessPath fallback walks every window Ã— pin via COM/.lnk â€”
+    // the ResolveLauncherProcessPath fallback walks every window Ãƒâ€” pin via COM/.lnk Ã¢â‚¬â€
     // that stalls WH_MOUSE_LL (same thread) and freezes the system cursor.
     // Optimistically splice m_displayApps from the already-updated pin list instead.
     const std::wstring pressedTarget = m_pressedTarget;
@@ -9934,8 +10178,8 @@ bool DockApp::MaintainNativeTaskbarSuppression() {
         }
         // Adaptive hold for the Win+N calendar/notifications panel (plus the
         // Start island, same as before). The old code held a blind 2.5 s from
-        // click and only tracked Start, so a quickly-dismissed panel — or one
-        // Explorer refused — kept the dock hidden for seconds after it was
+        // click and only tracked Start, so a quickly-dismissed panel â€” or one
+        // Explorer refused â€” kept the dock hidden for seconds after it was
         // gone. Instead: wait briefly for the panel to appear, hold while it
         // is visible, then release after a short slide-out grace.
         static constexpr double kFlyoutCloseGraceSeconds = 0.35;
@@ -10024,7 +10268,7 @@ void DockApp::EnsureMouseHook() noexcept {
 UINT DockApp::DesiredCursorWatchIntervalMs() const noexcept {
     // Fast poll while interacting, when the LL hook is missing, or when an elevated
     // foreground window may UIPI-block WH_MOUSE_LL. When Hidden with a healthy hook,
-    // return 0: no timer â€” hot-zone entry arrives via the hook; FG changes arrive via
+    // return 0: no timer Ã¢â‚¬â€ hot-zone entry arrives via the hook; FG changes arrive via
     // WinEvent. Visible + stationary pointer uses a calmer poll (hover still works;
     // leave/hide remains hook-assisted), unless the context menu is open where a
     // prompt leave-dismiss needs the fast cadence. Does not change kBackdropIntervalMs.
