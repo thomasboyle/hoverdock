@@ -395,8 +395,11 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
     }
 }
 HFONT CreateFlyoutFont(int pixelHeight, int weight) {
+    // Grayscale AA only: DrawFlyoutText -> CoverageToPremulInk treats luminance as
+    // coverage. ClearType's asymmetric RGB fringes become a ghosted second layer
+    // and look pixelated when remapped to premul ink on live glass.
     return CreateFontW(-pixelHeight, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-        OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
         DockTextFontFace());
 }
 
