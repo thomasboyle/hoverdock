@@ -136,6 +136,10 @@ private:
     static constexpr UINT kCursorWatchHiddenIntervalMs = 0;
     static constexpr UINT kDeferredRefreshDelayMs = 400;
     static constexpr UINT kBackdropIntervalMs = 8;
+    // Idle DWM / unchanged-capture backoff for the backdrop timer. Live menus
+    // force the fast cadence so TickLivePopupGlass stays ~120 Hz.
+    static constexpr UINT kBackdropIdleIntervalMs = 33;
+    static constexpr UINT kBackdropIdleHysteresisTicks = 4;
     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
     static constexpr UINT kTaskbarMonitorSlowIntervalMs = 5000;
     static constexpr int kTaskbarMonitorCalmPasses = 5;
@@ -344,6 +348,7 @@ private:
     void QueueRenderFrame(bool allowBlockingGpuWait = true);
     void StartBackdropTimer() noexcept;
     void StopBackdropTimer() noexcept;
+    void SyncBackdropTimerInterval(bool wantFast) noexcept;
     void HandlePointer(POINT cursor);
     void HandleContextMenu(POINT screenPoint);
     [[nodiscard]] std::vector<ContextItem> BuildContextItems(int icon, DisplayApp& outApp,
@@ -626,6 +631,9 @@ private:
     // plus a short slide-out grace).
     bool m_shellFlyoutSeen = false;
     double m_suppressBackdropUntil = 0.0;
+    UINT m_backdropTimerAppliedMs = 0;
+    UINT m_backdropIdleStreak = 0;
+    bool m_backdropCaptureWasIdle = false;
     bool m_dropPresentPending = false;
     std::atomic<bool> m_refreshInFlight{false};
     std::atomic<UINT> m_refreshGeneration{0};

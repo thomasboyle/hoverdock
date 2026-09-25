@@ -2486,14 +2486,36 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             // SRCCOPY without CAPTUREBLT, so layered popups and hover bubbles
             // never bake into the backdrop (no feedback loop). Pausing here
             // froze the dock background behind Quick Settings.
+            // Adaptive cadence: stay at ~8 ms while DWM/content changes or any
+            // live menu is open (TickLivePopupGlass rides this timer); back off
+            // to ~33 ms after a short idle hysteresis so PeekMessage wakeups
+            // drop without freezing moving wallpaper / video frost.
+            const bool menusOpen =
+                IsDockSettingsOpen() || IsOverflowOpen() || IsContextMenuOpen();
+            bool wantFast = menusOpen;
             if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
-                QpcSeconds() >= m_suppressBackdropUntil && CaptureLiveBackdrop()) {
-                QueueRenderFrame(false);
+                QpcSeconds() >= m_suppressBackdropUntil) {
+                if (CaptureLiveBackdrop()) {
+                    QueueRenderFrame(false);
+                    wantFast = true;
+                    m_backdropIdleStreak = 0;
+                } else if (m_backdropCaptureWasIdle) {
+                    ++m_backdropIdleStreak;
+                } else {
+                    // Capture failed (elevated FG, GPU busy, etc.): keep fast.
+                    wantFast = true;
+                    m_backdropIdleStreak = 0;
+                }
+            }
+            if (menusOpen) {
+                m_backdropIdleStreak = 0;
             }
             // Open menus get a dedicated non-blocking GlassPS rebake (~120 Hz
             // cadence via this timer). BeginLiveGlassPanelBake never waits on
             // the GPU fence; TakeLiveGlassPanelResult applies when ready.
             TickLivePopupGlass();
+            SyncBackdropTimerInterval(
+                wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks);
         } else if (wParam == kTaskbarMonitorTimerId) {
             // Adaptive cadence: poll fast while suppression is actively fighting
             // Explorer, then back off 10x when steady. Suppression latency in the
@@ -6781,6 +6803,7 @@ bool DockApp::AdoptMonitorForCursor(POINT cursor) {
 
 bool DockApp::CaptureLiveBackdrop() {
     ProfileScope scope("CaptureLiveBackdrop");
+    m_backdropCaptureWasIdle = false;
     if (m_shellFlyoutHold || !m_rendererInitialized || m_visibility == VisibilityState::Hidden) {
         return false;
     }
@@ -6798,6 +6821,7 @@ bool DockApp::CaptureLiveBackdrop() {
     // of the GDI desktop BitBlt used for the frosted backdrop.
     bool changed = true;
     const bool captured = m_renderer.CaptureBackdrop(captureBounds, &changed);
+    m_backdropCaptureWasIdle = captured && !changed;
     return captured && changed;
 }
 
@@ -6988,15 +7012,29 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
 }
 
 void DockApp::StartBackdropTimer() noexcept {
-    if (m_window != nullptr) {
-        SetTimer(m_window, kBackdropTimerId, kBackdropIntervalMs, nullptr);
-    }
+    m_backdropIdleStreak = 0;
+    m_backdropTimerAppliedMs = 0;
+    SyncBackdropTimerInterval(true);
 }
 
 void DockApp::StopBackdropTimer() noexcept {
+    m_backdropTimerAppliedMs = 0;
+    m_backdropIdleStreak = 0;
     if (m_window != nullptr) {
         KillTimer(m_window, kBackdropTimerId);
     }
+}
+
+void DockApp::SyncBackdropTimerInterval(bool wantFast) noexcept {
+    if (m_window == nullptr) {
+        return;
+    }
+    const UINT desired = wantFast ? kBackdropIntervalMs : kBackdropIdleIntervalMs;
+    if (desired == m_backdropTimerAppliedMs) {
+        return;
+    }
+    m_backdropTimerAppliedMs = desired;
+    SetTimer(m_window, kBackdropTimerId, desired, nullptr);
 }
 
 void DockApp::HandlePointer(POINT cursor) {

@@ -166,8 +166,16 @@ BITMAPV5HEADER IconBitmapHeader(UINT width, UINT height) {
     header.bV5GreenMask = 0x0000ff00U;
     header.bV5BlueMask = 0x000000ffU;
     header.bV5AlphaMask = 0xff000000U;
+    header.bV5CSType = LCS_sRGB;
     return header;
 }
+
+// Explicit sRGB V5 DIB for desktop / panel capture — avoids GDI probing the
+// default ICM profile (GetFileAttributesW / IcmGetDefaultCamp) on every create.
+BITMAPV5HEADER CaptureDibHeader(UINT width, UINT height) {
+    return IconBitmapHeader(width, height);
+}
+
 
 void ClearTransparentRgb(std::vector<uint8_t>& pixels) {
     for (size_t index = 0; index + 3 < pixels.size(); index += 4) {
@@ -851,6 +859,8 @@ Renderer::~Renderer() {
     } catch (...) {
     }
     ReleasePanelGlassResources();
+    ReleasePanelGlassPool();
+    ReleasePanelCaptureDib();
     ReleaseBackdropResources();
     if (m_frameLatencyWaitableObject != nullptr) {
         CloseHandle(m_frameLatencyWaitableObject);
@@ -1822,15 +1832,10 @@ void Renderer::CreateBackdropResources() {
         }
 
         m_backdropDc = CreateCompatibleDC(screen);
-        BITMAPINFO bitmapInfo{};
-        bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
-        bitmapInfo.bmiHeader.biWidth = static_cast<LONG>(m_width);
-        bitmapInfo.bmiHeader.biHeight = -static_cast<LONG>(m_height);
-        bitmapInfo.bmiHeader.biPlanes = 1;
-        bitmapInfo.bmiHeader.biBitCount = 32;
-        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+        BITMAPV5HEADER header = CaptureDibHeader(m_width, m_height);
         void* bits = nullptr;
-        m_backdropBitmap = CreateDIBSection(screen, &bitmapInfo, DIB_RGB_COLORS, &bits, nullptr, 0);
+        m_backdropBitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+            DIB_RGB_COLORS, &bits, nullptr, 0);
         const int released = ReleaseDC(nullptr, screen);
         if (released == 0) {
             throw std::runtime_error("ReleaseDC for desktop backdrop failed.");
@@ -2178,6 +2183,64 @@ void Renderer::SignalFrame(FrameResource& frame) {
 }
 
 
+void Renderer::ReleasePanelCaptureDib() noexcept
+{
+    if (m_panelCaptureDc != nullptr && m_panelCapturePrevious != nullptr &&
+        m_panelCapturePrevious != HGDI_ERROR) {
+        SelectObject(m_panelCaptureDc, m_panelCapturePrevious);
+    }
+    m_panelCapturePrevious = nullptr;
+    if (m_panelCaptureBitmap != nullptr) {
+        DeleteObject(m_panelCaptureBitmap);
+        m_panelCaptureBitmap = nullptr;
+    }
+    m_panelCapturePixels = nullptr;
+    if (m_panelCaptureDc != nullptr) {
+        DeleteDC(m_panelCaptureDc);
+        m_panelCaptureDc = nullptr;
+    }
+    m_panelCaptureWidth = 0;
+    m_panelCaptureHeight = 0;
+}
+
+bool Renderer::EnsurePanelCaptureDib(UINT width, UINT height)
+{
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    if (m_panelCaptureDc != nullptr && m_panelCaptureBitmap != nullptr &&
+        m_panelCapturePixels != nullptr && m_panelCaptureWidth == width &&
+        m_panelCaptureHeight == height) {
+        return true;
+    }
+
+    ReleasePanelCaptureDib();
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return false;
+    }
+    m_panelCaptureDc = CreateCompatibleDC(screen);
+    BITMAPV5HEADER header = CaptureDibHeader(width, height);
+    void* bits = nullptr;
+    m_panelCaptureBitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (m_panelCaptureDc == nullptr || m_panelCaptureBitmap == nullptr || bits == nullptr) {
+        ReleasePanelCaptureDib();
+        return false;
+    }
+    m_panelCapturePrevious = SelectObject(m_panelCaptureDc, m_panelCaptureBitmap);
+    if (m_panelCapturePrevious == nullptr || m_panelCapturePrevious == HGDI_ERROR) {
+        ReleasePanelCaptureDib();
+        return false;
+    }
+    m_panelCapturePixels = static_cast<uint8_t*>(bits);
+    m_panelCaptureWidth = width;
+    m_panelCaptureHeight = height;
+    return true;
+}
+
 void Renderer::ReleasePanelGlassResources() noexcept
 {
     if (m_panelBackdropUpload != nullptr && m_panelBackdropUploadPixels != nullptr) {
@@ -2194,24 +2257,114 @@ void Renderer::ReleasePanelGlassResources() noexcept
     m_panelRtvHeap.Reset();
     m_panelWidth = 0;
     m_panelHeight = 0;
+    m_panelBackdropFootprint = {};
+    m_panelBackdropRowCount = 0;
     m_panelBlurTempIsSrv = false;
     m_panelBlurTemp2IsSrv = false;
 }
 
-bool Renderer::EnsurePanelGlassResources(UINT width, UINT height)
+void Renderer::ReleasePanelGlassPool() noexcept
+{
+    for (auto& entry : m_panelPool) {
+        if (entry.backdropUpload != nullptr && entry.uploadPixels != nullptr) {
+            entry.backdropUpload->Unmap(0, nullptr);
+            entry.uploadPixels = nullptr;
+        }
+        entry.readback.Reset();
+        entry.color.Reset();
+        entry.blurTemp2.Reset();
+        entry.blurTemp.Reset();
+        entry.backdropUpload.Reset();
+        entry.backdrop.Reset();
+        entry.srvHeap.Reset();
+        entry.rtvHeap.Reset();
+        entry.width = 0;
+        entry.height = 0;
+        entry.footprint = {};
+        entry.rowCount = 0;
+        entry.blurTempIsSrv = false;
+        entry.blurTemp2IsSrv = false;
+        entry.lastUsed = 0;
+    }
+    m_panelPoolClock = 0;
+}
+
+void Renderer::StashActivePanelGlass() noexcept
+{
+    if (m_panelWidth == 0 || m_panelHeight == 0 || m_panelBackdrop == nullptr) {
+        ReleasePanelGlassResources();
+        return;
+    }
+
+    size_t slot = kPanelGlassPoolSize;
+    for (size_t i = 0; i < kPanelGlassPoolSize; ++i) {
+        if (m_panelPool[i].backdrop == nullptr) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == kPanelGlassPoolSize) {
+        slot = 0;
+        for (size_t i = 1; i < kPanelGlassPoolSize; ++i) {
+            if (m_panelPool[i].lastUsed < m_panelPool[slot].lastUsed) {
+                slot = i;
+            }
+        }
+        auto& victim = m_panelPool[slot];
+        if (victim.backdropUpload != nullptr && victim.uploadPixels != nullptr) {
+            victim.backdropUpload->Unmap(0, nullptr);
+            victim.uploadPixels = nullptr;
+        }
+        victim.readback.Reset();
+        victim.color.Reset();
+        victim.blurTemp2.Reset();
+        victim.blurTemp.Reset();
+        victim.backdropUpload.Reset();
+        victim.backdrop.Reset();
+        victim.srvHeap.Reset();
+        victim.rtvHeap.Reset();
+        victim.width = 0;
+        victim.height = 0;
+        victim.footprint = {};
+        victim.rowCount = 0;
+        victim.blurTempIsSrv = false;
+        victim.blurTemp2IsSrv = false;
+        victim.lastUsed = 0;
+    }
+
+    auto& entry = m_panelPool[slot];
+    entry.width = m_panelWidth;
+    entry.height = m_panelHeight;
+    entry.backdrop = std::move(m_panelBackdrop);
+    entry.backdropUpload = std::move(m_panelBackdropUpload);
+    entry.blurTemp = std::move(m_panelBlurTemp);
+    entry.blurTemp2 = std::move(m_panelBlurTemp2);
+    entry.color = std::move(m_panelColor);
+    entry.readback = std::move(m_panelReadback);
+    entry.srvHeap = std::move(m_panelSrvHeap);
+    entry.rtvHeap = std::move(m_panelRtvHeap);
+    entry.footprint = m_panelBackdropFootprint;
+    entry.rowCount = m_panelBackdropRowCount;
+    entry.uploadPixels = m_panelBackdropUploadPixels;
+    entry.blurTempIsSrv = m_panelBlurTempIsSrv;
+    entry.blurTemp2IsSrv = m_panelBlurTemp2IsSrv;
+    entry.lastUsed = ++m_panelPoolClock;
+
+    m_panelBackdropUploadPixels = nullptr;
+    m_panelWidth = 0;
+    m_panelHeight = 0;
+    m_panelBackdropFootprint = {};
+    m_panelBackdropRowCount = 0;
+    m_panelBlurTempIsSrv = false;
+    m_panelBlurTemp2IsSrv = false;
+}
+
+bool Renderer::CreatePanelGlassResourcesExact(UINT width, UINT height)
 {
     if (m_device == nullptr || width == 0 || height == 0) {
         return false;
     }
-    if (m_panelWidth == width && m_panelHeight == height && m_panelColor && m_panelBackdrop &&
-        m_panelBlurTemp && m_panelBlurTemp2 && m_panelReadback && m_panelSrvHeap && m_panelRtvHeap &&
-        m_panelBackdropUploadPixels != nullptr) {
-        return true;
-    }
 
-    CancelLiveGlassPanelBake();
-    WaitForAllFrames();
-    ReleasePanelGlassResources();
     m_panelWidth = width;
     m_panelHeight = height;
 
@@ -2299,6 +2452,74 @@ bool Renderer::EnsurePanelGlassResources(UINT width, UINT height)
     }
 }
 
+bool Renderer::EnsurePanelGlassResources(UINT width, UINT height)
+{
+    if (m_device == nullptr || width == 0 || height == 0) {
+        return false;
+    }
+    if (m_panelWidth == width && m_panelHeight == height && m_panelColor && m_panelBackdrop &&
+        m_panelBlurTemp && m_panelBlurTemp2 && m_panelReadback && m_panelSrvHeap && m_panelRtvHeap &&
+        m_panelBackdropUploadPixels != nullptr) {
+        return true;
+    }
+
+    // Exact-size pool hit: pull that set into active without CreateCommittedResource.
+    for (size_t i = 0; i < kPanelGlassPoolSize; ++i) {
+        if (m_panelPool[i].width == width && m_panelPool[i].height == height &&
+            m_panelPool[i].backdrop != nullptr && m_panelPool[i].uploadPixels != nullptr) {
+            CancelLiveGlassPanelBake();
+            PanelGlassPoolEntry hit{};
+            hit.width = m_panelPool[i].width;
+            hit.height = m_panelPool[i].height;
+            hit.backdrop = std::move(m_panelPool[i].backdrop);
+            hit.backdropUpload = std::move(m_panelPool[i].backdropUpload);
+            hit.blurTemp = std::move(m_panelPool[i].blurTemp);
+            hit.blurTemp2 = std::move(m_panelPool[i].blurTemp2);
+            hit.color = std::move(m_panelPool[i].color);
+            hit.readback = std::move(m_panelPool[i].readback);
+            hit.srvHeap = std::move(m_panelPool[i].srvHeap);
+            hit.rtvHeap = std::move(m_panelPool[i].rtvHeap);
+            hit.footprint = m_panelPool[i].footprint;
+            hit.rowCount = m_panelPool[i].rowCount;
+            hit.uploadPixels = m_panelPool[i].uploadPixels;
+            hit.blurTempIsSrv = m_panelPool[i].blurTempIsSrv;
+            hit.blurTemp2IsSrv = m_panelPool[i].blurTemp2IsSrv;
+            m_panelPool[i].uploadPixels = nullptr;
+            m_panelPool[i].width = 0;
+            m_panelPool[i].height = 0;
+            m_panelPool[i].footprint = {};
+            m_panelPool[i].rowCount = 0;
+            m_panelPool[i].blurTempIsSrv = false;
+            m_panelPool[i].blurTemp2IsSrv = false;
+            m_panelPool[i].lastUsed = 0;
+
+            StashActivePanelGlass();
+
+            m_panelWidth = hit.width;
+            m_panelHeight = hit.height;
+            m_panelBackdrop = std::move(hit.backdrop);
+            m_panelBackdropUpload = std::move(hit.backdropUpload);
+            m_panelBlurTemp = std::move(hit.blurTemp);
+            m_panelBlurTemp2 = std::move(hit.blurTemp2);
+            m_panelColor = std::move(hit.color);
+            m_panelReadback = std::move(hit.readback);
+            m_panelSrvHeap = std::move(hit.srvHeap);
+            m_panelRtvHeap = std::move(hit.rtvHeap);
+            m_panelBackdropFootprint = hit.footprint;
+            m_panelBackdropRowCount = hit.rowCount;
+            m_panelBackdropUploadPixels = hit.uploadPixels;
+            m_panelBlurTempIsSrv = hit.blurTempIsSrv;
+            m_panelBlurTemp2IsSrv = hit.blurTemp2IsSrv;
+            return true;
+        }
+    }
+
+    CancelLiveGlassPanelBake();
+    WaitForAllFrames();
+    StashActivePanelGlass();
+    return CreatePanelGlassResourcesExact(width, height);
+}
+
 void Renderer::SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const noexcept {
     // Mirror AdaptiveChromeInk: invalid backdrop -> light chrome; else hard cut
     // on average wallpaper luma across three mid-row samples.
@@ -2366,53 +2587,27 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
             }
         };
 
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = static_cast<LONG>(width);
-        bmi.bmiHeader.biHeight = -static_cast<LONG>(height);
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        void* dibPixels = nullptr;
+        if (!EnsurePanelCaptureDib(width, height)) {
+            return false;
+        }
         HDC screen = GetDC(nullptr);
         if (screen == nullptr) {
             return false;
         }
-        HDC memory = CreateCompatibleDC(screen);
-        HBITMAP dib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &dibPixels, nullptr, 0);
-        if (memory == nullptr || dib == nullptr || dibPixels == nullptr) {
-            if (dib != nullptr) {
-                DeleteObject(dib);
-            }
-            if (memory != nullptr) {
-                DeleteDC(memory);
-            }
-            ReleaseDC(nullptr, screen);
-            return false;
-        }
-        const HGDIOBJ previous = SelectObject(memory, dib);
         DWORD affA = 0, affB = 0, affC = 0, affDock = 0;
         bool armA = false, armB = false, armC = false, armDock = false;
         pushAffinity(excludeA, &affA, &armA);
         pushAffinity(excludeB, &affB, &armB);
         pushAffinity(excludeC, &affC, &armC);
         pushAffinity(m_window, &affDock, &armDock);
-        const BOOL copied = BitBlt(memory, 0, 0, static_cast<int>(width), static_cast<int>(height),
-            screen, screenRect.left, screenRect.top, SRCCOPY);
+        const BOOL copied = BitBlt(m_panelCaptureDc, 0, 0, static_cast<int>(width),
+            static_cast<int>(height), screen, screenRect.left, screenRect.top, SRCCOPY);
         popAffinity(m_window, affDock, armDock);
         popAffinity(excludeC, affC, armC);
         popAffinity(excludeB, affB, armB);
         popAffinity(excludeA, affA, armA);
-        std::vector<uint8_t> capture;
-        if (copied != FALSE) {
-            capture.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
-            std::memcpy(capture.data(), dibPixels, capture.size());
-        }
-        SelectObject(memory, previous);
-        DeleteObject(dib);
-        DeleteDC(memory);
         ReleaseDC(nullptr, screen);
-        if (capture.empty()) {
+        if (copied == FALSE) {
             return false;
         }
 
@@ -2425,12 +2620,14 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
             return false;
         }
 
+        // Single CPU copy: pooled capture DIB -> mapped upload (no staging vector).
+        const size_t rowBytes = static_cast<size_t>(width) * 4U;
         for (UINT row = 0; row < height; ++row) {
             std::memcpy(
                 m_panelBackdropUploadPixels + m_panelBackdropFootprint.Offset +
                     static_cast<size_t>(row) * m_panelBackdropFootprint.Footprint.RowPitch,
-                capture.data() + static_cast<size_t>(row) * width * 4U,
-                static_cast<size_t>(width) * 4U);
+                m_panelCapturePixels + static_cast<size_t>(row) * rowBytes,
+                rowBytes);
         }
 
         Check(m_panelAllocator->Reset(), "Reset panel glass allocator");
@@ -2716,62 +2913,38 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
             }
         };
 
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = static_cast<LONG>(width);
-        bmi.bmiHeader.biHeight = -static_cast<LONG>(height);
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        void* dibPixels = nullptr;
+        if (!EnsurePanelCaptureDib(width, height)) {
+            return false;
+        }
         HDC screen = GetDC(nullptr);
         if (screen == nullptr) {
             return false;
         }
-        HDC memory = CreateCompatibleDC(screen);
-        HBITMAP dib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &dibPixels, nullptr, 0);
-        if (memory == nullptr || dib == nullptr || dibPixels == nullptr) {
-            if (dib != nullptr) {
-                DeleteObject(dib);
-            }
-            if (memory != nullptr) {
-                DeleteDC(memory);
-            }
-            ReleaseDC(nullptr, screen);
-            return false;
-        }
-        const HGDIOBJ previous = SelectObject(memory, dib);
         DWORD affA = 0, affB = 0, affC = 0, affDock = 0;
         bool armA = false, armB = false, armC = false, armDock = false;
         pushAffinity(excludeA, &affA, &armA);
         pushAffinity(excludeB, &affB, &armB);
         pushAffinity(excludeC, &affC, &armC);
         pushAffinity(m_window, &affDock, &armDock);
-        const BOOL copied = BitBlt(memory, 0, 0, static_cast<int>(width), static_cast<int>(height),
-            screen, screenRect.left, screenRect.top, SRCCOPY);
+        const BOOL copied = BitBlt(m_panelCaptureDc, 0, 0, static_cast<int>(width),
+            static_cast<int>(height), screen, screenRect.left, screenRect.top, SRCCOPY);
         popAffinity(m_window, affDock, armDock);
         popAffinity(excludeC, affC, armC);
         popAffinity(excludeB, affB, armB);
         popAffinity(excludeA, affA, armA);
-        std::vector<uint8_t> capture;
-        if (copied != FALSE) {
-            capture.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
-            std::memcpy(capture.data(), dibPixels, capture.size());
-        }
-        SelectObject(memory, previous);
-        DeleteObject(dib);
-        DeleteDC(memory);
         ReleaseDC(nullptr, screen);
-        if (capture.empty()) {
+        if (copied == FALSE) {
             return false;
         }
 
+        // Single CPU copy: pooled capture DIB -> mapped upload (no staging vector).
+        const size_t rowBytes = static_cast<size_t>(width) * 4U;
         for (UINT row = 0; row < height; ++row) {
             std::memcpy(
                 m_panelBackdropUploadPixels + m_panelBackdropFootprint.Offset +
                     static_cast<size_t>(row) * m_panelBackdropFootprint.Footprint.RowPitch,
-                capture.data() + static_cast<size_t>(row) * width * 4U,
-                static_cast<size_t>(width) * 4U);
+                m_panelCapturePixels + static_cast<size_t>(row) * rowBytes,
+                rowBytes);
         }
 
         Check(m_panelAllocator->Reset(), "Reset live panel allocator");

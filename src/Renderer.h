@@ -232,6 +232,36 @@ private:
 
     void ReleasePanelGlassResources() noexcept;
     [[nodiscard]] bool EnsurePanelGlassResources(UINT width, UINT height);
+    [[nodiscard]] bool EnsurePanelCaptureDib(UINT width, UINT height);
+    void ReleasePanelCaptureDib() noexcept;
+    void ReleasePanelGlassPool() noexcept;
+    void StashActivePanelGlass() noexcept;
+    [[nodiscard]] bool CreatePanelGlassResourcesExact(UINT width, UINT height);
+
+    // Exact-size D3D panel glass pool. Live menus round-robin different sizes;
+    // stash up to 3 exact WxH sets so CreateCommittedResource is not paid every
+    // tick. Active set lives in m_panel* below; pool holds the rest.
+    static constexpr size_t kPanelGlassPoolSize = 3;
+    struct PanelGlassPoolEntry {
+        UINT width = 0;
+        UINT height = 0;
+        Microsoft::WRL::ComPtr<ID3D12Resource> backdrop;
+        Microsoft::WRL::ComPtr<ID3D12Resource> backdropUpload;
+        Microsoft::WRL::ComPtr<ID3D12Resource> blurTemp;
+        Microsoft::WRL::ComPtr<ID3D12Resource> blurTemp2;
+        Microsoft::WRL::ComPtr<ID3D12Resource> color;
+        Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srvHeap;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtvHeap;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT rowCount = 0;
+        uint8_t* uploadPixels = nullptr;
+        bool blurTempIsSrv = false;
+        bool blurTemp2IsSrv = false;
+        UINT64 lastUsed = 0;
+    };
+    std::array<PanelGlassPoolEntry, kPanelGlassPoolSize> m_panelPool{};
+    UINT64 m_panelPoolClock = 0;
 
     UINT m_panelWidth = 0;
     UINT m_panelHeight = 0;
@@ -248,6 +278,13 @@ private:
     uint8_t* m_panelBackdropUploadPixels = nullptr;
     bool m_panelBlurTempIsSrv = false;
     bool m_panelBlurTemp2IsSrv = false;
+    // Pooled GDI capture DIB for panel glass BitBlt (sRGB V5 → skip ICM probes).
+    HDC m_panelCaptureDc = nullptr;
+    HBITMAP m_panelCaptureBitmap = nullptr;
+    HGDIOBJ m_panelCapturePrevious = nullptr;
+    uint8_t* m_panelCapturePixels = nullptr;
+    UINT m_panelCaptureWidth = 0;
+    UINT m_panelCaptureHeight = 0;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_panelAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_panelCommandList;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_panelConstants;
