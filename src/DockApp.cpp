@@ -2835,9 +2835,25 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             // timer backs off to ~33 ms. Moving wallpaper / video still keeps
             // the fast cadence so frost stays live.
             bool wantFast = false;
+            // 1.1.47 forced the 8 ms backdrop lane whenever the pointer was over
+            // the dock. Cursor motion advances DWM cFrame, so CaptureLiveBackdrop
+            // then ran ProbeBackdropUnchanged (BitBlt + SetWindowDisplayAffinity)
+            // on the same thread as WH_MOUSE_LL — that is why cursor FPS stayed
+            // low after 1.1.47. Skip capture while the pointer is moving over the
+            // dock; resume when it settles. Do not force wantFast for dock hover.
+            POINT hoverCursor{};
+            const bool haveCursor = GetCursorPos(&hoverCursor) != FALSE;
+            const bool pointerOverDock = haveCursor && IsCursorOverDock(hoverCursor);
+            constexpr double kDockCaptureMotionSkipSeconds = 0.080;
+            const double nowQpc = QpcSeconds();
+            const bool pointerMovingOverDock = pointerOverDock && !IsDragActive() &&
+                m_lastPointerMotionAt > 0.0 &&
+                (nowQpc - m_lastPointerMotionAt) < kDockCaptureMotionSkipSeconds;
             if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
-                QpcSeconds() >= m_suppressBackdropUntil) {
-                if (CaptureLiveBackdrop()) {
+                nowQpc >= m_suppressBackdropUntil) {
+                if (pointerMovingOverDock) {
+                    // Leave glass frozen for a few frames; hook stays responsive.
+                } else if (CaptureLiveBackdrop()) {
                     QueueRenderFrame(false);
                     wantFast = true;
                     m_backdropIdleStreak = 0;
@@ -2856,24 +2872,15 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 wantFast = true;
                 m_backdropIdleStreak = 0;
             }
-            // Pointer over the dock or an open popup: keep the ~8 ms cadence so
-            // live glass / hover presents stay in lockstep with the cursor. Idle
-            // static desktop (no hover) still backs off to ~33 ms.
-            POINT hoverCursor{};
-            const bool pointerOverInteractive = GetCursorPos(&hoverCursor) != FALSE &&
-                (IsCursorOverDock(hoverCursor) ||
-                    (IsOverflowOpen() && IsCursorOverOverflow(hoverCursor)) ||
-                    (IsDockSettingsOpen() && IsCursorOverSettings(hoverCursor)) ||
-                    (IsContextMenuOpen() && IsCursorOverContextMenu(hoverCursor)));
-            if (pointerOverInteractive) {
-                wantFast = true;
-                m_backdropIdleStreak = 0;
-            }
             // With menus open and the pointer elsewhere, skip idle hysteresis:
             // stay at ~33 ms unless this tick observed a real backdrop/glass change.
             const bool menusOpen = IsDockSettingsOpen() || IsOverflowOpen() ||
                 IsContextMenuOpen();
-            if (menusOpen && !pointerOverInteractive) {
+            if (pointerMovingOverDock) {
+                // Prefer idle cadence while moving so settle ticks are not stacked
+                // on an 8 ms capture storm.
+                SyncBackdropTimerInterval(false);
+            } else if (menusOpen) {
                 SyncBackdropTimerInterval(wantFast);
             } else {
                 SyncBackdropTimerInterval(
@@ -4011,7 +4018,9 @@ void DockApp::RefreshTray(bool forceLayout) {
     if (IsOverflowOpen()) {
         PaintOverflowPopup();
     }
-    QueueRenderFrame();
+    // Non-blocking: the 1 Hz clock tick must not Present(1)/vsync-wait on the
+    // UI thread that services WH_MOUSE_LL (hitch while hovering the dock).
+    QueueRenderFrame(false);
 }
 
 // --- Trash / Recycle Bin ----------------------------------------------------
@@ -7726,6 +7735,9 @@ void DockApp::SyncBackdropTimerInterval(bool wantFast) noexcept {
 }
 
 void DockApp::HandlePointer(POINT cursor) {
+    if (cursor.x != m_lastCursor.x || cursor.y != m_lastCursor.y) {
+        m_lastPointerMotionAt = QpcSeconds();
+    }
     m_lastCursor = cursor;
     m_lastPointerSampleAt = QpcSeconds();
     if (IsDragActive()) {

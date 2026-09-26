@@ -588,6 +588,10 @@ private:
     POINT m_pressedAt{};
     double m_pressedAtTime = 0.0;
     double m_lastPointerSampleAt = 0.0;
+    // QPC time of the last actual cursor position change (not calm watch polls).
+    // Backdrop capture skips while this is recent and the pointer is over the dock
+    // so BitBlt / Present cannot stall WH_MOUSE_LL mid-move.
+    double m_lastPointerMotionAt = 0.0;
     bool m_suppressDragUntilRelease = false;
     bool m_launchClickInProgress = false;
     std::wstring m_pressedTarget;
