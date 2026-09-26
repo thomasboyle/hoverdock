@@ -779,6 +779,8 @@ private:
     std::vector<uint8_t> m_contextBaseBits;
     std::vector<uint8_t> m_contextPresentBits;
     LayerPresentDib m_contextLayerDib{};
+    RECT m_contextHoverDirty{};
+    bool m_contextHoverDirtyValid = false;
     SIZE m_contextPresentSize{};
     bool m_contextHoverPaintOnly = false;
     float m_contextFontScale = 0.0F;

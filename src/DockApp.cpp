@@ -2856,11 +2856,24 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 wantFast = true;
                 m_backdropIdleStreak = 0;
             }
-            // With menus open, skip idle hysteresis: stay at ~33 ms unless this
-            // tick observed a real backdrop/glass change.
+            // Pointer over the dock or an open popup: keep the ~8 ms cadence so
+            // live glass / hover presents stay in lockstep with the cursor. Idle
+            // static desktop (no hover) still backs off to ~33 ms.
+            POINT hoverCursor{};
+            const bool pointerOverInteractive = GetCursorPos(&hoverCursor) != FALSE &&
+                (IsCursorOverDock(hoverCursor) ||
+                    (IsOverflowOpen() && IsCursorOverOverflow(hoverCursor)) ||
+                    (IsDockSettingsOpen() && IsCursorOverSettings(hoverCursor)) ||
+                    (IsContextMenuOpen() && IsCursorOverContextMenu(hoverCursor)));
+            if (pointerOverInteractive) {
+                wantFast = true;
+                m_backdropIdleStreak = 0;
+            }
+            // With menus open and the pointer elsewhere, skip idle hysteresis:
+            // stay at ~33 ms unless this tick observed a real backdrop/glass change.
             const bool menusOpen = IsDockSettingsOpen() || IsOverflowOpen() ||
                 IsContextMenuOpen();
-            if (menusOpen) {
+            if (menusOpen && !pointerOverInteractive) {
                 SyncBackdropTimerInterval(wantFast);
             } else {
                 SyncBackdropTimerInterval(
@@ -5657,6 +5670,10 @@ bool DockApp::TickLivePopupGlass()
                     m_settingsHoverDirtyValid = false;
                     PaintSettingsHoverFast();
                     didWork = true;
+                } else if (m_settingsHover >= 0 || m_settingsHoverDirtyValid) {
+                    // Identical glass bake: still refresh hover highlight so
+                    // skip-identical cannot leave magnification/highlight stale.
+                    PaintSettingsHoverFast();
                 }
             }
         } else if (done == 1 && overflowOpen && !m_overflowBaseBits.empty()) {
@@ -5669,6 +5686,8 @@ bool DockApp::TickLivePopupGlass()
                     m_overflowHoverDirtyValid = false;
                     PaintOverflowHoverFast();
                     didWork = true;
+                } else if (m_overflowHover >= 0 || m_overflowHoverDirtyValid) {
+                    PaintOverflowHoverFast();
                 }
             }
         } else if (done == 2 && contextOpen && !m_contextBaseBits.empty()) {
@@ -5677,8 +5696,12 @@ bool DockApp::TickLivePopupGlass()
                 m_contextGlassSize.cy == m_contextSize.cy) {
                 if (ApplyLivePopupGlass(glass, m_contextSize, m_contextGlass, m_contextBaseBits,
                         m_contextPresentBits, m_contextPresentSize)) {
+                    m_contextLayerDib.contentValid = false;
+                    m_contextHoverDirtyValid = false;
                     PaintContextHoverFast();
                     didWork = true;
+                } else if (m_contextHover >= 0 || m_contextHoverDirtyValid) {
+                    PaintContextHoverFast();
                 }
             }
         }
@@ -6790,23 +6813,106 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
 }
 
 void DockApp::PaintOverflowHoverFast() {
-    if (m_overflowBaseBits.empty() || m_overflowWindow == nullptr) {
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (m_overflowBaseBits.empty() || m_overflowWindow == nullptr ||
+        m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0 ||
+        m_overflowPresentSize.cx != m_overflowSize.cx ||
+        m_overflowPresentSize.cy != m_overflowSize.cy ||
+        !OverflowScreenOrigin(origin, caret)) {
         PaintOverflowPopup();
         return;
     }
+    m_overflowCaretX = caret;
+    const ULONGLONG now = GetTickCount64();
+    const int width = SaturatedInt(m_overflowPresentSize.cx);
+    const int height = SaturatedInt(m_overflowPresentSize.cy);
     m_overflowPresentSize = m_overflowSize;
     if (m_overflowPresentBits.size() != m_overflowBaseBits.size()) {
         m_overflowPresentBits = m_overflowBaseBits;
-    } else {
-        std::memcpy(m_overflowPresentBits.data(), m_overflowBaseBits.data(), m_overflowBaseBits.size());
+        m_overflowHoverDirtyValid = false;
     }
+
+    auto restoreRect = [&](const RECT& rect) {
+        const LONG left = (std::max)(0L, rect.left);
+        const LONG top = (std::max)(0L, rect.top);
+        const LONG right = (std::min)(static_cast<LONG>(width), rect.right);
+        const LONG bottom = (std::min)(static_cast<LONG>(height), rect.bottom);
+        if (right <= left || bottom <= top) {
+            return;
+        }
+        const size_t rowBytes = static_cast<size_t>(right - left) * 4U;
+        for (LONG y = top; y < bottom; ++y) {
+            const size_t offset =
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) * 4U;
+            std::memcpy(m_overflowPresentBits.data() + offset, m_overflowBaseBits.data() + offset,
+                rowBytes);
+        }
+    };
+
+    auto expandDirty = [&](RECT rect) -> RECT {
+        rect.left = (std::max)(0L, rect.left - 8);
+        rect.top = (std::max)(0L, rect.top - 8);
+        rect.right = (std::min)(static_cast<LONG>(width), rect.right + 8);
+        rect.bottom = (std::min)(static_cast<LONG>(height), rect.bottom + 8);
+        return rect;
+    };
+
+    auto gearDirty = [&]() -> RECT {
+        // Gear hover scales ~30% about its center; dirty must cover the wipe.
+        constexpr float kGearHoverScale = 1.30F;
+        const int idle = static_cast<int>(m_overflowGearExtent);
+        const int hoverExt = std::max(1, static_cast<int>(std::lround(
+            static_cast<float>(idle) * kGearHoverScale)));
+        const int half = (std::max)(idle, hoverExt) / 2 + 2;
+        const int centerX = m_overflowGearX + idle / 2;
+        const int centerY = m_overflowGearY + idle / 2;
+        RECT r{
+            static_cast<LONG>((std::max)(0, centerX - half)),
+            static_cast<LONG>((std::max)(0, centerY - half)),
+            static_cast<LONG>((std::min)(width, centerX + half + 1)),
+            static_cast<LONG>((std::min)(height, centerY + half + 1))};
+        return r;
+    };
+
+    RECT dirty{};
+    bool haveDirty = false;
+    if (m_overflowHoverDirtyValid) {
+        restoreRect(m_overflowHoverDirty);
+        dirty = m_overflowHoverDirty;
+        haveDirty = true;
+    }
+
     if (m_overflowHover >= 0 && static_cast<size_t>(m_overflowHover) < m_overflowHits.size()) {
-        ApplyOverflowHoverHighlight(m_overflowPresentBits.data(),
-            SaturatedInt(m_overflowPresentSize.cx), SaturatedInt(m_overflowPresentSize.cy),
-            m_overflowHits[static_cast<size_t>(m_overflowHover)]);
+        const TrayFlyoutHit& hit = m_overflowHits[static_cast<size_t>(m_overflowHover)];
+        ApplyOverflowHoverHighlight(m_overflowPresentBits.data(), width, height, hit);
+        RECT next = (hit.kind == TrayFlyoutHitKind::Settings && m_overflowGearExtent > 0U)
+            ? gearDirty()
+            : expandDirty(hit.bounds);
+        if (!haveDirty) {
+            dirty = next;
+            haveDirty = true;
+        } else {
+            dirty.left = (std::min)(dirty.left, next.left);
+            dirty.top = (std::min)(dirty.top, next.top);
+            dirty.right = (std::max)(dirty.right, next.right);
+            dirty.bottom = (std::max)(dirty.bottom, next.bottom);
+        }
+        m_overflowHoverDirty = next;
+        m_overflowHoverDirtyValid = true;
+    } else {
+        m_overflowHoverDirtyValid = false;
     }
-    PresentOverflowLayer();
-    m_lastOverflowHoverPresentMs = GetTickCount64();
+
+    if (!PresentLayeredBits(m_overflowWindow, origin, m_overflowPresentSize.cx,
+            m_overflowPresentSize.cy, m_overflowPresentBits.data(), m_overflowPresentBits.size(),
+            m_overflowLayerDib, haveDirty ? &dirty : nullptr)) {
+        return;
+    }
+    m_lastOverflowHoverPresentMs = now;
+    if (!IsWindowVisible(m_overflowWindow)) {
+        ShowWindow(m_overflowWindow, SW_SHOWNA);
+    }
 }
 
 void DockApp::PaintOverflowPopup() {
@@ -7664,15 +7770,12 @@ void DockApp::HandlePointer(POINT cursor) {
     if (hoveredDivider >= 0 && m_hoveredIcon >= 0) {
         m_hoveredIcon = -1;
         HideHoverLabel();
-        if (!IsAnimating()) {
-            QueueRenderFrame();
-        }
+        // No dock Present: icon.hovered is unused by the GPU path; a blocking
+        // Present here was the main cursor-FPS stall after the backdrop timer
+        // stopped driving sticky non-blocking frames at 120 Hz.
     }
     if (hovered != m_hoveredIcon) {
         m_hoveredIcon = hovered;
-        if (!IsAnimating()) {
-            QueueRenderFrame();
-        }
         UpdateHoverLabel();
     }
     if (hoveredDivider != m_hoveredDivider) {
@@ -7982,18 +8085,60 @@ void DockApp::QueueContextPaint(bool hoverOnly) {
 
 void DockApp::PaintContextHoverFast() {
     if (m_contextBaseBits.empty() || m_contextWindow == nullptr ||
-        m_contextPresentSize.cx <= 0 || m_contextPresentSize.cy <= 0) {
+        m_contextPresentSize.cx <= 0 || m_contextPresentSize.cy <= 0 ||
+        m_contextPresentSize.cx != m_contextSize.cx ||
+        m_contextPresentSize.cy != m_contextSize.cy) {
         PaintContextMenu();
         return;
     }
-    m_contextPresentBits = m_contextBaseBits;
+    POINT origin = m_contextOrigin;
+    if (origin.x == 0 && origin.y == 0) {
+        if (!ContextScreenOrigin(origin)) {
+            return;
+        }
+    }
+    const int width = SaturatedInt(m_contextPresentSize.cx);
+    const int height = SaturatedInt(m_contextPresentSize.cy);
     m_contextPresentSize = m_contextSize;
+    if (m_contextPresentBits.size() != m_contextBaseBits.size()) {
+        m_contextPresentBits = m_contextBaseBits;
+        m_contextHoverDirtyValid = false;
+    }
+
+    auto restoreRect = [&](const RECT& rect) {
+        const LONG left = (std::max)(0L, rect.left);
+        const LONG top = (std::max)(0L, rect.top);
+        const LONG right = (std::min)(static_cast<LONG>(width), rect.right);
+        const LONG bottom = (std::min)(static_cast<LONG>(height), rect.bottom);
+        if (right <= left || bottom <= top) {
+            return;
+        }
+        const size_t rowBytes = static_cast<size_t>(right - left) * 4U;
+        for (LONG y = top; y < bottom; ++y) {
+            const size_t offset =
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) * 4U;
+            std::memcpy(m_contextPresentBits.data() + offset, m_contextBaseBits.data() + offset,
+                rowBytes);
+        }
+    };
+
+    RECT dirty{};
+    bool haveDirty = false;
+    if (m_contextHoverDirtyValid) {
+        RECT prev = m_contextHoverDirty;
+        prev.left = (std::max)(0L, prev.left - 8);
+        prev.top = (std::max)(0L, prev.top - 8);
+        prev.right = (std::min)(static_cast<LONG>(width), prev.right + 8);
+        prev.bottom = (std::min)(static_cast<LONG>(height), prev.bottom + 8);
+        restoreRect(prev);
+        dirty = prev;
+        haveDirty = true;
+    }
+
     if (m_contextHover >= 0 && static_cast<size_t>(m_contextHover) < m_contextHits.size() &&
         static_cast<size_t>(m_contextHover) < m_contextItems.size() &&
         static_cast<size_t>(m_contextHover) < m_contextGlyphs.size()) {
         const RECT& hit = m_contextHits[static_cast<size_t>(m_contextHover)].bounds;
-        const int width = SaturatedInt(m_contextPresentSize.cx);
-        const int height = SaturatedInt(m_contextPresentSize.cy);
         const UINT dpi = HostDpi();
         const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
         const float radius = std::max(8.0F, 10.0F * scale);
@@ -8026,15 +8171,29 @@ void DockApp::PaintContextHoverFast() {
             rowTop + rowHeight};
         DrawFlyoutText(m_contextPresentBits.data(), width, height, label, m_contextLabelFont,
             item.label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
-    }
-    POINT origin = m_contextOrigin;
-    if (origin.x == 0 && origin.y == 0) {
-        if (!ContextScreenOrigin(origin)) {
-            return;
+        RECT next = hit;
+        next.left = (std::max)(0L, next.left - 8);
+        next.top = (std::max)(0L, next.top - 8);
+        next.right = (std::min)(static_cast<LONG>(width), next.right + 8);
+        next.bottom = (std::min)(static_cast<LONG>(height), next.bottom + 8);
+        if (!haveDirty) {
+            dirty = next;
+            haveDirty = true;
+        } else {
+            dirty.left = (std::min)(dirty.left, next.left);
+            dirty.top = (std::min)(dirty.top, next.top);
+            dirty.right = (std::max)(dirty.right, next.right);
+            dirty.bottom = (std::max)(dirty.bottom, next.bottom);
         }
+        m_contextHoverDirty = hit;
+        m_contextHoverDirtyValid = true;
+    } else {
+        m_contextHoverDirtyValid = false;
     }
+
     if (!PresentLayeredBits(m_contextWindow, origin, m_contextPresentSize.cx, m_contextPresentSize.cy,
-            m_contextPresentBits.data(), m_contextPresentBits.size(), m_contextLayerDib)) {
+            m_contextPresentBits.data(), m_contextPresentBits.size(), m_contextLayerDib,
+            haveDirty ? &dirty : nullptr)) {
         return;
     }
     if (!IsWindowVisible(m_contextWindow)) {
