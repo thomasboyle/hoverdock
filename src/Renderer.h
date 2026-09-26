@@ -93,12 +93,22 @@ public:
     // Begin submits BitBlt + GPU work without waiting; Take copies readback when
     // the fence is signaled. Dedicated panel command list so this never races the
     // dock swap-chain Present path (the old shared-list rebake hitched the cursor).
+    // True when DWM has not composed since the last live panel capture attempt
+    // (and the forced-capture skip budget remains). TickLivePopupGlass uses this
+    // once per timer tick so round-robin targets do not burn the idle budget.
+    [[nodiscard]] bool ShouldSkipLivePanelCapture() noexcept;
+    // Skip BitBlt when this exact WxH was already confirmed unchanged for the
+    // current DWM composed frame (cursor motion advances cFrame without
+    // changing wallpaper under the menu).
+    [[nodiscard]] bool ShouldSkipLivePanelBitBlt(UINT width, UINT height) noexcept;
     [[nodiscard]] bool BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT height,
         UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB,
         HWND excludeC);
     [[nodiscard]] bool TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra);
     [[nodiscard]] bool IsLiveGlassPanelPending() const noexcept;
     void CancelLiveGlassPanelBake() noexcept;
+    // Increments only when CaptureBackdrop uploads new pixels (desktop changed).
+    [[nodiscard]] uint64_t BackdropChangeSerial() const noexcept { return m_backdropChangeSerial; }
     // Same wallpaper-luma cut as AdaptiveChromeInk in Shaders.hlsl so Quick /
     // Dock Settings text matches Start/Search/clock chrome on the dock.
     void SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const noexcept;
@@ -219,6 +229,7 @@ private:
     bool m_backdropInitialized = false;
     bool m_backdropValid = false;
     uint64_t m_backdropHash = 0;
+    uint64_t m_backdropChangeSerial = 0;
     // Last DWM composed-frame count seen by CaptureBackdrop. Used for the idle
     // fast path: when DWM hasn't composed since the last capture, the backdrop
     // pixels cannot have changed and the BitBlt is skipped (timer still fires).
@@ -234,6 +245,8 @@ private:
     [[nodiscard]] bool EnsurePanelGlassResources(UINT width, UINT height);
     [[nodiscard]] bool EnsurePanelCaptureDib(UINT width, UINT height);
     void ReleasePanelCaptureDib() noexcept;
+    void ReleasePanelCapturePool() noexcept;
+    [[nodiscard]] uint64_t HashPanelCapturePixels(UINT width, UINT height) const noexcept;
     void ReleasePanelGlassPool() noexcept;
     void StashActivePanelGlass() noexcept;
     [[nodiscard]] bool CreatePanelGlassResourcesExact(UINT width, UINT height);
@@ -278,13 +291,37 @@ private:
     uint8_t* m_panelBackdropUploadPixels = nullptr;
     bool m_panelBlurTempIsSrv = false;
     bool m_panelBlurTemp2IsSrv = false;
-    // Pooled GDI capture DIB for panel glass BitBlt (sRGB V5 → skip ICM probes).
+    // Exact-size GDI capture DIB pool (mirrors D3D panel pool). Live menus
+    // round-robin different WxH; without this, EnsurePanelCaptureDib destroyed
+    // and CreateDIBSection+ICM'd every tick. Active slot is mirrored in the
+    // m_panelCapture* aliases below for BitBlt/upload call sites.
+    static constexpr size_t kPanelCapturePoolSize = 3;
+    static constexpr UINT kPanelForcedCaptureSkips = 60;
+    struct PanelCapturePoolEntry {
+        HDC dc = nullptr;
+        HBITMAP bitmap = nullptr;
+        HGDIOBJ previous = nullptr;
+        uint8_t* pixels = nullptr;
+        UINT width = 0;
+        UINT height = 0;
+        uint64_t contentHash = 0;
+        bool hashValid = false;
+        // DWM cFrame when contentHash was last confirmed. Same frame => skip BitBlt.
+        uint64_t dwmAtHash = 0;
+        UINT64 lastUsed = 0;
+    };
+    std::array<PanelCapturePoolEntry, kPanelCapturePoolSize> m_panelCapturePool{};
+    UINT64 m_panelCapturePoolClock = 0;
     HDC m_panelCaptureDc = nullptr;
     HBITMAP m_panelCaptureBitmap = nullptr;
     HGDIOBJ m_panelCapturePrevious = nullptr;
     uint8_t* m_panelCapturePixels = nullptr;
     UINT m_panelCaptureWidth = 0;
     UINT m_panelCaptureHeight = 0;
+    // DWM composed-frame gate for live panel BitBlt (same idea as dock backdrop).
+    uint64_t m_panelCaptureDwmFrame = 0;
+    bool m_panelCaptureDwmFrameValid = false;
+    UINT m_panelCaptureIdleSkips = 0;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_panelAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_panelCommandList;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_panelConstants;

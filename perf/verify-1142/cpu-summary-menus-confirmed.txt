@@ -1,0 +1,6 @@
+version=1.1.45
+pid=18484
+avg=0.006
+peak=0.488
+over1=0
+log=D:\C++\hoverdock\perf\verify-1142\Hoverdock-perf-menus-confirmed-20260926-181609.log

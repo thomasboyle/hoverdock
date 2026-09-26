@@ -1137,6 +1137,7 @@ void Renderer::InvalidateBackdrop() noexcept {
     // Render cannot sample a desktop frame from a previous reveal.
     m_backdropValid = false;
     m_backdropHash = 0;
+    m_backdropChangeSerial = 0;
     m_backdropDwmFrameValid = false;
     m_backdropDwmFrame = 0;
 }
@@ -1302,6 +1303,7 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     }
     m_backdropHash = hash;
     m_backdropValid = true;
+    ++m_backdropChangeSerial;
     if (changed != nullptr) {
         *changed = true;
     }
@@ -1984,6 +1986,7 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropInitialized = false;
     m_backdropValid = false;
     m_backdropHash = 0;
+    m_backdropChangeSerial = 0;
     m_backdropDwmFrame = 0;
     m_backdropDwmFrameValid = false;
     m_backdropIdleSkips = 0;
@@ -2183,24 +2186,64 @@ void Renderer::SignalFrame(FrameResource& frame) {
 }
 
 
-void Renderer::ReleasePanelCaptureDib() noexcept
+void Renderer::ReleasePanelCapturePool() noexcept
 {
-    if (m_panelCaptureDc != nullptr && m_panelCapturePrevious != nullptr &&
-        m_panelCapturePrevious != HGDI_ERROR) {
-        SelectObject(m_panelCaptureDc, m_panelCapturePrevious);
+    for (auto& entry : m_panelCapturePool) {
+        if (entry.dc != nullptr && entry.previous != nullptr && entry.previous != HGDI_ERROR) {
+            SelectObject(entry.dc, entry.previous);
+        }
+        entry.previous = nullptr;
+        if (entry.bitmap != nullptr) {
+            DeleteObject(entry.bitmap);
+            entry.bitmap = nullptr;
+        }
+        entry.pixels = nullptr;
+        if (entry.dc != nullptr) {
+            DeleteDC(entry.dc);
+            entry.dc = nullptr;
+        }
+        entry.width = 0;
+        entry.height = 0;
+        entry.contentHash = 0;
+        entry.hashValid = false;
+        entry.dwmAtHash = 0;
+        entry.lastUsed = 0;
     }
+    m_panelCapturePoolClock = 0;
+    m_panelCaptureDc = nullptr;
+    m_panelCaptureBitmap = nullptr;
     m_panelCapturePrevious = nullptr;
-    if (m_panelCaptureBitmap != nullptr) {
-        DeleteObject(m_panelCaptureBitmap);
-        m_panelCaptureBitmap = nullptr;
-    }
     m_panelCapturePixels = nullptr;
-    if (m_panelCaptureDc != nullptr) {
-        DeleteDC(m_panelCaptureDc);
-        m_panelCaptureDc = nullptr;
-    }
     m_panelCaptureWidth = 0;
     m_panelCaptureHeight = 0;
+    m_panelCaptureDwmFrame = 0;
+    m_panelCaptureDwmFrameValid = false;
+    m_panelCaptureIdleSkips = 0;
+}
+
+void Renderer::ReleasePanelCaptureDib() noexcept
+{
+    ReleasePanelCapturePool();
+}
+
+uint64_t Renderer::HashPanelCapturePixels(UINT width, UINT height) const noexcept
+{
+    if (m_panelCapturePixels == nullptr || width == 0 || height == 0 ||
+        width != m_panelCaptureWidth || height != m_panelCaptureHeight) {
+        return 0;
+    }
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(m_panelCapturePixels);
+    const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    uint64_t hash = 14695981039346656037ull;
+    constexpr size_t stride = 8;
+    for (size_t index = 0; index < count; index += stride) {
+        hash ^= words[index];
+        hash *= 1099511628211ull;
+    }
+    hash ^= words[count - 1];
+    hash ^= static_cast<uint64_t>(width) << 32;
+    hash ^= height;
+    return hash;
 }
 
 bool Renderer::EnsurePanelCaptureDib(UINT width, UINT height)
@@ -2208,36 +2251,118 @@ bool Renderer::EnsurePanelCaptureDib(UINT width, UINT height)
     if (width == 0 || height == 0) {
         return false;
     }
-    if (m_panelCaptureDc != nullptr && m_panelCaptureBitmap != nullptr &&
-        m_panelCapturePixels != nullptr && m_panelCaptureWidth == width &&
-        m_panelCaptureHeight == height) {
-        return true;
+
+    // Exact WxH hit in the pool: rebind aliases (no CreateDIBSection).
+    for (auto& entry : m_panelCapturePool) {
+        if (entry.dc != nullptr && entry.bitmap != nullptr && entry.pixels != nullptr &&
+            entry.width == width && entry.height == height) {
+            m_panelCaptureDc = entry.dc;
+            m_panelCaptureBitmap = entry.bitmap;
+            m_panelCapturePrevious = entry.previous;
+            m_panelCapturePixels = entry.pixels;
+            m_panelCaptureWidth = entry.width;
+            m_panelCaptureHeight = entry.height;
+            entry.lastUsed = ++m_panelCapturePoolClock;
+            return true;
+        }
     }
 
-    ReleasePanelCaptureDib();
+    // Prefer an empty slot; otherwise evict LRU.
+    size_t slot = kPanelCapturePoolSize;
+    for (size_t i = 0; i < kPanelCapturePoolSize; ++i) {
+        if (m_panelCapturePool[i].bitmap == nullptr) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == kPanelCapturePoolSize) {
+        slot = 0;
+        for (size_t i = 1; i < kPanelCapturePoolSize; ++i) {
+            if (m_panelCapturePool[i].lastUsed < m_panelCapturePool[slot].lastUsed) {
+                slot = i;
+            }
+        }
+        auto& victim = m_panelCapturePool[slot];
+        if (victim.dc != nullptr && victim.previous != nullptr && victim.previous != HGDI_ERROR) {
+            SelectObject(victim.dc, victim.previous);
+        }
+        victim.previous = nullptr;
+        if (victim.bitmap != nullptr) {
+            DeleteObject(victim.bitmap);
+            victim.bitmap = nullptr;
+        }
+        victim.pixels = nullptr;
+        if (victim.dc != nullptr) {
+            DeleteDC(victim.dc);
+            victim.dc = nullptr;
+        }
+        victim.width = 0;
+        victim.height = 0;
+        victim.contentHash = 0;
+        victim.hashValid = false;
+        victim.dwmAtHash = 0;
+        victim.lastUsed = 0;
+        // Active aliases may have pointed at the victim; clear them.
+        m_panelCaptureDc = nullptr;
+        m_panelCaptureBitmap = nullptr;
+        m_panelCapturePrevious = nullptr;
+        m_panelCapturePixels = nullptr;
+        m_panelCaptureWidth = 0;
+        m_panelCaptureHeight = 0;
+    }
 
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
         return false;
     }
-    m_panelCaptureDc = CreateCompatibleDC(screen);
+    // ICM_OFF: CreateDIBSection otherwise probes the default color profile
+    // (GetFileAttributesW / IcmGetDefaultCamp) on every create — dominant when
+    // the single-slot pool thrashed across menu sizes. LCS_sRGB alone was not
+    // enough on this OS.
+    SetICMMode(screen, ICM_OFF);
+    auto& entry = m_panelCapturePool[slot];
+    entry.dc = CreateCompatibleDC(screen);
     BITMAPV5HEADER header = CaptureDibHeader(width, height);
     void* bits = nullptr;
-    m_panelCaptureBitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+    entry.bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
         DIB_RGB_COLORS, &bits, nullptr, 0);
     ReleaseDC(nullptr, screen);
-    if (m_panelCaptureDc == nullptr || m_panelCaptureBitmap == nullptr || bits == nullptr) {
-        ReleasePanelCaptureDib();
+    if (entry.dc == nullptr || entry.bitmap == nullptr || bits == nullptr) {
+        if (entry.bitmap != nullptr) {
+            DeleteObject(entry.bitmap);
+            entry.bitmap = nullptr;
+        }
+        if (entry.dc != nullptr) {
+            DeleteDC(entry.dc);
+            entry.dc = nullptr;
+        }
+        entry.pixels = nullptr;
         return false;
     }
-    m_panelCapturePrevious = SelectObject(m_panelCaptureDc, m_panelCaptureBitmap);
-    if (m_panelCapturePrevious == nullptr || m_panelCapturePrevious == HGDI_ERROR) {
-        ReleasePanelCaptureDib();
+    entry.previous = SelectObject(entry.dc, entry.bitmap);
+    if (entry.previous == nullptr || entry.previous == HGDI_ERROR) {
+        DeleteObject(entry.bitmap);
+        DeleteDC(entry.dc);
+        entry.bitmap = nullptr;
+        entry.dc = nullptr;
+        entry.previous = nullptr;
+        entry.pixels = nullptr;
         return false;
     }
-    m_panelCapturePixels = static_cast<uint8_t*>(bits);
-    m_panelCaptureWidth = width;
-    m_panelCaptureHeight = height;
+    entry.pixels = static_cast<uint8_t*>(bits);
+    entry.width = width;
+    entry.height = height;
+    entry.contentHash = 0;
+    entry.hashValid = false;
+    entry.dwmAtHash = 0;
+    entry.lastUsed = ++m_panelCapturePoolClock;
+
+    m_panelCaptureDc = entry.dc;
+    m_panelCaptureBitmap = entry.bitmap;
+    m_panelCapturePrevious = entry.previous;
+    m_panelCapturePixels = entry.pixels;
+    m_panelCaptureWidth = entry.width;
+    m_panelCaptureHeight = entry.height;
     return true;
 }
 
@@ -2614,6 +2739,17 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         // Blocking bake: finish any in-flight live panel bake first so the
         // dedicated allocator/list/constants are free.
         CancelLiveGlassPanelBake();
+        {
+            const uint64_t captureHash = HashPanelCapturePixels(width, height);
+            for (auto& entry : m_panelCapturePool) {
+                if (entry.bitmap == m_panelCaptureBitmap && entry.width == width &&
+                    entry.height == height) {
+                    entry.contentHash = captureHash;
+                    entry.hashValid = true;
+                    break;
+                }
+            }
+        }
         if (m_panelAllocator == nullptr || m_panelCommandList == nullptr ||
             m_panelMappedConstants == nullptr || m_panelConstants == nullptr ||
             m_panelIconInstances == nullptr) {
@@ -2803,6 +2939,11 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
 
 void Renderer::CancelLiveGlassPanelBake() noexcept
 {
+    for (auto& entry : m_panelCapturePool) {
+        entry.hashValid = false;
+    }
+    m_panelCaptureDwmFrameValid = false;
+    m_panelCaptureIdleSkips = 0;
     if (!m_panelBakePending) {
         if (m_panelFenceValue != 0 && m_fence != nullptr &&
             m_fence->GetCompletedValue() < m_panelFenceValue && m_fenceEvent != nullptr) {
@@ -2866,6 +3007,44 @@ bool Renderer::TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra)
     }
 }
 
+
+bool Renderer::ShouldSkipLivePanelCapture() noexcept
+{
+    DWM_TIMING_INFO timing{};
+    timing.cbSize = sizeof(timing);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
+        return false;
+    }
+    if (m_panelCaptureDwmFrameValid && timing.cFrame == m_panelCaptureDwmFrame) {
+        if (++m_panelCaptureIdleSkips < kPanelForcedCaptureSkips) {
+            return true;
+        }
+    }
+    m_panelCaptureDwmFrame = timing.cFrame;
+    m_panelCaptureDwmFrameValid = true;
+    m_panelCaptureIdleSkips = 0;
+    return false;
+}
+
+bool Renderer::ShouldSkipLivePanelBitBlt(UINT width, UINT height) noexcept
+{
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    DWM_TIMING_INFO timing{};
+    timing.cbSize = sizeof(timing);
+    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
+        return false;
+    }
+    for (const auto& entry : m_panelCapturePool) {
+        if (entry.bitmap != nullptr && entry.width == width && entry.height == height &&
+            entry.hashValid && entry.dwmAtHash == timing.cFrame) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT height,
     UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC)
 {
@@ -2913,6 +3092,9 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
             }
         };
 
+                        if (ShouldSkipLivePanelBitBlt(width, height)) {
+            return false;
+        }
         if (!EnsurePanelCaptureDib(width, height)) {
             return false;
         }
@@ -2935,6 +3117,32 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         ReleaseDC(nullptr, screen);
         if (copied == FALSE) {
             return false;
+        }
+
+        // Skip GPU rebake when the captured panel region is byte-identical to the
+        // last bake for this exact WxH (DWM advanced elsewhere on screen, or forced
+        // capture confirmed no change). Visual output stays identical.
+        const uint64_t captureHash = HashPanelCapturePixels(width, height);
+        UINT64 dwmFrame = 0;
+        {
+            DWM_TIMING_INFO timing{};
+            timing.cbSize = sizeof(timing);
+            if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
+                dwmFrame = timing.cFrame;
+            }
+        }
+        for (auto& entry : m_panelCapturePool) {
+            if (entry.bitmap == m_panelCaptureBitmap && entry.width == width &&
+                entry.height == height) {
+                if (entry.hashValid && entry.contentHash == captureHash) {
+                    entry.dwmAtHash = dwmFrame;
+                    return false;
+                }
+                entry.contentHash = captureHash;
+                entry.hashValid = true;
+                entry.dwmAtHash = dwmFrame;
+                break;
+            }
         }
 
         // Single CPU copy: pooled capture DIB -> mapped upload (no staging vector).

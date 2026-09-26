@@ -340,8 +340,9 @@ private:
     [[nodiscard]] UINT HostDpi() const noexcept;
     void BeginShow();
     [[nodiscard]] bool CaptureLiveBackdrop();
-    void TickLivePopupGlass();
-    void ApplyLivePopupGlass(std::vector<uint8_t>& glassBits, SIZE size,
+    // Returns true when a live bake was submitted or a completed bake was applied.
+    [[nodiscard]] bool TickLivePopupGlass();
+    [[nodiscard]] bool ApplyLivePopupGlass(std::vector<uint8_t>& glassBits, SIZE size,
         std::vector<uint8_t>& cachedGlass, std::vector<uint8_t>& baseBits,
         std::vector<uint8_t>& presentBits, SIZE& presentSize);
     void BeginHide();
@@ -530,6 +531,9 @@ private:
     std::vector<std::pair<HWND, RECT>> m_hiddenTaskbarRects;
     std::vector<std::pair<HWND, RECT>> m_collapsedTaskbars;
     UINT m_taskbarCreatedMessage = 0;
+    // Agent/perf: PostMessage RegisterWindowMessage(L"Hoverdock.OpenPerfMenus").
+    UINT m_openPerfMenusMessage = 0;
+    UINT m_closePerfMenusMessage = 0;
     HPOWERNOTIFY m_suspendNotify = nullptr;
     HPOWERNOTIFY m_monitorNotify = nullptr;
     bool m_sessionNotifyRegistered = false;
@@ -677,6 +681,14 @@ private:
     ULONGLONG m_frostSliderLastRenderMs = 0;
     // Last live rebake of open menu glass (Quick Settings / Dock Settings / context).
     ULONGLONG m_lastPopupGlassRefreshMs = 0;
+    // After a confirmed unchanged capture, wait this long before BitBlt again.
+    static constexpr ULONGLONG kLivePopupStaticIntervalMs = 33;
+    bool m_livePopupGlassStatic = false;
+    // Skip live menu BitBlt/GPU until dock backdrop reports a desktop change
+    // (or kLivePopupForcedRefreshMs elapses). Keeps glass live over moving
+    // wallpaper without 120 Hz rebakes on a static desktop.
+    static constexpr ULONGLONG kLivePopupForcedRefreshMs = 2000;
+    uint64_t m_livePopupBackdropSerial = 0;
     // Round-robin target for async menu glass rebakes (0=settings,1=overflow,2=context).
     int m_livePopupGlassTarget = 0;
     int m_livePopupGlassPending = -1;

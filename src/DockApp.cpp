@@ -1940,6 +1940,8 @@ int DockApp::Run() {
     // HideTaskbar is time the old taskbar stays visible. The taskbar monitor
     // keeps it suppressed while the rest of init proceeds below.
     m_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+    m_openPerfMenusMessage = RegisterWindowMessageW(L"Hoverdock.OpenPerfMenus");
+    m_closePerfMenusMessage = RegisterWindowMessageW(L"Hoverdock.ClosePerfMenus");
     RegisterSystemResumeNotifications();
     HideTaskbar();
     // Profiles first: enrichment (AppUserModelId coverage) depends on knowing
@@ -2394,6 +2396,28 @@ BOOL CALLBACK DockApp::FindTaskbarWindow(HWND window, LPARAM data) {
 }
 
 LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (m_openPerfMenusMessage != 0 && message == m_openPerfMenusMessage) {
+        // Hidden agent/perf hook: open Quick Settings + Dock Settings so live
+        // glass CPU can be sampled without synthetic mouse hit-testing.
+        if (m_visibility != VisibilityState::Visible) {
+            BeginShow();
+        }
+        if (!IsOverflowOpen()) {
+            BeginOverflowShow();
+        }
+        if (!IsDockSettingsOpen()) {
+            OpenDockSettings();
+        }
+        return 0;
+    }
+    if (m_closePerfMenusMessage != 0 && message == m_closePerfMenusMessage) {
+        CloseDockSettings();
+        if (IsOverflowOpen()) {
+            BeginOverflowHide(false);
+        }
+        return 0;
+    }
+
     switch (message) {
     case WM_NCHITTEST: {
         if (m_visibility != VisibilityState::Showing && m_visibility != VisibilityState::Visible) {
@@ -2802,13 +2826,13 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             // SRCCOPY without CAPTUREBLT, so layered popups and hover bubbles
             // never bake into the backdrop (no feedback loop). Pausing here
             // froze the dock background behind Quick Settings.
-            // Adaptive cadence: stay at ~8 ms while DWM/content changes or any
-            // live menu is open (TickLivePopupGlass rides this timer); back off
-            // to ~33 ms after a short idle hysteresis so PeekMessage wakeups
-            // drop without freezing moving wallpaper / video frost.
-            const bool menusOpen =
-                IsDockSettingsOpen() || IsOverflowOpen() || IsContextMenuOpen();
-            bool wantFast = menusOpen;
+            // Adaptive cadence: stay at ~8 ms while DWM/content changes (dock
+            // backdrop or live menu glass). Menus no longer force 120 Hz when
+            // the wallpaper is static — TickLivePopupGlass + BeginLiveGlass
+            // skip BitBlt/GPU on unchanged DWM frames; after hysteresis the
+            // timer backs off to ~33 ms. Moving wallpaper / video still keeps
+            // the fast cadence so frost stays live.
+            bool wantFast = false;
             if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
                 QpcSeconds() >= m_suppressBackdropUntil) {
                 if (CaptureLiveBackdrop()) {
@@ -2823,13 +2847,13 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                     m_backdropIdleStreak = 0;
                 }
             }
-            if (menusOpen) {
+            // Open menus: non-blocking GlassPS rebake. BeginLiveGlassPanelBake
+            // never waits on the GPU fence; TakeLiveGlassPanelResult applies
+            // when ready. didGlassWork keeps the fast timer while content moves.
+            if (TickLivePopupGlass()) {
+                wantFast = true;
                 m_backdropIdleStreak = 0;
             }
-            // Open menus get a dedicated non-blocking GlassPS rebake (~120 Hz
-            // cadence via this timer). BeginLiveGlassPanelBake never waits on
-            // the GPU fence; TakeLiveGlassPanelResult applies when ready.
-            TickLivePopupGlass();
             SyncBackdropTimerInterval(
                 wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks);
         } else if (wParam == kTaskbarMonitorTimerId) {
@@ -5439,13 +5463,17 @@ UINT DockApp::PackPopupGlassFxFlags() const noexcept
 }
 
 
-void DockApp::ApplyLivePopupGlass(std::vector<uint8_t>& glassBits, SIZE size,
+bool DockApp::ApplyLivePopupGlass(std::vector<uint8_t>& glassBits, SIZE size,
     std::vector<uint8_t>& cachedGlass, std::vector<uint8_t>& baseBits,
     std::vector<uint8_t>& presentBits, SIZE& presentSize)
 {
     const size_t bytes = static_cast<size_t>(size.cx) * static_cast<size_t>(size.cy) * 4U;
     if (glassBits.size() != bytes || cachedGlass.size() != bytes || baseBits.size() != bytes) {
-        return;
+        return false;
+    }
+    if (std::memcmp(glassBits.data(), cachedGlass.data(), bytes) == 0) {
+        // Identical glass bake: skip merge + UpdateLayeredWindow present.
+        return false;
     }
     auto* oldGlass = reinterpret_cast<uint32_t*>(cachedGlass.data());
     auto* newGlass = reinterpret_cast<uint32_t*>(glassBits.data());
@@ -5458,12 +5486,13 @@ void DockApp::ApplyLivePopupGlass(std::vector<uint8_t>& glassBits, SIZE size,
     cachedGlass.swap(glassBits);
     presentBits = baseBits;
     presentSize = size;
+    return true;
 }
 
-void DockApp::TickLivePopupGlass()
+bool DockApp::TickLivePopupGlass()
 {
     if (!m_rendererInitialized || m_frostSliderDragging) {
-        return;
+        return false;
     }
 
     const bool settingsOpen = IsDockSettingsOpen();
@@ -5474,8 +5503,12 @@ void DockApp::TickLivePopupGlass()
             m_renderer.CancelLiveGlassPanelBake();
             m_livePopupGlassPending = -1;
         }
-        return;
+        m_livePopupGlassStatic = false;
+        m_livePopupBackdropSerial = 0;
+        return false;
     }
+
+    bool didWork = false;
 
     // 1) Complete a prior bake without blocking.
     std::vector<uint8_t> glass;
@@ -5488,35 +5521,71 @@ void DockApp::TickLivePopupGlass()
                 glass.size() == m_settingsGlass.size() &&
                 m_settingsGlassSize.cx == m_settingsSize.cx &&
                 m_settingsGlassSize.cy == m_settingsSize.cy) {
-                ApplyLivePopupGlass(glass, m_settingsSize, m_settingsGlass, m_settingsBaseBits,
-                    m_settingsPresentBits, m_settingsPresentSize);
-                PaintSettingsHoverFast();
+                if (ApplyLivePopupGlass(glass, m_settingsSize, m_settingsGlass, m_settingsBaseBits,
+                        m_settingsPresentBits, m_settingsPresentSize)) {
+                    PaintSettingsHoverFast();
+                    didWork = true;
+                }
             }
         } else if (done == 1 && overflowOpen && !m_overflowBaseBits.empty()) {
             if (glass.size() == m_overflowGlass.size() &&
                 m_overflowGlassSize.cx == m_overflowSize.cx &&
                 m_overflowGlassSize.cy == m_overflowSize.cy) {
-                ApplyLivePopupGlass(glass, m_overflowSize, m_overflowGlass, m_overflowBaseBits,
-                    m_overflowPresentBits, m_overflowPresentSize);
-                PaintOverflowHoverFast();
+                if (ApplyLivePopupGlass(glass, m_overflowSize, m_overflowGlass, m_overflowBaseBits,
+                        m_overflowPresentBits, m_overflowPresentSize)) {
+                    PaintOverflowHoverFast();
+                    didWork = true;
+                }
             }
         } else if (done == 2 && contextOpen && !m_contextBaseBits.empty()) {
             if (glass.size() == m_contextGlass.size() &&
                 m_contextGlassSize.cx == m_contextSize.cx &&
                 m_contextGlassSize.cy == m_contextSize.cy) {
-                ApplyLivePopupGlass(glass, m_contextSize, m_contextGlass, m_contextBaseBits,
-                    m_contextPresentBits, m_contextPresentSize);
-                PaintContextHoverFast();
+                if (ApplyLivePopupGlass(glass, m_contextSize, m_contextGlass, m_contextBaseBits,
+                        m_contextPresentBits, m_contextPresentSize)) {
+                    PaintContextHoverFast();
+                    didWork = true;
+                }
             }
         }
     }
 
     if (m_renderer.IsLiveGlassPanelPending()) {
-        return;
+        return didWork;
     }
 
     // 2) Kick the next open menu (round-robin) â€” BitBlt + GPU submit only.
-    const float frostAmount = m_config.FrostAmount();
+        if (m_renderer.ShouldSkipLivePanelCapture()) {
+        m_livePopupGlassStatic = true;
+        return didWork;
+    }
+    // Gate live menu capture on dock backdrop change detection. The dock strip
+    // BitBlt already knows when the composed desktop moved; menus sit on the
+    // same desktop. When static, skip BitBlt/GPU entirely (forced refresh every
+    // kLivePopupForcedRefreshMs covers edge cases). When wallpaper/video moves,
+    // serial advances and live glass stays responsive.
+    {
+        const uint64_t serial = m_renderer.BackdropChangeSerial();
+        const ULONGLONG now = GetTickCount64();
+        const bool desktopChanged = serial != m_livePopupBackdropSerial;
+        const bool forced = (now - m_lastPopupGlassRefreshMs) >= kLivePopupForcedRefreshMs;
+        if (!desktopChanged && !forced) {
+            m_livePopupGlassStatic = true;
+            return didWork;
+        }
+        if (desktopChanged) {
+            m_livePopupBackdropSerial = serial;
+        }
+    }
+    // Static menus: at most ~30 Hz confirm BitBlts even after a forced tick.
+    if (m_livePopupGlassStatic) {
+        const ULONGLONG now = GetTickCount64();
+        if (now - m_lastPopupGlassRefreshMs < kLivePopupStaticIntervalMs) {
+            return didWork;
+        }
+    }
+
+const float frostAmount = m_config.FrostAmount();
     const float glassAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
     const UINT fxFlags = PackPopupGlassFxFlags();
@@ -5559,9 +5628,19 @@ void DockApp::TickLivePopupGlass()
             m_livePopupGlassPending = target;
             m_livePopupGlassTarget = (target + 1) % 3;
             m_lastPopupGlassRefreshMs = GetTickCount64();
+            m_livePopupGlassStatic = false;
+            didWork = true;
             break;
         }
     }
+    if (!didWork) {
+        // No bake submitted: captures were unchanged or GPU busy. Treat as static
+        // so the next confirm waits kLivePopupStaticIntervalMs (moving content
+        // clears this on the next successful Begin).
+        m_livePopupGlassStatic = true;
+        m_lastPopupGlassRefreshMs = GetTickCount64();
+    }
+    return didWork;
 }
 
 bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* pixels,
