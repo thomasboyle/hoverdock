@@ -1864,6 +1864,7 @@ DockApp::~DockApp() {
     RevokeTrashDropTarget();
     UnregisterTrashNotify();
     CloseLaunchPrompt(false);
+    m_perfProfiler.Stop();
     DestroyDockSettings();
     DestroyOverflowPopup();
     DestroyContextMenu();
@@ -2887,6 +2888,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         UnregisterSystemResumeNotifications();
         StopShellFlyoutWatch();
         CloseLaunchPrompt(false);
+        m_perfProfiler.Stop();
         DestroyDockSettings();
         BeginOverflowHide(false);
         DestroyOverflowPopup();
@@ -5292,6 +5294,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         break;
     }
     case SettingsHitKind::CheckNow:
+    case SettingsHitKind::PerfProfile:
         // Base button is baked at 0.72 white; hover wants ~0.88. An extra
         // translucent overlay brightens toward hover without redrawing text.
         FillRectPremul(pixels, width, height, hit.bounds, 0.16F);
@@ -5725,6 +5728,28 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
             SetUpdateStatus(L"Already checking for updates...");
         }
         break;
+    case SettingsHitKind::PerfProfile: {
+        if (m_perfProfiler.IsRunning()) {
+            m_perfProfiler.Stop();
+            const std::wstring logPath = m_perfProfiler.LogPath();
+            if (!logPath.empty()) {
+                m_perfStatus = L"Saved " + logPath;
+                Log(L"Performance profile saved: " + logPath);
+            } else {
+                m_perfStatus = L"Profiling stopped.";
+            }
+        } else {
+            if (m_perfProfiler.Start()) {
+                m_perfStatus = L"Profiling... " + m_perfProfiler.LogPath();
+                Log(L"Performance profile started: " + m_perfProfiler.LogPath());
+            } else {
+                m_perfStatus = L"Could not start performance profile.";
+                Log(L"Performance profile failed to start.");
+            }
+        }
+        PaintSettingsPopup();
+        break;
+    }
     }
 }
 
@@ -5842,10 +5867,13 @@ void DockApp::PaintSettingsPopup() {
     LONG contentY = padding;
     contentY += headerHeight;
     contentY += dividerGap;
+    const LONG statusLineHeight = std::max(14L, std::lround(16.0F * scale));
     contentY += (rowHeight + rowGap) * switchRowCount;
     contentY += buttonHeight;
+    contentY += rowGap;
+    contentY += buttonHeight;
     contentY += dividerGap;
-    contentY += statusHeight;
+    contentY += statusHeight + statusLineHeight;  // update status + perf path
     contentY += padding;
     m_settingsSize.cx = panelWidth;
     m_settingsSize.cy = contentY;
@@ -6131,6 +6159,16 @@ void DockApp::PaintSettingsPopup() {
         checking ? L"Checking..." : L"Check for updates now",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 170 : 245);
     pushHit(SettingsHitKind::CheckNow, buttonBounds);
+    y += buttonHeight + rowGap;
+
+    const bool profiling = m_perfProfiler.IsRunning();
+    RECT perfBounds{padding, y, panelWidth - padding, y + buttonHeight};
+    // Slightly brighter wash while active so running state reads clearly.
+    FillRectPremul(pixels, width, height, perfBounds, profiling ? 0.88F : 0.72F);
+    DrawFlyoutText(pixels, width, height, perfBounds, labelFont,
+        profiling ? L"Stop profiling" : L"Start performance profile",
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE, profiling ? 250 : 245);
+    pushHit(SettingsHitKind::PerfProfile, perfBounds);
     y += buttonHeight + dividerGap;
     FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
         y - dividerGap / 2L + 1}, 0.16F);
@@ -6141,9 +6179,19 @@ void DockApp::PaintSettingsPopup() {
     DrawFlyoutText(pixels, width, height, versionBounds, statusFont,
         L"Hoverdock v" + wideVersion, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
     RECT statusBounds{padding, versionBounds.bottom + 2, panelWidth - padding,
-        y + statusHeight};
+        versionBounds.bottom + 2 + subHeight + 4};
     DrawFlyoutText(pixels, width, height, statusBounds, statusFont, m_updateStatus,
-        DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 225);
+        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 225);
+    if (!m_perfStatus.empty() || profiling) {
+        std::wstring perfLine = m_perfStatus;
+        if (profiling && perfLine.empty()) {
+            perfLine = L"Profiling... " + m_perfProfiler.LogPath();
+        }
+        RECT perfStatusBounds{padding, statusBounds.bottom, panelWidth - padding,
+            y + statusHeight + subHeight};
+        DrawFlyoutText(pixels, width, height, perfStatusBounds, statusFont, perfLine,
+            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 225);
+    }
 
     const size_t bytes = pixelCount * 4U;
     m_settingsBaseBits.resize(bytes);

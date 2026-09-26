@@ -4,7 +4,7 @@ if(NOT WIN32)
     message(FATAL_ERROR "Liquid Glass Dock is a native Windows/MSVC project.")
 endif()
 
-project(LiquidGlassDock VERSION 1.1.40 LANGUAGES CXX)
+project(LiquidGlassDock VERSION 1.1.41 LANGUAGES CXX)
 
 # Tag builds override the version: -DDOCK_VERSION=1.2.3 (release.yml passes the
 # git tag through). Defaults to the project version above.
@@ -42,6 +42,7 @@ add_executable(Dock WIN32
     src/Updater.cpp
     src/WindowCatalog.cpp
     src/PerfBoost.cpp
+    src/PerfProfiler.cpp
     src/RecycleBin.cpp
 )
 

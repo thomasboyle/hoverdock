@@ -7,6 +7,7 @@
 #include "WindowCatalog.h"
 #include "SystemTray.h"
 #include "Weather.h"
+#include "PerfProfiler.h"
 
 #include <Windows.h>
 
@@ -193,6 +194,7 @@ private:
         DropShadow,
         DepthShade,
         CheckNow,
+        PerfProfile,
         Close,
     };
 
@@ -687,6 +689,8 @@ private:
     std::wstring m_updateStatus = L"Checking for updates...";
     std::atomic<bool> m_updateInFlight{false};
     std::atomic<bool> m_updateInstalling{false};
+    PerfProfiler m_perfProfiler;
+    std::wstring m_perfStatus;
     double m_lastUpdateCheck = 0.0;
     std::wstring m_overflowGlyphKey;
     std::vector<uint8_t> m_overflowGlyphGear;
