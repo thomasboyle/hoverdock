@@ -126,6 +126,15 @@ private:
     // cache (e.g. black frames validated before first composition at
     // logon/resume) always heals while a static desktop still skips ~99%.
     static constexpr UINT kBackdropForcedCaptureSkips = 120;
+    // Sparse scanline probe before a full dock-strip BitBlt. Hover/Present
+    // advances DWM cFrame without changing wallpaper; probing a few rows is
+    // ~height/kProbeRows cheaper and avoids the 2-10 ms kernel BitBlt.
+    static constexpr UINT kBackdropProbeRows = 6;
+    // Allow a few flapping pixels (DWM subpixel / cursor-adjacent) before a
+    // probe miss or a committed-sample "changed" decision. Stops hash flap
+    // from bumping BackdropChangeSerial and storming live menu rebakes.
+    static constexpr UINT kBackdropProbeNoisePixels = 24;
+    static constexpr UINT kBackdropChangeMinSamples = 96;
     static constexpr UINT kIconTextureDescriptor = 0;
     static constexpr UINT kBackdropTextureDescriptor = 1;
     static constexpr UINT kTempBlurDescriptor = 2;
@@ -160,6 +169,12 @@ private:
     void ReleaseBackdropResources() noexcept;
     [[nodiscard]] bool UploadBackdropPixels();
     [[nodiscard]] uint64_t HashBackdropPixels() const noexcept;
+    [[nodiscard]] bool EnsureBackdropProbe(UINT width);
+    void ReleaseBackdropProbe() noexcept;
+    [[nodiscard]] bool ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept;
+    void CommitBackdropProbeFromDib() noexcept;
+    [[nodiscard]] size_t CountBackdropSampleDiffs() const noexcept;
+    void CommitBackdropSamplesFromDib() noexcept;
     [[nodiscard]] bool WaitForBackdropCopy(DWORD timeoutMs = INFINITE);
     [[nodiscard]] bool WaitForFrame(FrameResource& frame, DWORD timeoutMs = INFINITE);
     void WaitForAllFrames();
@@ -238,6 +253,19 @@ private:
     // Consecutive idle skips since the last live BitBlt (see
     // kBackdropForcedCaptureSkips). Reset on every capture attempt.
     UINT m_backdropIdleSkips = 0;
+    // Sparse probe DIB (width x kBackdropProbeRows) + reference from last commit.
+    HDC m_backdropProbeDc = nullptr;
+    HBITMAP m_backdropProbeBitmap = nullptr;
+    HGDIOBJ m_backdropProbePrevious = nullptr;
+    uint8_t* m_backdropProbePixels = nullptr;
+    UINT m_backdropProbeWidth = 0;
+    bool m_backdropProbeValid = false;
+    std::vector<uint8_t> m_backdropProbeReference;
+    // Stride-8 samples of the last uploaded/accepted backdrop (noise-tolerant
+    // change detection after a full BitBlt).
+    std::vector<uint32_t> m_backdropCommittedSamples;
+    ULONGLONG m_lastBackdropSerialBumpMs = 0;
+    static constexpr ULONGLONG kBackdropSerialMinIntervalMs = 100;
     UINT64 m_backdropCopyFenceValue = 0;
     HANDLE m_fenceEvent = nullptr;
 

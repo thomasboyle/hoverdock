@@ -1140,6 +1140,11 @@ void Renderer::InvalidateBackdrop() noexcept {
     m_backdropChangeSerial = 0;
     m_backdropDwmFrameValid = false;
     m_backdropDwmFrame = 0;
+    m_backdropIdleSkips = 0;
+    m_backdropProbeValid = false;
+    m_backdropProbeReference.clear();
+    m_backdropCommittedSamples.clear();
+    m_lastBackdropSerialBumpMs = 0;
 }
 
 UINT Renderer::TextureIndexForTarget(const std::wstring& target) const noexcept {
@@ -1236,6 +1241,11 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     // Bound: cFrame can also stay frozen while the cache is stale (black frames
     // validated before first composition at logon/resume, then a static desktop),
     // so at most kBackdropForcedCaptureSkips ticks pass before a live BitBlt.
+    //
+    // Busy-use caveat: dock Present / hover / menu UpdateLayeredWindow also
+    // advance cFrame without changing wallpaper. A sparse scanline probe then
+    // skips the full strip BitBlt; noise-tolerant sample diffs stop single-pixel
+    // flap from bumping BackdropChangeSerial (which stormed live menu rebakes).
     if (m_backdropValid) {
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
@@ -1247,9 +1257,20 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
                     }
                     return true;
                 }
+            } else {
+                m_backdropDwmFrame = timing.cFrame;
+                m_backdropDwmFrameValid = true;
+                // DWM advanced (often from our own Present). Probe a few rows
+                // before paying for a full dock-strip BitBlt.
+                if (m_backdropProbeValid && ProbeBackdropUnchanged(screenRectangle)) {
+                    if (++m_backdropIdleSkips < kBackdropForcedCaptureSkips) {
+                        if (changed != nullptr) {
+                            *changed = false;
+                        }
+                        return true;
+                    }
+                }
             }
-            m_backdropDwmFrame = timing.cFrame;
-            m_backdropDwmFrameValid = true;
         }
         // DWM timing unavailable (composition off): fall through to BitBlt.
     } else {
@@ -1261,7 +1282,7 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         }
     }
 
-    // Any BitBlt attempt (forced or regular) resets the idle-skip budget,
+    // Any full BitBlt attempt (forced or regular) resets the idle-skip budget,
     // whether the readback succeeds or not: persistent failure retries at
     // the forced cadence instead of every tick.
     m_backdropIdleSkips = 0;
@@ -1284,8 +1305,14 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         return false;
     }
 
-    const uint64_t hash = HashBackdropPixels();
-    if (m_backdropValid && hash == m_backdropHash) {
+    // Noise-tolerant change check (preferred over raw FNV hash): a few flapping
+    // pixels must not upload or advance BackdropChangeSerial.
+    const size_t sampleDiffs = CountBackdropSampleDiffs();
+    const bool meaningfullyChanged =
+        !m_backdropValid || sampleDiffs > kBackdropChangeMinSamples;
+    if (!meaningfullyChanged) {
+        CommitBackdropProbeFromDib();
+        m_backdropHash = HashBackdropPixels();
         if (changed != nullptr) {
             *changed = false;
         }
@@ -1301,9 +1328,18 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
             return false;
         }
     }
-    m_backdropHash = hash;
+    m_backdropHash = HashBackdropPixels();
     m_backdropValid = true;
-    ++m_backdropChangeSerial;
+    CommitBackdropSamplesFromDib();
+    CommitBackdropProbeFromDib();
+    // Cap menu-glass wakeups at ~10 Hz even when wallpaper/video is busy so a
+    // 200 ms CPU sample cannot stack dock BitBlt + large panel rebake + hover.
+    const ULONGLONG nowMs = GetTickCount64();
+    if (m_lastBackdropSerialBumpMs == 0 ||
+        nowMs - m_lastBackdropSerialBumpMs >= kBackdropSerialMinIntervalMs) {
+        ++m_backdropChangeSerial;
+        m_lastBackdropSerialBumpMs = nowMs;
+    }
     if (changed != nullptr) {
         *changed = true;
     }
@@ -1990,6 +2026,10 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropDwmFrame = 0;
     m_backdropDwmFrameValid = false;
     m_backdropIdleSkips = 0;
+    m_backdropProbeValid = false;
+    m_backdropProbeReference.clear();
+    m_backdropCommittedSamples.clear();
+    ReleaseBackdropProbe();
 
     if (m_backdropDc != nullptr && m_backdropPreviousBitmap != nullptr &&
         m_backdropPreviousBitmap != HGDI_ERROR) {
@@ -2024,6 +2064,190 @@ uint64_t Renderer::HashBackdropPixels() const noexcept {
     hash ^= static_cast<uint64_t>(m_width) << 32;
     hash ^= m_height;
     return hash;
+}
+
+void Renderer::ReleaseBackdropProbe() noexcept {
+    if (m_backdropProbeDc != nullptr && m_backdropProbePrevious != nullptr &&
+        m_backdropProbePrevious != HGDI_ERROR) {
+        SelectObject(m_backdropProbeDc, m_backdropProbePrevious);
+    }
+    m_backdropProbePrevious = nullptr;
+    if (m_backdropProbeBitmap != nullptr) {
+        DeleteObject(m_backdropProbeBitmap);
+        m_backdropProbeBitmap = nullptr;
+    }
+    m_backdropProbePixels = nullptr;
+    if (m_backdropProbeDc != nullptr) {
+        DeleteDC(m_backdropProbeDc);
+        m_backdropProbeDc = nullptr;
+    }
+    m_backdropProbeWidth = 0;
+    m_backdropProbeValid = false;
+}
+
+bool Renderer::EnsureBackdropProbe(UINT width) {
+    if (width == 0) {
+        return false;
+    }
+    if (m_backdropProbeDc != nullptr && m_backdropProbeBitmap != nullptr &&
+        m_backdropProbePixels != nullptr && m_backdropProbeWidth == width) {
+        return true;
+    }
+    ReleaseBackdropProbe();
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return false;
+    }
+    SetICMMode(screen, ICM_OFF);
+    m_backdropProbeDc = CreateCompatibleDC(screen);
+    BITMAPV5HEADER header = CaptureDibHeader(width, kBackdropProbeRows);
+    void* bits = nullptr;
+    m_backdropProbeBitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (m_backdropProbeDc == nullptr || m_backdropProbeBitmap == nullptr || bits == nullptr) {
+        ReleaseBackdropProbe();
+        return false;
+    }
+    m_backdropProbePrevious = SelectObject(m_backdropProbeDc, m_backdropProbeBitmap);
+    if (m_backdropProbePrevious == nullptr || m_backdropProbePrevious == HGDI_ERROR) {
+        ReleaseBackdropProbe();
+        return false;
+    }
+    m_backdropProbePixels = static_cast<uint8_t*>(bits);
+    m_backdropProbeWidth = width;
+    return true;
+}
+
+bool Renderer::ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept {
+    const LONG width = screenRectangle.right - screenRectangle.left;
+    const LONG height = screenRectangle.bottom - screenRectangle.top;
+    if (width <= 0 || height <= 0 || !m_backdropProbeValid ||
+        m_backdropProbeReference.size() !=
+            static_cast<size_t>(width) * static_cast<size_t>(kBackdropProbeRows) * 4U) {
+        return false;
+    }
+    if (!EnsureBackdropProbe(static_cast<UINT>(width))) {
+        return false;
+    }
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return false;
+    }
+    DWORD previousAffinity = WDA_NONE;
+    const BOOL affinityRead = m_window != nullptr &&
+        GetWindowDisplayAffinity(m_window, &previousAffinity) != FALSE;
+    if (affinityRead != FALSE) {
+        SetWindowDisplayAffinity(m_window, WDA_EXCLUDEFROMCAPTURE);
+    }
+    BOOL ok = TRUE;
+    for (UINT row = 0; row < kBackdropProbeRows; ++row) {
+        const LONG srcY = screenRectangle.top +
+            (height <= 1 ? 0
+                         : static_cast<LONG>((static_cast<long long>(height - 1) * row) /
+                               static_cast<long long>(kBackdropProbeRows - 1)));
+        if (BitBlt(m_backdropProbeDc, 0, static_cast<int>(row), static_cast<int>(width), 1, screen,
+                screenRectangle.left, srcY, SRCCOPY) == FALSE) {
+            ok = FALSE;
+            break;
+        }
+    }
+    if (affinityRead != FALSE) {
+        SetWindowDisplayAffinity(m_window, previousAffinity);
+    }
+    ReleaseDC(nullptr, screen);
+    if (ok == FALSE) {
+        return false;
+    }
+
+    const uint32_t* cur = reinterpret_cast<const uint32_t*>(m_backdropProbePixels);
+    const uint32_t* ref = reinterpret_cast<const uint32_t*>(m_backdropProbeReference.data());
+    const size_t count =
+        static_cast<size_t>(width) * static_cast<size_t>(kBackdropProbeRows);
+    size_t diffs = 0;
+    constexpr size_t stride = 4;
+    for (size_t i = 0; i < count; i += stride) {
+        if (cur[i] != ref[i]) {
+            ++diffs;
+            if (diffs > kBackdropProbeNoisePixels) {
+                return false;
+            }
+        }
+    }
+    if (cur[count - 1] != ref[count - 1]) {
+        ++diffs;
+    }
+    return diffs <= kBackdropProbeNoisePixels;
+}
+
+void Renderer::CommitBackdropProbeFromDib() noexcept {
+    if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0) {
+        m_backdropProbeValid = false;
+        m_backdropProbeReference.clear();
+        return;
+    }
+    const size_t rowBytes = static_cast<size_t>(m_width) * 4U;
+    m_backdropProbeReference.resize(rowBytes * kBackdropProbeRows);
+    for (UINT row = 0; row < kBackdropProbeRows; ++row) {
+        const UINT srcRow = (m_height <= 1)
+            ? 0U
+            : static_cast<UINT>((static_cast<UINT64>(m_height - 1) * row) /
+                  (kBackdropProbeRows - 1));
+        std::memcpy(m_backdropProbeReference.data() + row * rowBytes,
+            m_backdropDibPixels + static_cast<size_t>(srcRow) * rowBytes, rowBytes);
+    }
+    m_backdropProbeValid = true;
+}
+
+size_t Renderer::CountBackdropSampleDiffs() const noexcept {
+    if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0 ||
+        m_backdropCommittedSamples.empty()) {
+        return SIZE_MAX / 4U;
+    }
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(m_backdropDibPixels);
+    const size_t count = static_cast<size_t>(m_width) * static_cast<size_t>(m_height);
+    constexpr size_t stride = 8;
+    size_t sampleCount = (count + stride - 1) / stride;
+    if (count > 0) {
+        // HashBackdropPixels also folds words[count-1]; keep the same sample set.
+        if ((count - 1) % stride != 0) {
+            ++sampleCount;
+        }
+    }
+    if (m_backdropCommittedSamples.size() != sampleCount) {
+        return SIZE_MAX / 4U;
+    }
+    size_t diffs = 0;
+    size_t sample = 0;
+    for (size_t index = 0; index < count; index += stride) {
+        if (words[index] != m_backdropCommittedSamples[sample++]) {
+            ++diffs;
+        }
+    }
+    if (count > 0 && (count - 1) % stride != 0) {
+        if (words[count - 1] != m_backdropCommittedSamples[sample++]) {
+            ++diffs;
+        }
+    }
+    return diffs;
+}
+
+void Renderer::CommitBackdropSamplesFromDib() noexcept {
+    m_backdropCommittedSamples.clear();
+    if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0) {
+        return;
+    }
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(m_backdropDibPixels);
+    const size_t count = static_cast<size_t>(m_width) * static_cast<size_t>(m_height);
+    constexpr size_t stride = 8;
+    m_backdropCommittedSamples.reserve((count / stride) + 2U);
+    for (size_t index = 0; index < count; index += stride) {
+        m_backdropCommittedSamples.push_back(words[index]);
+    }
+    if (count > 0 && (count - 1) % stride != 0) {
+        m_backdropCommittedSamples.push_back(words[count - 1]);
+    }
 }
 
 bool Renderer::UploadBackdropPixels() {

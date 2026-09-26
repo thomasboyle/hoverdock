@@ -125,6 +125,7 @@ private:
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
     static constexpr UINT_PTR kConfigSaveTimerId = 3;
     static constexpr UINT_PTR kBackdropTimerId = 4;
+    static constexpr UINT_PTR kPerfOpenSettingsTimerId = 14;
     static constexpr UINT_PTR kStartMenuTimerId = 5;
     static constexpr UINT_PTR kTaskbarMonitorTimerId = 6;
     static constexpr UINT_PTR kTrayTimerId = 7;
@@ -140,7 +141,7 @@ private:
     // Idle DWM / unchanged-capture backoff for the backdrop timer. Live menus
     // force the fast cadence so TickLivePopupGlass stays ~120 Hz.
     static constexpr UINT kBackdropIdleIntervalMs = 33;
-    static constexpr UINT kBackdropIdleHysteresisTicks = 4;
+    static constexpr UINT kBackdropIdleHysteresisTicks = 1;
     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
     static constexpr UINT kTaskbarMonitorSlowIntervalMs = 5000;
     static constexpr int kTaskbarMonitorCalmPasses = 5;
@@ -284,6 +285,20 @@ private:
     void ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height,
         const SettingsHit& hit) const;
     void PresentSettingsLayer() noexcept;
+    struct LayerPresentDib {
+        HDC dc = nullptr;
+        HBITMAP bitmap = nullptr;
+        HGDIOBJ previous = nullptr;
+        void* bits = nullptr;
+        LONG width = 0;
+        LONG height = 0;
+        bool contentValid = false;
+    };
+    [[nodiscard]] bool EnsureLayerPresentDib(LayerPresentDib& slot, LONG width, LONG height) noexcept;
+    void ReleaseLayerPresentDib(LayerPresentDib& slot) noexcept;
+    bool PresentLayeredBits(HWND window, const POINT& origin, LONG width, LONG height,
+        const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
+        const RECT* dirty = nullptr) noexcept;
     void QueueSettingsPaint(bool hoverOnly = false);
     [[nodiscard]] UINT PackPopupGlassFxFlags() const noexcept;
     [[nodiscard]] bool TryBakePopupGlass(POINT origin, LONG width, LONG height,
@@ -676,6 +691,10 @@ private:
     bool m_settingsHoverPaintOnly = false;
     std::vector<uint8_t> m_settingsBaseBits;
     std::vector<uint8_t> m_settingsPresentBits;
+    LayerPresentDib m_settingsLayerDib{};
+    ULONGLONG m_lastSettingsHoverPresentMs = 0;
+    RECT m_settingsHoverDirty{};
+    bool m_settingsHoverDirtyValid = false;
     SIZE m_settingsPresentSize{};
     bool m_frostSliderDragging = false;
     ULONGLONG m_frostSliderLastRenderMs = 0;
@@ -687,7 +706,7 @@ private:
     // Skip live menu BitBlt/GPU until dock backdrop reports a desktop change
     // (or kLivePopupForcedRefreshMs elapses). Keeps glass live over moving
     // wallpaper without 120 Hz rebakes on a static desktop.
-    static constexpr ULONGLONG kLivePopupForcedRefreshMs = 2000;
+    static constexpr ULONGLONG kLivePopupForcedRefreshMs = 8000;
     uint64_t m_livePopupBackdropSerial = 0;
     // Round-robin target for async menu glass rebakes (0=settings,1=overflow,2=context).
     int m_livePopupGlassTarget = 0;
@@ -725,6 +744,10 @@ private:
     LONG m_overflowCaretX = 0;
     std::vector<uint8_t> m_overflowBaseBits;
     std::vector<uint8_t> m_overflowPresentBits;
+    LayerPresentDib m_overflowLayerDib{};
+    ULONGLONG m_lastOverflowHoverPresentMs = 0;
+    RECT m_overflowHoverDirty{};
+    bool m_overflowHoverDirtyValid = false;
     SIZE m_overflowPresentSize{};
     bool m_overflowHoverPaintOnly = false;
     std::vector<uint8_t> m_overflowGlass;
@@ -755,6 +778,7 @@ private:
     float m_contextGlassFrost = -1.0F;
     std::vector<uint8_t> m_contextBaseBits;
     std::vector<uint8_t> m_contextPresentBits;
+    LayerPresentDib m_contextLayerDib{};
     SIZE m_contextPresentSize{};
     bool m_contextHoverPaintOnly = false;
     float m_contextFontScale = 0.0F;

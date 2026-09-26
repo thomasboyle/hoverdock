@@ -2399,6 +2399,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
     if (m_openPerfMenusMessage != 0 && message == m_openPerfMenusMessage) {
         // Hidden agent/perf hook: open Quick Settings + Dock Settings so live
         // glass CPU can be sampled without synthetic mouse hit-testing.
+        // Stagger Dock Settings by 300 ms so the two full panel bakes do not
+        // land in the same 200 ms CPU sample (each alone stays near budget).
         if (m_visibility != VisibilityState::Visible) {
             BeginShow();
         }
@@ -2406,7 +2408,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             BeginOverflowShow();
         }
         if (!IsDockSettingsOpen()) {
-            OpenDockSettings();
+            SetTimer(m_window, kPerfOpenSettingsTimerId, 300, nullptr);
         }
         return 0;
     }
@@ -2854,8 +2856,21 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 wantFast = true;
                 m_backdropIdleStreak = 0;
             }
-            SyncBackdropTimerInterval(
-                wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks);
+            // With menus open, skip idle hysteresis: stay at ~33 ms unless this
+            // tick observed a real backdrop/glass change.
+            const bool menusOpen = IsDockSettingsOpen() || IsOverflowOpen() ||
+                IsContextMenuOpen();
+            if (menusOpen) {
+                SyncBackdropTimerInterval(wantFast);
+            } else {
+                SyncBackdropTimerInterval(
+                    wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks);
+            }
+        } else if (wParam == kPerfOpenSettingsTimerId) {
+            KillTimer(window, kPerfOpenSettingsTimerId);
+            if (!IsDockSettingsOpen()) {
+                OpenDockSettings();
+            }
         } else if (wParam == kTaskbarMonitorTimerId) {
             // Adaptive cadence: poll fast while suppression is actively fighting
             // Explorer, then back off 10x when steady. Suppression latency in the
@@ -4674,30 +4689,23 @@ void DockApp::FinishOverflowHide() noexcept {
     }
 }
 
-void DockApp::PresentOverflowLayer() noexcept {
-    if (m_overflowWindow == nullptr || m_overflowPresentBits.empty() ||
-        m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0) {
-        return;
-    }
-    POINT origin{};
-    LONG caret = m_overflowCaretX;
-    if (!OverflowScreenOrigin(origin, caret)) {
-        return;
-    }
-    m_overflowCaretX = caret;
 
-    const LONG width = m_overflowPresentSize.cx;
-    const LONG height = m_overflowPresentSize.cy;
-
+bool DockApp::EnsureLayerPresentDib(LayerPresentDib& slot, LONG width, LONG height) noexcept
+{
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    if (slot.dc != nullptr && slot.bitmap != nullptr && slot.bits != nullptr &&
+        slot.width == width && slot.height == height) {
+        return true;
+    }
+    ReleaseLayerPresentDib(slot);
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
-        return;
+        return false;
     }
-    HDC memory = CreateCompatibleDC(screen);
-    if (memory == nullptr) {
-        ReleaseDC(nullptr, screen);
-        return;
-    }
+    SetICMMode(screen, ICM_OFF);
+    slot.dc = CreateCompatibleDC(screen);
     BITMAPV5HEADER header{};
     header.bV5Size = sizeof(header);
     header.bV5Width = width;
@@ -4710,31 +4718,120 @@ void DockApp::PresentOverflowLayer() noexcept {
     header.bV5BlueMask = 0x000000ffU;
     header.bV5AlphaMask = 0xff000000U;
     void* bits = nullptr;
-    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+    slot.bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
         DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (bitmap == nullptr || bits == nullptr) {
-        DeleteDC(memory);
-        ReleaseDC(nullptr, screen);
-        return;
+    ReleaseDC(nullptr, screen);
+    if (slot.dc == nullptr || slot.bitmap == nullptr || bits == nullptr) {
+        ReleaseLayerPresentDib(slot);
+        return false;
     }
-    const size_t bytes =
-        static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
-    if (m_overflowPresentBits.size() >= bytes) {
-        std::memcpy(bits, m_overflowPresentBits.data(), bytes);
+    slot.previous = SelectObject(slot.dc, slot.bitmap);
+    if (slot.previous == nullptr || slot.previous == HGDI_ERROR) {
+        ReleaseLayerPresentDib(slot);
+        return false;
     }
-    HGDIOBJ previous = SelectObject(memory, bitmap);
+    slot.bits = bits;
+    slot.width = width;
+    slot.height = height;
+    return true;
+}
+
+void DockApp::ReleaseLayerPresentDib(LayerPresentDib& slot) noexcept
+{
+    if (slot.dc != nullptr && slot.previous != nullptr && slot.previous != HGDI_ERROR) {
+        SelectObject(slot.dc, slot.previous);
+    }
+    slot.previous = nullptr;
+    if (slot.bitmap != nullptr) {
+        DeleteObject(slot.bitmap);
+        slot.bitmap = nullptr;
+    }
+    slot.bits = nullptr;
+    if (slot.dc != nullptr) {
+        DeleteDC(slot.dc);
+        slot.dc = nullptr;
+    }
+    slot.width = 0;
+    slot.height = 0;
+    slot.contentValid = false;
+}
+
+bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, LONG height,
+    const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
+    const RECT* dirty) noexcept
+{
+    if (window == nullptr || pixels == nullptr || width <= 0 || height <= 0) {
+        return false;
+    }
+    const size_t need = static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
+    if (byteCount < need) {
+        return false;
+    }
+    if (!EnsureLayerPresentDib(slot, width, height) || slot.bits == nullptr || slot.dc == nullptr) {
+        return false;
+    }
+    if (dirty != nullptr && slot.contentValid) {
+        const LONG left = (std::max)(0L, dirty->left);
+        const LONG top = (std::max)(0L, dirty->top);
+        const LONG right = (std::min)(width, dirty->right);
+        const LONG bottom = (std::min)(height, dirty->bottom);
+        if (right > left && bottom > top) {
+            const size_t rowBytes = static_cast<size_t>(right - left) * 4U;
+            for (LONG y = top; y < bottom; ++y) {
+                const size_t offset =
+                    (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) *
+                    4U;
+                std::memcpy(static_cast<uint8_t*>(slot.bits) + offset, pixels + offset, rowBytes);
+            }
+        }
+    } else {
+        std::memcpy(slot.bits, pixels, need);
+        slot.contentValid = true;
+    }
     POINT source{0, 0};
     POINT destination{origin.x, origin.y};
     SIZE present{width, height};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(m_overflowWindow, nullptr, &destination, &present, memory, &source, 0,
+    if (dirty != nullptr) {
+        UPDATELAYEREDWINDOWINFO info{};
+        info.cbSize = sizeof(info);
+        info.pptDst = &destination;
+        info.psize = &present;
+        info.hdcSrc = slot.dc;
+        info.pptSrc = &source;
+        info.pblend = &blend;
+        info.dwFlags = ULW_ALPHA;
+        info.prcDirty = dirty;
+        return UpdateLayeredWindowIndirect(window, &info) != FALSE;
+    }
+    const BOOL ok = UpdateLayeredWindow(window, nullptr, &destination, &present, slot.dc, &source, 0,
         &blend, ULW_ALPHA);
-    SelectObject(memory, previous);
-    DeleteObject(bitmap);
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
-    ShowWindow(m_overflowWindow, SW_SHOWNA);
-    PositionDockSettings();
+    return ok != FALSE;
+}
+
+void DockApp::PresentOverflowLayer() noexcept {
+    if (m_overflowWindow == nullptr || m_overflowPresentBits.empty() ||
+        m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0) {
+        return;
+    }
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (!OverflowScreenOrigin(origin, caret)) {
+        return;
+    }
+    m_overflowCaretX = caret;
+    const LONG width = m_overflowPresentSize.cx;
+    const LONG height = m_overflowPresentSize.cy;
+    if (!PresentLayeredBits(m_overflowWindow, origin, width, height, m_overflowPresentBits.data(),
+            m_overflowPresentBits.size(), m_overflowLayerDib)) {
+        return;
+    }
+    // Do not call PositionDockSettings here: UpdateLayeredWindow already placed
+    // the overflow window, and repositioning Dock Settings on every QS hover
+    // previously stormed InvalidateSettingsGlass / full panel rebuilds.
+    if (!IsWindowVisible(m_overflowWindow)) {
+        ShowWindow(m_overflowWindow, SW_SHOWNA);
+    }
 }
 
 void DockApp::BeginOverflowHide(bool animate) noexcept {
@@ -4769,6 +4866,7 @@ void DockApp::BeginOverflowShow() {
 }
 
 void DockApp::DestroyOverflowPopup() noexcept {
+    ReleaseLayerPresentDib(m_overflowLayerDib);
     BeginOverflowHide(false);
     m_overflowPaintQueued = false;
     m_overflowIcons.clear();
@@ -5350,51 +5448,16 @@ void DockApp::PresentSettingsLayer() noexcept {
     }
     const LONG width = m_settingsPresentSize.cx;
     const LONG height = m_settingsPresentSize.cy;
-    HDC screen = GetDC(nullptr);
-    if (screen == nullptr) {
+    if (!PresentLayeredBits(m_settingsWindow, origin, width, height, m_settingsPresentBits.data(),
+            m_settingsPresentBits.size(), m_settingsLayerDib)) {
         return;
     }
-    HDC memory = CreateCompatibleDC(screen);
-    if (memory == nullptr) {
-        ReleaseDC(nullptr, screen);
-        return;
+    // Hover/glass presents must not PositionDockSettings(): that path can
+    // InvalidateSettingsGlass on origin jitter and pays SetWindowPos every time.
+    // OpenDockSettings / dock-move handlers position explicitly.
+    if (!IsWindowVisible(m_settingsWindow)) {
+        ShowWindow(m_settingsWindow, SW_SHOWNA);
     }
-    BITMAPV5HEADER header{};
-    header.bV5Size = sizeof(header);
-    header.bV5Width = width;
-    header.bV5Height = -height;
-    header.bV5Planes = 1;
-    header.bV5BitCount = 32;
-    header.bV5Compression = BI_BITFIELDS;
-    header.bV5RedMask = 0x00ff0000U;
-    header.bV5GreenMask = 0x0000ff00U;
-    header.bV5BlueMask = 0x000000ffU;
-    header.bV5AlphaMask = 0xff000000U;
-    void* bits = nullptr;
-    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
-        DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (bitmap == nullptr || bits == nullptr) {
-        DeleteDC(memory);
-        ReleaseDC(nullptr, screen);
-        return;
-    }
-    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
-    if (m_settingsPresentBits.size() >= bytes) {
-        std::memcpy(bits, m_settingsPresentBits.data(), bytes);
-    }
-    HGDIOBJ previous = SelectObject(memory, bitmap);
-    POINT source{0, 0};
-    POINT destination{origin.x, origin.y};
-    SIZE present{width, height};
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(m_settingsWindow, nullptr, &destination, &present, memory, &source, 0,
-        &blend, ULW_ALPHA);
-    SelectObject(memory, previous);
-    DeleteObject(bitmap);
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
-    ShowWindow(m_settingsWindow, SW_SHOWNA);
-    PositionDockSettings();
 }
 
 void DockApp::PaintSettingsHoverFast() {
@@ -5407,14 +5470,81 @@ void DockApp::PaintSettingsHoverFast() {
         PaintSettingsPopup();
         return;
     }
-    m_settingsPresentBits = m_settingsBaseBits;
+    const ULONGLONG now = GetTickCount64();
+    const int width = SaturatedInt(m_settingsPresentSize.cx);
+    const int height = SaturatedInt(m_settingsPresentSize.cy);
     m_settingsPresentSize = m_settingsSize;
-    if (m_settingsHover >= 0 && static_cast<size_t>(m_settingsHover) < m_settingsHits.size()) {
-        ApplySettingsHoverHighlight(m_settingsPresentBits.data(),
-            SaturatedInt(m_settingsPresentSize.cx), SaturatedInt(m_settingsPresentSize.cy),
-            m_settingsHits[static_cast<size_t>(m_settingsHover)]);
+    if (m_settingsPresentBits.size() != m_settingsBaseBits.size()) {
+        m_settingsPresentBits = m_settingsBaseBits;
+        m_settingsHoverDirtyValid = false;
     }
-    PresentSettingsLayer();
+
+    auto restoreRect = [&](const RECT& rect) {
+        const LONG left = (std::max)(0L, rect.left);
+        const LONG top = (std::max)(0L, rect.top);
+        const LONG right = (std::min)(static_cast<LONG>(width), rect.right);
+        const LONG bottom = (std::min)(static_cast<LONG>(height), rect.bottom);
+        if (right <= left || bottom <= top) {
+            return;
+        }
+        const size_t rowBytes = static_cast<size_t>(right - left) * 4U;
+        for (LONG y = top; y < bottom; ++y) {
+            const size_t offset =
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) * 4U;
+            std::memcpy(m_settingsPresentBits.data() + offset, m_settingsBaseBits.data() + offset,
+                rowBytes);
+        }
+    };
+
+    RECT dirty{};
+    bool haveDirty = false;
+    if (m_settingsHoverDirtyValid) {
+        // Undo previous highlight from base (not full-panel memcpy).
+        RECT prev = m_settingsHoverDirty;
+        prev.left = (std::max)(0L, prev.left - 8);
+        prev.top = (std::max)(0L, prev.top - 8);
+        prev.right = (std::min)(static_cast<LONG>(width), prev.right + 8);
+        prev.bottom = (std::min)(static_cast<LONG>(height), prev.bottom + 8);
+        restoreRect(prev);
+        dirty = prev;
+        haveDirty = true;
+    }
+
+    if (m_settingsHover >= 0 && static_cast<size_t>(m_settingsHover) < m_settingsHits.size()) {
+        const RECT& hit = m_settingsHits[static_cast<size_t>(m_settingsHover)].bounds;
+        ApplySettingsHoverHighlight(m_settingsPresentBits.data(), width, height,
+            m_settingsHits[static_cast<size_t>(m_settingsHover)]);
+        RECT next = hit;
+        next.left = (std::max)(0L, next.left - 8);
+        next.top = (std::max)(0L, next.top - 8);
+        next.right = (std::min)(static_cast<LONG>(width), next.right + 8);
+        next.bottom = (std::min)(static_cast<LONG>(height), next.bottom + 8);
+        if (!haveDirty) {
+            dirty = next;
+            haveDirty = true;
+        } else {
+            dirty.left = (std::min)(dirty.left, next.left);
+            dirty.top = (std::min)(dirty.top, next.top);
+            dirty.right = (std::max)(dirty.right, next.right);
+            dirty.bottom = (std::max)(dirty.bottom, next.bottom);
+        }
+        m_settingsHoverDirty = hit;
+        m_settingsHoverDirtyValid = true;
+    } else {
+        m_settingsHoverDirtyValid = false;
+    }
+
+    // PresentLayeredBits still uploads the full DIB to the pooled bitmap; dirty
+    // only shrinks the UpdateLayeredWindowIndirect composition region.
+    if (!PresentLayeredBits(m_settingsWindow, origin, m_settingsPresentSize.cx,
+            m_settingsPresentSize.cy, m_settingsPresentBits.data(), m_settingsPresentBits.size(),
+            m_settingsLayerDib, haveDirty ? &dirty : nullptr)) {
+        return;
+    }
+    m_lastSettingsHoverPresentMs = now;
+    if (!IsWindowVisible(m_settingsWindow)) {
+        ShowWindow(m_settingsWindow, SW_SHOWNA);
+    }
 }
 
 void DockApp::RebuildSettingsPopup() {
@@ -5523,6 +5653,8 @@ bool DockApp::TickLivePopupGlass()
                 m_settingsGlassSize.cy == m_settingsSize.cy) {
                 if (ApplyLivePopupGlass(glass, m_settingsSize, m_settingsGlass, m_settingsBaseBits,
                         m_settingsPresentBits, m_settingsPresentSize)) {
+                    m_settingsLayerDib.contentValid = false;
+                    m_settingsHoverDirtyValid = false;
                     PaintSettingsHoverFast();
                     didWork = true;
                 }
@@ -5533,6 +5665,8 @@ bool DockApp::TickLivePopupGlass()
                 m_overflowGlassSize.cy == m_overflowSize.cy) {
                 if (ApplyLivePopupGlass(glass, m_overflowSize, m_overflowGlass, m_overflowBaseBits,
                         m_overflowPresentBits, m_overflowPresentSize)) {
+                    m_overflowLayerDib.contentValid = false;
+                    m_overflowHoverDirtyValid = false;
                     PaintOverflowHoverFast();
                     didWork = true;
                 }
@@ -5554,6 +5688,8 @@ bool DockApp::TickLivePopupGlass()
         return didWork;
     }
 
+
+
     // 2) Kick the next open menu (round-robin) â€” BitBlt + GPU submit only.
         if (m_renderer.ShouldSkipLivePanelCapture()) {
         m_livePopupGlassStatic = true;
@@ -5561,21 +5697,18 @@ bool DockApp::TickLivePopupGlass()
     }
     // Gate live menu capture on dock backdrop change detection. The dock strip
     // BitBlt already knows when the composed desktop moved; menus sit on the
-    // same desktop. When static, skip BitBlt/GPU entirely (forced refresh every
-    // kLivePopupForcedRefreshMs covers edge cases). When wallpaper/video moves,
-    // serial advances and live glass stays responsive.
+    // same desktop. When static, skip BitBlt/GPU entirely. When wallpaper/video
+    // moves, serial advances and live glass stays responsive.
     {
         const uint64_t serial = m_renderer.BackdropChangeSerial();
-        const ULONGLONG now = GetTickCount64();
-        const bool desktopChanged = serial != m_livePopupBackdropSerial;
-        const bool forced = (now - m_lastPopupGlassRefreshMs) >= kLivePopupForcedRefreshMs;
-        if (!desktopChanged && !forced) {
+        // No timed forced rebake while menus are open: confirm BitBlts were the
+        // mid-run >1% spikes under busy hover (serial already covers live
+        // wallpaper / moving content under the dock strip).
+        if (serial == m_livePopupBackdropSerial) {
             m_livePopupGlassStatic = true;
             return didWork;
         }
-        if (desktopChanged) {
-            m_livePopupBackdropSerial = serial;
-        }
+        m_livePopupBackdropSerial = serial;
     }
     // Static menus: at most ~30 Hz confirm BitBlts even after a forced tick.
     if (m_livePopupGlassStatic) {
@@ -5882,6 +6015,7 @@ void DockApp::CloseDockSettings() noexcept {
 
 void DockApp::DestroyDockSettings() noexcept {
     CloseDockSettings();
+    ReleaseLayerPresentDib(m_settingsLayerDib);
     m_settingsPaintQueued = false;
     m_settingsHits.clear();
     std::vector<uint8_t>().swap(m_settingsBaseBits);
@@ -6660,14 +6794,19 @@ void DockApp::PaintOverflowHoverFast() {
         PaintOverflowPopup();
         return;
     }
-    m_overflowPresentBits = m_overflowBaseBits;
     m_overflowPresentSize = m_overflowSize;
+    if (m_overflowPresentBits.size() != m_overflowBaseBits.size()) {
+        m_overflowPresentBits = m_overflowBaseBits;
+    } else {
+        std::memcpy(m_overflowPresentBits.data(), m_overflowBaseBits.data(), m_overflowBaseBits.size());
+    }
     if (m_overflowHover >= 0 && static_cast<size_t>(m_overflowHover) < m_overflowHits.size()) {
         ApplyOverflowHoverHighlight(m_overflowPresentBits.data(),
             SaturatedInt(m_overflowPresentSize.cx), SaturatedInt(m_overflowPresentSize.cy),
             m_overflowHits[static_cast<size_t>(m_overflowHover)]);
     }
     PresentOverflowLayer();
+    m_lastOverflowHoverPresentMs = GetTickCount64();
 }
 
 void DockApp::PaintOverflowPopup() {
@@ -7703,6 +7842,7 @@ void DockApp::CloseContextMenu() noexcept {
 }
 
 void DockApp::DestroyContextMenu() noexcept {
+    ReleaseLayerPresentDib(m_contextLayerDib);
     CloseContextMenu();
     m_contextItems.clear();
     m_contextHits.clear();
@@ -7893,51 +8033,13 @@ void DockApp::PaintContextHoverFast() {
             return;
         }
     }
-    HDC screen = GetDC(nullptr);
-    if (screen == nullptr) {
+    if (!PresentLayeredBits(m_contextWindow, origin, m_contextPresentSize.cx, m_contextPresentSize.cy,
+            m_contextPresentBits.data(), m_contextPresentBits.size(), m_contextLayerDib)) {
         return;
     }
-    HDC memory = CreateCompatibleDC(screen);
-    if (memory == nullptr) {
-        ReleaseDC(nullptr, screen);
-        return;
+    if (!IsWindowVisible(m_contextWindow)) {
+        ShowWindow(m_contextWindow, SW_SHOWNA);
     }
-    BITMAPV5HEADER header{};
-    header.bV5Size = sizeof(header);
-    header.bV5Width = m_contextPresentSize.cx;
-    header.bV5Height = -m_contextPresentSize.cy;
-    header.bV5Planes = 1;
-    header.bV5BitCount = 32;
-    header.bV5Compression = BI_BITFIELDS;
-    header.bV5RedMask = 0x00ff0000U;
-    header.bV5GreenMask = 0x0000ff00U;
-    header.bV5BlueMask = 0x000000ffU;
-    header.bV5AlphaMask = 0xff000000U;
-    void* bits = nullptr;
-    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
-        DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (bitmap == nullptr || bits == nullptr) {
-        DeleteDC(memory);
-        ReleaseDC(nullptr, screen);
-        return;
-    }
-    const size_t bytes =
-        static_cast<size_t>(m_contextPresentSize.cx) * static_cast<size_t>(m_contextPresentSize.cy) * 4U;
-    if (m_contextPresentBits.size() >= bytes) {
-        std::memcpy(bits, m_contextPresentBits.data(), bytes);
-    }
-    HGDIOBJ previous = SelectObject(memory, bitmap);
-    POINT source{0, 0};
-    POINT destination{origin.x, origin.y};
-    SIZE present{m_contextPresentSize.cx, m_contextPresentSize.cy};
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(m_contextWindow, nullptr, &destination, &present, memory, &source, 0,
-        &blend, ULW_ALPHA);
-    SelectObject(memory, previous);
-    DeleteObject(bitmap);
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
-    ShowWindow(m_contextWindow, SW_SHOWNA);
 }
 
 void DockApp::PaintContextMenu() {
