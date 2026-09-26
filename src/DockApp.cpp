@@ -2835,23 +2835,29 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             // timer backs off to ~33 ms. Moving wallpaper / video still keeps
             // the fast cadence so frost stays live.
             bool wantFast = false;
-            // 1.1.47 forced the 8 ms backdrop lane whenever the pointer was over
-            // the dock. Cursor motion advances DWM cFrame, so CaptureLiveBackdrop
-            // then ran ProbeBackdropUnchanged (BitBlt + SetWindowDisplayAffinity)
-            // on the same thread as WH_MOUSE_LL — that is why cursor FPS stayed
-            // low after 1.1.47. Skip capture while the pointer is moving over the
-            // dock; resume when it settles. Do not force wantFast for dock hover.
+            // 1.1.48 skipped CaptureLiveBackdrop while the pointer moved over the
+            // dock. QS / Dock Settings / context still ran CaptureLiveBackdrop +
+            // TickLivePopupGlass BitBlt/GPU on the UI/hook thread mid-move (cursor
+            // motion advances DWM cFrame), so FPS stayed low over those menus.
+            // Extend the same ~80 ms settle skip to open-menu hover; do not force
+            // wantFast under menu hover (that reintroduces BitBlt-on-move).
             POINT hoverCursor{};
             const bool haveCursor = GetCursorPos(&hoverCursor) != FALSE;
             const bool pointerOverDock = haveCursor && IsCursorOverDock(hoverCursor);
-            constexpr double kDockCaptureMotionSkipSeconds = 0.080;
+            const bool pointerOverOpenMenu = haveCursor &&
+                ((IsOverflowOpen() && IsCursorOverOverflow(hoverCursor)) ||
+                    (IsDockSettingsOpen() && IsCursorOverSettings(hoverCursor)) ||
+                    (IsContextMenuOpen() && IsCursorOverContextMenu(hoverCursor)));
+            constexpr double kUiCaptureMotionSkipSeconds = 0.080;
             const double nowQpc = QpcSeconds();
-            const bool pointerMovingOverDock = pointerOverDock && !IsDragActive() &&
-                m_lastPointerMotionAt > 0.0 &&
-                (nowQpc - m_lastPointerMotionAt) < kDockCaptureMotionSkipSeconds;
+            const bool pointerMovingRecently = m_lastPointerMotionAt > 0.0 &&
+                (nowQpc - m_lastPointerMotionAt) < kUiCaptureMotionSkipSeconds;
+            const bool pointerMovingOverUi =
+                !IsDragActive() && pointerMovingRecently &&
+                (pointerOverDock || pointerOverOpenMenu);
             if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
                 nowQpc >= m_suppressBackdropUntil) {
-                if (pointerMovingOverDock) {
+                if (pointerMovingOverUi) {
                     // Leave glass frozen for a few frames; hook stays responsive.
                 } else if (CaptureLiveBackdrop()) {
                     QueueRenderFrame(false);
@@ -2868,7 +2874,11 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             // Open menus: non-blocking GlassPS rebake. BeginLiveGlassPanelBake
             // never waits on the GPU fence; TakeLiveGlassPanelResult applies
             // when ready. didGlassWork keeps the fast timer while content moves.
-            if (TickLivePopupGlass()) {
+            // Skip entirely while the pointer is moving over dock/menus so BitBlt
+            // + GPU submit cannot stall WH_MOUSE_LL; resume when it settles.
+            if (pointerMovingOverUi) {
+                // Glass stays at last good frame for ~80 ms of motion.
+            } else if (TickLivePopupGlass()) {
                 wantFast = true;
                 m_backdropIdleStreak = 0;
             }
@@ -2876,7 +2886,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             // stay at ~33 ms unless this tick observed a real backdrop/glass change.
             const bool menusOpen = IsDockSettingsOpen() || IsOverflowOpen() ||
                 IsContextMenuOpen();
-            if (pointerMovingOverDock) {
+            if (pointerMovingOverUi) {
                 // Prefer idle cadence while moving so settle ticks are not stacked
                 // on an 8 ms capture storm.
                 SyncBackdropTimerInterval(false);
