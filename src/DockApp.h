@@ -590,8 +590,8 @@ private:
     double m_lastPointerSampleAt = 0.0;
     // QPC time of the last actual cursor position change (not calm watch polls).
     // Backdrop capture + TickLivePopupGlass skip while this is recent and the
-    // pointer is over the dock / open QS / Dock Settings / context so BitBlt /
-    // Present cannot stall WH_MOUSE_LL mid-move.
+    // dock is open (or QS / Dock Settings / context) so BitBlt / Present cannot
+    // stall WH_MOUSE_LL mid-move — including pointer motion over empty desktop.
     double m_lastPointerMotionAt = 0.0;
     bool m_suppressDragUntilRelease = false;
     bool m_launchClickInProgress = false;

@@ -2835,26 +2835,25 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             // timer backs off to ~33 ms. Moving wallpaper / video still keeps
             // the fast cadence so frost stays live.
             bool wantFast = false;
-            // 1.1.48 skipped CaptureLiveBackdrop while the pointer moved over the
-            // dock. QS / Dock Settings / context still ran CaptureLiveBackdrop +
-            // TickLivePopupGlass BitBlt/GPU on the UI/hook thread mid-move (cursor
-            // motion advances DWM cFrame), so FPS stayed low over those menus.
-            // Extend the same ~80 ms settle skip to open-menu hover; do not force
-            // wantFast under menu hover (that reintroduces BitBlt-on-move).
-            POINT hoverCursor{};
-            const bool haveCursor = GetCursorPos(&hoverCursor) != FALSE;
-            const bool pointerOverDock = haveCursor && IsCursorOverDock(hoverCursor);
-            const bool pointerOverOpenMenu = haveCursor &&
-                ((IsOverflowOpen() && IsCursorOverOverflow(hoverCursor)) ||
-                    (IsDockSettingsOpen() && IsCursorOverSettings(hoverCursor)) ||
-                    (IsContextMenuOpen() && IsCursorOverContextMenu(hoverCursor)));
+            // 1.1.49 gated the settle skip on hit-testing dock / open menus. With
+            // the dock open and the pointer on empty desktop, mouse moves still
+            // advanced DWM cFrame and CaptureLiveBackdrop + TickLivePopupGlass
+            // kept BitBlt/GPU on the UI/hook thread -> system-wide low cursor FPS.
+            // Skip while dock or menus are open and the pointer is moving
+            // *anywhere*; resume when it settles (~80 ms). Do not force wantFast
+            // under motion (that reintroduces BitBlt-on-move). Glass look when
+            // idle/settled is unchanged.
             constexpr double kUiCaptureMotionSkipSeconds = 0.080;
             const double nowQpc = QpcSeconds();
             const bool pointerMovingRecently = m_lastPointerMotionAt > 0.0 &&
                 (nowQpc - m_lastPointerMotionAt) < kUiCaptureMotionSkipSeconds;
+            const bool menusOpen = IsDockSettingsOpen() || IsOverflowOpen() ||
+                IsContextMenuOpen();
+            const bool dockOpen =
+                m_visibility == VisibilityState::Visible ||
+                m_visibility == VisibilityState::Showing;
             const bool pointerMovingOverUi =
-                !IsDragActive() && pointerMovingRecently &&
-                (pointerOverDock || pointerOverOpenMenu);
+                !IsDragActive() && pointerMovingRecently && (dockOpen || menusOpen);
             if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
                 nowQpc >= m_suppressBackdropUntil) {
                 if (pointerMovingOverUi) {
@@ -2874,7 +2873,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             // Open menus: non-blocking GlassPS rebake. BeginLiveGlassPanelBake
             // never waits on the GPU fence; TakeLiveGlassPanelResult applies
             // when ready. didGlassWork keeps the fast timer while content moves.
-            // Skip entirely while the pointer is moving over dock/menus so BitBlt
+            // Skip entirely while pointer moves with dock/menus open so BitBlt
             // + GPU submit cannot stall WH_MOUSE_LL; resume when it settles.
             if (pointerMovingOverUi) {
                 // Glass stays at last good frame for ~80 ms of motion.
@@ -2884,8 +2883,6 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             }
             // With menus open and the pointer elsewhere, skip idle hysteresis:
             // stay at ~33 ms unless this tick observed a real backdrop/glass change.
-            const bool menusOpen = IsDockSettingsOpen() || IsOverflowOpen() ||
-                IsContextMenuOpen();
             if (pointerMovingOverUi) {
                 // Prefer idle cadence while moving so settle ticks are not stacked
                 // on an 8 ms capture storm.
