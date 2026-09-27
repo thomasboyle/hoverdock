@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "DockConfig.h"
 #include "InstalledApps.h"
@@ -486,6 +486,10 @@ private:
     void Log(const std::wstring& message) const;
 
     [[nodiscard]] bool IsCursorInBottomHotZone(POINT cursor) const noexcept;
+    // True when the foreground app is borderless / monitor-covering fullscreen on
+    // the monitor under `cursor` (typical game borderless). Used to suppress
+    // edge-show so the dock does not interrupt gameplay.
+    [[nodiscard]] bool IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept;
     [[nodiscard]] int IconAtScreenPoint(POINT cursor) const noexcept;
     [[nodiscard]] int DividerAtScreenPoint(POINT cursor) const noexcept;
     [[nodiscard]] int InsertionIndexForDrag(POINT cursor) const noexcept;

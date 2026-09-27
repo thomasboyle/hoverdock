@@ -7755,23 +7755,34 @@ void DockApp::HandlePointer(POINT cursor) {
     }
 
     const bool inHotZone = IsCursorInBottomHotZone(cursor);
+    const bool borderlessFullscreen = IsForegroundBorderlessFullscreenAt(cursor);
     if (m_shellFlyoutHold) {
         return;
     }
-    if (inHotZone) {
+    if (inHotZone && !borderlessFullscreen) {
         static_cast<void>(AdoptMonitorForCursor(cursor));
     }
 
     if (m_visibility == VisibilityState::Hidden) {
         HideHoverLabel();
-        if (inHotZone) {
+        if (inHotZone && !borderlessFullscreen) {
             BeginShow();
         }
         return;
     }
 
-    if (m_visibility == VisibilityState::Hiding && inHotZone) {
+    if (m_visibility == VisibilityState::Hiding && inHotZone && !borderlessFullscreen) {
         BeginShow();
+        return;
+    }
+
+    // If a borderless fullscreen game/app took focus while the dock was up,
+    // slide away unless the user is actively over the dock or a flyout.
+    if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
+        borderlessFullscreen && !IsLaunchPromptOpen() && !IsCursorOverDock(cursor) &&
+        !IsCursorWithinFlyoutZone(cursor) && !IsOverflowOpen() && !IsDockSettingsOpen() &&
+        !IsContextMenuOpen()) {
+        BeginHide();
         return;
     }
 
@@ -11003,6 +11014,55 @@ void DockApp::Log(const std::wstring& message) const {
     OutputDebugStringW((message + L"\n").c_str());
 }
 
+bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr || IsWindowVisible(foreground) == FALSE ||
+        IsIconic(foreground) != FALSE) {
+        return false;
+    }
+    if (foreground == m_window || foreground == m_inputWindow ||
+        foreground == m_hoverLabelWindow || foreground == m_dragGhostWindow ||
+        foreground == m_launchPromptWindow || foreground == m_overflowWindow ||
+        foreground == m_settingsWindow || foreground == m_contextWindow) {
+        return false;
+    }
+    wchar_t className[64]{};
+    if (GetClassNameW(foreground, className, static_cast<int>(std::size(className))) > 0) {
+        // All dock-owned windows use the LiquidGlassDock* class prefix.
+        if (_wcsnicmp(className, L"LiquidGlassDock", 15) == 0) {
+            return false;
+        }
+    }
+
+    const LONG_PTR style = GetWindowLongPtrW(foreground, GWL_STYLE);
+    // Borderless / exclusive fullscreen: no caption chrome and no thick resize
+    // frame (typically WS_POPUP). Maximized windowed apps keep WS_CAPTION /
+    // WS_THICKFRAME and must still be allowed to edge-show the dock.
+    if ((style & WS_CAPTION) != 0 || (style & WS_THICKFRAME) != 0) {
+        return false;
+    }
+
+    RECT windowRect{};
+    if (GetWindowRect(foreground, &windowRect) == FALSE) {
+        return false;
+    }
+    const HMONITOR cursorMonitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    const HMONITOR windowMonitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+    if (cursorMonitor == nullptr || windowMonitor == nullptr || cursorMonitor != windowMonitor) {
+        return false;
+    }
+    MONITORINFO info{sizeof(info)};
+    if (GetMonitorInfoW(windowMonitor, &info) == FALSE) {
+        return false;
+    }
+    // Allow a couple of pixels of slack for DPI/rounding quirks; require the
+    // window to essentially cover the full monitor rect (not just the work area).
+    constexpr LONG kTol = 4;
+    const RECT& mon = info.rcMonitor;
+    return windowRect.left <= mon.left + kTol && windowRect.top <= mon.top + kTol &&
+        windowRect.right >= mon.right - kTol && windowRect.bottom >= mon.bottom - kTol;
+}
+
 bool DockApp::IsCursorInBottomHotZone(POINT cursor) const noexcept {
     RECT bounds{};
     if (!MonitorRect(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), bounds)) {
@@ -11102,9 +11162,8 @@ bool DockApp::IsCursorOverDock(POINT cursor) const noexcept {
 bool DockApp::ShouldPostPointerUpdate(POINT cursor) const noexcept {
     switch (m_visibility) {
     case VisibilityState::Hidden:
-        return IsCursorInBottomHotZone(cursor);
     case VisibilityState::Hiding:
-        return IsCursorInBottomHotZone(cursor);
+        return IsCursorInBottomHotZone(cursor) && !IsForegroundBorderlessFullscreenAt(cursor);
     case VisibilityState::Showing:
     case VisibilityState::Visible:
         return !IsCursorOverDock(cursor);
