@@ -915,7 +915,7 @@ void FillRectColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT boun
     }
 }
 
-// Concept D Minimal Sage — panel toggles/slider (#BFDDBE Sage 300).
+// Concept D Minimal Sage — panel toggles/slider (#98A869).
 // Dock running-indicator dot stays amber in Shaders.hlsl. DIB order: B, G, R.
 constexpr uint8_t kAmberB = DOCK_PANEL_TOGGLE_B;
 constexpr uint8_t kAmberG = DOCK_PANEL_TOGGLE_G;
@@ -5476,8 +5476,8 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     }
     case SettingsHitKind::CheckNow:
     case SettingsHitKind::PerfProfile:
-        // Light sage bar + forest label ink. Extra white overlay brightens
-        // toward hover; forest ink stays readable on pressed too.
+        // Olive sage bar (#98A869) + forest label ink. Extra white overlay
+        // brightens toward hover; forest ink stays readable on pressed too.
         FillRectPremul(pixels, width, height, hit.bounds, 0.14F);
         break;
     case SettingsHitKind::Startup:
@@ -6348,7 +6348,7 @@ void DockApp::PaintSettingsPopup() {
         const float trackCy = static_cast<float>(trackTop) + trackRadius;
         const float wash = enabled ? (hovered ? 0.96F : 0.90F) : (hovered ? 0.55F : 0.48F);
         if (enabled) {
-            // On = Sage 300 toggle fill (Concept D Minimal Sage).
+            // On = #98A869 toggle fill (Concept D Minimal Sage).
             FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
                 wash, kAmberB, kAmberG, kAmberR);
         } else {
@@ -6434,8 +6434,9 @@ void DockApp::PaintSettingsPopup() {
 
     const bool checking = m_updateInFlight.load() || m_updateInstalling.load();
     RECT buttonBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    // Concept D: light sage bars (#BFDDBE) + forest label ink (already set).
-    FillRectColorPremul(pixels, width, height, buttonBounds, 0.82F,
+    // Concept D: lighter #98A869 wash plate + forest label ink (already set).
+    // Idle alpha kept soft so empty buttons read clearly on Minimal Sage.
+    FillRectColorPremul(pixels, width, height, buttonBounds, 0.50F,
         DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
     DrawFlyoutText(pixels, width, height, buttonBounds, labelFont,
         checking ? L"Checking..." : L"Check for updates now",
@@ -6445,8 +6446,8 @@ void DockApp::PaintSettingsPopup() {
 
     const bool profiling = m_perfProfiler.IsRunning();
     RECT perfBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    // Slightly stronger sage wash while active so running state reads clearly.
-    FillRectColorPremul(pixels, width, height, perfBounds, profiling ? 0.94F : 0.82F,
+    // Slightly stronger #98A869 wash while active; idle stays a light plate.
+    FillRectColorPremul(pixels, width, height, perfBounds, profiling ? 0.70F : 0.50F,
         DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
     DrawFlyoutText(pixels, width, height, perfBounds, labelFont,
         profiling ? L"Stop profiling" : L"Start performance profile",

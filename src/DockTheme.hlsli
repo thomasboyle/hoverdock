@@ -55,10 +55,10 @@
 #define DOCK_PANEL_ICON_R 94
 #define DOCK_PANEL_ICON_G 127
 #define DOCK_PANEL_ICON_B 108
-// Toggles + frost slider fill (#BFDDBE Sage 300).
-#define DOCK_PANEL_TOGGLE_R 191
-#define DOCK_PANEL_TOGGLE_G 221
-#define DOCK_PANEL_TOGGLE_B 190
+// Toggles + frost slider / action accent (#98A869 olive sage).
+#define DOCK_PANEL_TOGGLE_R 152
+#define DOCK_PANEL_TOGGLE_G 168
+#define DOCK_PANEL_TOGGLE_B 105
 // High plate milk so the sage face reads; still below solid chrome.
 #define DOCK_PANEL_PLATE_MIX_FLOOR 0.76f
 // Floor frost for mica radii / blur so wallpaper detail dissolves under glyphs.
