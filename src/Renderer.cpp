@@ -1140,7 +1140,6 @@ void Renderer::InvalidateBackdrop() noexcept {
     m_backdropChangeSerial = 0;
     m_backdropDwmFrameValid = false;
     m_backdropDwmFrame = 0;
-    m_backdropIdleSkips = 0;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();
@@ -1198,6 +1197,15 @@ bool Renderer::NeedsBackdropBitBlt(const RECT& screenRectangle) const noexcept {
 
 namespace {
 
+// Desktop BitBlt writes an unstable alpha byte. The glass shaders sample RGB
+// only, so change detection must ignore alpha or a static desktop looks dirty
+// forever and the 8 ms timer keeps allocating GDI mirrors and presenting.
+constexpr uint32_t kBackdropRgbMask = 0x00FFFFFFu;
+
+bool BackdropRgbDiffers(uint32_t left, uint32_t right) noexcept {
+    return (left & kBackdropRgbMask) != (right & kBackdropRgbMask);
+}
+
 // Reads the desktop into a memory DC while hiding one window from legacy GDI
 // capture. POD-only so __try is legal here (C2712): __finally restores the
 // affinity even on fault, so an exception can never leave the dock stuck
@@ -1231,45 +1239,32 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         return false;
     }
 
-    // Idle fast path: any pixel change behind the dock requires a DWM composition,
-    // which advances cFrame. When DWM hasn't composed since the last capture and a
-    // valid backdrop already exists, the pixels cannot have changed: skip the
-    // BitBlt + hash entirely. The 8 ms timer still fires (FPS preserved); idle ticks
-    // cost one DWM query (~0.01 ms) instead of a screen readback (measured 2-10 ms).
-    // When content moves or video plays, cFrame advances every vsync and captures
-    // continue at the full rate, so the glass stays pixel-identical to always-capture.
-    // Bound: cFrame can also stay frozen while the cache is stale (black frames
-    // validated before first composition at logon/resume, then a static desktop),
-    // so at most kBackdropForcedCaptureSkips ticks pass before a live BitBlt.
-    //
-    // Busy-use caveat: dock Present / hover / menu UpdateLayeredWindow also
-    // advance cFrame without changing wallpaper. A sparse scanline probe then
-    // skips the full strip BitBlt; noise-tolerant sample diffs stop single-pixel
-    // flap from bumping BackdropChangeSerial (which stormed live menu rebakes).
+    // Resting path: a static desktop does not advance DWM cFrame. The query
+    // fills a stack struct and does not allocate, BitBlt, or Present. A frozen
+    // cFrame never falls through to a "heal" BitBlt — that periodic full-strip
+    // read allocated a fresh GDI mirror (soft page faults) and, when alpha
+    // noise looked like a change, restarted the 8 ms upload/Present loop.
+    // A stale pre-composition cache heals on the next real cFrame (logon and
+    // resume both compose). cFrame also advances from our own Present and from
+    // cursor motion elsewhere; the reused probe DIB distinguishes that from
+    // wallpaper or video under the strip without a full-size BitBlt.
     if (m_backdropValid) {
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
         if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
             if (m_backdropDwmFrameValid && timing.cFrame == m_backdropDwmFrame) {
-                if (++m_backdropIdleSkips < kBackdropForcedCaptureSkips) {
-                    if (changed != nullptr) {
-                        *changed = false;
-                    }
-                    return true;
+                if (changed != nullptr) {
+                    *changed = false;
                 }
-            } else {
-                m_backdropDwmFrame = timing.cFrame;
-                m_backdropDwmFrameValid = true;
-                // DWM advanced (often from our own Present). Probe a few rows
-                // before paying for a full dock-strip BitBlt.
-                if (m_backdropProbeValid && ProbeBackdropUnchanged(screenRectangle)) {
-                    if (++m_backdropIdleSkips < kBackdropForcedCaptureSkips) {
-                        if (changed != nullptr) {
-                            *changed = false;
-                        }
-                        return true;
-                    }
+                return true;
+            }
+            m_backdropDwmFrame = timing.cFrame;
+            m_backdropDwmFrameValid = true;
+            if (m_backdropProbeValid && ProbeBackdropUnchanged(screenRectangle)) {
+                if (changed != nullptr) {
+                    *changed = false;
                 }
+                return true;
             }
         }
         // DWM timing unavailable (composition off): fall through to BitBlt.
@@ -1281,11 +1276,6 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
             m_backdropDwmFrameValid = true;
         }
     }
-
-    // Any full BitBlt attempt (forced or regular) resets the idle-skip budget,
-    // whether the readback succeeds or not: persistent failure retries at
-    // the forced cadence instead of every tick.
-    m_backdropIdleSkips = 0;
 
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
@@ -2029,7 +2019,6 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropChangeSerial = 0;
     m_backdropDwmFrame = 0;
     m_backdropDwmFrameValid = false;
-    m_backdropIdleSkips = 0;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();
@@ -2061,10 +2050,10 @@ uint64_t Renderer::HashBackdropPixels() const noexcept {
     uint64_t hash = 14695981039346656037ull;
     constexpr size_t stride = 8;
     for (size_t index = 0; index < count; index += stride) {
-        hash ^= words[index];
+        hash ^= words[index] & kBackdropRgbMask;
         hash *= 1099511628211ull;
     }
-    hash ^= words[count - 1];
+    hash ^= words[count - 1] & kBackdropRgbMask;
     hash ^= static_cast<uint64_t>(m_width) << 32;
     hash ^= m_height;
     return hash;
@@ -2172,14 +2161,14 @@ bool Renderer::ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept {
     size_t diffs = 0;
     constexpr size_t stride = 4;
     for (size_t i = 0; i < count; i += stride) {
-        if (cur[i] != ref[i]) {
+        if (BackdropRgbDiffers(cur[i], ref[i])) {
             ++diffs;
             if (diffs > kBackdropProbeNoisePixels) {
                 return false;
             }
         }
     }
-    if (cur[count - 1] != ref[count - 1]) {
+    if (BackdropRgbDiffers(cur[count - 1], ref[count - 1])) {
         ++diffs;
     }
     return diffs <= kBackdropProbeNoisePixels;
@@ -2225,12 +2214,12 @@ size_t Renderer::CountBackdropSampleDiffs() const noexcept {
     size_t diffs = 0;
     size_t sample = 0;
     for (size_t index = 0; index < count; index += stride) {
-        if (words[index] != m_backdropCommittedSamples[sample++]) {
+        if (BackdropRgbDiffers(words[index], m_backdropCommittedSamples[sample++])) {
             ++diffs;
         }
     }
     if (count > 0 && (count - 1) % stride != 0) {
-        if (words[count - 1] != m_backdropCommittedSamples[sample++]) {
+        if (BackdropRgbDiffers(words[count - 1], m_backdropCommittedSamples[sample++])) {
             ++diffs;
         }
     }
@@ -2465,10 +2454,10 @@ uint64_t Renderer::HashPanelCapturePixels(UINT width, UINT height) const noexcep
     uint64_t hash = 14695981039346656037ull;
     constexpr size_t stride = 8;
     for (size_t index = 0; index < count; index += stride) {
-        hash ^= words[index];
+        hash ^= words[index] & kBackdropRgbMask;
         hash *= 1099511628211ull;
     }
-    hash ^= words[count - 1];
+    hash ^= words[count - 1] & kBackdropRgbMask;
     hash ^= static_cast<uint64_t>(width) << 32;
     hash ^= height;
     return hash;

@@ -126,11 +126,6 @@ public:
 private:
     static constexpr UINT kBufferCount = 3;
     static constexpr UINT kMaximumIcons = 512;
-    // Idle BitBlt skips before a forced live re-capture (~1 s at the
-    // 8 ms/120 Hz backdrop cadence). Bounds the DWM fast path so a stale
-    // cache (e.g. black frames validated before first composition at
-    // logon/resume) always heals while a static desktop still skips ~99%.
-    static constexpr UINT kBackdropForcedCaptureSkips = 120;
     // Sparse scanline probe before a full dock-strip BitBlt. Hover/Present
     // advances DWM cFrame without changing wallpaper; probing a few rows is
     // ~height/kProbeRows cheaper and avoids the 2-10 ms kernel BitBlt.
@@ -256,9 +251,6 @@ private:
     // pixels cannot have changed and the BitBlt is skipped (timer still fires).
     uint64_t m_backdropDwmFrame = 0;
     bool m_backdropDwmFrameValid = false;
-    // Consecutive idle skips since the last live BitBlt (see
-    // kBackdropForcedCaptureSkips). Reset on every capture attempt.
-    UINT m_backdropIdleSkips = 0;
     // Sparse probe DIB (width x kBackdropProbeRows) + reference from last commit.
     HDC m_backdropProbeDc = nullptr;
     HBITMAP m_backdropProbeBitmap = nullptr;

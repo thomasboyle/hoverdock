@@ -2417,11 +2417,15 @@ BOOL CALLBACK DockApp::FindTaskbarWindow(HWND window, LPARAM data) {
         return TRUE;
     }
 
-    const std::wstring classValue(className);
-    if (classValue == L"Shell_TrayWnd" || classValue == L"Shell_SecondaryTrayWnd") {
-        auto* taskbars = reinterpret_cast<std::vector<HWND>*>(data);
-        taskbars->push_back(window);
+    // Compare in place. A temporary wstring here is allocated once per top-level
+    // window on every taskbar-monitor pass (hidden or visible) and was a steady
+    // source of soft faults while the dock was resting.
+    if (lstrcmpW(className, L"Shell_TrayWnd") != 0 &&
+        lstrcmpW(className, L"Shell_SecondaryTrayWnd") != 0) {
+        return TRUE;
     }
+    auto* taskbars = reinterpret_cast<std::vector<HWND>*>(data);
+    taskbars->push_back(window);
     return TRUE;
 }
 
@@ -2538,6 +2542,9 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         break;
 
     case kCursorWatchSyncMessage: {
+        // Foreground just changed. Drop the elevation cache before the cadence
+        // sync so Task Manager still promotes the 33 ms watch on this message.
+        m_elevatedForegroundValid = false;
         EnsureMouseHook();
         SyncCursorWatchInterval();
         // Foreground changes (e.g. the notification panel closing) must
@@ -2859,6 +2866,12 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         } else if (wParam == kGlintTimerId) {
             TickGlint();
         } else if (wParam == kBackdropTimerId) {
+            // A timer that outlives hide must not keep BitBlt/Present running.
+            if (m_visibility == VisibilityState::Hidden ||
+                m_visibility == VisibilityState::Hiding) {
+                StopBackdropTimer();
+                return 0;
+            }
             // The dock glass stays live while popups are open: the capture is
             // SRCCOPY without CAPTUREBLT, so layered popups and hover bubbles
             // never bake into the backdrop (no feedback loop). Pausing here
@@ -10472,8 +10485,18 @@ bool DockApp::ExpandPrimaryWorkArea(bool notify) {
     if (work.left == m_primaryBounds.left && work.top == m_primaryBounds.top &&
         work.right == m_primaryBounds.right && work.bottom == m_primaryBounds.bottom) {
         m_workAreaExpanded = true;
+        m_hasLastObservedWorkArea = true;
+        m_lastObservedWorkArea = work;
         return false;
     }
+
+    // Explorer often leaves the same non-full work area in place. Retrying the
+    // set is fine, but reporting "corrected" every pass pinned the monitor at
+    // 100 ms and re-enumerated every top-level window for the life of the process.
+    const bool repeat =
+        m_hasLastObservedWorkArea && RectsEqual(work, m_lastObservedWorkArea);
+    m_hasLastObservedWorkArea = true;
+    m_lastObservedWorkArea = work;
 
     RECT full = m_primaryBounds;
     const UINT flags = notify ? SPIF_SENDCHANGE : 0;
@@ -10481,7 +10504,7 @@ bool DockApp::ExpandPrimaryWorkArea(bool notify) {
         Log(L"Desktop work area expanded.");
     }
     m_workAreaExpanded = true;
-    return true;
+    return !repeat;
 }
 
 void DockApp::RestoreDesktopWorkArea() {
@@ -10491,6 +10514,7 @@ void DockApp::RestoreDesktopWorkArea() {
     static_cast<void>(SystemParametersInfoW(SPI_SETWORKAREA, 0, &m_savedWorkArea, SPIF_SENDCHANGE));
     m_workAreaSaved = false;
     m_workAreaExpanded = false;
+    m_hasLastObservedWorkArea = false;
 }
 
 void DockApp::NotifyExplorerTraySettings() noexcept {
@@ -10534,12 +10558,19 @@ void DockApp::RestoreMultiMonitorTaskbars() {
     NotifyExplorerTraySettings();
 }
 
-bool DockApp::ExpandSecondaryMonitorWorkAreas() {
-    std::vector<HWND> taskbars;
+void DockApp::CollectTaskbarWindows(std::vector<HWND>& taskbars) {
+    taskbars.clear();
     EnumWindows(&DockApp::FindTaskbarWindow, reinterpret_cast<LPARAM>(&taskbars));
+}
 
-    std::vector<std::pair<HMONITOR, RECT>> monitors;
-    EnumDisplayMonitors(nullptr, nullptr, &CollectMonitorBounds, reinterpret_cast<LPARAM>(&monitors));
+bool DockApp::ExpandSecondaryMonitorWorkAreas() {
+    CollectTaskbarWindows(m_taskbarEnumScratch);
+    const std::vector<HWND>& taskbars = m_taskbarEnumScratch;
+
+    m_monitorEnumScratch.clear();
+    EnumDisplayMonitors(nullptr, nullptr, &CollectMonitorBounds,
+        reinterpret_cast<LPARAM>(&m_monitorEnumScratch));
+    const std::vector<std::pair<HMONITOR, RECT>>& monitors = m_monitorEnumScratch;
     bool changed = false;
     for (const auto& [monitor, bounds] : monitors) {
         MONITORINFO information{sizeof(information)};
@@ -10562,6 +10593,16 @@ bool DockApp::ExpandSecondaryMonitorWorkAreas() {
                 continue;
             }
             if (MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST) != monitor) {
+                continue;
+            }
+
+            // Already collapsed: another SHAppBarMessage every pass kept the
+            // monitor at 100 ms on any secondary display Explorer would not
+            // give a full work area.
+            RECT trayRect{};
+            GetWindowRect(tray, &trayRect);
+            if (IsWindowVisible(tray) == FALSE && trayRect.bottom - trayRect.top <= 0 &&
+                trayRect.top >= information.rcMonitor.bottom) {
                 continue;
             }
 
@@ -10692,11 +10733,13 @@ void DockApp::DestroyFullscreenClaimWindows() noexcept {
 }
 
 bool DockApp::CollapseNativeTaskbarAppBar() {
-    std::vector<HWND> taskbars;
-    EnumWindows(&DockApp::FindTaskbarWindow, reinterpret_cast<LPARAM>(&taskbars));
+    CollectTaskbarWindows(m_taskbarEnumScratch);
+    const std::vector<HWND>& taskbars = m_taskbarEnumScratch;
     bool collapsed = false;
-    std::vector<std::pair<HWND, RECT>> stillCollapsed;
-    stillCollapsed.reserve(taskbars.size());
+    m_collapsedTaskbarScratch.clear();
+    if (m_collapsedTaskbarScratch.capacity() < taskbars.size()) {
+        m_collapsedTaskbarScratch.reserve(taskbars.size());
+    }
     for (HWND tray : taskbars) {
         RECT trayRect{};
         GetWindowRect(tray, &trayRect);
@@ -10719,7 +10762,7 @@ bool DockApp::CollapseNativeTaskbarAppBar() {
             }
         }
         if (unchanged) {
-            stillCollapsed.emplace_back(tray, trayRect);
+            m_collapsedTaskbarScratch.emplace_back(tray, trayRect);
             continue;
         }
 
@@ -10734,18 +10777,17 @@ bool DockApp::CollapseNativeTaskbarAppBar() {
         SHAppBarMessage(ABM_WINDOWPOSCHANGED, &data);
         SetWindowPos(tray, HWND_BOTTOM, monitorBounds.left, monitorBounds.bottom,
             monitorBounds.right - monitorBounds.left, 0, SWP_NOACTIVATE | SWP_HIDEWINDOW);
-        stillCollapsed.emplace_back(tray, trayRect);
+        m_collapsedTaskbarScratch.emplace_back(tray, trayRect);
         collapsed = true;
     }
-    m_collapsedTaskbars = std::move(stillCollapsed);
+    m_collapsedTaskbars.swap(m_collapsedTaskbarScratch);
     return collapsed;
 }
 
 bool DockApp::MaintainNativeTaskbarSuppression() {
     if (m_shellFlyoutHold) {
-        std::vector<HWND> taskbars;
-        EnumWindows(&DockApp::FindTaskbarWindow, reinterpret_cast<LPARAM>(&taskbars));
-        for (HWND taskbar : taskbars) {
+        CollectTaskbarWindows(m_taskbarEnumScratch);
+        for (HWND taskbar : m_taskbarEnumScratch) {
             if (IsWindowVisible(taskbar) != FALSE) {
                 HideTaskbarWindow(taskbar);
             }
@@ -10784,9 +10826,8 @@ bool DockApp::MaintainNativeTaskbarSuppression() {
         corrected = true;
     }
 
-    std::vector<HWND> taskbars;
-    EnumWindows(&DockApp::FindTaskbarWindow, reinterpret_cast<LPARAM>(&taskbars));
-    for (HWND taskbar : taskbars) {
+    CollectTaskbarWindows(m_taskbarEnumScratch);
+    for (HWND taskbar : m_taskbarEnumScratch) {
         if (IsWindowVisible(taskbar) != FALSE) {
             HideTaskbarWindow(taskbar);
             corrected = true;
@@ -10907,7 +10948,15 @@ void CALLBACK DockApp::ForegroundWinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG, 
 }
 
 bool DockApp::IsElevatedForeground() const noexcept {
-    return IsWindowProcessElevated(GetForegroundWindow());
+    const double now = QpcSeconds();
+    constexpr double kCacheSeconds = 0.5;
+    if (m_elevatedForegroundValid && (now - m_elevatedForegroundCheckedAt) < kCacheSeconds) {
+        return m_elevatedForegroundCached;
+    }
+    m_elevatedForegroundCached = IsWindowProcessElevated(GetForegroundWindow());
+    m_elevatedForegroundCheckedAt = now;
+    m_elevatedForegroundValid = true;
+    return m_elevatedForegroundCached;
 }
 
 void DockApp::PumpCursorWatch() {
