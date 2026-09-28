@@ -1,0 +1,31 @@
+name: Apply CPU idle patch
+on:
+  push:
+    branches:
+      - cursor/cpu-under-1pct-a6f3
+    paths:
+      - patches/cpu-under-1pct.patch
+      - .github/workflows/apply-cpu-idle-patch.yml
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cursor/cpu-under-1pct-a6f3
+          fetch-depth: 0
+      - name: Restore sources from main and apply patch
+        run: |
+          git fetch origin main
+          git checkout origin/main -- src/DockApp.cpp src/DockApp.h
+          git apply patches/cpu-under-1pct.patch
+          git add src/DockApp.cpp src/DockApp.h
+          if git diff --cached --quiet; then
+            echo "No changes after patch; skipping commit."
+            exit 0
+          fi
+          git rm -f .github/workflows/apply-cpu-idle-patch.yml patches/cpu-under-1pct.patch
+          git commit -m "fix: idle CPU under 1% without changing dock behavior"
+          git push origin HEAD:cursor/cpu-under-1pct-a6f3
