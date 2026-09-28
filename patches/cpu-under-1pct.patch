@@ -1,0 +1,133 @@
+diff --git a/src/DockApp.cpp b/src/DockApp.cpp
+index 4c8f592..024c3de 100644
+--- a/src/DockApp.cpp
++++ b/src/DockApp.cpp
+@@ -2021,7 +2021,10 @@ int DockApp::Run() {
+         HANDLE frameWaitable = slideAnimating ? m_renderer.FrameLatencyWaitableObject() : nullptr;
+         const DWORD count = frameWaitable == nullptr ? 0 : 1;
+         const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
+-        const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, QS_ALLINPUT,
++        const DWORD wakeMask = (slideAnimating || m_dragSnapAnimating)
++            ? QS_ALLINPUT
++            : (QS_TIMER | QS_POSTMESSAGE);
++        const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, wakeMask,
+             MWMO_INPUTAVAILABLE);
+ 
+         if (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT) {
+@@ -2351,7 +2354,7 @@ LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
+     if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
+         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+         if (wParam == WM_MOUSEMOVE && !s_instance->IsDragActive() &&
+-            s_instance->ShouldPostPointerUpdate(mouse->pt)) {
++            s_instance->NeedsHookPointerPost(mouse->pt)) {
+             static POINT s_lastPostedCursor{std::numeric_limits<LONG>::min(),
+                 std::numeric_limits<LONG>::min()};
+             if (mouse->pt.x != s_lastPostedCursor.x || mouse->pt.y != s_lastPostedCursor.y) {
+@@ -2915,8 +2918,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
+             } else if (menusOpen) {
+                 SyncBackdropTimerInterval(wantFast);
+             } else {
++                const bool wantResting =
++                    !wantFast && m_backdropIdleStreak >= kBackdropRestingHysteresisTicks;
+                 SyncBackdropTimerInterval(
+-                    wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks);
++                    wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks, wantResting);
+             }
+         } else if (wParam == kPerfOpenSettingsTimerId) {
+             KillTimer(window, kPerfOpenSettingsTimerId);
+@@ -7795,11 +7800,12 @@ void DockApp::StopBackdropTimer() noexcept {
+     }
+ }
+ 
+-void DockApp::SyncBackdropTimerInterval(bool wantFast) noexcept {
++void DockApp::SyncBackdropTimerInterval(bool wantFast, bool wantResting) noexcept {
+     if (m_window == nullptr) {
+         return;
+     }
+-    const UINT desired = wantFast ? kBackdropIntervalMs : kBackdropIdleIntervalMs;
++    const UINT desired = wantFast ? kBackdropIntervalMs
++        : (wantResting ? kBackdropRestingIntervalMs : kBackdropIdleIntervalMs);
+     if (desired == m_backdropTimerAppliedMs) {
+         return;
+     }
+@@ -11314,6 +11320,29 @@ bool DockApp::ShouldPostPointerUpdate(POINT cursor) const noexcept {
+     }
+ }
+ 
++bool DockApp::NeedsHookPointerPost(POINT cursor) const noexcept {
++    if (!ShouldPostPointerUpdate(cursor)) {
++        return false;
++    }
++    switch (m_visibility) {
++    case VisibilityState::Hidden:
++    case VisibilityState::Hiding:
++        return true;
++    case VisibilityState::Showing:
++    case VisibilityState::Visible:
++        if (IsCursorOverDock(cursor) || IsCursorInBottomHotZone(cursor)) {
++            return true;
++        }
++        if (IsCursorWithinFlyoutZone(cursor) || IsOverflowOpen() || IsDockSettingsOpen() ||
++            IsContextMenuOpen() || IsLaunchPromptOpen()) {
++            return true;
++        }
++        return false;
++    default:
++        return false;
++    }
++}
++
+ bool DockApp::IsDragActive() const noexcept {
+     return m_draggedIcon >= 0 || m_dragSnapAnimating || m_scalingDivider;
+ }
+diff --git a/src/DockApp.h b/src/DockApp.h
+index 405d908..89294e5 100644
+--- a/src/DockApp.h
++++ b/src/DockApp.h
+@@ -144,15 +144,18 @@ private:
+     static constexpr UINT kBackdropIntervalMs = 8;
+     // Idle DWM / unchanged-capture backoff for the backdrop timer. Live menus
+     // force the fast cadence so TickLivePopupGlass stays ~120 Hz.
+-    static constexpr UINT kBackdropIdleIntervalMs = 33;
++    static constexpr UINT kBackdropIdleIntervalMs = 250;
++    // Static desktop + resting dock: one DWM probe per second (no Present).
++    static constexpr UINT kBackdropRestingIntervalMs = 2000;
+     static constexpr UINT kBackdropIdleHysteresisTicks = 1;
++    static constexpr UINT kBackdropRestingHysteresisTicks = 2;
+     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
+     static constexpr UINT kTaskbarMonitorSlowIntervalMs = 5000;
+     static constexpr int kTaskbarMonitorCalmPasses = 5;
+     static constexpr UINT kTrayIntervalMs = 1000;
+     // Dock face clock uses TIME_NOSECONDS. While Quick Settings is closed, StartTrayTimer
+     // arms for the next minute boundary (not a fixed 30 s idle) so the face clock moves.
+-    static constexpr UINT kCursorWatchCalmIntervalMs = 100;
++    static constexpr UINT kCursorWatchCalmIntervalMs = 250;
+     static constexpr UINT kContextOpen = 1;
+     static constexpr UINT kContextOpenLocation = 2;
+     static constexpr UINT kContextClose = 3;
+@@ -370,7 +373,7 @@ private:
+     void QueueRenderFrame(bool allowBlockingGpuWait = true);
+     void StartBackdropTimer() noexcept;
+     void StopBackdropTimer() noexcept;
+-    void SyncBackdropTimerInterval(bool wantFast) noexcept;
++    void SyncBackdropTimerInterval(bool wantFast, bool wantResting = false) noexcept;
+     void HandlePointer(POINT cursor);
+     void UpdateGlintTarget(POINT cursor);
+     void TickGlint();
+@@ -503,6 +506,7 @@ private:
+     [[nodiscard]] bool HasCrossedDragThreshold(POINT cursor) const noexcept;
+     [[nodiscard]] bool IsCursorOverDock(POINT cursor) const noexcept;
+     [[nodiscard]] bool ShouldPostPointerUpdate(POINT cursor) const noexcept;
++    [[nodiscard]] bool NeedsHookPointerPost(POINT cursor) const noexcept;
+     [[nodiscard]] bool IsDragActive() const noexcept;
+     [[nodiscard]] bool IsPersistentDisplayIcon(int icon) const noexcept;
+     [[nodiscard]] LONG CurrentY() const noexcept;
+@@ -727,7 +731,7 @@ private:
+     // Last live rebake of open menu glass (Quick Settings / Dock Settings / context).
+     ULONGLONG m_lastPopupGlassRefreshMs = 0;
+     // After a confirmed unchanged capture, wait this long before BitBlt again.
+-    static constexpr ULONGLONG kLivePopupStaticIntervalMs = 33;
++    static constexpr ULONGLONG kLivePopupStaticIntervalMs = 250;
+     bool m_livePopupGlassStatic = false;
+     // Skip live menu BitBlt/GPU until dock backdrop reports a desktop change
+     // (or kLivePopupForcedRefreshMs elapses). Keeps glass live over moving
