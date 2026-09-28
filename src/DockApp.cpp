@@ -1,1 +1,1 @@
-workspace:/workspace/hoverdock/src/DockApp.cpp
+__python__:open('/workspace/hoverdock/src/DockApp.cpp',encoding='utf-8').read()
