@@ -37,6 +37,19 @@
 #define DOCK_GLASS_MIX 0.85f
 #define DOCK_GLASS_ALPHA 0.97f
 
+// Panel (Quick Settings / Dock Settings / context) dark-glass plate — Concept A+D.
+// Darker translucent charcoal so white text / blue tiles / amber toggles stay
+// legible on busy wallpapers. Dock bar keeps DOCK_FACE_* above; GlassPS branches
+// on DOCK_FX_PANEL so shared constants do not wash the dock chrome.
+#define DOCK_PANEL_FACE_OVER_BLACK (26.0f / 255.0f)  // ~#1a1a1a charcoal
+#define DOCK_PANEL_FACE_OVER_WHITE (68.0f / 255.0f)  // ~#444444 still dark over light WP
+// Minimum plate milk even at Frost=0 (dock clear mix starts at 0.10).
+#define DOCK_PANEL_PLATE_MIX_FLOOR 0.62f
+// Floor frost for mica radii / blur so wallpaper detail dissolves under glyphs.
+#define DOCK_PANEL_FROST_BLUR_FLOOR 0.45f
+// Slightly higher plate opacity floor vs dock clear (Concept D frost borrow).
+#define DOCK_PANEL_GLASS_ALPHA 0.985f
+
 // Drop-shadow margin around the dock pill, shared by layout (window
 // inflation, input-region inset, popup anchors) and the glass shader (pill
 // inset, shadow band). Device px at 1x; both sides scale by display DPI.

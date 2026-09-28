@@ -357,15 +357,16 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
-    const float overBlack = DOCK_FACE_OVER_BLACK * 255.0F;
-    const float overWhite = DOCK_FACE_OVER_WHITE * 255.0F;
+    // CPU popup fallback only (QS / Dock Settings / context). Match the
+    // panel dark-glass plate in GlassPS (Concept A+D); dock never hits this.
+    const float overBlack = DOCK_PANEL_FACE_OVER_BLACK * 255.0F;
+    const float overWhite = DOCK_PANEL_FACE_OVER_WHITE * 255.0F;
     const float frost = std::clamp(frostAmount, 0.0F, 1.0F);
-    // Match GlassPS FrostPlateMix: clear Apple mix at 0, full milky map at mid+.
-    const float plateMix = frost <= 0.5F ? (0.10F + 0.90F * (frost * 2.0F)) : 1.0F;
-    // FrostAmount 0 keeps the old translucent popup alpha; 1 is opaque plate
-    // so sharp desktop cannot leak through (same rule as the dock face).
+    // Match GlassPS FrostPlateMix + panel milk floor.
+    float plateMix = frost <= 0.5F ? (0.10F + 0.90F * (frost * 2.0F)) : 1.0F;
+    plateMix = (std::max)(plateMix, DOCK_PANEL_PLATE_MIX_FLOOR);
     const float alpha =
-        DOCK_GLASS_ALPHA + (1.0F - DOCK_GLASS_ALPHA) * frost;
+        DOCK_PANEL_GLASS_ALPHA + (1.0F - DOCK_PANEL_GLASS_ALPHA) * frost;
     constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F}; // DIB B,G,R
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
@@ -5603,9 +5604,9 @@ UINT DockApp::PackPopupGlassFxFlags() const noexcept
     if (m_config.Dispersion()) {
         glassFx |= DOCK_FX_DISPERSION;
     }
-    if (frostAmount > 0.001f) {
-        glassFx |= DOCK_FX_BLUR;
-    }
+    // Panels always run the mica stack (Concept A strong backdrop blur) so
+    // busy wallpaper detail dissolves under glyphs even at clear Frost.
+    glassFx |= DOCK_FX_BLUR;
     if (m_config.Specular()) {
         glassFx |= DOCK_FX_SPECULAR;
     }
@@ -5758,7 +5759,7 @@ bool DockApp::TickLivePopupGlass()
     }
 
 const float frostAmount = m_config.FrostAmount();
-    const float glassAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
+    const float glassAlpha = DOCK_PANEL_GLASS_ALPHA + (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
     const UINT fxFlags = PackPopupGlassFxFlags();
 
@@ -5826,7 +5827,7 @@ bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* 
     }
     const RECT screenRect{origin.x, origin.y, origin.x + width, origin.y + height};
     const float frostAmount = m_config.FrostAmount();
-    const float glassAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
+    const float glassAlpha = DOCK_PANEL_GLASS_ALPHA + (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
     std::vector<uint8_t> glass;
     if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(width), static_cast<UINT>(height),
@@ -6209,7 +6210,8 @@ void DockApp::PaintSettingsPopup() {
             screen, SaturatedInt(origin.x), SaturatedInt(origin.y), SRCCOPY);
         ReleaseDC(nullptr, screen);
         // CPU fallback when GlassPS bake is unavailable.
-        const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
+        const float frostAmt = (std::max)(std::clamp(m_config.FrostAmount(), 0.0F, 1.0F),
+            DOCK_PANEL_FROST_BLUR_FLOOR);
         const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         BoxBlurRgb(pixels, SaturatedInt(m_settingsSize.cx), SaturatedInt(m_settingsSize.cy),
             frostRadius);
@@ -6347,11 +6349,9 @@ void DockApp::PaintSettingsPopup() {
         FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
     };
 
-    uint8_t inkR = DOCK_INK_R;
-    uint8_t inkG = DOCK_INK_G;
-    uint8_t inkB = DOCK_INK_B;
-    m_renderer.SampleAdaptiveChromeInk(inkR, inkG, inkB);
-    SetFlyoutChromeInk(inkR, inkG, inkB);
+    // Dark charcoal panel plate (Concept A): always light chrome so labels,
+    // version line, and glyphs stay high-contrast on busy wallpapers.
+    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
@@ -7049,7 +7049,8 @@ void DockApp::PaintOverflowPopup() {
             SaturatedInt(origin.x), SaturatedInt(origin.y), SRCCOPY);
         ReleaseDC(nullptr, screen);
         // CPU fallback when GlassPS bake is unavailable.
-        const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
+        const float frostAmt = (std::max)(std::clamp(m_config.FrostAmount(), 0.0F, 1.0F),
+            DOCK_PANEL_FROST_BLUR_FLOOR);
         const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         BoxBlurRgb(pixels, SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy),
             frostRadius);
@@ -7171,14 +7172,9 @@ void DockApp::PaintOverflowPopup() {
         return hasHover && hoveredHit.kind == kind && hoveredHit.index == index;
     };
 
-    // Sample adaptive chrome ink before any flyout text so the Quick Settings
-    // title matches Start/Search and the rest of this panel (was drawn against
-    // stale g_flyoutInk* and read as the opposite polarity).
-    uint8_t inkR = DOCK_INK_R;
-    uint8_t inkG = DOCK_INK_G;
-    uint8_t inkB = DOCK_INK_B;
-    m_renderer.SampleAdaptiveChromeInk(inkR, inkG, inkB);
-    SetFlyoutChromeInk(inkR, inkG, inkB);
+    // Dark charcoal panel plate (Concept A): force light chrome so QS title,
+    // tile labels, and glyphs stay readable (blue tiles / amber state intact).
+    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - gearSize - 8, y + headerHeight};
@@ -8358,7 +8354,8 @@ void DockApp::PaintContextMenu() {
         BitBlt(memory, 0, 0, SaturatedInt(m_contextSize.cx), SaturatedInt(m_contextSize.cy), screen,
             SaturatedInt(origin.x), SaturatedInt(origin.y), SRCCOPY);
         ReleaseDC(nullptr, screen);
-        const float frostAmt = std::clamp(m_config.FrostAmount(), 0.0F, 1.0F);
+        const float frostAmt = (std::max)(std::clamp(m_config.FrostAmount(), 0.0F, 1.0F),
+            DOCK_PANEL_FROST_BLUR_FLOOR);
         const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         const int width = SaturatedInt(m_contextSize.cx);
         const int height = SaturatedInt(m_contextSize.cy);
@@ -8439,11 +8436,16 @@ void DockApp::PaintContextMenu() {
     m_contextGlyphs.clear();
     m_contextGlyphs.reserve(m_contextItems.size());
 
+    // Same dark-glass plate as QS/Dock Settings: light chrome for labels/glyphs.
+    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
+
     const UINT glyphExtent =
         static_cast<UINT>(std::max(14L, std::lround(20.0F * scale)));
     for (const ContextItem& item : m_contextItems) {
         if (item.glyph != 0) {
             m_contextGlyphs.push_back(m_tray.RasterizeSymbol(item.glyph, glyphExtent));
+            RemapPremulInkColor(m_contextGlyphs.back(), DOCK_CHROME_INK_R, DOCK_CHROME_INK_G,
+                DOCK_CHROME_INK_B);
         } else {
             m_contextGlyphs.emplace_back();
         }

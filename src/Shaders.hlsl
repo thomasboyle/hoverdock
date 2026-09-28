@@ -357,7 +357,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Frost radii: clear veil through mid, full mica on the right half.
     float frostRim;
     float frostCore;
-    FrostMicaRadii(frostAmount, frostRim, frostCore);
+    // Panels keep a minimum mica dissolve so busy wallpaper detail cannot
+    // fight glyphs even when the user parks Frost near clear.
+    const float panelFrost = max(frostAmount, panelOn * DOCK_PANEL_FROST_BLUR_FLOOR);
+    FrostMicaRadii(panelFrost, frostRim, frostCore);
 
     float3 frostedBackground;
     if (!hasBackdrop)
@@ -450,12 +453,15 @@ float4 GlassPS(VertexOutput input) : SV_Target
     }
 
     // ---- 1. Face plate (Frost slider) -----------------------------------
-    // Left (0): Apple clear lens — light plate over lensed wallpaper.
-    // Mid (0.5): full milky tone-map (#000->#3a .. #fff->#e1).
-    // Right (1): same milky plate + heavy mica (radii/passes ramp above).
-    const float3 toneMapped = lerp(DOCK_FACE_OVER_BLACK, DOCK_FACE_OVER_WHITE,
-        saturate(frostedBackground));
-    const float plateMix = FrostPlateMix(frostAmount);
+    // Dock: calibrated #3a..#e1 lift (clear Apple mix -> milky mica).
+    // Panels (DOCK_FX_PANEL): dark charcoal plate (Concept A) with a higher
+    // milk floor (Concept D) so white text / blue tiles / amber toggles stay
+    // readable on busy wallpapers without washing the dock bar.
+    const float faceLo = lerp(DOCK_FACE_OVER_BLACK, DOCK_PANEL_FACE_OVER_BLACK, panelOn);
+    const float faceHi = lerp(DOCK_FACE_OVER_WHITE, DOCK_PANEL_FACE_OVER_WHITE, panelOn);
+    const float3 toneMapped = lerp(faceLo, faceHi, saturate(frostedBackground));
+    float plateMix = FrostPlateMix(frostAmount);
+    plateMix = max(plateMix, panelOn * DOCK_PANEL_PLATE_MIX_FLOOR);
     float3 color = lerp(frostedBackground, toneMapped, plateMix);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
@@ -489,7 +495,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
     color *= lerp(1.0, thicknessShade, thickOn);
     color += glassTint * rim * 0.03 * rimGain * haloDamp;
     // Thin bright rim specular (Apple-style white edge light).
-    color += float3(1.0, 1.0, 1.0) * pow(rim, 10.0) * 0.58 * (0.30 + 0.70 * ndl) * rimGain * haloDamp;
+    // Panels: slightly stronger light-gray edge (Concept A thin rim) so the
+    // dark plate separates from busy wallpaper without a chalk outline.
+    const float rimStrength = lerp(0.58, 0.78, panelOn);
+    const float3 rimEdge = lerp(float3(1.0, 1.0, 1.0), float3(0.82, 0.84, 0.88), panelOn);
+    color += rimEdge * pow(rim, 10.0) * rimStrength * (0.30 + 0.70 * ndl) * rimGain * haloDamp;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
     color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.06 * rimGain * haloDamp;
 
@@ -590,7 +600,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float frostAmt = saturate(((uint)scene1.x >> 16) / 255.0);
     float micaRim;
     float micaCore;
-    FrostMicaRadii(frostAmt, micaRim, micaCore);
+    FrostMicaRadii(max(frostAmt, panelOn * DOCK_PANEL_FROST_BLUR_FLOOR), micaRim, micaCore);
     blurPx = lerp(micaRim, micaCore, height01) * dpi;
 }
 
