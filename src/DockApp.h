@@ -145,7 +145,8 @@ private:
     // Idle DWM / unchanged-capture backoff for the backdrop timer. Live menus
     // force the fast cadence so TickLivePopupGlass stays ~120 Hz.
     static constexpr UINT kBackdropIdleIntervalMs = 250;
-    // Static desktop + resting dock: one DWM probe per second (no Present).
+    // Static desktop + resting dock: 2 s DWM cFrame query, no BitBlt or Present
+    // while that frame is frozen.
     static constexpr UINT kBackdropRestingIntervalMs = 2000;
     static constexpr UINT kBackdropIdleHysteresisTicks = 1;
     static constexpr UINT kBackdropRestingHysteresisTicks = 2;
@@ -464,6 +465,7 @@ private:
     void SuppressNativeTaskbar();
     [[nodiscard]] bool MaintainNativeTaskbarSuppression();
     [[nodiscard]] bool ExpandPrimaryWorkArea(bool notify);
+    void CollectTaskbarWindows(std::vector<HWND>& taskbars);
     [[nodiscard]] bool ExpandSecondaryMonitorWorkAreas();
     void RestoreDesktopWorkArea();
     void DisableMultiMonitorTaskbars();
@@ -560,6 +562,11 @@ private:
     std::vector<HWND> m_hiddenTaskbars;
     std::vector<std::pair<HWND, RECT>> m_hiddenTaskbarRects;
     std::vector<std::pair<HWND, RECT>> m_collapsedTaskbars;
+    // Retained across monitor passes so a resting dock does not heap-allocate
+    // a fresh window list, collapse list, or monitor list on every tick.
+    std::vector<HWND> m_taskbarEnumScratch;
+    std::vector<std::pair<HWND, RECT>> m_collapsedTaskbarScratch;
+    std::vector<std::pair<HMONITOR, RECT>> m_monitorEnumScratch;
     UINT m_taskbarCreatedMessage = 0;
     // Agent/perf: PostMessage RegisterWindowMessage(L"Hoverdock.OpenPerfMenus").
     UINT m_openPerfMenusMessage = 0;
@@ -636,6 +643,14 @@ private:
     RECT m_savedWorkArea{};
     bool m_workAreaSaved = false;
     bool m_workAreaExpanded = false;
+    RECT m_lastObservedWorkArea{};
+    bool m_hasLastObservedWorkArea = false;
+    // OpenProcess/token query is kernel-heavy. Cache it so a 33 ms elevated
+    // cursor watch (or a taskbar-monitor sync) does not fault every tick.
+    // Invalidated on kCursorWatchSyncMessage when the foreground changes.
+    mutable bool m_elevatedForegroundValid = false;
+    mutable bool m_elevatedForegroundCached = false;
+    mutable double m_elevatedForegroundCheckedAt = 0.0;
     bool m_multiMonTaskbarSaved = false;
     bool m_multiMonTaskbarHadValue = false;
     DWORD m_savedMultiMonTaskbar = 1;
