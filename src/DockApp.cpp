@@ -2023,7 +2023,7 @@ int DockApp::Run() {
         const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
         const DWORD wakeMask = (slideAnimating || m_dragSnapAnimating)
             ? QS_ALLINPUT
-            : (QS_TIMER | QS_POSTMESSAGE);
+            : (QS_POSTMESSAGE | QS_TIMER | QS_PAINT);
         const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, wakeMask,
             MWMO_INPUTAVAILABLE);
 
