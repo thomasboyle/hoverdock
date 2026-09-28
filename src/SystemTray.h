@@ -54,7 +54,7 @@ struct TrayNotifyIcon {
     ~TrayNotifyIcon();
 };
 
-// Dock text face: JetBrainsMono Nerd Font for labels and clock.
+// Dock text face: Segoe UI (Windows default) for labels and clock.
 // Icons stay on Segoe Fluent/MDL2; this is text only (clock, labels, flyouts).
 [[nodiscard]] const wchar_t* DockTextFontFace() noexcept;
 

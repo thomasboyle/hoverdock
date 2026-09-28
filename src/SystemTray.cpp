@@ -126,8 +126,38 @@ bool SendWinChord(WORD key) {
         sizeof(INPUT)) == static_cast<UINT>(inputs.size());
 }
 
+bool FontFamilyInstalled(const wchar_t* faceName) noexcept {
+    HDC dc = GetDC(nullptr);
+    if (dc == nullptr) {
+        return false;
+    }
+    LOGFONTW probe{};
+    probe.lfCharSet = DEFAULT_CHARSET;
+    wcsncpy_s(probe.lfFaceName, faceName, _TRUNCATE);
+    BOOL found = FALSE;
+    EnumFontFamiliesExW(
+        dc, &probe,
+        [](const LOGFONTW* /*lf*/, const TEXTMETRICW* /*tm*/, DWORD /*type*/, LPARAM lParam) -> int {
+            *reinterpret_cast<BOOL*>(lParam) = TRUE;
+            return 0;
+        },
+        reinterpret_cast<LPARAM>(&found), 0);
+    ReleaseDC(nullptr, dc);
+    return found != FALSE;
+}
+
 const wchar_t* ResolveDockTextFontFace() noexcept {
-    return L"JetBrainsMono Nerd Font";
+    // Prefer Windows default UI face; fall back only if Segoe UI is missing.
+    static const wchar_t* face = []() -> const wchar_t* {
+        if (FontFamilyInstalled(L"Segoe UI")) {
+            return L"Segoe UI";
+        }
+        if (FontFamilyInstalled(L"Segoe UI Variable")) {
+            return L"Segoe UI Variable";
+        }
+        return L"Microsoft Sans Serif";
+    }();
+    return face;
 }
 
 HFONT CreateTrayFont(int pixelHeight, int weight) {
@@ -917,7 +947,7 @@ void QueryClock(TrayStatus& status) {
 
 }  // namespace
 
-// Dock text face: JetBrainsMono Nerd Font for labels and clock.
+// Dock text face: Segoe UI (Windows default) for labels and clock.
 // Icons stay on Segoe Fluent/MDL2; this is text only (clock, labels, flyouts).
 const wchar_t* DockTextFontFace() noexcept {
     return ResolveDockTextFontFace();

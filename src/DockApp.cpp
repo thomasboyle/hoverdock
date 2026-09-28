@@ -3226,7 +3226,7 @@ HFONT DockApp::HoverLabelFont() {
     const UINT dpi = m_window != nullptr ? GetDpiForWindow(m_window) : 96U;
     const float scale =
         static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F * std::max(0.75F, m_dockScale);
-    // Match the dock clock date face: JetBrainsMono Nerd Font / FW_NORMAL / ~17px at 96 DPI.
+    // Match the dock clock date face: Segoe UI / FW_NORMAL / ~17px at 96 DPI.
     const int pixelHeight = std::max(15, static_cast<int>(std::lround(17.0F * scale)));
     if (m_hoverLabelFont != nullptr && dpi == m_hoverLabelFontDpi &&
         pixelHeight == m_hoverLabelFontPx) {
