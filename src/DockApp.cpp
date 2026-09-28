@@ -1,1 +1,1 @@
-@/workspace/hoverdock/src/DockApp.cpp
+file:///workspace/hoverdock/src/DockApp.cpp
