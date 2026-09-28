@@ -20,16 +20,18 @@
 #define DOCK_CHROME_INK_G 245
 #define DOCK_CHROME_INK_B 247
 
-// Dock face tone map (linear lift), calibrated from solid swatches:
-//   backdrop #000000 -> face #3a3a3a
-//   backdrop #1f1f1f -> face #4e4e4e   (fit err < 0.5 LSB)
-//   backdrop #ffffff -> face #e1e1e1
-// face = lerp(OVER_BLACK, OVER_WHITE, blurredBackdrop). Shared by GlassPS and
-// the CPU popup baker (Quick Settings / Dock Settings / context).
-#define DOCK_FACE_OVER_BLACK (58.0f / 255.0f)
-#define DOCK_FACE_OVER_WHITE (225.0f / 255.0f)
-// Alias used by rim/specular accents (highlight body = over-white plate).
-#define DOCK_FROST_OVER_WHITE DOCK_FACE_OVER_WHITE
+// Dock face tone map (linear lift), Apple-style light veil that keeps most of
+// the backdrop contrast instead of flattening it to a grey slab:
+//   backdrop #000000 -> face #282828
+//   backdrop #ffffff -> face #f2f2f2
+// face = lerp(OVER_BLACK, OVER_WHITE, vibrantBackdrop). Dock only (GlassPS);
+// panels use DOCK_PANEL_FACE_* and the CPU popup baker.
+#define DOCK_FACE_OVER_BLACK (40.0f / 255.0f)
+#define DOCK_FACE_OVER_WHITE (242.0f / 255.0f)
+// Glass body color for rim/specular accents (dock and panels).
+#define DOCK_FROST_OVER_WHITE (225.0f / 255.0f)
+// Backdrop saturation boost under the dock face (Apple vibrancy).
+#define DOCK_VIBRANCY 1.45f
 
 // Legacy popup alpha floor. FrostAmount lerps toward 1 so the plate is opaque
 // at full frost (same rule as the dock). Tint/mix kept for any residual refs.

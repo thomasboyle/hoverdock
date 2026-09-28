@@ -2846,6 +2846,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             }).detach();
         } else if (wParam == kCursorWatchTimerId) {
             PumpCursorWatch();
+        } else if (wParam == kGlintTimerId) {
+            TickGlint();
         } else if (wParam == kBackdropTimerId) {
             // The dock glass stays live while popups are open: the capture is
             // SRCCOPY without CAPTUREBLT, so layered popups and hover bubbles
@@ -7642,6 +7644,7 @@ void DockApp::BeginHide() {
     StopRefreshTimer();
     StopTrayTimer();
     StopBackdropTimer();
+    StopGlint();
     m_visibility = VisibilityState::Hiding;
     ShowWindow(m_inputWindow, SW_HIDE);
     m_animationFromY = m_currentY;
@@ -7674,12 +7677,14 @@ void DockApp::AdvanceAnimation() {
         StartBackdropTimer();
         ScheduleDeferredRefresh();
         UpdateHoverLabel();
+        UpdateGlintTarget(m_lastCursor);
         return;
     }
 
     m_visibility = VisibilityState::Hidden;
     m_currentY = m_hiddenY;
     StopBackdropTimer();
+    StopGlint();
     StopRefreshTimer();
     StopTrayTimer();
     BeginOverflowHide(false);
@@ -7760,8 +7765,16 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     const UINT frostByte = static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0f, 1.0f) * 255.0f));
     state.fxFlags = (frostByte << 16) | (haloSlots << 8) | glassFx;
     state.dockScale = m_dockScale;
+    if (m_config.Specular() && m_glintStrength > 0.001F) {
+        state.glintX = m_glintX;
+        state.glintY = m_glintY;
+        state.glintStrength = m_glintStrength;
+    }
     state.showDevBounds = m_config.ShowDevBounds();
-    state.skipIfGpuBusy = m_dropPresentPending || (IsDragActive() && !m_dragSnapAnimating);
+    // Glint easing frames are cosmetic: drop one rather than wait on the GPU
+    // (the settle frame in TickGlint is allowed to wait).
+    state.skipIfGpuBusy = m_dropPresentPending || (IsDragActive() && !m_dragSnapAnimating) ||
+        (m_glintTimerRunning && !IsAnimating());
     state.allowBlockingGpuWait = allowBlockingGpuWait && !IsAnimating() && !IsDragActive() &&
         !m_dragSnapAnimating && !m_dropPresentPending;
     state.icons = m_iconRenderData;
@@ -7800,6 +7813,7 @@ void DockApp::HandlePointer(POINT cursor) {
     }
     m_lastCursor = cursor;
     m_lastPointerSampleAt = QpcSeconds();
+    UpdateGlintTarget(cursor);
     if (IsDragActive()) {
         if (m_draggedIcon >= 0) {
             UpdateDrag(cursor);
@@ -7864,6 +7878,75 @@ void DockApp::HandlePointer(POINT cursor) {
     if (hoveredDivider != m_hoveredDivider) {
         m_hoveredDivider = hoveredDivider;
     }
+}
+
+void DockApp::UpdateGlintTarget(POINT cursor) {
+    // Visible only: the show/hide slide renders every frame itself and must
+    // never share the thread or frame-skip policy with glint easing.
+    const bool active = m_visibility == VisibilityState::Visible && !IsDragActive() &&
+        m_config.Specular() && IsCursorOverDock(cursor);
+    if (active) {
+        const POINT client = ClientFromDockOrigin(cursor, m_windowX, m_currentY);
+        m_glintTargetX = static_cast<float>(client.x);
+        m_glintTargetY = static_cast<float>(client.y);
+        if (m_glintStrength <= 0.001F) {
+            // Fade in at the cursor instead of sliding from the last exit point.
+            m_glintX = m_glintTargetX;
+            m_glintY = m_glintTargetY;
+        }
+    }
+    m_glintTargetStrength = active ? 1.0F : 0.0F;
+    const bool fadedOut = m_glintTargetStrength <= 0.0F && m_glintStrength <= 0.001F;
+    const bool atTarget = std::abs(m_glintTargetX - m_glintX) < 0.5F &&
+        std::abs(m_glintTargetY - m_glintY) < 0.5F &&
+        std::abs(m_glintTargetStrength - m_glintStrength) < 0.002F;
+    if (fadedOut || atTarget || m_glintTimerRunning || m_window == nullptr ||
+        !m_rendererInitialized) {
+        return;
+    }
+    m_glintLastTickAt = QpcSeconds();
+    m_glintTimerRunning = true;
+    SetTimer(m_window, kGlintTimerId, kGlintIntervalMs, nullptr);
+}
+
+void DockApp::TickGlint() {
+    if (m_visibility != VisibilityState::Visible) {
+        StopGlint();
+        return;
+    }
+    const double now = QpcSeconds();
+    const float dt = static_cast<float>(std::clamp(now - m_glintLastTickAt, 0.0, 0.1));
+    m_glintLastTickAt = now;
+    // Exponential easing: the glint trails the cursor slightly (liquid feel)
+    // and fades in/out over ~0.2 s.
+    constexpr float kFollowSeconds = 0.06F;
+    constexpr float kFadeSeconds = 0.18F;
+    const float follow = 1.0F - std::exp(-dt / kFollowSeconds);
+    const float fade = 1.0F - std::exp(-dt / kFadeSeconds);
+    m_glintX += (m_glintTargetX - m_glintX) * follow;
+    m_glintY += (m_glintTargetY - m_glintY) * follow;
+    m_glintStrength += (m_glintTargetStrength - m_glintStrength) * fade;
+
+    const bool positionSettled = (m_glintTargetStrength <= 0.0F && m_glintStrength < 0.002F) ||
+        (std::abs(m_glintTargetX - m_glintX) < 0.5F && std::abs(m_glintTargetY - m_glintY) < 0.5F);
+    const bool strengthSettled = std::abs(m_glintTargetStrength - m_glintStrength) < 0.002F;
+    if (positionSettled && strengthSettled) {
+        m_glintX = m_glintTargetX;
+        m_glintY = m_glintTargetY;
+        m_glintStrength = m_glintTargetStrength;
+        KillTimer(m_window, kGlintTimerId);
+        m_glintTimerRunning = false;
+    }
+    QueueRenderFrame(false);
+}
+
+void DockApp::StopGlint() noexcept {
+    if (m_glintTimerRunning && m_window != nullptr) {
+        KillTimer(m_window, kGlintTimerId);
+    }
+    m_glintTimerRunning = false;
+    m_glintStrength = 0.0F;
+    m_glintTargetStrength = 0.0F;
 }
 
 void DockApp::UpdateDividerScaleDrag(POINT screenCursor) {

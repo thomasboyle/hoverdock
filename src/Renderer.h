@@ -50,6 +50,11 @@ struct DockRenderState {
     // width so icons always clear the lensing band (see Shaders.hlsl).
     // (Previously wall-clock seconds; the shader never consumed it.)
     float dockScale = 1.0F;
+    // Pointer-reactive rim glint: dock-client px position and 0..1 strength
+    // (scene2). Strength 0 disables it.
+    float glintX = 0.0F;
+    float glintY = 0.0F;
+    float glintStrength = 0.0F;
     bool showDevBounds = false;
     bool allowBlockingGpuWait = true;
     bool skipIfGpuBusy = false;
@@ -143,7 +148,8 @@ private:
     struct alignas(256) FrameConstants {
         float scene0[4]{};
         float scene1[4]{};
-        std::byte padding[224]{};
+        float scene2[4]{};
+        std::byte padding[208]{};
     };
 
     struct IconInstanceConstants {

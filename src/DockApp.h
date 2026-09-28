@@ -131,6 +131,10 @@ private:
     static constexpr UINT_PTR kTrayTimerId = 7;
     static constexpr UINT_PTR kUpdateTimerId = 8;
     static constexpr UINT_PTR kCursorWatchTimerId = 9;
+    static constexpr UINT_PTR kGlintTimerId = 15;
+    // Pointer glint easing cadence (~60 Hz); the timer only runs while the
+    // glint is still converging on the cursor, so an idle dock costs nothing.
+    static constexpr UINT kGlintIntervalMs = 16;
     static constexpr UINT kUpdateIntervalMs = 6U * 60U * 60U * 1000U;
     static constexpr UINT kUpdateInitialDelayMs = 15000;
     static constexpr UINT kCursorWatchIntervalMs = 33;
@@ -368,6 +372,9 @@ private:
     void StopBackdropTimer() noexcept;
     void SyncBackdropTimerInterval(bool wantFast) noexcept;
     void HandlePointer(POINT cursor);
+    void UpdateGlintTarget(POINT cursor);
+    void TickGlint();
+    void StopGlint() noexcept;
     void HandleContextMenu(POINT screenPoint);
     [[nodiscard]] std::vector<ContextItem> BuildContextItems(int icon, DisplayApp& outApp,
         bool& outHasApp, bool& outIsSpecial) const;
@@ -597,6 +604,16 @@ private:
     // dock is open (or QS / Dock Settings / context) so BitBlt / Present cannot
     // stall WH_MOUSE_LL mid-move — including pointer motion over empty desktop.
     double m_lastPointerMotionAt = 0.0;
+    // Pointer-reactive rim glint (dock-client px). The eased values feed
+    // DockRenderState; targets follow the cursor while it is over the dock.
+    float m_glintX = 0.0F;
+    float m_glintY = 0.0F;
+    float m_glintStrength = 0.0F;
+    float m_glintTargetX = 0.0F;
+    float m_glintTargetY = 0.0F;
+    float m_glintTargetStrength = 0.0F;
+    double m_glintLastTickAt = 0.0;
+    bool m_glintTimerRunning = false;
     bool m_suppressDragUntilRelease = false;
     bool m_launchClickInProgress = false;
     std::wstring m_pressedTarget;

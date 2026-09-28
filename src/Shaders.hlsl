@@ -8,6 +8,7 @@ cbuffer FrameData : register(b0)
 {
     float4 scene0; // output width, output height, glass alpha, dock scale
     float4 scene1; // fx bitmask | icon count, DPI scale, dev bounds, backdrop valid
+    float4 scene2; // pointer glint x, y (output px), strength 0..1, unused
 };
 
 struct IconInstance
@@ -95,6 +96,43 @@ float SoftLensCap(float d, float lensMax)
 float FxEnabled(float packed, float bit)
 {
     return (((uint)packed) & (uint)bit) != 0u ? 1.0 : 0.0;
+}
+
+// Bevel (lens band) width. Panels refract as one full-face slab. The dock
+// confines the lens to an edge band about one corner radius wide so the
+// center stays flat and undistorted and only the rim bends (Apple edge
+// lensing). Shared by GlassPS and ComputeFrostUVs so all passes agree.
+float GlassBevelWidth(float2 halfSize, float cornerRadius, float dpi, bool isPanel)
+{
+    const float faceBevel = max(min(halfSize.x, halfSize.y) * 0.95, 8.0 * dpi);
+    return isPanel ? faceBevel : clamp(cornerRadius * 1.1, 8.0 * dpi, faceBevel);
+}
+
+// Icon-calm halos: 1 on/near an icon rect, 0 beyond a 10px feather. Live
+// count rides bits 8-13 of scene1.x; lookups capped at 64.
+float IconHaloCalm(float2 pixel, float dpi)
+{
+    const uint haloCount = min(((uint)scene1.x >> 8) & 63u, 64u);
+    float minIconDist = 1e9;
+    for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
+    {
+        if (haloIndex >= haloCount)
+        {
+            break;
+        }
+        const float4 haloRect = iconInstances[haloIndex].iconRect; // l,t,w,h px
+        const float2 haloCenter = haloRect.xy + haloRect.zw * 0.5;
+        const float2 haloQ = abs(pixel - haloCenter) - haloRect.zw * 0.5;
+        minIconDist = min(minIconDist, length(max(haloQ, 0.0)));
+    }
+    return 1.0 - smoothstep(0.0, 10.0 * dpi, minIconDist);
+}
+
+// Slope damping from the halos. The dock's lens band already sits outside
+// the icon field, so it only needs a light calm; panels keep the strong one.
+float IconHaloDamp(float haloCalm, bool isPanel)
+{
+    return 1.0 - haloCalm * (isPanel ? 0.9 : 0.35);
 }
 
 VertexOutput FullscreenVS(uint vertexId : SV_VertexID)
@@ -245,6 +283,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // drop shade into the margin outside the mask.
     // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
+    const bool isPanel = panelOn > 0.5;
     const float marginDev = (1.0 - panelOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli). Squircle n=4 gives
@@ -280,16 +319,18 @@ float4 GlassPS(VertexOutput input) : SV_Target
             return float4(0.0, 0.0, 0.0, 0.0);
         }
         // Soft outer contact shadow: the pill SDF re-evaluated with a small
-        // down-right offset (top-left key light), quadratic falloff over a
-        // 14px band. Premultiplied black over the desktop = drop shade via
-        // the DComp blend. Fits inside the layout margin (18px) with room.
-        const float2 shadowCenter = outputSize * 0.5 + float2(2.0, 6.0) * dpi;
+        // downward offset, falloff over a 16px band. Premultiplied black over
+        // the desktop = drop shade via the DComp blend. Fits inside the layout
+        // margin (18px). Panels: down-right key-light shade. Dock: lighter,
+        // centered ambient float with a smooth tail (Apple glass).
+        const float2 shadowOffset = isPanel ? float2(2.0, 6.0) : float2(0.0, 4.0);
+        const float2 shadowCenter = outputSize * 0.5 + shadowOffset * dpi;
         const float shadowSdf = SdSquircleBox(pixel - shadowCenter, halfSize, cornerRadius);
         const float shadowWidth = 16.0 * dpi;
         if (shadowSdf < shadowWidth)
         {
             float s = 1.0 - max(shadowSdf, 0.0) / shadowWidth;
-            const float shadowAlpha = s * s * 0.30;
+            const float shadowAlpha = isPanel ? s * s * 0.30 : s * s * (3.0 - 2.0 * s) * 0.20;
             return float4(0.0, 0.0, 0.0, shadowAlpha);
         }
         return float4(0.0, 0.0, 0.0, 0.0);
@@ -306,16 +347,16 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const bool hasBackdrop = scene1.w > 0.5;
     // Face accents use the over-white plate; the tone map below sets the body.
     // Rim/specular accents still reference this as the glass body color.
-    const float3 glassTint = DOCK_FACE_OVER_WHITE;
+    const float3 glassTint = DOCK_FROST_OVER_WHITE;
 
-    // ---- Bevel geometry: one slab -----------------------------------------
-    // The bevel spans the short half-axis so the whole face refracts as one
-    // convex lens: gentle magnification in the field, steep warp at the rim,
-    // exact calm only at the center point. minHalf already carries dpi and
-    // dock scale via the layout, so the lens stays proportional at every
-    // size. x = saturate(depth/bevel) still reaches 1 at the center because
-    // the SDF returns true interior depth.
-    float bevelWidth = max(min(halfSize.x, halfSize.y) * 0.95, 8.0 * dpi);
+    // ---- Bevel geometry ---------------------------------------------------
+    // Panels: the bevel spans the short half-axis so the whole face refracts
+    // as one convex lens. Dock: an edge band (see GlassBevelWidth) - steep
+    // warp at the rim, flat undistorted center. halfSize already carries dpi
+    // and dock scale via the layout, so the lens stays proportional at every
+    // size. x = saturate(depth/bevel) reaches 1 inside the band because the
+    // SDF returns true interior depth.
+    float bevelWidth = GlassBevelWidth(halfSize, cornerRadius, dpi, isPanel);
     const float x = saturate(insideDistance / max(bevelWidth, 1e-3)); // 0 rim -> 1 flat
     const float oneMinusX = 1.0 - x;
     const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
@@ -328,28 +369,12 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // relaxes toward flat, so refraction peaks in the background gaps
     // instead of crowding glyphs. (Icons are opaque and drawn undisplaced
     // on top regardless; this stills the glass around them.) Tint and frost
-    // are untouched - only the visible warp calms. Live count rides the high
-    // bits of scene1.x; lookups capped at 64.
-    const uint fxU = (uint)fxBits;
-    const uint haloCount = min((fxU >> 8) & 63u, 64u);
-    // Frost notches ride bits 17-18: 0 clear, 1 balanced, 2 full frost.
-    // (Frost-notch decoding retired with the 3-notch slider; frost is back
-    // to boolean DOCK_FX_BLUR.)
-    float minIconDist = 1e9;
-    for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
-    {
-        if (haloIndex >= haloCount)
-        {
-            break;
-        }
-        const float4 haloRect = iconInstances[haloIndex].iconRect; // l,t,w,h px
-        const float2 haloCenter = haloRect.xy + haloRect.zw * 0.5;
-        const float2 haloQ = abs(pixel - haloCenter) - haloRect.zw * 0.5;
-        minIconDist = min(minIconDist, length(max(haloQ, 0.0)));
-    }
-    const float haloCalm = 1.0 - smoothstep(0.0, 10.0 * dpi, minIconDist);
-    const float haloDamp = 1.0 - haloCalm * 0.9;
+    // are untouched - only the visible warp calms.
+    const float haloDamp = IconHaloDamp(IconHaloCalm(pixel, dpi), isPanel);
     slopeMag *= haloDamp;
+    // Panels also calm rim lights near glyphs; the dock keeps its rim
+    // highlight continuous around the silhouette.
+    const float rimLightDamp = isPanel ? haloDamp : 1.0;
     // Slab thickness T(x) = T0 + B*f(x), T0 = 0.35*bevel, B = 0.65*bevel.
     const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
@@ -453,9 +478,15 @@ float4 GlassPS(VertexOutput input) : SV_Target
     }
 
     // ---- 1. Face plate (Frost slider) -----------------------------------
-    // Dock: calibrated #3a..#e1 lift (clear Apple mix -> milky mica).
+    // Dock: vibrancy (saturation boost) then a light #28..#f2 veil (clear
+    // Apple mix -> milky glass) so the backdrop keeps its color and contrast.
     // Panels (DOCK_FX_PANEL): neutral charcoal plate (pre-sage Concept A+D)
     // with milk floor — live capture+blur, no sage wash on the dock bar.
+    if (!isPanel && hasBackdrop)
+    {
+        const float backdropLuma = dot(frostedBackground, float3(0.2126, 0.7152, 0.0722));
+        frostedBackground = saturate(lerp(backdropLuma.xxx, frostedBackground, DOCK_VIBRANCY));
+    }
     const float faceLo = lerp(DOCK_FACE_OVER_BLACK, DOCK_PANEL_FACE_OVER_BLACK, panelOn);
     const float faceHi = lerp(DOCK_FACE_OVER_WHITE, DOCK_PANEL_FACE_OVER_WHITE, panelOn);
     const float3 toneMapped = lerp(faceLo, faceHi, saturate(frostedBackground));
@@ -479,7 +510,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float3 fillDir = normalize(float3(0.55, 0.6, 0.45));
     const float fillSpec = pow(saturate(dot(surfN, fillDir)), 28.0) * bevelFactor;
     // Narrow Fresnel veil + thin bright rim caustic (not a chalk outline).
-    color += fresnel * float3(0.92, 0.96, 1.0) * 0.32 * pow(rim, 2.2) * rimGain * haloDamp;
+    color += fresnel * float3(0.92, 0.96, 1.0) * 0.32 * pow(rim, 2.2) * rimGain * rimLightDamp;
     color += specular * float3(1.0, 1.0, 1.0) * 0.78 * specOn;
     color += fillSpec * float3(0.75, 0.85, 1.0) * 0.12 * specOn;
 
@@ -492,15 +523,51 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // grounded edge. True outer shadow is drawn outside the mask below.
     const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
     color *= lerp(1.0, thicknessShade, thickOn);
-    color += glassTint * rim * 0.03 * rimGain * haloDamp;
+    color += glassTint * rim * 0.03 * rimGain * rimLightDamp;
     // Thin bright rim specular (Apple-style white edge light).
     // Panels: slightly stronger light-gray edge so the charcoal plate
-    // separates from busy wallpaper without a chalk outline.
-    const float rimStrength = lerp(0.58, 0.78, panelOn);
+    // separates from busy wallpaper without a chalk outline, lit via NdotL.
+    // Dock: Apple dual glint - the key light catches the top-left corner,
+    // internal reflection lights the opposite bottom-right corner, and the
+    // long edges keep only a faint line (no uniform outline).
+    // Pointer glint (dock only, scene2): the glint axis swings toward the
+    // cursor, as if the light source followed it.
+    const float glintStrength = isPanel ? 0.0 : saturate(scene2.z) * specOn;
+    const float2 glintPos = scene2.xy;
+    float2 glintAxis = float2(-0.70710678, -0.70710678);
+    if (glintStrength > 0.0)
+    {
+        const float2 fromCenter = (glintPos - outputSize * 0.5) / max(halfSize, float2(1.0, 1.0));
+        const float fromLen = length(fromCenter);
+        const float2 toward = fromCenter / max(fromLen, 1e-4);
+        const float swing = glintStrength * saturate(fromLen * 2.0);
+        const float2 swung = lerp(glintAxis, toward, swing);
+        glintAxis = swung / max(length(swung), 1e-4);
+    }
+    float rimFacing = 0.30 + 0.70 * ndl;
+    if (!isPanel)
+    {
+        const float facing = dot(outward, glintAxis);
+        rimFacing = 0.15 + 0.85 * pow(saturate(facing), 4.0) + 0.55 * pow(saturate(-facing), 4.0);
+    }
+    const float rimStrength = lerp(0.85, 0.78, panelOn);
     const float3 rimEdge = lerp(float3(1.0, 1.0, 1.0), float3(0.82, 0.84, 0.88), panelOn);
-    color += rimEdge * pow(rim, 10.0) * rimStrength * (0.30 + 0.70 * ndl) * rimGain * haloDamp;
+    color += rimEdge * pow(rim, 10.0) * rimStrength * rimFacing * rimGain * rimLightDamp;
+    if (glintStrength > 0.0)
+    {
+        // Local rim flare nearest the cursor plus a faint in-slab bloom.
+        const float2 toGlint = pixel - glintPos;
+        const float glintDist2 = dot(toGlint, toGlint);
+        const float rimSigma = 48.0 * dpi;
+        const float bloomSigma = 70.0 * dpi;
+        const float nearRim = exp(-glintDist2 / (2.0 * rimSigma * rimSigma));
+        const float bloom = exp(-glintDist2 / (2.0 * bloomSigma * bloomSigma));
+        color += float3(1.0, 1.0, 1.0) * pow(rim, 6.0) * 0.60 * nearRim * glintStrength * rimGain;
+        color += float3(0.92, 0.96, 1.0) * pow(rim, 2.2) * 0.12 * nearRim * glintStrength * rimGain;
+        color += float3(1.0, 1.0, 1.0) * 0.04 * bloom * glintStrength;
+    }
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
-    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.06 * rimGain * haloDamp;
+    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.06 * rimGain * rimLightDamp;
 
     if (scene1.z > 0.5)
     {
@@ -532,6 +599,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
 {
     // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
+    const bool isPanel = panelOn > 0.5;
     const float marginDev = (1.0 - panelOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
@@ -541,7 +609,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float2 uv = pixel * texel;
     const float2 outward = gradient / max(length(gradient), 0.0001);
     const float insideDistance = max(-distance, 0.0);
-    float bevelWidth = max(min(halfSize.x, halfSize.y) * 0.95, 8.0 * dpi);
+    float bevelWidth = GlassBevelWidth(halfSize, cornerRadius, dpi, isPanel);
     const float x = saturate(insideDistance / max(bevelWidth, 1e-3)); // 0 rim -> 1 flat
     const float oneMinusX = 1.0 - x;
     const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
@@ -551,21 +619,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float fxBits = scene1.x;
     const float lensOn = FxEnabled(fxBits, 2.0);
     const float dispOn = FxEnabled(fxBits, 4.0);
-    const uint haloCount = min(((uint)fxBits >> 8) & 63u, 64u);
-    float minIconDist = 1e9;
-    for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
-    {
-        if (haloIndex >= haloCount)
-        {
-            break;
-        }
-        const float4 haloRect = iconInstances[haloIndex].iconRect; // l,t,w,h px
-        const float2 haloCenter = haloRect.xy + haloRect.zw * 0.5;
-        const float2 haloQ = abs(pixel - haloCenter) - haloRect.zw * 0.5;
-        minIconDist = min(minIconDist, length(max(haloQ, 0.0)));
-    }
-    const float haloCalm = 1.0 - smoothstep(0.0, 10.0 * dpi, minIconDist);
-    slopeMag *= 1.0 - haloCalm * 0.9;
+    slopeMag *= IconHaloDamp(IconHaloCalm(pixel, dpi), isPanel);
     const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float thetaS = atan(slopeMag);
     const float sinS = sin(thetaS);

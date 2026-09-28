@@ -1398,6 +1398,10 @@ bool Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene1[1] = m_dpiScale;
     frame.mappedConstants->scene1[2] = state.showDevBounds ? 1.0F : 0.0F;
     frame.mappedConstants->scene1[3] = m_backdropValid ? 1.0F : 0.0F;
+    frame.mappedConstants->scene2[0] = state.glintX;
+    frame.mappedConstants->scene2[1] = state.glintY;
+    frame.mappedConstants->scene2[2] = state.glintStrength;
+    frame.mappedConstants->scene2[3] = 0.0F;
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3001,6 +3005,8 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         m_panelMappedConstants->scene1[1] = (std::max)(dpiScale, 1.0F);
         m_panelMappedConstants->scene1[2] = 0.0F;
         m_panelMappedConstants->scene1[3] = 1.0F;
+        std::fill(std::begin(m_panelMappedConstants->scene2),
+            std::end(m_panelMappedConstants->scene2), 0.0F);
 
         D3D12_TEXTURE_COPY_LOCATION srcLoc{};
         srcLoc.pResource = m_panelBackdropUpload.Get();
@@ -3390,6 +3396,8 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         m_panelMappedConstants->scene1[1] = (std::max)(dpiScale, 1.0F);
         m_panelMappedConstants->scene1[2] = 0.0F;
         m_panelMappedConstants->scene1[3] = 1.0F;
+        std::fill(std::begin(m_panelMappedConstants->scene2),
+            std::end(m_panelMappedConstants->scene2), 0.0F);
 
         D3D12_TEXTURE_COPY_LOCATION srcLoc{};
         srcLoc.pResource = m_panelBackdropUpload.Get();
