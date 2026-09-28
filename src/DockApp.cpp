@@ -5447,8 +5447,8 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     }
     case SettingsHitKind::CheckNow:
     case SettingsHitKind::PerfProfile:
-        // Base button is baked at 0.72 white; hover wants ~0.88. An extra
-        // translucent overlay brightens toward hover without redrawing text.
+        // Light frost fill (0.72) + dark charcoal label ink. Extra white overlay
+        // brightens toward hover (~0.88); dark ink stays readable on pressed too.
         FillRectPremul(pixels, width, height, hit.bounds, 0.16F);
         break;
     case SettingsHitKind::Startup:
@@ -6406,7 +6406,10 @@ void DockApp::PaintSettingsPopup() {
 
     const bool checking = m_updateInFlight.load() || m_updateInstalling.load();
     RECT buttonBounds{padding, y, panelWidth - padding, y + buttonHeight};
+    // macOS-style secondary actions on dark-glass: light frosted fill + dark charcoal
+    // label ink. Panel chrome stays light for titles/rows; flip only for these fills.
     FillRectPremul(pixels, width, height, buttonBounds, 0.72F);
+    SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
     DrawFlyoutText(pixels, width, height, buttonBounds, labelFont,
         checking ? L"Checking..." : L"Check for updates now",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 170 : 245);
@@ -6420,6 +6423,7 @@ void DockApp::PaintSettingsPopup() {
     DrawFlyoutText(pixels, width, height, perfBounds, labelFont,
         profiling ? L"Stop profiling" : L"Start performance profile",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, profiling ? 250 : 245);
+    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
     pushHit(SettingsHitKind::PerfProfile, perfBounds);
     y += buttonHeight + dividerGap;
     FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
