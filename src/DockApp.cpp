@@ -358,18 +358,9 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
         return;
     }
     // CPU popup fallback only (QS / Dock Settings / context). Match the
-    // Concept D Minimal Sage plate in GlassPS; dock never hits this.
-    // DIB order B,G,R for the sage RGB face map.
-    const float overBlack[3] = {
-        DOCK_PANEL_FACE_OVER_BLACK_B * 255.0F,
-        DOCK_PANEL_FACE_OVER_BLACK_G * 255.0F,
-        DOCK_PANEL_FACE_OVER_BLACK_R * 255.0F,
-    };
-    const float overWhite[3] = {
-        DOCK_PANEL_FACE_OVER_WHITE_B * 255.0F,
-        DOCK_PANEL_FACE_OVER_WHITE_G * 255.0F,
-        DOCK_PANEL_FACE_OVER_WHITE_R * 255.0F,
-    };
+    // panel charcoal plate in GlassPS; dock never hits this.
+    const float overBlack = DOCK_PANEL_FACE_OVER_BLACK * 255.0F;
+    const float overWhite = DOCK_PANEL_FACE_OVER_WHITE * 255.0F;
     const float frost = std::clamp(frostAmount, 0.0F, 1.0F);
     // Match GlassPS FrostPlateMix + panel milk floor.
     float plateMix = frost <= 0.5F ? (0.10F + 0.90F * (frost * 2.0F)) : 1.0F;
@@ -391,13 +382,13 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
             uint8_t* pixel = pixels + flat * 4U;
             for (int channel = 0; channel < 3; ++channel) {
                 const float frosted = static_cast<float>(pixel[channel]);
-                // Sage RGB face tone map (same as GlassPS), blended by plateMix.
+                // Neutral charcoal face tone map (same as GlassPS), blended by plateMix.
                 const float toneMapped =
-                    overBlack[channel] + (overWhite[channel] - overBlack[channel]) * (frosted / 255.0F);
+                    overBlack + (overWhite - overBlack) * (frosted / 255.0F);
                 float mapped = frosted + (toneMapped - frosted) * plateMix;
-                const float target = mapped * kChannelK[channel] + overWhite[channel] * 0.08F;
+                const float target = mapped * kChannelK[channel] + overWhite * 0.08F;
                 float shaded = mapped + 0.22F * (target - mapped);
-                shaded += overWhite[channel] * rim * 0.12F + 255.0F * rim4 * 0.18F;
+                shaded += overWhite * rim * 0.12F + 255.0F * rim4 * 0.18F;
                 shaded = std::clamp(shaded + noise, 0.0F, 255.0F);
                 pixel[channel] = static_cast<uint8_t>(std::lround(shaded * shape * alpha));
             }
@@ -5477,7 +5468,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     }
     case SettingsHitKind::CheckNow:
     case SettingsHitKind::PerfProfile:
-        // Olive sage bar (#98A869) + forest label ink. Extra white overlay
+        // Olive sage bar (#98A869) + light chrome label ink. Extra white overlay
         // brightens toward hover; forest ink stays readable on pressed too.
         FillRectPremul(pixels, width, height, hit.bounds, 0.14F);
         break;
@@ -6379,8 +6370,8 @@ void DockApp::PaintSettingsPopup() {
         FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
     };
 
-    // Concept D Minimal Sage: forest chrome (#24362E) on the light sage plate.
-    SetFlyoutChromeInk(DOCK_PANEL_INK_R, DOCK_PANEL_INK_G, DOCK_PANEL_INK_B);
+    // Light chrome ink on the charcoal panel plate.
+    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
@@ -6435,8 +6426,8 @@ void DockApp::PaintSettingsPopup() {
 
     const bool checking = m_updateInFlight.load() || m_updateInstalling.load();
     RECT buttonBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    // Concept D: lighter #98A869 wash plate + forest label ink (already set).
-    // Idle alpha kept soft so empty buttons read clearly on Minimal Sage.
+    // #98A869 wash plate + light chrome label ink (already set).
+    // Idle alpha kept soft so empty buttons read clearly on charcoal glass.
     FillRectColorPremul(pixels, width, height, buttonBounds, 0.50F,
         DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
     DrawFlyoutText(pixels, width, height, buttonBounds, labelFont,
@@ -7205,9 +7196,9 @@ void DockApp::PaintOverflowPopup() {
         return hasHover && hoveredHit.kind == kind && hoveredHit.index == index;
     };
 
-    // Concept D Minimal Sage: forest chrome so QS title, tile labels, and
-    // glyphs stay readable on the light olive-sage (#98A869) tile plates.
-    SetFlyoutChromeInk(DOCK_PANEL_INK_R, DOCK_PANEL_INK_G, DOCK_PANEL_INK_B);
+    // Light chrome ink so QS title, tile labels, and
+    // glyphs stay readable on the #98A869 tile plates over charcoal glass.
+    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - gearSize - 8, y + headerHeight};
@@ -8470,16 +8461,16 @@ void DockApp::PaintContextMenu() {
     m_contextGlyphs.clear();
     m_contextGlyphs.reserve(m_contextItems.size());
 
-    // Same Minimal Sage plate as QS/Dock Settings: forest chrome for labels/glyphs.
-    SetFlyoutChromeInk(DOCK_PANEL_INK_R, DOCK_PANEL_INK_G, DOCK_PANEL_INK_B);
+    // Same charcoal plate as QS/Dock Settings: light chrome for labels/glyphs.
+    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
 
     const UINT glyphExtent =
         static_cast<UINT>(std::max(14L, std::lround(20.0F * scale)));
     for (const ContextItem& item : m_contextItems) {
         if (item.glyph != 0) {
             m_contextGlyphs.push_back(m_tray.RasterizeSymbol(item.glyph, glyphExtent));
-            RemapPremulInkColor(m_contextGlyphs.back(), DOCK_PANEL_INK_R, DOCK_PANEL_INK_G,
-                DOCK_PANEL_INK_B);
+            RemapPremulInkColor(m_contextGlyphs.back(), DOCK_CHROME_INK_R, DOCK_CHROME_INK_G,
+                DOCK_CHROME_INK_B);
         } else {
             m_contextGlyphs.emplace_back();
         }

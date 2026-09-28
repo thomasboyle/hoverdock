@@ -37,20 +37,17 @@
 #define DOCK_GLASS_MIX 0.85f
 #define DOCK_GLASS_ALPHA 0.97f
 
-// Panel (Quick Settings / Dock Settings / context) - Concept D Minimal Sage.
-// Light sage-frosted plate (#F1F6F3) at high opacity with blur still readable
-// through the milk. Dock bar keeps DOCK_FACE_* above; GlassPS branches on
-// DOCK_FX_PANEL so shared constants do not wash the dock chrome.
-#define DOCK_PANEL_FACE_OVER_BLACK_R (220.0f / 255.0f)  // soft sage milk over dark WP
-#define DOCK_PANEL_FACE_OVER_BLACK_G (232.0f / 255.0f)
-#define DOCK_PANEL_FACE_OVER_BLACK_B (225.0f / 255.0f)
-#define DOCK_PANEL_FACE_OVER_WHITE_R (241.0f / 255.0f)  // #F1F6F3 sage off-white
-#define DOCK_PANEL_FACE_OVER_WHITE_G (246.0f / 255.0f)
-#define DOCK_PANEL_FACE_OVER_WHITE_B (243.0f / 255.0f)
-// Forest chrome ink for panel glyphs/labels (#24362E).
-#define DOCK_PANEL_INK_R 36
-#define DOCK_PANEL_INK_G 54
-#define DOCK_PANEL_INK_B 46
+// Panel (Quick Settings / Dock Settings / context) - neutral dark glass.
+// Charcoal plate (pre-sage Concept A+D) so live capture+blur reads without a
+// sage wash. Dock bar keeps DOCK_FACE_* above; GlassPS branches on DOCK_FX_PANEL.
+// Alpha 1.0: layered ULW must be fully opaque so the one-shot/live bake is the
+// only backdrop (alpha < 1 composited a frozen snapshot OVER live desktop).
+#define DOCK_PANEL_FACE_OVER_BLACK (26.0f / 255.0f)  // ~#1a1a1a charcoal
+#define DOCK_PANEL_FACE_OVER_WHITE (68.0f / 255.0f)  // ~#444444 over light WP
+// Light chrome ink on dark plate (forest sage ink is unreadable here).
+#define DOCK_PANEL_INK_R DOCK_CHROME_INK_R
+#define DOCK_PANEL_INK_G DOCK_CHROME_INK_G
+#define DOCK_PANEL_INK_B DOCK_CHROME_INK_B
 // Legacy icon-plate (unused by QS tiles since 1.1.57; kept for reference).
 #define DOCK_PANEL_ICON_R 94
 #define DOCK_PANEL_ICON_G 127
@@ -59,12 +56,12 @@
 #define DOCK_PANEL_TOGGLE_R 152
 #define DOCK_PANEL_TOGGLE_G 168
 #define DOCK_PANEL_TOGGLE_B 105
-// High plate milk so the sage face reads; still below solid chrome.
-#define DOCK_PANEL_PLATE_MIX_FLOOR 0.76f
+// Milk floor for charcoal plate readability (same as 1.1.52 dark glass).
+#define DOCK_PANEL_PLATE_MIX_FLOOR 0.62f
 // Floor frost for mica radii / blur so wallpaper detail dissolves under glyphs.
 #define DOCK_PANEL_FROST_BLUR_FLOOR 0.45f
-// High opacity light frost - translucent glass, not opaque paint.
-#define DOCK_PANEL_GLASS_ALPHA 0.955f
+// Fully opaque plate: live look comes only from TickLivePopupGlass rebakes.
+#define DOCK_PANEL_GLASS_ALPHA 1.0f
 
 // Drop-shadow margin around the dock pill, shared by layout (window
 // inflation, input-region inset, popup anchors) and the glass shader (pill
