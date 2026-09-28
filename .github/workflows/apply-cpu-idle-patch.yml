@@ -1,5 +1,6 @@
 name: Apply CPU idle patch
 on:
+  workflow_dispatch:
   push:
     branches:
       - cursor/cpu-under-1pct-a6f3
@@ -16,6 +17,7 @@ jobs:
         with:
           ref: cursor/cpu-under-1pct-a6f3
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Restore sources from main and apply patch
         run: |
           git fetch origin main
@@ -26,6 +28,7 @@ jobs:
             echo "No changes after patch; skipping commit."
             exit 0
           fi
-          git rm -f .github/workflows/apply-cpu-idle-patch.yml patches/cpu-under-1pct.patch
+          git rm -f .github/workflows/apply-cpu-idle-patch.yml patches/cpu-under-1pct.patch || true
+          git add -A
           git commit -m "fix: idle CPU under 1% without changing dock behavior"
           git push origin HEAD:cursor/cpu-under-1pct-a6f3
