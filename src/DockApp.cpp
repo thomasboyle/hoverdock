@@ -1,1 +1,1 @@
-REPLACEME
+test-inline-small
