@@ -277,6 +277,22 @@ bool PerfProfiler::CollectSample(HANDLE process, DWORD pid, double wallSeconds, 
     ULONG64 cycles = 0;
     QueryProcessCycleTime(process, &cycles);
 
+    // VirtualQueryEx walks ~4 GB of VA and the toolhelp snapshot allocates.
+    // Doing both every 200 ms sample was itself a soft-fault source while a
+    // profile was running. Refresh about once a second; this thread is the
+    // only caller.
+    struct HeavyQueryCache {
+        double checkedAtMs = -1.0e12;
+        uint64_t virtualSize = 0;
+        DWORD threadCount = 0;
+    };
+    static HeavyQueryCache heavy;
+    if (elapsedMs - heavy.checkedAtMs >= 1000.0) {
+        heavy.virtualSize = QueryVirtualSize(process);
+        heavy.threadCount = QueryThreadCount(pid);
+        heavy.checkedAtMs = elapsedMs;
+    }
+
     out = {};
     out.wallSeconds = wallSeconds;
     out.elapsedMs = elapsedMs;
@@ -287,10 +303,10 @@ bool PerfProfiler::CollectSample(HANDLE process, DWORD pid, double wallSeconds, 
     out.workingSet = memory.WorkingSetSize;
     out.peakWorkingSet = memory.PeakWorkingSetSize;
     out.privateBytes = memory.PrivateUsage;
-    out.virtualSize = QueryVirtualSize(process);
+    out.virtualSize = heavy.virtualSize;
     out.pageFaults = memory.PageFaultCount;
     out.handleCount = handles;
-    out.threadCount = QueryThreadCount(pid);
+    out.threadCount = heavy.threadCount;
     out.gdiCount = GetGuiResources(process, GR_GDIOBJECTS);
     out.userCount = GetGuiResources(process, GR_USEROBJECTS);
     out.ioReadBytes = io.ReadTransferCount;
