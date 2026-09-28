@@ -454,11 +454,14 @@ float4 GlassPS(VertexOutput input) : SV_Target
 
     // ---- 1. Face plate (Frost slider) -----------------------------------
     // Dock: calibrated #3a..#e1 lift (clear Apple mix -> milky mica).
-    // Panels (DOCK_FX_PANEL): dark charcoal plate (Concept A) with a higher
-    // milk floor (Concept D) so white text / blue tiles / amber toggles stay
-    // readable on busy wallpapers without washing the dock bar.
-    const float faceLo = lerp(DOCK_FACE_OVER_BLACK, DOCK_PANEL_FACE_OVER_BLACK, panelOn);
-    const float faceHi = lerp(DOCK_FACE_OVER_WHITE, DOCK_PANEL_FACE_OVER_WHITE, panelOn);
+    // Panels (DOCK_FX_PANEL): Concept D Minimal Sage light frosted plate
+    // (#F1F6F3) with high milk floor — translucent glass, dock bar untouched.
+    const float3 panelLo = float3(DOCK_PANEL_FACE_OVER_BLACK_R, DOCK_PANEL_FACE_OVER_BLACK_G,
+        DOCK_PANEL_FACE_OVER_BLACK_B);
+    const float3 panelHi = float3(DOCK_PANEL_FACE_OVER_WHITE_R, DOCK_PANEL_FACE_OVER_WHITE_G,
+        DOCK_PANEL_FACE_OVER_WHITE_B);
+    const float3 faceLo = lerp(DOCK_FACE_OVER_BLACK.xxx, panelLo, panelOn);
+    const float3 faceHi = lerp(DOCK_FACE_OVER_WHITE.xxx, panelHi, panelOn);
     const float3 toneMapped = lerp(faceLo, faceHi, saturate(frostedBackground));
     float plateMix = FrostPlateMix(frostAmount);
     plateMix = max(plateMix, panelOn * DOCK_PANEL_PLATE_MIX_FLOOR);
@@ -495,10 +498,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     color *= lerp(1.0, thicknessShade, thickOn);
     color += glassTint * rim * 0.03 * rimGain * haloDamp;
     // Thin bright rim specular (Apple-style white edge light).
-    // Panels: slightly stronger light-gray edge (Concept A thin rim) so the
-    // dark plate separates from busy wallpaper without a chalk outline.
-    const float rimStrength = lerp(0.58, 0.78, panelOn);
-    const float3 rimEdge = lerp(float3(1.0, 1.0, 1.0), float3(0.82, 0.84, 0.88), panelOn);
+    // Panels: soft sage-tinted edge on the light frosted plate (Concept D) —
+    // separates from wallpaper without chalk or dark-chrome outline.
+    const float rimStrength = lerp(0.58, 0.50, panelOn);
+    const float3 rimEdge = lerp(float3(1.0, 1.0, 1.0), float3(0.84, 0.90, 0.86), panelOn);
     color += rimEdge * pow(rim, 10.0) * rimStrength * (0.30 + 0.70 * ndl) * rimGain * haloDamp;
     const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
     color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.06 * rimGain * haloDamp;

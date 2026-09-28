@@ -358,9 +358,18 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
         return;
     }
     // CPU popup fallback only (QS / Dock Settings / context). Match the
-    // panel dark-glass plate in GlassPS (Concept A+D); dock never hits this.
-    const float overBlack = DOCK_PANEL_FACE_OVER_BLACK * 255.0F;
-    const float overWhite = DOCK_PANEL_FACE_OVER_WHITE * 255.0F;
+    // Concept D Minimal Sage plate in GlassPS; dock never hits this.
+    // DIB order B,G,R for the sage RGB face map.
+    const float overBlack[3] = {
+        DOCK_PANEL_FACE_OVER_BLACK_B * 255.0F,
+        DOCK_PANEL_FACE_OVER_BLACK_G * 255.0F,
+        DOCK_PANEL_FACE_OVER_BLACK_R * 255.0F,
+    };
+    const float overWhite[3] = {
+        DOCK_PANEL_FACE_OVER_WHITE_B * 255.0F,
+        DOCK_PANEL_FACE_OVER_WHITE_G * 255.0F,
+        DOCK_PANEL_FACE_OVER_WHITE_R * 255.0F,
+    };
     const float frost = std::clamp(frostAmount, 0.0F, 1.0F);
     // Match GlassPS FrostPlateMix + panel milk floor.
     float plateMix = frost <= 0.5F ? (0.10F + 0.90F * (frost * 2.0F)) : 1.0F;
@@ -382,13 +391,13 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
             uint8_t* pixel = pixels + flat * 4U;
             for (int channel = 0; channel < 3; ++channel) {
                 const float frosted = static_cast<float>(pixel[channel]);
-                // Calibrated face tone map (same as GlassPS), blended by plateMix.
+                // Sage RGB face tone map (same as GlassPS), blended by plateMix.
                 const float toneMapped =
-                    overBlack + (overWhite - overBlack) * (frosted / 255.0F);
+                    overBlack[channel] + (overWhite[channel] - overBlack[channel]) * (frosted / 255.0F);
                 float mapped = frosted + (toneMapped - frosted) * plateMix;
-                const float target = mapped * kChannelK[channel] + overWhite * 0.08F;
+                const float target = mapped * kChannelK[channel] + overWhite[channel] * 0.08F;
                 float shaded = mapped + 0.22F * (target - mapped);
-                shaded += overWhite * rim * 0.12F + 255.0F * rim4 * 0.18F;
+                shaded += overWhite[channel] * rim * 0.12F + 255.0F * rim4 * 0.18F;
                 shaded = std::clamp(shaded + noise, 0.0F, 255.0F);
                 pixel[channel] = static_cast<uint8_t>(std::lround(shaded * shape * alpha));
             }
@@ -886,16 +895,36 @@ void FillRectPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, f
     }
 }
 
-// Amber accent shared with the dock's running-indicator dot
-// (Shaders.hlsl runningDot = float3(1.0, 191/255, 0.0)). DIB order: B, G, R.
-constexpr uint8_t kAmberB = 0;
-constexpr uint8_t kAmberG = 191;
-constexpr uint8_t kAmberR = 255;
+void FillRectColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, float alpha,
+    uint8_t blue, uint8_t green, uint8_t red) {
+    const int left = std::max(0L, bounds.left);
+    const int top = std::max(0L, bounds.top);
+    const int right = std::min(static_cast<LONG>(destWidth), bounds.right);
+    const int bottom = std::min(static_cast<LONG>(destHeight), bounds.bottom);
+    const float a = std::clamp(alpha, 0.0F, 1.0F);
+    uint8_t pixel[4] = {
+        static_cast<uint8_t>(std::lround(static_cast<float>(blue) * a)),
+        static_cast<uint8_t>(std::lround(static_cast<float>(green) * a)),
+        static_cast<uint8_t>(std::lround(static_cast<float>(red) * a)),
+        static_cast<uint8_t>(std::lround(255.0F * a)),
+    };
+    for (int y = top; y < bottom; ++y) {
+        for (int x = left; x < right; ++x) {
+            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+        }
+    }
+}
 
-// Quick Settings control circles (#1a91dc). DIB order: B, G, R.
-constexpr uint8_t kQuickAccentB = 0xDC;
-constexpr uint8_t kQuickAccentG = 0x91;
-constexpr uint8_t kQuickAccentR = 0x1A;
+// Concept D Minimal Sage — panel toggles/slider (#BFDDBE Sage 300).
+// Dock running-indicator dot stays amber in Shaders.hlsl. DIB order: B, G, R.
+constexpr uint8_t kAmberB = DOCK_PANEL_TOGGLE_B;
+constexpr uint8_t kAmberG = DOCK_PANEL_TOGGLE_G;
+constexpr uint8_t kAmberR = DOCK_PANEL_TOGGLE_R;
+
+// Quick Settings control circles (#5E7F6C Sage 500). DIB order: B, G, R.
+constexpr uint8_t kQuickAccentB = DOCK_PANEL_ICON_B;
+constexpr uint8_t kQuickAccentG = DOCK_PANEL_ICON_G;
+constexpr uint8_t kQuickAccentR = DOCK_PANEL_ICON_R;
 
 void FillPillColorPremul(uint8_t* dest, int destWidth, int destHeight, float cxLeft,
     float cxRight, float cy, float radius, float alpha, uint8_t blue, uint8_t green,
@@ -5447,9 +5476,9 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     }
     case SettingsHitKind::CheckNow:
     case SettingsHitKind::PerfProfile:
-        // Light frost fill (0.72) + dark charcoal label ink. Extra white overlay
-        // brightens toward hover (~0.88); dark ink stays readable on pressed too.
-        FillRectPremul(pixels, width, height, hit.bounds, 0.16F);
+        // Light sage bar + forest label ink. Extra white overlay brightens
+        // toward hover; forest ink stays readable on pressed too.
+        FillRectPremul(pixels, width, height, hit.bounds, 0.14F);
         break;
     case SettingsHitKind::Startup:
     case SettingsHitKind::Updates:
@@ -6319,7 +6348,7 @@ void DockApp::PaintSettingsPopup() {
         const float trackCy = static_cast<float>(trackTop) + trackRadius;
         const float wash = enabled ? (hovered ? 0.96F : 0.90F) : (hovered ? 0.55F : 0.48F);
         if (enabled) {
-            // On = amber accent, matching the dock's running-indicator dot.
+            // On = Sage 300 toggle fill (Concept D Minimal Sage).
             FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
                 wash, kAmberB, kAmberG, kAmberR);
         } else {
@@ -6349,9 +6378,8 @@ void DockApp::PaintSettingsPopup() {
         FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
     };
 
-    // Dark charcoal panel plate (Concept A): always light chrome so labels,
-    // version line, and glyphs stay high-contrast on busy wallpapers.
-    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
+    // Concept D Minimal Sage: forest chrome (#24362E) on the light sage plate.
+    SetFlyoutChromeInk(DOCK_PANEL_INK_R, DOCK_PANEL_INK_G, DOCK_PANEL_INK_B);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
@@ -6406,10 +6434,9 @@ void DockApp::PaintSettingsPopup() {
 
     const bool checking = m_updateInFlight.load() || m_updateInstalling.load();
     RECT buttonBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    // macOS-style secondary actions on dark-glass: light frosted fill + dark charcoal
-    // label ink. Panel chrome stays light for titles/rows; flip only for these fills.
-    FillRectPremul(pixels, width, height, buttonBounds, 0.72F);
-    SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
+    // Concept D: light sage bars (#BFDDBE) + forest label ink (already set).
+    FillRectColorPremul(pixels, width, height, buttonBounds, 0.82F,
+        DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
     DrawFlyoutText(pixels, width, height, buttonBounds, labelFont,
         checking ? L"Checking..." : L"Check for updates now",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 170 : 245);
@@ -6418,12 +6445,12 @@ void DockApp::PaintSettingsPopup() {
 
     const bool profiling = m_perfProfiler.IsRunning();
     RECT perfBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    // Slightly brighter wash while active so running state reads clearly.
-    FillRectPremul(pixels, width, height, perfBounds, profiling ? 0.88F : 0.72F);
+    // Slightly stronger sage wash while active so running state reads clearly.
+    FillRectColorPremul(pixels, width, height, perfBounds, profiling ? 0.94F : 0.82F,
+        DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
     DrawFlyoutText(pixels, width, height, perfBounds, labelFont,
         profiling ? L"Stop profiling" : L"Start performance profile",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, profiling ? 250 : 245);
-    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
     pushHit(SettingsHitKind::PerfProfile, perfBounds);
     y += buttonHeight + dividerGap;
     FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
@@ -7176,9 +7203,9 @@ void DockApp::PaintOverflowPopup() {
         return hasHover && hoveredHit.kind == kind && hoveredHit.index == index;
     };
 
-    // Dark charcoal panel plate (Concept A): force light chrome so QS title,
-    // tile labels, and glyphs stay readable (blue tiles / amber state intact).
-    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
+    // Concept D Minimal Sage: forest chrome so QS title, tile labels, and
+    // glyphs stay readable on the light sage plate (Sage 500 tiles intact).
+    SetFlyoutChromeInk(DOCK_PANEL_INK_R, DOCK_PANEL_INK_G, DOCK_PANEL_INK_B);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - gearSize - 8, y + headerHeight};
@@ -7235,7 +7262,7 @@ void DockApp::PaintOverflowPopup() {
         const float tileRadius = static_cast<float>(circle) * 0.5F;
         const bool isSlider = tiles[index].kind == TrayFlyoutHitKind::Sound ||
             tiles[index].kind == TrayFlyoutHitKind::Brightness;
-        // Level meter source of truth (also drives the amber state): muted
+        // Level meter source of truth (also drives the sage accent state): muted
         // (sound) or unavailable (brightness) renders empty unless a projected
         // scroll value is being shown.
         const TrayStatus& trayStatus = m_tray.Status();
@@ -7253,14 +7280,14 @@ void DockApp::PaintOverflowPopup() {
             (tiles[index].kind == TrayFlyoutHitKind::Wifi &&
                 trayStatus.network != TrayNetworkKind::Disconnected);
         if (isSlider) {
-            // Dim accent disc plus stronger #1a91dc fill rising with progress.
+            // Dim Sage 500 disc plus stronger fill rising with progress.
             // Hover ring is applied later in ApplyOverflowHoverHighlight.
             FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.48F,
                 kQuickAccentB, kQuickAccentG, kQuickAccentR);
             FillCircleLevelColorPremul(pixels, width, height, cx, cy, tileRadius, level, 0.88F,
                 kQuickAccentB, kQuickAccentG, kQuickAccentR);
         } else if (isFullAmber) {
-            // Full accent disc when the toggle is on (Wi-Fi connected / Boost).
+            // Full Sage 500 disc when the toggle is on (Wi-Fi connected / Boost).
             FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.82F,
                 kQuickAccentB, kQuickAccentG, kQuickAccentR);
         } else {
@@ -8440,16 +8467,16 @@ void DockApp::PaintContextMenu() {
     m_contextGlyphs.clear();
     m_contextGlyphs.reserve(m_contextItems.size());
 
-    // Same dark-glass plate as QS/Dock Settings: light chrome for labels/glyphs.
-    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
+    // Same Minimal Sage plate as QS/Dock Settings: forest chrome for labels/glyphs.
+    SetFlyoutChromeInk(DOCK_PANEL_INK_R, DOCK_PANEL_INK_G, DOCK_PANEL_INK_B);
 
     const UINT glyphExtent =
         static_cast<UINT>(std::max(14L, std::lround(20.0F * scale)));
     for (const ContextItem& item : m_contextItems) {
         if (item.glyph != 0) {
             m_contextGlyphs.push_back(m_tray.RasterizeSymbol(item.glyph, glyphExtent));
-            RemapPremulInkColor(m_contextGlyphs.back(), DOCK_CHROME_INK_R, DOCK_CHROME_INK_G,
-                DOCK_CHROME_INK_B);
+            RemapPremulInkColor(m_contextGlyphs.back(), DOCK_PANEL_INK_R, DOCK_PANEL_INK_G,
+                DOCK_PANEL_INK_B);
         } else {
             m_contextGlyphs.emplace_back();
         }
