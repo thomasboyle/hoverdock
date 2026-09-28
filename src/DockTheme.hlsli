@@ -51,11 +51,11 @@
 #define DOCK_PANEL_INK_R 36
 #define DOCK_PANEL_INK_G 54
 #define DOCK_PANEL_INK_B 46
-// QS circle accents / icon plate (#5E7F6C Sage 500).
+// Legacy icon-plate (unused by QS tiles since 1.1.57; kept for reference).
 #define DOCK_PANEL_ICON_R 94
 #define DOCK_PANEL_ICON_G 127
 #define DOCK_PANEL_ICON_B 108
-// Toggles + frost slider / action accent (#98A869 olive sage).
+// Toggles + frost slider / QS tile + action accent (#98A869 olive sage).
 #define DOCK_PANEL_TOGGLE_R 152
 #define DOCK_PANEL_TOGGLE_G 168
 #define DOCK_PANEL_TOGGLE_B 105

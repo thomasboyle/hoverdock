@@ -921,10 +921,11 @@ constexpr uint8_t kAmberB = DOCK_PANEL_TOGGLE_B;
 constexpr uint8_t kAmberG = DOCK_PANEL_TOGGLE_G;
 constexpr uint8_t kAmberR = DOCK_PANEL_TOGGLE_R;
 
-// Quick Settings control circles (#5E7F6C Sage 500). DIB order: B, G, R.
-constexpr uint8_t kQuickAccentB = DOCK_PANEL_ICON_B;
-constexpr uint8_t kQuickAccentG = DOCK_PANEL_ICON_G;
-constexpr uint8_t kQuickAccentR = DOCK_PANEL_ICON_R;
+// Quick Settings control circles (#98A869 olive sage — same as Dock Settings).
+// DIB order: B, G, R.
+constexpr uint8_t kQuickAccentB = DOCK_PANEL_TOGGLE_B;
+constexpr uint8_t kQuickAccentG = DOCK_PANEL_TOGGLE_G;
+constexpr uint8_t kQuickAccentR = DOCK_PANEL_TOGGLE_R;
 
 void FillPillColorPremul(uint8_t* dest, int destWidth, int destHeight, float cxLeft,
     float cxRight, float cy, float radius, float alpha, uint8_t blue, uint8_t green,
@@ -7205,7 +7206,7 @@ void DockApp::PaintOverflowPopup() {
     };
 
     // Concept D Minimal Sage: forest chrome so QS title, tile labels, and
-    // glyphs stay readable on the light sage plate (Sage 500 tiles intact).
+    // glyphs stay readable on the light olive-sage (#98A869) tile plates.
     SetFlyoutChromeInk(DOCK_PANEL_INK_R, DOCK_PANEL_INK_G, DOCK_PANEL_INK_B);
 
     LONG y = padding;
@@ -7281,18 +7282,19 @@ void DockApp::PaintOverflowPopup() {
             (tiles[index].kind == TrayFlyoutHitKind::Wifi &&
                 trayStatus.network != TrayNetworkKind::Disconnected);
         if (isSlider) {
-            // Dim Sage 500 disc plus stronger fill rising with progress.
+            // Light #98A869 wash plate plus stronger fill rising with progress.
             // Hover ring is applied later in ApplyOverflowHoverHighlight.
-            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.48F,
+            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.50F,
                 kQuickAccentB, kQuickAccentG, kQuickAccentR);
             FillCircleLevelColorPremul(pixels, width, height, cx, cy, tileRadius, level, 0.88F,
                 kQuickAccentB, kQuickAccentG, kQuickAccentR);
         } else if (isFullAmber) {
-            // Full Sage 500 disc when the toggle is on (Wi-Fi connected / Boost).
-            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.82F,
+            // Stronger #98A869 disc when the toggle is on (Wi-Fi connected / Boost).
+            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.70F,
                 kQuickAccentB, kQuickAccentG, kQuickAccentR);
         } else {
-            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.48F,
+            // Idle plate: lighter wash so empty tiles read clearly (match Dock Settings).
+            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.50F,
                 kQuickAccentB, kQuickAccentG, kQuickAccentR);
         }
         // Glyph bitmaps are cached by EnsureOverflowGlyphs above; hover repaints only composite.
