@@ -2021,11 +2021,13 @@ int DockApp::Run() {
         HANDLE frameWaitable = slideAnimating ? m_renderer.FrameLatencyWaitableObject() : nullptr;
         const DWORD count = frameWaitable == nullptr ? 0 : 1;
         const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
-        // WH_MOUSE_LL runs on this thread; the idle wake mask must include QS_INPUT
-        // so MsgWait returns and the hook proc can finish before LowLevelHooksTimeout.
+        // WH_MOUSE_LL is delivered by a sent message, which sets QS_SENDMESSAGE.
+        // That bit is in QS_ALLINPUT but not QS_INPUT, so an idle wait missed the
+        // hook until LowLevelHooksTimeout and the system cursor stalled. The dock
+        // stayed smooth because its 16 ms glint timer still woke this thread.
         const DWORD wakeMask = (slideAnimating || m_dragSnapAnimating)
             ? QS_ALLINPUT
-            : (QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT);
+            : (QS_SENDMESSAGE | QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT);
         const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, wakeMask,
             MWMO_INPUTAVAILABLE);
 
@@ -2355,7 +2357,8 @@ LRESULT CALLBACK DockApp::ContextWindowProcedure(HWND window, UINT message, WPAR
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-        if (wParam == WM_MOUSEMOVE && !s_instance->IsDragActive()) {
+        if (wParam == WM_MOUSEMOVE && !s_instance->IsDragActive() &&
+            s_instance->NeedsHookPointerPost(mouse->pt)) {
             static POINT s_lastPostedCursor{std::numeric_limits<LONG>::min(),
                 std::numeric_limits<LONG>::min()};
             if (mouse->pt.x != s_lastPostedCursor.x || mouse->pt.y != s_lastPostedCursor.y) {
