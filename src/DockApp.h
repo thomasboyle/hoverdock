@@ -1,1 +1,1 @@
-__python__:open('/workspace/hoverdock/src/DockApp.h',encoding='utf-8').read()
+cursor-file:///workspace/hoverdock/src/DockApp.h

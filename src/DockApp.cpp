@@ -1,0 +1,1 @@
+cursor-file:///workspace/hoverdock/src/DockApp.cpp
