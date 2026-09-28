@@ -144,15 +144,18 @@ private:
     static constexpr UINT kBackdropIntervalMs = 8;
     // Idle DWM / unchanged-capture backoff for the backdrop timer. Live menus
     // force the fast cadence so TickLivePopupGlass stays ~120 Hz.
-    static constexpr UINT kBackdropIdleIntervalMs = 33;
+    static constexpr UINT kBackdropIdleIntervalMs = 250;
+    // Static desktop + resting dock: one DWM probe per second (no Present).
+    static constexpr UINT kBackdropRestingIntervalMs = 2000;
     static constexpr UINT kBackdropIdleHysteresisTicks = 1;
+    static constexpr UINT kBackdropRestingHysteresisTicks = 2;
     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
     static constexpr UINT kTaskbarMonitorSlowIntervalMs = 5000;
     static constexpr int kTaskbarMonitorCalmPasses = 5;
     static constexpr UINT kTrayIntervalMs = 1000;
     // Dock face clock uses TIME_NOSECONDS. While Quick Settings is closed, StartTrayTimer
     // arms for the next minute boundary (not a fixed 30 s idle) so the face clock moves.
-    static constexpr UINT kCursorWatchCalmIntervalMs = 100;
+    static constexpr UINT kCursorWatchCalmIntervalMs = 250;
     static constexpr UINT kContextOpen = 1;
     static constexpr UINT kContextOpenLocation = 2;
     static constexpr UINT kContextClose = 3;
@@ -370,7 +373,7 @@ private:
     void QueueRenderFrame(bool allowBlockingGpuWait = true);
     void StartBackdropTimer() noexcept;
     void StopBackdropTimer() noexcept;
-    void SyncBackdropTimerInterval(bool wantFast) noexcept;
+    void SyncBackdropTimerInterval(bool wantFast, bool wantResting = false) noexcept;
     void HandlePointer(POINT cursor);
     void UpdateGlintTarget(POINT cursor);
     void TickGlint();
@@ -503,6 +506,7 @@ private:
     [[nodiscard]] bool HasCrossedDragThreshold(POINT cursor) const noexcept;
     [[nodiscard]] bool IsCursorOverDock(POINT cursor) const noexcept;
     [[nodiscard]] bool ShouldPostPointerUpdate(POINT cursor) const noexcept;
+    [[nodiscard]] bool NeedsHookPointerPost(POINT cursor) const noexcept;
     [[nodiscard]] bool IsDragActive() const noexcept;
     [[nodiscard]] bool IsPersistentDisplayIcon(int icon) const noexcept;
     [[nodiscard]] LONG CurrentY() const noexcept;
@@ -727,7 +731,7 @@ private:
     // Last live rebake of open menu glass (Quick Settings / Dock Settings / context).
     ULONGLONG m_lastPopupGlassRefreshMs = 0;
     // After a confirmed unchanged capture, wait this long before BitBlt again.
-    static constexpr ULONGLONG kLivePopupStaticIntervalMs = 33;
+    static constexpr ULONGLONG kLivePopupStaticIntervalMs = 250;
     bool m_livePopupGlassStatic = false;
     // Skip live menu BitBlt/GPU until dock backdrop reports a desktop change
     // (or kLivePopupForcedRefreshMs elapses). Keeps glass live over moving

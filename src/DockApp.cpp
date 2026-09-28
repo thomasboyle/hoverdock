@@ -2021,7 +2021,10 @@ int DockApp::Run() {
         HANDLE frameWaitable = slideAnimating ? m_renderer.FrameLatencyWaitableObject() : nullptr;
         const DWORD count = frameWaitable == nullptr ? 0 : 1;
         const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
-        const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, QS_ALLINPUT,
+        const DWORD wakeMask = (slideAnimating || m_dragSnapAnimating)
+            ? QS_ALLINPUT
+            : (QS_POSTMESSAGE | QS_TIMER | QS_PAINT);
+        const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, wakeMask,
             MWMO_INPUTAVAILABLE);
 
         if (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT) {
@@ -2351,7 +2354,7 @@ LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         if (wParam == WM_MOUSEMOVE && !s_instance->IsDragActive() &&
-            s_instance->ShouldPostPointerUpdate(mouse->pt)) {
+            s_instance->NeedsHookPointerPost(mouse->pt)) {
             static POINT s_lastPostedCursor{std::numeric_limits<LONG>::min(),
                 std::numeric_limits<LONG>::min()};
             if (mouse->pt.x != s_lastPostedCursor.x || mouse->pt.y != s_lastPostedCursor.y) {
@@ -2915,8 +2918,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             } else if (menusOpen) {
                 SyncBackdropTimerInterval(wantFast);
             } else {
+                const bool wantResting =
+                    !wantFast && m_backdropIdleStreak >= kBackdropRestingHysteresisTicks;
                 SyncBackdropTimerInterval(
-                    wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks);
+                    wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks, wantResting);
             }
         } else if (wParam == kPerfOpenSettingsTimerId) {
             KillTimer(window, kPerfOpenSettingsTimerId);
@@ -7795,11 +7800,12 @@ void DockApp::StopBackdropTimer() noexcept {
     }
 }
 
-void DockApp::SyncBackdropTimerInterval(bool wantFast) noexcept {
+void DockApp::SyncBackdropTimerInterval(bool wantFast, bool wantResting) noexcept {
     if (m_window == nullptr) {
         return;
     }
-    const UINT desired = wantFast ? kBackdropIntervalMs : kBackdropIdleIntervalMs;
+    const UINT desired = wantFast ? kBackdropIntervalMs
+        : (wantResting ? kBackdropRestingIntervalMs : kBackdropIdleIntervalMs);
     if (desired == m_backdropTimerAppliedMs) {
         return;
     }
@@ -11309,6 +11315,29 @@ bool DockApp::ShouldPostPointerUpdate(POINT cursor) const noexcept {
     case VisibilityState::Showing:
     case VisibilityState::Visible:
         return !IsCursorOverDock(cursor);
+    default:
+        return false;
+    }
+}
+
+bool DockApp::NeedsHookPointerPost(POINT cursor) const noexcept {
+    if (!ShouldPostPointerUpdate(cursor)) {
+        return false;
+    }
+    switch (m_visibility) {
+    case VisibilityState::Hidden:
+    case VisibilityState::Hiding:
+        return true;
+    case VisibilityState::Showing:
+    case VisibilityState::Visible:
+        if (IsCursorOverDock(cursor) || IsCursorInBottomHotZone(cursor)) {
+            return true;
+        }
+        if (IsCursorWithinFlyoutZone(cursor) || IsOverflowOpen() || IsDockSettingsOpen() ||
+            IsContextMenuOpen() || IsLaunchPromptOpen()) {
+            return true;
+        }
+        return false;
     default:
         return false;
     }
