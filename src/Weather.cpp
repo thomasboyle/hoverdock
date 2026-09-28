@@ -512,8 +512,8 @@ const wchar_t* WeatherService::ConditionForWmo(int code) noexcept {
 }
 
 std::vector<uint8_t> WeatherService::DecodePngToPremul(const uint8_t* bytes, size_t size,
-    UINT extent) {
-    if (bytes == nullptr || size == 0 || extent == 0) {
+    UINT extent, UINT* outWidth, UINT* outHeight) {
+    if (bytes == nullptr || size == 0) {
         return {};
     }
 
@@ -547,16 +547,36 @@ std::vector<uint8_t> WeatherService::DecodePngToPremul(const uint8_t* bytes, siz
         return {};
     }
 
-    ComPtr<IWICBitmapScaler> scaler;
-    if (FAILED(factory->CreateBitmapScaler(&scaler)) ||
-        FAILED(scaler->Initialize(converter.Get(), extent, extent, WICBitmapInterpolationModeFant))) {
+    UINT frameWidth = 0;
+    UINT frameHeight = 0;
+    if (FAILED(converter->GetSize(&frameWidth, &frameHeight)) || frameWidth == 0 || frameHeight == 0) {
         return {};
     }
 
-    std::vector<uint8_t> pixels(static_cast<size_t>(extent) * extent * 4U, 0);
-    const UINT stride = extent * 4U;
-    if (FAILED(scaler->CopyPixels(nullptr, stride, static_cast<UINT>(pixels.size()), pixels.data()))) {
+    ComPtr<IWICBitmapSource> source = converter;
+    UINT outW = frameWidth;
+    UINT outH = frameHeight;
+    ComPtr<IWICBitmapScaler> scaler;
+    if (extent > 0) {
+        if (FAILED(factory->CreateBitmapScaler(&scaler)) ||
+            FAILED(scaler->Initialize(converter.Get(), extent, extent, WICBitmapInterpolationModeFant))) {
+            return {};
+        }
+        source = scaler;
+        outW = extent;
+        outH = extent;
+    }
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(outW) * outH * 4U, 0);
+    const UINT stride = outW * 4U;
+    if (FAILED(source->CopyPixels(nullptr, stride, static_cast<UINT>(pixels.size()), pixels.data()))) {
         return {};
+    }
+    if (outWidth != nullptr) {
+        *outWidth = outW;
+    }
+    if (outHeight != nullptr) {
+        *outHeight = outH;
     }
     return pixels;
 }

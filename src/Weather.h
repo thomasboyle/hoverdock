@@ -37,6 +37,10 @@ public:
     // Premultiplied BGRA atlas-sized buffer (extent x extent), empty on failure.
     [[nodiscard]] std::vector<uint8_t> RasterizeIcon(UINT extent) const;
     [[nodiscard]] static const wchar_t* Target() noexcept { return kTarget; }
+    // Premultiplied BGRA. extent > 0 scales to a square; extent == 0 keeps the
+    // frame size and writes it to outWidth/outHeight when those are non-null.
+    [[nodiscard]] static std::vector<uint8_t> DecodePngToPremul(const uint8_t* bytes, size_t size,
+        UINT extent, UINT* outWidth = nullptr, UINT* outHeight = nullptr);
 
 private:
     static DWORD WINAPI ThreadProc(LPVOID param);
@@ -48,7 +52,6 @@ private:
     static std::wstring CachePath();
     static const char* SlugForWmo(int code, bool isDay) noexcept;
     static const wchar_t* ConditionForWmo(int code) noexcept;
-    static std::vector<uint8_t> DecodePngToPremul(const uint8_t* bytes, size_t size, UINT extent);
 
     mutable std::mutex m_mutex;
     Snapshot m_snapshot;

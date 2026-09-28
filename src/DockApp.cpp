@@ -1,5 +1,6 @@
 #include "DockApp.h"
 #include "DockTheme.hlsli"
+#include "SettingsIconData.h"
 #include "PerfBoost.h"
 #include "Profile.h"
 #include "RecycleBin.h"
@@ -41,6 +42,53 @@
 #include <vector>
 
 DockApp* DockApp::s_instance = nullptr;
+
+std::vector<uint8_t> BoxDownsamplePremultiplied(const std::vector<uint8_t>& source, UINT sourceExtent,
+    UINT destExtent) {
+    if (sourceExtent == destExtent) {
+        return source;
+    }
+
+    std::vector<uint8_t> dest(static_cast<size_t>(destExtent) * destExtent * 4U, 0);
+    if (sourceExtent == 0 || destExtent == 0 ||
+        source.size() < static_cast<size_t>(sourceExtent) * sourceExtent * 4U) {
+        return dest;
+    }
+
+    for (UINT y = 0; y < destExtent; ++y) {
+        const UINT sourceY0 = y * sourceExtent / destExtent;
+        const UINT sourceY1 = std::max(sourceY0 + 1U, (y + 1U) * sourceExtent / destExtent);
+        for (UINT x = 0; x < destExtent; ++x) {
+            const UINT sourceX0 = x * sourceExtent / destExtent;
+            const UINT sourceX1 = std::max(sourceX0 + 1U, (x + 1U) * sourceExtent / destExtent);
+            UINT blue = 0;
+            UINT green = 0;
+            UINT red = 0;
+            UINT alpha = 0;
+            UINT count = 0;
+            for (UINT sourceY = sourceY0; sourceY < sourceY1; ++sourceY) {
+                for (UINT sourceX = sourceX0; sourceX < sourceX1; ++sourceX) {
+                    const size_t offset =
+                        (static_cast<size_t>(sourceY) * sourceExtent + sourceX) * 4U;
+                    blue += source[offset];
+                    green += source[offset + 1];
+                    red += source[offset + 2];
+                    alpha += source[offset + 3];
+                    ++count;
+                }
+            }
+            if (count == 0) {
+                continue;
+            }
+            const size_t destOffset = (static_cast<size_t>(y) * destExtent + x) * 4U;
+            dest[destOffset] = static_cast<uint8_t>(blue / count);
+            dest[destOffset + 1] = static_cast<uint8_t>(green / count);
+            dest[destOffset + 2] = static_cast<uint8_t>(red / count);
+            dest[destOffset + 3] = static_cast<uint8_t>(alpha / count);
+        }
+    }
+    return dest;
+}
 
 namespace {
 
@@ -1102,53 +1150,6 @@ std::wstring NotifyIconStatus(const TrayNotifyIcon& icon) {
         return icon.tip.substr(dash + 3);
     }
     return {};
-}
-
-std::vector<uint8_t> BoxDownsamplePremultiplied(const std::vector<uint8_t>& source, UINT sourceExtent,
-    UINT destExtent) {
-    if (sourceExtent == destExtent) {
-        return source;
-    }
-
-    std::vector<uint8_t> dest(static_cast<size_t>(destExtent) * destExtent * 4U, 0);
-    if (sourceExtent == 0 || destExtent == 0 ||
-        source.size() < static_cast<size_t>(sourceExtent) * sourceExtent * 4U) {
-        return dest;
-    }
-
-    for (UINT y = 0; y < destExtent; ++y) {
-        const UINT sourceY0 = y * sourceExtent / destExtent;
-        const UINT sourceY1 = std::max(sourceY0 + 1U, (y + 1U) * sourceExtent / destExtent);
-        for (UINT x = 0; x < destExtent; ++x) {
-            const UINT sourceX0 = x * sourceExtent / destExtent;
-            const UINT sourceX1 = std::max(sourceX0 + 1U, (x + 1U) * sourceExtent / destExtent);
-            UINT blue = 0;
-            UINT green = 0;
-            UINT red = 0;
-            UINT alpha = 0;
-            UINT count = 0;
-            for (UINT sourceY = sourceY0; sourceY < sourceY1; ++sourceY) {
-                for (UINT sourceX = sourceX0; sourceX < sourceX1; ++sourceX) {
-                    const size_t offset =
-                        (static_cast<size_t>(sourceY) * sourceExtent + sourceX) * 4U;
-                    blue += source[offset];
-                    green += source[offset + 1];
-                    red += source[offset + 2];
-                    alpha += source[offset + 3];
-                    ++count;
-                }
-            }
-            if (count == 0) {
-                continue;
-            }
-            const size_t destOffset = (static_cast<size_t>(y) * destExtent + x) * 4U;
-            dest[destOffset] = static_cast<uint8_t>(blue / count);
-            dest[destOffset + 1] = static_cast<uint8_t>(green / count);
-            dest[destOffset + 2] = static_cast<uint8_t>(red / count);
-            dest[destOffset + 3] = static_cast<uint8_t>(alpha / count);
-        }
-    }
-    return dest;
 }
 
 HWND FindNamedCoreWindow(const wchar_t* title) {
@@ -4690,6 +4691,31 @@ void DockApp::ScrollBrightness(int delta) {
     }
 }
 
+std::vector<uint8_t> RasterizeSettingsGear(UINT extent) {
+    struct Master {
+        std::vector<uint8_t> pixels;
+        UINT extent = 0;
+    };
+    static const Master master = [] {
+        Master loaded;
+        UINT width = 0;
+        UINT height = 0;
+        loaded.pixels = WeatherService::DecodePngToPremul(SettingsIconData::kPng,
+            SettingsIconData::kPngSize, 0, &width, &height);
+        if (width == height && width > 0 &&
+            loaded.pixels.size() == static_cast<size_t>(width) * width * 4U) {
+            loaded.extent = width;
+        } else {
+            loaded.pixels.clear();
+        }
+        return loaded;
+    }();
+    if (master.pixels.empty() || master.extent == 0 || extent == 0) {
+        return {};
+    }
+    return BoxDownsamplePremultiplied(master.pixels, master.extent, extent);
+}
+
 void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notifyExtent) {
     const TrayStatus& status = m_tray.Status();
     std::wstring key = std::to_wstring(gearExtent) + L"|" + std::to_wstring(tileExtent) + L"|" +
@@ -4702,7 +4728,10 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notify
         return;
     }
     m_overflowGlyphKey = std::move(key);
-    m_overflowGlyphGear = m_tray.RasterizeSymbol(L'\uE713', gearExtent);
+    m_overflowGlyphGear = RasterizeSettingsGear(gearExtent);
+    if (m_overflowGlyphGear.empty()) {
+        m_overflowGlyphGear = m_tray.RasterizeSymbol(L'\uE713', gearExtent);
+    }
     m_overflowGlyphWifi = m_tray.RasterizeGlyph(TraySlot::Network, tileExtent);
     m_overflowGlyphSound = m_tray.RasterizeGlyph(TraySlot::Volume, tileExtent);
     m_overflowGlyphBrightness = m_tray.RasterizeSymbol(L'\uE706', tileExtent);
@@ -6817,8 +6846,12 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
                 m_overflowGlass.data() + row + static_cast<size_t>(left) * 4U,
                 static_cast<size_t>(right - left) * 4U);
         }
-        const std::vector<uint8_t> scaled = ScalePremultipliedNearest(
-            m_overflowGlyphGear, idle, idle, hoverExt, hoverExt);
+        std::vector<uint8_t> scaled = RasterizeSettingsGear(static_cast<UINT>(hoverExt));
+        if (scaled.empty()) {
+            scaled = ScalePremultipliedNearest(m_overflowGlyphGear, idle, idle, hoverExt, hoverExt);
+        } else {
+            RemapPremulInkColor(scaled, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
+        }
         CompositePremul(pixels, width, height, centerX - hoverExt / 2, centerY - hoverExt / 2,
             scaled.data(), hoverExt, hoverExt);
         break;
@@ -6963,8 +6996,8 @@ void DockApp::PaintOverflowPopup() {
     const LONG caretWidth = std::max(16L, std::lround(18.0F * scale));
     const LONG radius =
         std::max(16L, std::lround(DOCK_CORNER_RADIUS_PT * scale));
-    const LONG headerHeight = std::max(28L, std::lround(32.0F * scale));
-    const LONG gearSize = std::max(18L, std::lround(20.0F * scale));
+    const LONG gearSize = std::max(36L, std::lround(44.0F * scale));
+    const LONG headerHeight = std::max(gearSize, std::max(28L, std::lround(32.0F * scale)));
     const LONG circle = std::max(44L, std::lround(52.0F * scale));
     const LONG tileGap = std::max(8L, std::lround(10.0F * scale));
     const LONG labelHeight = std::max(16L, std::lround(18.0F * scale));
@@ -7206,8 +7239,7 @@ void DockApp::PaintOverflowPopup() {
         DT_LEFT | DT_VCENTER | DT_SINGLELINE, 250);
     RECT gearBounds{panelWidth - padding - gearSize, y + (headerHeight - gearSize) / 2L,
         panelWidth - padding, y + (headerHeight - gearSize) / 2L + gearSize};
-    const UINT gearExtent =
-        static_cast<UINT>(std::max(1L, static_cast<LONG>(std::lround(static_cast<float>(gearSize) * 0.85F))));
+    const UINT gearExtent = static_cast<UINT>(std::max(1L, gearSize));
     const UINT glyphExtent =
         static_cast<UINT>(std::max(18L, std::lround(static_cast<float>(circle) * 0.38F)));
     const UINT notifyGlyph = static_cast<UINT>(std::max(18L, std::lround(19.0F * scale)));
