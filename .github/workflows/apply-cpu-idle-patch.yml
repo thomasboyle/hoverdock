@@ -17,17 +17,20 @@ jobs:
         with:
           ref: cursor/cpu-under-1pct-a6f3
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Restore sources from main and apply patch
         run: |
+          set -euxo pipefail
           git fetch origin main
-          git checkout origin/main -- src/DockApp.cpp src/DockApp.h
+          git checkout FETCH_HEAD -- src/DockApp.cpp src/DockApp.h
+          git apply --check patches/cpu-under-1pct.patch
           git apply patches/cpu-under-1pct.patch
           git add src/DockApp.cpp src/DockApp.h
           if git diff --cached --quiet; then
             echo "No changes after patch; skipping commit."
             exit 0
           fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm -f .github/workflows/apply-cpu-idle-patch.yml patches/cpu-under-1pct.patch || true
           git add -A
           git commit -m "fix: idle CPU under 1% without changing dock behavior"
