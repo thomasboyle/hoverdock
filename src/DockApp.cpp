@@ -2016,6 +2016,7 @@ DockApp::DockApp(HINSTANCE instance)
 }
 
 DockApp::~DockApp() {
+    m_bluetooth.Stop();
     RevokeTrashDropTarget();
     UnregisterTrashNotify();
     CloseLaunchPrompt(false);
@@ -2110,6 +2111,7 @@ int DockApp::Run() {
     static_cast<void>(m_windows.Refresh());
     static_cast<void>(m_tray.Refresh());
     m_weather.Start(m_window, kWeatherMessage);
+    m_bluetooth.Start(m_window, kBluetoothMessage);
     SetTimer(m_window, kWeatherTimerId, WeatherService::kRefreshIntervalMs, nullptr);
     RebuildDisplayApps();
     RebuildLayout(false);
@@ -2533,6 +2535,7 @@ LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
             // open a fresh menu for that icon.
             s_instance->CloseContextMenu();
         } else if (wParam == WM_LBUTTONDOWN && s_instance->IsOverflowOpen() &&
+            !s_instance->m_bluetooth.IsPairing() &&
             !s_instance->IsCursorOverOverflow(mouse->pt) &&
             !s_instance->IsCursorOverSettings(mouse->pt) &&
             !s_instance->IsCursorOverContextMenu(mouse->pt) &&
@@ -2980,6 +2983,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         OnWeatherUpdated();
         return 0;
 
+    case kBluetoothMessage:
+        ApplyBluetoothSnapshot();
+        return 0;
+
     case kOpenStartMenuMessage:
         // Legacy async entry: OpenStartMenuFromDock now sends synchronously.
         // Keep the handler as a no-broadcast fallback so any in-flight message
@@ -3057,6 +3064,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             StartTrayTimer();
         } else if (wParam == kWeatherTimerId) {
             m_weather.RequestRefresh();
+        } else if (wParam == kBluetoothTimerId) {
+            if (IsOverflowOpen() && !m_bluetoothSnapshot.discovering && !m_bluetooth.IsPairing()) {
+                m_bluetooth.RequestRefresh();
+            }
         } else if (wParam == kUpdateTimerId) {
             // First tick is the delayed startup check; re-arm for the steady
             // 6 h cadence afterwards.
@@ -3079,7 +3090,9 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
 
     case WM_DESTROY:
         KillTimer(window, kWeatherTimerId);
+        KillTimer(window, kBluetoothTimerId);
         m_weather.Stop();
+        m_bluetooth.Stop();
         StopTaskbarMonitor();
         StopUpdateTimer();
         UnregisterSystemResumeNotifications();
@@ -4799,10 +4812,10 @@ void DockApp::ScrollBrightness(int delta) {
     }
 }
 
-void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notifyExtent) {
+void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent) {
     const TrayStatus& status = m_tray.Status();
     std::wstring key = std::to_wstring(gearExtent) + L"|" + std::to_wstring(tileExtent) + L"|" +
-        std::to_wstring(notifyExtent) + L"|" + std::to_wstring(static_cast<int>(status.network)) +
+        std::to_wstring(static_cast<int>(status.network)) +
         L"|" + std::to_wstring(status.wifiBars) + L"|" + (status.volumeMuted ? L"1" : L"0") + L"|" +
         std::to_wstring(static_cast<int>(std::lround(status.volumeLevel * 100.0F))) + L"|" +
         std::to_wstring(g_flyoutInkR) + L"|" + std::to_wstring(g_flyoutInkG) + L"|" +
@@ -4815,10 +4828,6 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notify
     m_overflowGlyphWifi = m_tray.RasterizeGlyph(TraySlot::Network, tileExtent);
     m_overflowGlyphSound = m_tray.RasterizeGlyph(TraySlot::Volume, tileExtent);
     m_overflowGlyphBrightness = m_tray.RasterizeSymbol(L'\uE706', tileExtent);
-    m_overflowGlyphBell = m_tray.RasterizeSymbol(L'\uE91C', notifyExtent);
-    if (m_overflowGlyphBell.empty()) {
-        m_overflowGlyphBell = m_tray.RasterizeSymbol(L'\uE7E7', notifyExtent);
-    }
     // E945 is the Segoe MDL2 Assets lightning bolt: the Boost mark.
     m_overflowGlyphBoost = m_tray.RasterizeSymbol(L'\uE945', tileExtent);
 
@@ -4828,11 +4837,14 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notify
     RemapPremulInkColor(m_overflowGlyphWifi, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
     RemapPremulInkColor(m_overflowGlyphSound, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
     RemapPremulInkColor(m_overflowGlyphBrightness, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
-    RemapPremulInkColor(m_overflowGlyphBell, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
     RemapPremulInkColor(m_overflowGlyphBoost, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
 }
 
 void DockApp::FinishOverflowHide() noexcept {
+    if (m_window != nullptr) {
+        KillTimer(m_window, kBluetoothTimerId);
+    }
+    m_bluetooth.StopDiscovery();
     CloseDockSettings();
     if (m_overflowWindow != nullptr) {
         ShowWindow(m_overflowWindow, SW_HIDE);
@@ -5024,6 +5036,10 @@ void DockApp::BeginOverflowShow() {
         return;
     }
     PresentOverflowLayer();
+    m_bluetooth.RequestRefresh();
+    if (m_window != nullptr) {
+        SetTimer(m_window, kBluetoothTimerId, 4000, nullptr);
+    }
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
     }
@@ -6734,6 +6750,16 @@ void DockApp::OnWeatherUpdated() {
     QueueRenderFrame();
 }
 
+void DockApp::ApplyBluetoothSnapshot() {
+    m_bluetooth.AllowNextNotify();
+    m_bluetoothSnapshot = m_bluetooth.GetSnapshot();
+    if (!IsOverflowOpen()) {
+        return;
+    }
+    m_overflowHover = -1;
+    PaintOverflowPopup();
+}
+
 int DockApp::AppSlotCount() const noexcept {
     return static_cast<int>(m_displayApps.size());
 }
@@ -6837,18 +6863,67 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         // Stays open: progress and the result report in the Boost tile itself.
         RunPerformanceBoost();
         break;
-    case TrayFlyoutHitKind::ClearAll:
-    case TrayFlyoutHitKind::NotificationCenter:
-        CloseOverflowPopup();
-        PrepareShellForStartMenu();
-        UnmarkFullscreenClaims();
-        if (!SystemTray::OpenNotificationCenter()) {
-            ReleaseShellFlyoutHold();
-            Log(L"Notification Center did not open.");
+    case TrayFlyoutHitKind::BluetoothRadio:
+        if (!m_bluetoothSnapshot.ready || !m_bluetoothSnapshot.radioPresent) {
             break;
         }
-        m_shellFlyoutIsSearch = false;
-        m_shellFlyoutIsTray = true;
+        m_bluetoothSnapshot.radioOn = !m_bluetoothSnapshot.radioOn;
+        if (!m_bluetoothSnapshot.radioOn) {
+            m_bluetoothSnapshot.discovering = false;
+            m_bluetoothSnapshot.discovered.clear();
+            m_bluetoothSnapshot.hint.clear();
+        }
+        m_bluetooth.SetRadioEnabled(m_bluetoothSnapshot.radioOn);
+        PaintOverflowPopup();
+        break;
+    case TrayFlyoutHitKind::BluetoothConnect:
+        if (hit.index < 0 ||
+            static_cast<size_t>(hit.index) >= m_bluetoothSnapshot.paired.size()) {
+            break;
+        }
+        {
+            const BluetoothDeviceInfo& device =
+                m_bluetoothSnapshot.paired[static_cast<size_t>(hit.index)];
+            if (!device.busy && !device.id.empty()) {
+                if (device.connected) {
+                    m_bluetooth.Disconnect(device.id);
+                } else {
+                    m_bluetooth.Connect(device.id);
+                }
+            }
+        }
+        break;
+    case TrayFlyoutHitKind::BluetoothPair:
+        if (m_bluetooth.IsPairing() || hit.index < 0 ||
+            static_cast<size_t>(hit.index) >= m_bluetoothSnapshot.discovered.size()) {
+            break;
+        }
+        {
+            const BluetoothDeviceInfo& device =
+                m_bluetoothSnapshot.discovered[static_cast<size_t>(hit.index)];
+            if (!device.busy && !device.id.empty()) {
+                SetForegroundWindow(m_window);
+                m_bluetooth.Pair(device.id);
+            }
+        }
+        break;
+    case TrayFlyoutHitKind::BluetoothDiscover:
+        if (m_bluetoothSnapshot.discovering) {
+            m_bluetoothSnapshot.discovering = false;
+            m_bluetoothSnapshot.discovered.clear();
+            m_bluetoothSnapshot.hint.clear();
+            m_bluetooth.StopDiscovery();
+        } else if (m_bluetoothSnapshot.radioOn) {
+            m_bluetoothSnapshot.discovering = true;
+            m_bluetoothSnapshot.hint = L"Searching...";
+            m_bluetooth.StartDiscovery();
+        }
+        PaintOverflowPopup();
+        break;
+    case TrayFlyoutHitKind::BluetoothSettings:
+        CloseOverflowPopup();
+        SetForegroundWindow(m_window);
+        ShellExecuteW(nullptr, L"open", L"ms-settings:bluetooth", nullptr, nullptr, SW_SHOWNORMAL);
         break;
     case TrayFlyoutHitKind::NotifyIcon:
         if (hit.index >= 0 && static_cast<size_t>(hit.index) < m_overflowIcons.size()) {
@@ -6969,18 +7044,16 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
             kQuickAccentR);
         break;
     }
-    case TrayFlyoutHitKind::ClearAll: {
+    case TrayFlyoutHitKind::BluetoothRadio:
+    case TrayFlyoutHitKind::BluetoothSettings: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
-        const LONG insetY = std::max(2L, std::lround(3.0F * scale));
-        RECT chip = hit.bounds;
-        chip.top += insetY;
-        chip.bottom -= insetY;
-        const LONG hug = std::min(chip.right - chip.left, std::max(72L, std::lround(92.0F * scale)));
-        chip.left = chip.right - hug;
-        FillSquirclePremul(pixels, width, height, chip, ContentSquircleRadius(chip, scale), 0.10F);
+        FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
+            0.12F);
         break;
     }
-    case TrayFlyoutHitKind::NotificationCenter: {
+    case TrayFlyoutHitKind::BluetoothConnect:
+    case TrayFlyoutHitKind::BluetoothPair:
+    case TrayFlyoutHitKind::BluetoothDiscover: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
             0.10F);
@@ -7117,7 +7190,20 @@ void DockApp::PaintOverflowPopup() {
     const LONG statusHeight = std::max(14L, std::lround(16.0F * scale));
     const LONG tileBlock = circle + std::max(6L, std::lround(8.0F * scale)) + labelHeight + statusHeight;
     const LONG sectionHeader = std::max(24L, std::lround(28.0F * scale));
-    const LONG notificationRow = std::max(48L, std::lround(54.0F * scale));
+    const LONG deviceRow = std::max(48L, std::lround(52.0F * scale));
+    const LONG bluetoothGap = std::max(6L, std::lround(8.0F * scale));
+    const LONG switchWidth = std::max(40L, std::lround(44.0F * scale));
+    const LONG switchHeight = std::max(22L, std::lround(24.0F * scale));
+    const LONG actionWidth = std::max(88L, std::lround(96.0F * scale));
+    const LONG actionHeight = std::max(26L, std::lround(28.0F * scale));
+    const BluetoothSnapshot& bluetooth = m_bluetoothSnapshot;
+    const LONG bluetoothRows = (!bluetooth.ready || !bluetooth.radioPresent || !bluetooth.radioOn)
+        ? 1L
+        : (bluetooth.paired.empty() ? 1L : static_cast<LONG>(bluetooth.paired.size())) +
+            static_cast<LONG>(bluetooth.discovered.size()) + 1L +
+            (bluetooth.hiddenPaired > 0 ? 1L : 0L);
+    const LONG bluetoothBlock = bluetoothRows * deviceRow +
+        (bluetoothRows > 1 ? (bluetoothRows - 1) * bluetoothGap : 0L);
     const LONG otherIconHeight = std::max(62L, std::lround(70.0F * scale));
     const LONG otherIconSize = std::max(20L, std::lround(22.0F * scale));
     const LONG dividerGap = std::max(10L, std::lround(12.0F * scale));
@@ -7132,7 +7218,7 @@ void DockApp::PaintOverflowPopup() {
     contentY += tileBlock;
     contentY += dividerGap;
     contentY += sectionHeader;
-    contentY += notificationRow;
+    contentY += bluetoothBlock;
     contentY += dividerGap;
     contentY += sectionHeader;
     contentY += otherRows * otherIconHeight;
@@ -7326,8 +7412,6 @@ void DockApp::PaintOverflowPopup() {
     HFONT statusFont = m_overflowStatusFont;
     // Hover chrome is applied after a base frame is cached so mouse moves can
     // repaint with PaintOverflowHoverFast (no blur / text / icon redraw).
-    TrayFlyoutHit hoveredHit{};
-    const bool hasHover = false;
     const int pendingHover = m_overflowHover;
     m_overflowHits.clear();
 
@@ -7337,9 +7421,6 @@ void DockApp::PaintOverflowPopup() {
         hit.index = index;
         hit.bounds = bounds;
         m_overflowHits.push_back(hit);
-    };
-    auto hoveredKind = [&hoveredHit, hasHover](TrayFlyoutHitKind kind, int index = -1) {
-        return hasHover && hoveredHit.kind == kind && hoveredHit.index == index;
     };
 
     if (m_config.LightPanels()) {
@@ -7357,10 +7438,9 @@ void DockApp::PaintOverflowPopup() {
     const UINT gearExtent = static_cast<UINT>(std::max(1L, gearSize));
     const UINT glyphExtent =
         static_cast<UINT>(std::max(18L, std::lround(static_cast<float>(circle) * 0.38F)));
-    const UINT notifyGlyph = static_cast<UINT>(std::max(18L, std::lround(19.0F * scale)));
     // Glyphs don't depend on hover; rasterize once per status/extent combination so
     // hover transitions only pay for compositing, not font rasterization.
-    EnsureOverflowGlyphs(gearExtent, glyphExtent, notifyGlyph);
+    EnsureOverflowGlyphs(gearExtent, glyphExtent);
     m_overflowGearX = SaturatedInt(gearBounds.left);
     m_overflowGearY = SaturatedInt(gearBounds.top);
     m_overflowGearExtent = gearExtent;
@@ -7465,33 +7545,144 @@ void DockApp::PaintOverflowPopup() {
     FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
         y - dividerGap / 2L + 1}, 0.16F);
 
-    RECT notifyHeader{padding, y, panelWidth / 2L, y + sectionHeader};
-    DrawFlyoutText(pixels, width, height, notifyHeader, sectionFont, L"Notifications",
+    auto drawSwitch = [&](LONG centerY, LONG right, bool enabled) {
+        const LONG trackLeft = right - switchWidth;
+        const LONG trackTop = centerY - switchHeight / 2L;
+        const float trackRadius = static_cast<float>(switchHeight) * 0.5F;
+        const float trackCxL = static_cast<float>(trackLeft) + trackRadius;
+        const float trackCxR = static_cast<float>(right) - trackRadius;
+        const float trackCy = static_cast<float>(trackTop) + trackRadius;
+        if (enabled) {
+            FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
+                0.92F, kQuickAccentB, kQuickAccentG, kQuickAccentR);
+        } else {
+            FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
+                0.62F, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
+        }
+        const float knobRadius = trackRadius - std::max(2.0F, 2.0F * scale);
+        FillCirclePremul(pixels, width, height, enabled ? trackCxR : trackCxL, trackCy, knobRadius,
+            0.95F);
+    };
+    auto advanceBluetoothRow = [&]() {
+        y += deviceRow + bluetoothGap;
+    };
+    auto drawPlainRow = [&](const std::wstring& text) {
+        const RECT row{padding, y, panelWidth - padding, y + deviceRow};
+        FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
+        DrawFlyoutText(pixels, width, height, row, labelFont, text,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
+        advanceBluetoothRow();
+    };
+    auto drawDeviceRow = [&](const BluetoothDeviceInfo& device, const wchar_t* action, bool primary,
+                              TrayFlyoutHitKind kind, int index) {
+        const RECT row{padding, y, panelWidth - padding, y + deviceRow};
+        FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
+        const LONG buttonLeft = row.right - 8 - actionWidth;
+        const LONG buttonTop = y + (deviceRow - actionHeight) / 2L;
+        const RECT button{buttonLeft, buttonTop, buttonLeft + actionWidth, buttonTop + actionHeight};
+        if (primary && !device.busy) {
+            FillSquircleColorPremul(pixels, width, height, button,
+                ContentSquircleRadius(button, scale), 0.90F, kQuickAccentB, kQuickAccentG,
+                kQuickAccentR);
+        } else {
+            FillSquirclePremul(pixels, width, height, button, ContentSquircleRadius(button, scale),
+                0.16F);
+        }
+        DrawFlyoutText(pixels, width, height, button, statusFont, action,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, device.busy ? 170 : 250);
+        const RECT name{row.left + 12, y + 6, buttonLeft - 8, y + 6 + labelHeight};
+        const RECT status{name.left, name.bottom, name.right, y + deviceRow - 4};
+        DrawFlyoutText(pixels, width, height, name, labelFont, device.name,
+            DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+        DrawFlyoutText(pixels, width, height, status, statusFont, device.status,
+            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
+        pushHit(kind, row, index);
+        advanceBluetoothRow();
+    };
+
+    RECT bluetoothHeader{padding, y, panelWidth - padding - switchWidth - 12, y + sectionHeader};
+    DrawFlyoutText(pixels, width, height, bluetoothHeader, sectionFont, L"Bluetooth",
         DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-    RECT clearBounds{panelWidth / 2L, y, panelWidth - padding, y + sectionHeader};
-    DrawFlyoutText(pixels, width, height, clearBounds, statusFont, L"Clear all",
-        DT_RIGHT | DT_VCENTER | DT_SINGLELINE, hoveredKind(TrayFlyoutHitKind::ClearAll) ? 255 : 225);
-    pushHit(TrayFlyoutHitKind::ClearAll, clearBounds);
+    if (bluetooth.ready && bluetooth.radioPresent) {
+        const LONG switchRight = panelWidth - padding;
+        drawSwitch(y + sectionHeader / 2L, switchRight, bluetooth.radioOn);
+        pushHit(TrayFlyoutHitKind::BluetoothRadio,
+            {switchRight - switchWidth - 8, y, switchRight + 4, y + sectionHeader});
+    }
     y += sectionHeader;
 
-    RECT notifyRow{padding, y, panelWidth - padding, y + notificationRow};
-    FillSquirclePremul(pixels, width, height, notifyRow, ContentSquircleRadius(notifyRow, scale),
-        0.10F);
-    if (!m_overflowGlyphBell.empty()) {
-        CompositePremul(pixels, width, height, SaturatedInt(padding + 4),
-            SaturatedInt(y + (notificationRow - static_cast<LONG>(notifyGlyph)) / 2L),
-            m_overflowGlyphBell.data(), static_cast<int>(notifyGlyph),
-            static_cast<int>(notifyGlyph));
+    if (!bluetooth.ready) {
+        drawPlainRow(L"Looking for devices...");
+    } else if (!bluetooth.radioPresent) {
+        drawPlainRow(bluetooth.hint.empty() ? L"Bluetooth is unavailable" : bluetooth.hint);
+    } else if (!bluetooth.radioOn) {
+        drawPlainRow(L"Bluetooth is off");
+    } else {
+        if (bluetooth.paired.empty()) {
+            drawPlainRow(L"No paired devices");
+        } else {
+            for (size_t index = 0; index < bluetooth.paired.size(); ++index) {
+                const BluetoothDeviceInfo& device = bluetooth.paired[index];
+                const wchar_t* action = device.busy ? L"..."
+                    : (device.connected ? L"Disconnect" : L"Connect");
+                drawDeviceRow(device, action, !device.connected, TrayFlyoutHitKind::BluetoothConnect,
+                    static_cast<int>(index));
+            }
+        }
+        for (size_t index = 0; index < bluetooth.discovered.size(); ++index) {
+            const BluetoothDeviceInfo& device = bluetooth.discovered[index];
+            drawDeviceRow(device, device.busy ? L"..." : L"Pair", true, TrayFlyoutHitKind::BluetoothPair,
+                static_cast<int>(index));
+        }
+        if (bluetooth.hiddenPaired > 0) {
+            const RECT row{padding, y, panelWidth - padding, y + deviceRow};
+            FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
+            const std::wstring more = std::to_wstring(bluetooth.hiddenPaired) +
+                (bluetooth.hiddenPaired == 1 ? L" more paired device" : L" more paired devices");
+            DrawFlyoutText(pixels, width, height, row, labelFont, more,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
+            pushHit(TrayFlyoutHitKind::BluetoothSettings, row);
+            advanceBluetoothRow();
+        }
+        {
+            const RECT row{padding, y, panelWidth - padding, y + deviceRow};
+            FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
+            const LONG settingsWidth = std::max(72L, std::lround(78.0F * scale));
+            RECT text{row.left + 12, y + 6, row.right - 12, y + 6 + labelHeight};
+            RECT settings{};
+            if (bluetooth.discovering) {
+                const LONG buttonTop = y + (deviceRow - actionHeight) / 2L;
+                settings = {row.right - 8 - settingsWidth, buttonTop, row.right - 8,
+                    buttonTop + actionHeight};
+                text.right = settings.left - 8;
+                FillSquirclePremul(pixels, width, height, settings,
+                    ContentSquircleRadius(settings, scale), 0.16F);
+                DrawFlyoutText(pixels, width, height, settings, statusFont, L"Settings",
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE, 240);
+                pushHit(TrayFlyoutHitKind::BluetoothSettings, settings);
+            }
+            const wchar_t* discoverLabel =
+                bluetooth.discovering ? L"Stop searching" : L"Pair new device";
+            const std::wstring discoverStatus = bluetooth.discovering
+                ? (bluetooth.hint.empty() ? L"Looking for devices" : bluetooth.hint)
+                : L"Headphones, speakers, and more";
+            const RECT status{text.left, text.bottom, text.right, y + deviceRow - 4};
+            DrawFlyoutText(pixels, width, height, text, labelFont, discoverLabel,
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            DrawFlyoutText(pixels, width, height, status, statusFont, discoverStatus,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
+            RECT discoverHit = row;
+            if (bluetooth.discovering) {
+                discoverHit.right = settings.left - 4;
+            }
+            pushHit(TrayFlyoutHitKind::BluetoothDiscover, discoverHit);
+            advanceBluetoothRow();
+        }
     }
-    RECT notifyTitle{padding + static_cast<LONG>(notifyGlyph) + 14, y + 8, panelWidth - padding - 8,
-        y + notificationRow / 2L};
-    RECT notifyStatus{notifyTitle.left, notifyTitle.bottom - 2, notifyTitle.right, y + notificationRow - 8};
-    DrawFlyoutText(pixels, width, height, notifyTitle, labelFont, L"Notification Center",
-        DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
-    DrawFlyoutText(pixels, width, height, notifyStatus, statusFont, L"Calendar, toasts, and alerts",
-        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
-    pushHit(TrayFlyoutHitKind::NotificationCenter, notifyRow);
-    y += notificationRow + dividerGap;
+    if (bluetoothRows > 0) {
+        y -= bluetoothGap;
+    }
+    y += dividerGap;
     FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
         y - dividerGap / 2L + 1}, 0.16F);
 

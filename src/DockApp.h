@@ -6,6 +6,7 @@
 #include "TypeSafeClient.h"
 #include "WindowCatalog.h"
 #include "SystemTray.h"
+#include "Bluetooth.h"
 #include "Weather.h"
 #include "PerfProfiler.h"
 
@@ -120,6 +121,7 @@ private:
     static constexpr UINT kLayoutApplyMessage = WM_APP + 16;
     static constexpr UINT kDeferredClickMessage = WM_APP + 17;
     static constexpr UINT kWeatherMessage = WM_APP + 22;
+    static constexpr UINT kBluetoothMessage = WM_APP + 23;
     static constexpr UINT_PTR kWeatherTimerId = 10;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
@@ -132,6 +134,7 @@ private:
     static constexpr UINT_PTR kUpdateTimerId = 8;
     static constexpr UINT_PTR kCursorWatchTimerId = 9;
     static constexpr UINT_PTR kGlintTimerId = 15;
+    static constexpr UINT_PTR kBluetoothTimerId = 16;
     // Pointer glint easing cadence (~60 Hz); the timer only runs while the
     // glint is still converging on the cursor, so an idle dock costs nothing.
     static constexpr UINT kGlintIntervalMs = 16;
@@ -182,8 +185,11 @@ private:
         Sound,
         Brightness,
         Boost,
-        ClearAll,
-        NotificationCenter,
+        BluetoothRadio,
+        BluetoothConnect,
+        BluetoothPair,
+        BluetoothDiscover,
+        BluetoothSettings,
         NotifyIcon,
     };
 
@@ -276,6 +282,7 @@ private:
     void EnsureTrayIcons();
     void RefreshTray(bool forceLayout);
     void OnWeatherUpdated();
+    void ApplyBluetoothSnapshot();
     [[nodiscard]] bool IsWeatherRenderIndex(int index) const noexcept;
     void OpenTraySlot(TraySlot slot);
     void ToggleOverflowPopup();
@@ -339,7 +346,7 @@ private:
     void StopUpdateTimer() noexcept;
     [[nodiscard]] bool IsDockSettingsOpen() const noexcept;
     [[nodiscard]] bool IsCursorOverSettings(POINT cursor) const noexcept;
-    void EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notifyExtent);
+    void EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent);
     void InvalidateOverflowGlass() noexcept;
     void EnsureOverflowFonts(float scale);
     void DestroyOverflowFonts() noexcept;
@@ -727,6 +734,8 @@ private:
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;
     WeatherService m_weather;
+    BluetoothService m_bluetooth;
+    BluetoothSnapshot m_bluetoothSnapshot;
     HWND m_overflowWindow = nullptr;
     VisibilityState m_overflowVisibility = VisibilityState::Hidden;
     std::vector<TrayNotifyIcon> m_overflowIcons;
@@ -794,7 +803,6 @@ private:
     std::vector<uint8_t> m_overflowGlyphWifi;
     std::vector<uint8_t> m_overflowGlyphSound;
     std::vector<uint8_t> m_overflowGlyphBrightness;
-    std::vector<uint8_t> m_overflowGlyphBell;
     std::vector<uint8_t> m_overflowGlyphBoost;
     // Quick Settings Boost tile status, UI thread only. Updated through
     // kBoostResultMessage so the worker never touches popup state.

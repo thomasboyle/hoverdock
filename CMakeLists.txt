@@ -41,6 +41,7 @@ add_executable(Dock WIN32
     src/TypeSafeClient.cpp
     src/Updater.cpp
     src/WindowCatalog.cpp
+    src/Bluetooth.cpp
     src/PerfBoost.cpp
     src/PerfProfiler.cpp
     src/RecycleBin.cpp
@@ -106,6 +107,8 @@ target_link_libraries(Dock PRIVATE
     winhttp
     comctl32
     wlanapi
+    Bthprops
+    runtimeobject
     powrprof
     dxva2
 )
