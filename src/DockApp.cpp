@@ -400,19 +400,23 @@ int PopupFrostRadiusPx(float frostAmount, float scale) noexcept
 
 void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
     const std::vector<float>& coverage, const std::vector<float>& blurredCoverage,
-    float frostAmount)
+    float frostAmount, bool dockFace)
 {
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
     // CPU popup fallback only (QS / Dock Settings / context). Match the
-    // panel charcoal plate in GlassPS; dock never hits this.
-    const float overBlack = DOCK_PANEL_FACE_OVER_BLACK * 255.0F;
-    const float overWhite = DOCK_PANEL_FACE_OVER_WHITE * 255.0F;
+    // GlassPS plate: dock face for QS / Dock Settings, charcoal for context.
+    const float overBlack =
+        (dockFace ? DOCK_FACE_OVER_BLACK : DOCK_PANEL_FACE_OVER_BLACK) * 255.0F;
+    const float overWhite =
+        (dockFace ? DOCK_FACE_OVER_WHITE : DOCK_PANEL_FACE_OVER_WHITE) * 255.0F;
     const float frost = std::clamp(frostAmount, 0.0F, 1.0F);
-    // Match GlassPS FrostPlateMix + panel milk floor.
+    // Match GlassPS FrostPlateMix (+ panel milk floor on the charcoal plate).
     float plateMix = frost <= 0.5F ? (0.10F + 0.90F * (frost * 2.0F)) : 1.0F;
-    plateMix = (std::max)(plateMix, DOCK_PANEL_PLATE_MIX_FLOOR);
+    if (!dockFace) {
+        plateMix = (std::max)(plateMix, DOCK_PANEL_PLATE_MIX_FLOOR);
+    }
     const float alpha =
         DOCK_PANEL_GLASS_ALPHA + (1.0F - DOCK_PANEL_GLASS_ALPHA) * frost;
     constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F}; // DIB B,G,R
@@ -461,6 +465,34 @@ void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept {
     g_flyoutInkR = r;
     g_flyoutInkG = g;
     g_flyoutInkB = b;
+}
+
+// AdaptiveChromeInk cut (dark ink over a light face) measured on the baked
+// glass so glyphs follow whatever the panel actually sits over.
+void SetFlyoutChromeInkForGlass(const uint8_t* pixels, int width, int height) noexcept {
+    constexpr int kGrid = 8;
+    constexpr float kLightFaceLuma = 0.55F;
+    float lumaSum = 0.0F;
+    int samples = 0;
+    if (pixels != nullptr && width > 0 && height > 0) {
+        for (int gy = 0; gy < kGrid; ++gy) {
+            for (int gx = 0; gx < kGrid; ++gx) {
+                const int x = (2 * gx + 1) * width / (2 * kGrid);
+                const int y = (2 * gy + 1) * height / (2 * kGrid);
+                const uint8_t* p = pixels + (static_cast<size_t>(y) * width + x) * 4U;
+                if (p[3] == 0) {
+                    continue;
+                }
+                lumaSum += (0.0722F * p[0] + 0.7152F * p[1] + 0.2126F * p[2]) / p[3];
+                ++samples;
+            }
+        }
+    }
+    if (samples > 0 && lumaSum / static_cast<float>(samples) >= kLightFaceLuma) {
+        SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
+    } else {
+        SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
+    }
 }
 
 void RemapPremulInkColor(std::vector<uint8_t>& pixels, uint8_t r, uint8_t g, uint8_t b) {
@@ -881,7 +913,10 @@ void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, H
 }
 
 void FillCirclePremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
-    float radius, float alpha) {
+    float radius, float alpha, bool useInk = false) {
+    const float inkB = useInk ? static_cast<float>(g_flyoutInkB) / 255.0F : 1.0F;
+    const float inkG = useInk ? static_cast<float>(g_flyoutInkG) / 255.0F : 1.0F;
+    const float inkR = useInk ? static_cast<float>(g_flyoutInkR) / 255.0F : 1.0F;
     const int left = std::max(0, static_cast<int>(std::floor(cx - radius - 1.0F)));
     const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 1.0F)));
     const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 1.0F)));
@@ -898,9 +933,9 @@ void FillCirclePremul(uint8_t* dest, int destWidth, int destHeight, float cx, fl
             }
             const float srcA = coverage * alpha;
             uint8_t pixel[4] = {
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
+                static_cast<uint8_t>(std::lround(255.0F * srcA * inkB)),
+                static_cast<uint8_t>(std::lround(255.0F * srcA * inkG)),
+                static_cast<uint8_t>(std::lround(255.0F * srcA * inkR)),
                 static_cast<uint8_t>(std::lround(255.0F * srcA)),
             };
             CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
@@ -949,8 +984,13 @@ void FillRectPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, f
     const int top = std::max(0L, bounds.top);
     const int right = std::min(static_cast<LONG>(destWidth), bounds.right);
     const int bottom = std::min(static_cast<LONG>(destHeight), bounds.bottom);
-    const uint8_t channel = static_cast<uint8_t>(std::lround(255.0F * alpha));
-    uint8_t pixel[4] = {channel, channel, channel, channel};
+    const float a = std::clamp(alpha, 0.0F, 1.0F);
+    uint8_t pixel[4] = {
+        static_cast<uint8_t>(std::lround(static_cast<float>(g_flyoutInkB) * a)),
+        static_cast<uint8_t>(std::lround(static_cast<float>(g_flyoutInkG) * a)),
+        static_cast<uint8_t>(std::lround(static_cast<float>(g_flyoutInkR) * a)),
+        static_cast<uint8_t>(std::lround(255.0F * a)),
+    };
     for (int y = top; y < bottom; ++y) {
         for (int x = left; x < right; ++x) {
             CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
@@ -5557,7 +5597,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         const float closeExtent = static_cast<float>(std::max(22L, std::lround(24.0F * scale)));
         const float cx = static_cast<float>(hit.bounds.right) - closeExtent * 0.5F - 4.0F;
         const float cy = 0.5F * static_cast<float>(hit.bounds.top + hit.bounds.bottom);
-        FillCirclePremul(pixels, width, height, cx, cy, closeExtent * 0.62F, 0.55F);
+        FillCirclePremul(pixels, width, height, cx, cy, closeExtent * 0.62F, 0.55F, true);
         break;
     }
     case SettingsHitKind::CheckNow:
@@ -5706,13 +5746,16 @@ void DockApp::RebuildSettingsPopup() {
 }
 
 
-UINT DockApp::PackPopupGlassFxFlags() const noexcept
+UINT DockApp::PackPopupGlassFxFlags(bool dockFace) const noexcept
 {
     // Same packing as the dock frame (frost<<16 | halo<<8 | fx), plus PANEL so
     // GlassPS fills the plate without the dock shadow margin. Halo slots stay 0
     // (no icons on the menu plate).
     const float frostAmount = m_config.FrostAmount();
     UINT glassFx = DOCK_FX_PANEL | DOCK_FX_TINT;
+    if (dockFace) {
+        glassFx |= DOCK_FX_DOCK_FACE;
+    }
     if (m_config.RimLight()) {
         glassFx |= DOCK_FX_RIM;
     }
@@ -5879,10 +5922,12 @@ bool DockApp::TickLivePopupGlass()
 const float frostAmount = m_config.FrostAmount();
     const float glassAlpha = DOCK_PANEL_GLASS_ALPHA + (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
-    const UINT fxFlags = PackPopupGlassFxFlags();
+    const UINT dockFaceFlags = PackPopupGlassFxFlags(true);
+    const UINT contextFlags = PackPopupGlassFxFlags(false);
 
     for (int attempt = 0; attempt < 3; ++attempt) {
         const int target = (m_livePopupGlassTarget + attempt) % 3;
+        const UINT fxFlags = target == 2 ? contextFlags : dockFaceFlags;
         POINT origin{};
         LONG width = 0;
         LONG height = 0;
@@ -5935,7 +5980,7 @@ const float frostAmount = m_config.FrostAmount();
 }
 
 bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* pixels,
-    size_t byteCount)
+    size_t byteCount, bool dockFace)
 {
     if (!m_rendererInitialized || pixels == nullptr || width <= 0 || height <= 0) {
         return false;
@@ -5949,8 +5994,8 @@ bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* 
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
     std::vector<uint8_t> glass;
     if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(width), static_cast<UINT>(height),
-            PackPopupGlassFxFlags(), glassAlpha, dpiScale, m_settingsWindow, m_overflowWindow,
-            m_contextWindow, glass)) {
+            PackPopupGlassFxFlags(dockFace), glassAlpha, dpiScale, m_settingsWindow,
+            m_overflowWindow, m_contextWindow, glass)) {
         return false;
     }
     if (glass.size() != static_cast<size_t>(width) * static_cast<size_t>(height) * 4U) {
@@ -6330,7 +6375,7 @@ void DockApp::PaintSettingsPopup() {
     } else {
         std::memset(pixels, 0, pixelCount * 4U);
         const bool gpuGlass = TryBakePopupGlass(origin, m_settingsSize.cx, m_settingsSize.cy, pixels,
-            pixelCount * 4U);
+            pixelCount * 4U, true);
         if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {
@@ -6412,7 +6457,7 @@ void DockApp::PaintSettingsPopup() {
                 std::max(1, static_cast<int>(std::lround(2.6F * scale))));
             // Same liquid-glass face as the dock (calibrated tone map + rim).
             ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
-                blurredCoverage, m_config.FrostAmount());
+                blurredCoverage, m_config.FrostAmount(), true);
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
@@ -6457,7 +6502,7 @@ void DockApp::PaintSettingsPopup() {
                 wash, kAmberB, kAmberG, kAmberR);
         } else {
             FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
-                wash, 255, 255, 255);
+                wash, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
         }
         const float knobRadius = trackRadius - std::max(2.0F, 2.0F * scale);
         const float knobCx = enabled ? trackCxR : trackCxL;
@@ -6470,7 +6515,7 @@ void DockApp::PaintSettingsPopup() {
         const float trackCxL = static_cast<float>(left) + trackRadius;
         const float trackCxR = static_cast<float>(right) - trackRadius;
         FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
-            hovered ? 0.55F : 0.48F, 255, 255, 255);
+            hovered ? 0.55F : 0.48F, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
         const float filled = std::clamp(amount, 0.0F, 1.0F);
         const float fillRight = trackCxL + (trackCxR - trackCxL) * filled;
         if (fillRight > trackCxL + 0.5F) {
@@ -6482,8 +6527,7 @@ void DockApp::PaintSettingsPopup() {
         FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
     };
 
-    // Light chrome ink on the charcoal panel plate.
-    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
+    SetFlyoutChromeInkForGlass(pixels, width, height);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
@@ -7184,7 +7228,7 @@ void DockApp::PaintOverflowPopup() {
     } else {
         std::memset(pixels, 0, pixelCount * 4U);
         const bool gpuGlass = TryBakePopupGlass(origin, m_overflowSize.cx, m_overflowSize.cy, pixels,
-            pixelCount * 4U);
+            pixelCount * 4U, true);
         if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {
@@ -7282,7 +7326,7 @@ void DockApp::PaintOverflowPopup() {
             // shared with GlassPS via DockTheme.hlsli.
             // Same liquid-glass face as the dock (calibrated tone map + rim).
             ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
-                blurredCoverage, m_config.FrostAmount());
+                blurredCoverage, m_config.FrostAmount(), true);
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
@@ -7320,9 +7364,7 @@ void DockApp::PaintOverflowPopup() {
         return hasHover && hoveredHit.kind == kind && hoveredHit.index == index;
     };
 
-    // Light chrome ink so QS title, tile labels, and
-    // glyphs stay readable on the #98A869 tile plates over charcoal glass.
-    SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
+    SetFlyoutChromeInkForGlass(pixels, width, height);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - gearSize - 8, y + headerHeight};
@@ -8572,7 +8614,7 @@ void DockApp::PaintContextMenu() {
     } else {
         std::memset(pixels, 0, pixelCount * 4U);
         const bool gpuGlass = TryBakePopupGlass(origin, m_contextSize.cx, m_contextSize.cy, pixels,
-            pixelCount * 4U);
+            pixelCount * 4U, false);
         if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {
@@ -8647,7 +8689,7 @@ void DockApp::PaintContextMenu() {
                 std::max(1, static_cast<int>(std::lround(2.6F * scale))));
             // Same liquid-glass face as the dock (calibrated tone map + rim).
             ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
-                blurredCoverage, m_config.FrostAmount());
+                blurredCoverage, m_config.FrostAmount(), false);
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);

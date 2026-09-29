@@ -284,6 +284,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
     const bool isPanel = panelOn > 0.5;
+    // Charcoal plate only for panels that did not opt into the dock face.
+    const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE));
     const float marginDev = (1.0 - panelOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli). Squircle n=4 gives
@@ -384,7 +386,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     float frostCore;
     // Panels keep a minimum mica dissolve so busy wallpaper detail cannot
     // fight glyphs even when the user parks Frost near clear.
-    const float panelFrost = max(frostAmount, panelOn * DOCK_PANEL_FROST_BLUR_FLOOR);
+    const float panelFrost = max(frostAmount, charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR);
     FrostMicaRadii(panelFrost, frostRim, frostCore);
 
     float3 frostedBackground;
@@ -482,16 +484,16 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Apple mix -> milky glass) so the backdrop keeps its color and contrast.
     // Panels (DOCK_FX_PANEL): neutral charcoal plate (pre-sage Concept A+D)
     // with milk floor — live capture+blur, no sage wash on the dock bar.
-    if (!isPanel && hasBackdrop)
+    if (charcoalOn < 0.5 && hasBackdrop)
     {
         const float backdropLuma = dot(frostedBackground, float3(0.2126, 0.7152, 0.0722));
         frostedBackground = saturate(lerp(backdropLuma.xxx, frostedBackground, DOCK_VIBRANCY));
     }
-    const float faceLo = lerp(DOCK_FACE_OVER_BLACK, DOCK_PANEL_FACE_OVER_BLACK, panelOn);
-    const float faceHi = lerp(DOCK_FACE_OVER_WHITE, DOCK_PANEL_FACE_OVER_WHITE, panelOn);
+    const float faceLo = lerp(DOCK_FACE_OVER_BLACK, DOCK_PANEL_FACE_OVER_BLACK, charcoalOn);
+    const float faceHi = lerp(DOCK_FACE_OVER_WHITE, DOCK_PANEL_FACE_OVER_WHITE, charcoalOn);
     const float3 toneMapped = lerp(faceLo, faceHi, saturate(frostedBackground));
     float plateMix = FrostPlateMix(frostAmount);
-    plateMix = max(plateMix, panelOn * DOCK_PANEL_PLATE_MIX_FLOOR);
+    plateMix = max(plateMix, charcoalOn * DOCK_PANEL_PLATE_MIX_FLOOR);
     float3 color = lerp(frostedBackground, toneMapped, plateMix);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
@@ -545,13 +547,13 @@ float4 GlassPS(VertexOutput input) : SV_Target
         glintAxis = swung / max(length(swung), 1e-4);
     }
     float rimFacing = 0.30 + 0.70 * ndl;
-    if (!isPanel)
+    if (charcoalOn < 0.5)
     {
         const float facing = dot(outward, glintAxis);
         rimFacing = 0.15 + 0.85 * pow(saturate(facing), 4.0) + 0.55 * pow(saturate(-facing), 4.0);
     }
-    const float rimStrength = lerp(0.85, 0.78, panelOn);
-    const float3 rimEdge = lerp(float3(1.0, 1.0, 1.0), float3(0.82, 0.84, 0.88), panelOn);
+    const float rimStrength = lerp(0.85, 0.78, charcoalOn);
+    const float3 rimEdge = lerp(float3(1.0, 1.0, 1.0), float3(0.82, 0.84, 0.88), charcoalOn);
     color += rimEdge * pow(rim, 10.0) * rimStrength * rimFacing * rimGain * rimLightDamp;
     if (glintStrength > 0.0)
     {
@@ -653,7 +655,8 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float frostAmt = saturate(((uint)scene1.x >> 16) / 255.0);
     float micaRim;
     float micaCore;
-    FrostMicaRadii(max(frostAmt, panelOn * DOCK_PANEL_FROST_BLUR_FLOOR), micaRim, micaCore);
+    const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE));
+    FrostMicaRadii(max(frostAmt, charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR), micaRim, micaCore);
     blurPx = lerp(micaRim, micaCore, height01) * dpi;
 }
 

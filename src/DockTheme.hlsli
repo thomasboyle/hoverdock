@@ -73,7 +73,8 @@
 // Glass effect toggles packed into scene1.x (float-stored bitmask).
 // DockRenderState composes these from the DockConfig bools; GlassPS
 // decodes with FxEnabled(). All on = current look.
-// Layout: bits 0-7 FX toggles, 8-13 halo icon count, 14 PANEL, 16-23 frost.
+// Layout: bits 0-7 FX toggles, 8-13 halo icon count, 14 PANEL, 15 DOCK_FACE,
+// 16-23 frost.
 // Total stays below 2^24 so every bit survives the CPU float store exactly.
 #define DOCK_FX_RIM 1
 #define DOCK_FX_LENS 2
@@ -88,3 +89,6 @@
 // Bit 14 (not bit 24): bit 24 pushed the packed float into ULP=2 range and
 // destroyed rim/lens/specular flags on every popup bake.
 #define DOCK_FX_PANEL 0x4000u
+// With PANEL: use the dock's face tone map, rim and blur instead of the
+// charcoal plate (Quick Settings / Dock Settings).
+#define DOCK_FX_DOCK_FACE 0x8000u

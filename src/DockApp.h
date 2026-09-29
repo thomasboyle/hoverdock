@@ -309,9 +309,9 @@ private:
         const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
         const RECT* dirty = nullptr) noexcept;
     void QueueSettingsPaint(bool hoverOnly = false);
-    [[nodiscard]] UINT PackPopupGlassFxFlags() const noexcept;
+    [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace) const noexcept;
     [[nodiscard]] bool TryBakePopupGlass(POINT origin, LONG width, LONG height,
-        uint8_t* pixels, size_t byteCount);
+        uint8_t* pixels, size_t byteCount, bool dockFace);
     void RebuildSettingsPopup();
     void HandleSettingsClick(const SettingsHit& hit, UINT message);
     void ApplyFrostSliderAt(LONG clientX);
