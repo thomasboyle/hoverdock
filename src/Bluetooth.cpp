@@ -1,7 +1,11 @@
+#include <winsock2.h>
+#include <ws2bth.h>
+
 #include "Bluetooth.h"
 
 #include <winioctl.h>
 #include <bluetoothapis.h>
+#include <cfgmgr32.h>
 #include <roapi.h>
 
 #pragma warning(push)
@@ -122,6 +126,7 @@ uint64_t ParseBluetoothAddress(const std::wstring& text) {
     if (text.size() < 17) {
         return 0;
     }
+    uint64_t found = 0;
     for (size_t start = 0; start + 17 <= text.size(); ++start) {
         unsigned bytes[6]{};
         bool matched = true;
@@ -154,9 +159,9 @@ uint64_t ParseBluetoothAddress(const std::wstring& text) {
         for (int index = 0; index < 6; ++index) {
             address.rgBytes[index] = static_cast<BYTE>(bytes[5 - index]);
         }
-        return address.ullLong;
+        found = address.ullLong;
     }
-    return 0;
+    return found;
 }
 
 uint64_t AddressFromTwelveHex(const wchar_t* hex) {
@@ -424,81 +429,221 @@ bool ForEachRadio(const auto& visit) {
     return matched;
 }
 
-bool ConnectClassic(uint64_t address) {
-    if (address == 0) {
-        return false;
+bool LoadDeviceInfo(HANDLE radio, uint64_t address, BLUETOOTH_DEVICE_INFO& info) {
+    info = {};
+    info.dwSize = sizeof(info);
+    info.Address.ullLong = address;
+    return BluetoothGetDeviceInfo(radio, &info) == ERROR_SUCCESS;
+}
+
+bool RadioConnected(HANDLE radio, uint64_t address) {
+    BLUETOOTH_DEVICE_INFO info{};
+    return LoadDeviceInfo(radio, address, info) && info.fConnected != FALSE;
+}
+
+bool AnyRadioConnected(uint64_t address) {
+    return ForEachRadio([&](HANDLE radio) { return RadioConnected(radio, address); });
+}
+
+bool WaitForLink(uint64_t address, DWORD timeoutMs, const std::atomic<bool>& running, bool wantConnected) {
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    for (;;) {
+        if (AnyRadioConnected(address) == wantConnected) {
+            return true;
+        }
+        if (!running.load() || GetTickCount64() >= deadline) {
+            return false;
+        }
+        Sleep(200);
     }
-    const GUID fallback[] = {
+}
+
+std::vector<GUID> ConnectServices(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
+    const GUID preferred[] = {
         ServiceUuid(0x110B),
         ServiceUuid(0x1108),
         ServiceUuid(0x111E),
         ServiceUuid(0x1124),
         ServiceUuid(0x110A),
     };
-    return ForEachRadio([&](HANDLE radio) {
-        BLUETOOTH_DEVICE_INFO info{};
-        info.dwSize = sizeof(info);
-        info.Address.ullLong = address;
-        if (BluetoothGetDeviceInfo(radio, &info) != ERROR_SUCCESS) {
-            info.dwSize = sizeof(info);
-            info.Address.ullLong = address;
-        }
-        DWORD count = 0;
-        std::vector<GUID> services;
-        if (BluetoothEnumerateInstalledServices(radio, &info, &count, nullptr) == ERROR_SUCCESS &&
-            count > 0) {
-            services.resize(count);
-            if (BluetoothEnumerateInstalledServices(radio, &info, &count, services.data()) !=
-                ERROR_SUCCESS) {
-                services.clear();
-            } else {
-                services.resize(count);
-            }
-        }
-        if (services.empty()) {
-            services.assign(std::begin(fallback), std::end(fallback));
-        }
-        bool enabled = false;
-        for (const GUID& service : services) {
-            if (BluetoothSetServiceState(radio, &info, &service, BLUETOOTH_SERVICE_ENABLE) ==
-                ERROR_SUCCESS) {
-                enabled = true;
-            }
-        }
-        return enabled;
-    });
-}
-
-bool DisconnectClassic(uint64_t address) {
-    if (address == 0) {
-        return false;
-    }
-    return ForEachRadio([&](HANDLE radio) {
-        BLUETOOTH_DEVICE_INFO info{};
-        info.dwSize = sizeof(info);
-        info.Address.ullLong = address;
-        BluetoothGetDeviceInfo(radio, &info);
-        DWORD returned = 0;
-        const BOOL disconnected = DeviceIoControl(radio, kDisconnectIoctl, &address, sizeof(address),
-            nullptr, 0, &returned, nullptr);
-        DWORD count = 0;
-        bool disabled = false;
-        if (BluetoothEnumerateInstalledServices(radio, &info, &count, nullptr) == ERROR_SUCCESS &&
-            count > 0) {
-            std::vector<GUID> services(count);
-            if (BluetoothEnumerateInstalledServices(radio, &info, &count, services.data()) ==
-                ERROR_SUCCESS) {
-                services.resize(count);
-                for (const GUID& service : services) {
-                    if (BluetoothSetServiceState(radio, &info, &service, BLUETOOTH_SERVICE_DISABLE) ==
-                        ERROR_SUCCESS) {
-                        disabled = true;
-                    }
+    std::vector<GUID> services(std::begin(preferred), std::end(preferred));
+    DWORD count = 0;
+    if (BluetoothEnumerateInstalledServices(radio, &info, &count, nullptr) == ERROR_SUCCESS && count > 0) {
+        std::vector<GUID> installed(count);
+        if (BluetoothEnumerateInstalledServices(radio, &info, &count, installed.data()) == ERROR_SUCCESS) {
+            installed.resize(count);
+            for (const GUID& service : installed) {
+                const bool known = std::any_of(services.begin(), services.end(),
+                    [&](const GUID& item) { return IsEqualGUID(item, service) != FALSE; });
+                if (!known) {
+                    services.push_back(service);
                 }
             }
         }
-        return disconnected != FALSE || disabled;
+    }
+    return services;
+}
+
+void SetServices(HANDLE radio, BLUETOOTH_DEVICE_INFO& info, DWORD state) {
+    for (const GUID& service : ConnectServices(radio, info)) {
+        BluetoothSetServiceState(radio, &info, &service, state);
+    }
+}
+
+bool RememberedClassic(uint64_t address) {
+    return ForEachRadio([&](HANDLE radio) {
+        BLUETOOTH_DEVICE_INFO info{};
+        return LoadDeviceInfo(radio, address, info) && info.fRemembered != FALSE;
     });
+}
+
+bool PageClassic(uint64_t address) {
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        return false;
+    }
+    const unsigned short profiles[] = {0x111E, 0x1108};
+    bool paged = false;
+    for (unsigned short profile : profiles) {
+        const SOCKET sock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+        if (sock == INVALID_SOCKET) {
+            break;
+        }
+        u_long nonblocking = 1;
+        ioctlsocket(sock, FIONBIO, &nonblocking);
+        SOCKADDR_BTH remote{};
+        remote.addressFamily = AF_BTH;
+        remote.btAddr = address;
+        remote.serviceClassId = ServiceUuid(profile);
+        remote.port = 0;
+        const int started = connect(sock, reinterpret_cast<SOCKADDR*>(&remote), sizeof(remote));
+        if (started == 0) {
+            paged = true;
+        } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            const WSAEVENT ready = WSACreateEvent();
+            if (ready != WSA_INVALID_EVENT && WSAEventSelect(sock, ready, FD_CONNECT) == 0) {
+                const DWORD waited = WSAWaitForMultipleEvents(1, &ready, FALSE, 6000, FALSE);
+                WSANETWORKEVENTS network{};
+                if (waited == WSA_WAIT_EVENT_0 &&
+                    WSAEnumNetworkEvents(sock, ready, &network) == 0 &&
+                    (network.lNetworkEvents & FD_CONNECT) != 0 &&
+                    network.iErrorCode[FD_CONNECT_BIT] == 0) {
+                    paged = true;
+                }
+            }
+            if (ready != WSA_INVALID_EVENT) {
+                WSACloseEvent(ready);
+            }
+        }
+        if (paged) {
+            ForEachRadio([&](HANDLE radio) {
+                BLUETOOTH_DEVICE_INFO info{};
+                if (!LoadDeviceInfo(radio, address, info)) {
+                    return false;
+                }
+                SetServices(radio, info, BLUETOOTH_SERVICE_ENABLE);
+                return RadioConnected(radio, address);
+            });
+        }
+        closesocket(sock);
+        if (paged) {
+            break;
+        }
+    }
+    WSACleanup();
+    return paged;
+}
+
+bool RestartPairedDevnode(uint64_t address) {
+    BLUETOOTH_ADDRESS value{};
+    value.ullLong = address;
+    wchar_t token[13]{};
+    swprintf_s(token, L"%02X%02X%02X%02X%02X%02X", value.rgBytes[5], value.rgBytes[4], value.rgBytes[3],
+        value.rgBytes[2], value.rgBytes[1], value.rgBytes[0]);
+    ULONG length = 0;
+    if (CM_Get_Device_ID_List_SizeW(&length, L"BTHENUM", CM_GETIDLIST_FILTER_ENUMERATOR) != CR_SUCCESS ||
+        length < 2) {
+        return false;
+    }
+    std::vector<wchar_t> ids(length);
+    if (CM_Get_Device_ID_ListW(L"BTHENUM", ids.data(), length, CM_GETIDLIST_FILTER_ENUMERATOR) != CR_SUCCESS) {
+        return false;
+    }
+    bool restarted = false;
+    for (wchar_t* id = ids.data(); id != nullptr && *id != L'\0'; id += wcslen(id) + 1) {
+        if (!ContainsInsensitive(id, token) || !ContainsInsensitive(id, L"BLUETOOTHDEVICE_")) {
+            continue;
+        }
+        DEVINST node = 0;
+        if (CM_Locate_DevNodeW(&node, id, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) {
+            continue;
+        }
+        CM_Disable_DevNode(node, CM_DISABLE_UI_NOT_OK | CM_DISABLE_POLITE);
+        Sleep(300);
+        if (CM_Enable_DevNode(node, 0) == CR_SUCCESS) {
+            restarted = true;
+        }
+    }
+    return restarted;
+}
+
+bool ConnectClassic(uint64_t address, const std::atomic<bool>& running) {
+    if (address == 0 || !running.load()) {
+        return false;
+    }
+    ForEachRadio([&](HANDLE radio) {
+        BLUETOOTH_DEVICE_INFO info{};
+        if (!LoadDeviceInfo(radio, address, info)) {
+            return false;
+        }
+        SetServices(radio, info, BLUETOOTH_SERVICE_ENABLE);
+        return RadioConnected(radio, address);
+    });
+    if (WaitForLink(address, 2500, running, true)) {
+        return true;
+    }
+    // Service flags do not page a device that was dropped with a hard disconnect.
+    if (running.load()) {
+        PageClassic(address);
+        ForEachRadio([&](HANDLE radio) {
+            BLUETOOTH_DEVICE_INFO info{};
+            if (!LoadDeviceInfo(radio, address, info)) {
+                return false;
+            }
+            SetServices(radio, info, BLUETOOTH_SERVICE_ENABLE);
+            return RadioConnected(radio, address);
+        });
+    }
+    if (WaitForLink(address, 4000, running, true)) {
+        return true;
+    }
+    if (running.load() && RestartPairedDevnode(address)) {
+        return WaitForLink(address, 5000, running, true);
+    }
+    return false;
+}
+
+bool DisconnectClassic(uint64_t address, const std::atomic<bool>& running) {
+    if (address == 0) {
+        return false;
+    }
+    ForEachRadio([&](HANDLE radio) {
+        BLUETOOTH_DEVICE_INFO info{};
+        if (!LoadDeviceInfo(radio, address, info)) {
+            return false;
+        }
+        SetServices(radio, info, BLUETOOTH_SERVICE_DISABLE);
+        return !RadioConnected(radio, address);
+    });
+    if (WaitForLink(address, 2500, running, false)) {
+        return true;
+    }
+    const bool forced = ForEachRadio([&](HANDLE radio) {
+        DWORD returned = 0;
+        return DeviceIoControl(radio, kDisconnectIoctl, &address, sizeof(address), nullptr, 0, &returned,
+                   nullptr) != FALSE;
+    });
+    return forced && WaitForLink(address, 2500, running, false);
 }
 
 const wchar_t* PairFailureText(
@@ -1193,9 +1338,9 @@ struct BluetoothService::Impl {
         }
         ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus status =
             ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Disconnected;
-        if (SUCCEEDED(bt->get_ConnectionStatus(&status)) &&
-            status == ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Connected) {
-            device.connected = true;
+        if (SUCCEEDED(bt->get_ConnectionStatus(&status))) {
+            device.connected =
+                status == ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Connected;
         }
         if (device.address == 0) {
             UINT64 address = 0;
@@ -1235,9 +1380,9 @@ struct BluetoothService::Impl {
         }
         ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus status =
             ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Disconnected;
-        if (SUCCEEDED(bt->get_ConnectionStatus(&status)) &&
-            status == ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Connected) {
-            device.connected = true;
+        if (SUCCEEDED(bt->get_ConnectionStatus(&status))) {
+            device.connected =
+                status == ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Connected;
         }
         if (device.address == 0) {
             UINT64 address = 0;
@@ -1468,11 +1613,18 @@ struct BluetoothService::Impl {
     }
 
     bool ConnectDevice(const RadioDevice& device) {
-        if (ConnectClassic(device.address)) {
+        uint64_t address = device.address;
+        if (address == 0) {
+            address = AddressFromTaggedId(device.id);
+        }
+        if (address == 0) {
+            address = ParseBluetoothAddress(device.id);
+        }
+        if (ConnectClassic(address, running)) {
             return true;
         }
-        if (device.lowEnergy) {
-            return ConnectLe(device.address);
+        if (device.lowEnergy && !RememberedClassic(address)) {
+            return ConnectLe(address);
         }
         return false;
     }
@@ -1526,7 +1678,7 @@ struct BluetoothService::Impl {
             busyText = connect ? L"Connecting..." : L"Disconnecting...";
             errorId.clear();
             Publish();
-            const bool ok = connect ? ConnectDevice(copy) : DisconnectClassic(copy.address);
+            const bool ok = connect ? ConnectDevice(copy) : DisconnectClassic(copy.address, running);
             busyId.clear();
             busyText.clear();
             if (RadioDevice* current = FindMutable(job.id); current != nullptr) {

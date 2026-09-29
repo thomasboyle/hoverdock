@@ -108,6 +108,8 @@ target_link_libraries(Dock PRIVATE
     comctl32
     wlanapi
     Bthprops
+    Ws2_32
+    Cfgmgr32
     runtimeobject
     powrprof
     dxva2
