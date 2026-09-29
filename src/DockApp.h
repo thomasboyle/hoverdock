@@ -204,6 +204,7 @@ private:
         Specular,
         DropShadow,
         DepthShade,
+        LightPanels,
         CheckNow,
         PerfProfile,
         PerfLog,

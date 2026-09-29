@@ -101,7 +101,7 @@ public:
     // plate fills the surface (no dock shadow margin ring).
     [[nodiscard]] bool BakeGlassPanel(const RECT& screenRect, UINT width, UINT height,
         UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB,
-        HWND excludeC, std::vector<uint8_t>& outBgra);
+        HWND excludeC, bool lightPlate, std::vector<uint8_t>& outBgra);
     // Non-blocking GlassPS bake for open menus (Quick/Dock Settings / context).
     // Begin submits BitBlt + GPU work without waiting; Take copies readback when
     // the fence is signaled. Dedicated panel command list so this never races the
@@ -119,7 +119,7 @@ public:
     // the BitBlt matched the last bake and no GPU work was submitted.
     [[nodiscard]] bool BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT height,
         UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB,
-        HWND excludeC, int tag = -1, bool* skippedUnchanged = nullptr);
+        HWND excludeC, bool lightPlate, int tag = -1, bool* skippedUnchanged = nullptr);
     [[nodiscard]] bool TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra, int* tag = nullptr);
     [[nodiscard]] bool IsLiveGlassPanelPending() const noexcept;
     void CancelLiveGlassPanelBake() noexcept;

@@ -66,6 +66,18 @@
 // DOCK_QS_SETTINGS_GLASS_ALPHA so a little of the live desktop shows through.
 #define DOCK_PANEL_GLASS_ALPHA 1.0f
 #define DOCK_QS_SETTINGS_GLASS_ALPHA 0.95f
+// Text panels (Quick Settings / Dock Settings). The dock face veil is too
+// clear for labels: crush the backdrop into a dark band, keep a frost floor
+// so detail dissolves, and bend only the outer rim.
+#define DOCK_TEXT_PANEL_FACE_OVER_BLACK (18.0f / 255.0f)
+#define DOCK_TEXT_PANEL_FACE_OVER_WHITE (40.0f / 255.0f)
+// Light-mode veil for the same panels. Still crushed so wallpaper cannot
+// compete with labels; scene0.w selects this over the dark pair.
+#define DOCK_TEXT_PANEL_LIGHT_OVER_BLACK (228.0f / 255.0f)
+#define DOCK_TEXT_PANEL_LIGHT_OVER_WHITE (247.0f / 255.0f)
+#define DOCK_TEXT_PANEL_PLATE_MIX_FLOOR 0.82f
+#define DOCK_TEXT_PANEL_FROST_FLOOR 0.85f
+#define DOCK_TEXT_PANEL_BEVEL_PT 12.0f
 
 // Drop-shadow margin around the dock pill, shared by layout (window
 // inflation, input-region inset, popup anchors) and the glass shader (pill

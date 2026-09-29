@@ -47,6 +47,9 @@ public:
     void SetDropShadow(bool enabled) noexcept;
     [[nodiscard]] bool DepthShade() const noexcept;
     void SetDepthShade(bool enabled) noexcept;
+    // Quick Settings and Dock Settings. Off is the dark plate.
+    [[nodiscard]] bool LightPanels() const noexcept;
+    void SetLightPanels(bool enabled) noexcept;
     // Remembers the last version whose installer/mover was actually launched,
     // with the wall-clock time of the attempt (unix seconds, 0 = none). Used
     // to break reinstall loops: if the install did not take effect (wrong
@@ -81,6 +84,7 @@ private:
     bool m_specular = true;
     bool m_dropShadow = true;
     bool m_depthShade = true;
+    bool m_lightPanels = false;
     std::wstring m_lastInstalledVersion;
     long long m_lastInstalledTime = 0;
     int m_lastInstalledAttempts = 0;

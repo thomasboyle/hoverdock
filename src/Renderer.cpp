@@ -3257,7 +3257,7 @@ void Renderer::SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const
 
 bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, UINT fxFlags,
     float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC,
-    std::vector<uint8_t>& outBgra)
+    bool lightPlate, std::vector<uint8_t>& outBgra)
 {
     outBgra.clear();
     if (m_device == nullptr || m_queue == nullptr || m_panelCommandList == nullptr ||
@@ -3354,7 +3354,7 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         m_panelMappedConstants->scene0[0] = static_cast<float>(width);
         m_panelMappedConstants->scene0[1] = static_cast<float>(height);
         m_panelMappedConstants->scene0[2] = glassAlpha;
-        m_panelMappedConstants->scene0[3] = 1.0F;
+        m_panelMappedConstants->scene0[3] = lightPlate ? 1.0F : 0.0F;
         m_panelMappedConstants->scene1[0] = static_cast<float>(fxFlags | DOCK_FX_PANEL);
         m_panelMappedConstants->scene1[1] = (std::max)(dpiScale, 1.0F);
         m_panelMappedConstants->scene1[2] = 0.0F;
@@ -3441,8 +3441,11 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
 
         // Same frost-scaled stack as the live dock (1H at clear/mid, up to
         // 5H+4V here + GlassPS final V at full frost).
-        const float panelFrostAmt =
+        float panelFrostAmt =
             static_cast<float>((fxFlags >> 16) & 0xFFu) / 255.0F;
+        if ((fxFlags & DOCK_FX_DOCK_FACE) != 0) {
+            panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
+        }
         blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurPipeline.Get());
         const int panelExtraPairs = static_cast<int>(std::lround(
             std::clamp((panelFrostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
@@ -3667,7 +3670,7 @@ bool Renderer::ShouldSkipLivePanelBitBlt(UINT width, UINT height) noexcept
 
 bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT height,
     UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC,
-    int tag, bool* skippedUnchanged)
+    bool lightPlate, int tag, bool* skippedUnchanged)
 {
     if (skippedUnchanged != nullptr) {
         *skippedUnchanged = false;
@@ -3830,7 +3833,7 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         m_panelMappedConstants->scene0[0] = static_cast<float>(width);
         m_panelMappedConstants->scene0[1] = static_cast<float>(height);
         m_panelMappedConstants->scene0[2] = glassAlpha;
-        m_panelMappedConstants->scene0[3] = 1.0F;
+        m_panelMappedConstants->scene0[3] = lightPlate ? 1.0F : 0.0F;
         m_panelMappedConstants->scene1[0] = static_cast<float>(fxFlags | DOCK_FX_PANEL);
         m_panelMappedConstants->scene1[1] = (std::max)(dpiScale, 1.0F);
         m_panelMappedConstants->scene1[2] = 0.0F;
@@ -3919,8 +3922,11 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
             m_device->CreateShaderResourceView(target, &blurView, blurSrv);
         };
 
-        const float panelFrostAmt =
+        float panelFrostAmt =
             static_cast<float>((fxFlags >> 16) & 0xFFu) / 255.0F;
+        if ((fxFlags & DOCK_FX_DOCK_FACE) != 0) {
+            panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
+        }
         blurPass(m_panelBlurTemp.Get(), blurTempIsSrv, 0, 2, m_blurPipeline.Get());
         const int panelExtraPairs = static_cast<int>(std::lround(
             std::clamp((panelFrostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));

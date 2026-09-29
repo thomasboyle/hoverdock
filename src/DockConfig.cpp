@@ -955,6 +955,7 @@ bool DockConfig::Load() {
     m_specular = true;
     m_dropShadow = true;
     m_depthShade = true;
+    m_lightPanels = false;
     m_lastInstalledVersion.clear();
     m_lastInstalledTime = 0;
     m_lastInstalledAttempts = 0;
@@ -1024,6 +1025,10 @@ bool DockConfig::Load() {
         const auto depthShade = dockSection->second.find(L"depthshade");
         if (depthShade != dockSection->second.end()) {
             m_depthShade = ParseBoolean(depthShade->second);
+        }
+        const auto lightPanels = dockSection->second.find(L"lightpanels");
+        if (lightPanels != dockSection->second.end()) {
+            m_lightPanels = ParseBoolean(lightPanels->second);
         }
         const auto lastInstalledVersion =
             dockSection->second.find(L"lastinstalledversion");
@@ -1100,6 +1105,7 @@ bool DockConfig::Save() const {
     contents << L"Specular=" << (m_specular ? L"1" : L"0") << L"\n";
     contents << L"DropShadow=" << (m_dropShadow ? L"1" : L"0") << L"\n";
     contents << L"DepthShade=" << (m_depthShade ? L"1" : L"0") << L"\n";
+    contents << L"LightPanels=" << (m_lightPanels ? L"1" : L"0") << L"\n";
     if (!m_lastInstalledVersion.empty()) {
         contents << L"LastInstalledVersion=" << m_lastInstalledVersion << L"\n";
         contents << L"LastInstalledTime=" << m_lastInstalledTime << L"\n";
@@ -1241,6 +1247,14 @@ void DockConfig::SetDepthShade(bool enabled) noexcept {
     m_depthShade = enabled;
 }
 
+bool DockConfig::LightPanels() const noexcept {
+    return m_lightPanels;
+}
+
+void DockConfig::SetLightPanels(bool enabled) noexcept {
+    m_lightPanels = enabled;
+}
+
 std::wstring DockConfig::LastInstalledVersion() const {
     return m_lastInstalledVersion;
 }
@@ -1291,5 +1305,6 @@ void DockConfig::SetDefaults() {
     m_specular = true;
     m_dropShadow = true;
     m_depthShade = true;
+    m_lightPanels = false;
     m_frostAmount = 0.0F;
 }

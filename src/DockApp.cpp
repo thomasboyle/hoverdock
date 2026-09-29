@@ -431,23 +431,24 @@ int PopupFrostRadiusPx(float frostAmount, float scale) noexcept
 
 void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
     const std::vector<float>& coverage, const std::vector<float>& blurredCoverage,
-    float frostAmount, bool dockFace)
+    float frostAmount, bool dockFace, bool lightPlate)
 {
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
-    // CPU popup fallback only (QS / Dock Settings / context). Match the
-    // GlassPS plate: dock face for QS / Dock Settings, charcoal for context.
-    const float overBlack =
-        (dockFace ? DOCK_FACE_OVER_BLACK : DOCK_PANEL_FACE_OVER_BLACK) * 255.0F;
-    const float overWhite =
-        (dockFace ? DOCK_FACE_OVER_WHITE : DOCK_PANEL_FACE_OVER_WHITE) * 255.0F;
-    const float frost = std::clamp(frostAmount, 0.0F, 1.0F);
-    // Match GlassPS FrostPlateMix (+ panel milk floor on the charcoal plate).
+    // CPU popup fallback only (QS / Dock Settings / context). Match GlassPS:
+    // dark or light text-panel veil for QS / Dock Settings, charcoal for context.
+    const float overBlack = (!dockFace ? DOCK_PANEL_FACE_OVER_BLACK
+        : (lightPlate ? DOCK_TEXT_PANEL_LIGHT_OVER_BLACK : DOCK_TEXT_PANEL_FACE_OVER_BLACK)) *
+        255.0F;
+    const float overWhite = (!dockFace ? DOCK_PANEL_FACE_OVER_WHITE
+        : (lightPlate ? DOCK_TEXT_PANEL_LIGHT_OVER_WHITE : DOCK_TEXT_PANEL_FACE_OVER_WHITE)) *
+        255.0F;
+    const float frost = std::clamp(
+        dockFace ? (std::max)(frostAmount, DOCK_TEXT_PANEL_FROST_FLOOR) : frostAmount, 0.0F, 1.0F);
     float plateMix = frost <= 0.5F ? (0.10F + 0.90F * (frost * 2.0F)) : 1.0F;
-    if (!dockFace) {
-        plateMix = (std::max)(plateMix, DOCK_PANEL_PLATE_MIX_FLOOR);
-    }
+    plateMix = (std::max)(plateMix,
+        dockFace ? DOCK_TEXT_PANEL_PLATE_MIX_FLOOR : DOCK_PANEL_PLATE_MIX_FLOOR);
     const float alpha = dockFace ? DOCK_QS_SETTINGS_GLASS_ALPHA
                                 : DOCK_PANEL_GLASS_ALPHA + (1.0F - DOCK_PANEL_GLASS_ALPHA) * frost;
     constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F}; // DIB B,G,R
@@ -5634,7 +5635,8 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     case SettingsHitKind::Frost:
     case SettingsHitKind::Specular:
     case SettingsHitKind::DropShadow:
-    case SettingsHitKind::DepthShade: {
+    case SettingsHitKind::DepthShade:
+    case SettingsHitKind::LightPanels: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         const float wash = (hit.kind == SettingsHitKind::CheckNow ||
                                hit.kind == SettingsHitKind::PerfProfile)
@@ -5966,7 +5968,8 @@ bool DockApp::TickLivePopupGlass()
         bool unchanged = false;
         if (m_renderer.BeginLiveGlassPanelBake(screenRect, static_cast<UINT>(width),
                 static_cast<UINT>(height), fxFlags, glassAlpha, dpiScale, m_settingsWindow,
-                m_overflowWindow, m_contextWindow, target, &unchanged)) {
+                m_overflowWindow, m_contextWindow, target != 2 && m_config.LightPanels(), target,
+                &unchanged)) {
             m_popupGlassDirty[target] = false;
             m_lastPopupGlassRefreshMs = GetTickCount64();
             didWork = true;
@@ -5997,7 +6000,7 @@ bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* 
     std::vector<uint8_t> glass;
     if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(width), static_cast<UINT>(height),
             PackPopupGlassFxFlags(dockFace), glassAlpha, dpiScale, m_settingsWindow,
-            m_overflowWindow, m_contextWindow, glass)) {
+            m_overflowWindow, m_contextWindow, dockFace && m_config.LightPanels(), glass)) {
         return false;
     }
     if (glass.size() != static_cast<size_t>(width) * static_cast<size_t>(height) * 4U) {
@@ -6138,6 +6141,17 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         QueueRenderFrame();
         break;
     }
+    case SettingsHitKind::LightPanels: {
+        m_config.SetLightPanels(!m_config.LightPanels());
+        ScheduleConfigSave();
+        InvalidateSettingsGlass();
+        InvalidateOverflowGlass();
+        PaintSettingsPopup();
+        if (IsOverflowOpen()) {
+            PaintOverflowPopup();
+        }
+        break;
+    }
     case SettingsHitKind::CheckNow:
         if (!m_updateInFlight.load() && !m_updateInstalling.load()) {
             CheckForUpdatesAsync(true);
@@ -6276,6 +6290,9 @@ void DockApp::PaintSettingsPopup() {
         float amount;
     };
     const SettingsRow rows[] = {
+        {SettingsHitKind::LightPanels, L"Light mode",
+            L"Light glass for Quick Settings and Dock Settings", false, m_config.LightPanels(),
+            0.0F},
         {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows", false,
             m_config.LaunchAtStartup(), 0.0F},
         {SettingsHitKind::Updates, L"Check for updates", L"Auto-download and install builds", false,
@@ -6391,7 +6408,7 @@ void DockApp::PaintSettingsPopup() {
         ReleaseDC(nullptr, screen);
         // CPU fallback when GlassPS bake is unavailable.
         const float frostAmt = (std::max)(std::clamp(m_config.FrostAmount(), 0.0F, 1.0F),
-            DOCK_PANEL_FROST_BLUR_FLOOR);
+            DOCK_TEXT_PANEL_FROST_FLOOR);
         const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         BoxBlurRgb(pixels, SaturatedInt(m_settingsSize.cx), SaturatedInt(m_settingsSize.cy),
             frostRadius);
@@ -6459,7 +6476,7 @@ void DockApp::PaintSettingsPopup() {
                 std::max(1, static_cast<int>(std::lround(2.6F * scale))));
             // Same liquid-glass face as the dock (calibrated tone map + rim).
             ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
-                blurredCoverage, m_config.FrostAmount(), true);
+                blurredCoverage, m_config.FrostAmount(), true, m_config.LightPanels());
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
@@ -6497,7 +6514,7 @@ void DockApp::PaintSettingsPopup() {
         const float trackCxL = static_cast<float>(trackLeft) + trackRadius;
         const float trackCxR = static_cast<float>(right) - trackRadius;
         const float trackCy = static_cast<float>(trackTop) + trackRadius;
-        const float wash = enabled ? (hovered ? 0.96F : 0.90F) : (hovered ? 0.55F : 0.48F);
+        const float wash = enabled ? (hovered ? 0.96F : 0.90F) : (hovered ? 0.72F : 0.62F);
         if (enabled) {
             // On = #98A869 toggle fill (Concept D Minimal Sage).
             FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
@@ -6511,13 +6528,13 @@ void DockApp::PaintSettingsPopup() {
         FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
     };
     auto drawSlider = [&](LONG centerY, LONG left, LONG right, float amount, bool hovered) {
-        const LONG trackHeight = std::max(4L, std::lround(5.0F * scale));
+        const LONG trackHeight = std::max(6L, std::lround(8.0F * scale));
         const float trackRadius = static_cast<float>(trackHeight) * 0.5F;
         const float trackCy = static_cast<float>(centerY);
         const float trackCxL = static_cast<float>(left) + trackRadius;
         const float trackCxR = static_cast<float>(right) - trackRadius;
         FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
-            hovered ? 0.55F : 0.48F, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
+            hovered ? 0.78F : 0.68F, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
         const float filled = std::clamp(amount, 0.0F, 1.0F);
         const float fillRight = trackCxL + (trackCxR - trackCxL) * filled;
         if (fillRight > trackCxL + 0.5F) {
@@ -6529,7 +6546,11 @@ void DockApp::PaintSettingsPopup() {
         FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
     };
 
-    SetFlyoutChromeInkForGlass(pixels, width, height);
+    if (m_config.LightPanels()) {
+        SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
+    } else {
+        SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
+    }
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
@@ -6552,7 +6573,7 @@ void DockApp::PaintSettingsPopup() {
     for (const SettingsRow& row : rows) {
         const RECT rowBounds{padding, y, panelWidth - padding, y + rowHeight};
         FillSquirclePremul(pixels, width, height, rowBounds, ContentSquircleRadius(rowBounds, scale),
-            0.07F);
+            0.10F);
         if (row.slider) {
             const LONG sliderLeft = padding + 4L;
             const LONG sliderRight = panelWidth - padding - 4L;
@@ -6617,7 +6638,7 @@ void DockApp::PaintSettingsPopup() {
     RECT statusBounds{padding, versionBounds.bottom + 2, panelWidth - padding,
         versionBounds.bottom + 2 + subHeight + 4};
     DrawFlyoutText(pixels, width, height, statusBounds, statusFont, m_updateStatus,
-        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 225);
+        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
     if (!m_perfStatus.empty() || profiling) {
         std::wstring perfLine = m_perfStatus;
         if (profiling && perfLine.empty()) {
@@ -6631,7 +6652,7 @@ void DockApp::PaintSettingsPopup() {
             ? static_cast<int>(savedPrefix.size())
             : -1;
         DrawFlyoutText(pixels, width, height, perfStatusBounds, statusFont, perfLine,
-            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 225, underlineFrom);
+            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 245, underlineFrom);
         if (savedLink) {
             pushHit(SettingsHitKind::PerfLog, perfStatusBounds);
         }
@@ -6939,11 +6960,11 @@ void DockApp::EnsureOverflowFonts(float scale) {
     m_overflowTitleFont = CreateFlyoutFont(std::max(16, static_cast<int>(std::lround(18.0F * scale))),
         FW_NORMAL);
     m_overflowSectionFont = CreateFlyoutFont(std::max(13, static_cast<int>(std::lround(14.0F * scale))),
+        FW_SEMIBOLD);
+    m_overflowLabelFont = CreateFlyoutFont(std::max(12, static_cast<int>(std::lround(13.0F * scale))),
         FW_NORMAL);
-    m_overflowLabelFont = CreateFlyoutFont(std::max(11, static_cast<int>(std::lround(12.0F * scale))),
-        FW_NORMAL);
-    m_overflowStatusFont = CreateFlyoutFont(std::max(10, static_cast<int>(std::lround(11.0F * scale))),
-        FW_NORMAL);
+    m_overflowStatusFont = CreateFlyoutFont(std::max(11, static_cast<int>(std::lround(12.0F * scale))),
+        FW_MEDIUM);
     m_overflowFontScale = scale;
 }
 
@@ -7265,7 +7286,7 @@ void DockApp::PaintOverflowPopup() {
         ReleaseDC(nullptr, screen);
         // CPU fallback when GlassPS bake is unavailable.
         const float frostAmt = (std::max)(std::clamp(m_config.FrostAmount(), 0.0F, 1.0F),
-            DOCK_PANEL_FROST_BLUR_FLOOR);
+            DOCK_TEXT_PANEL_FROST_FLOOR);
         const int frostRadius = PopupFrostRadiusPx(frostAmt, scale);
         BoxBlurRgb(pixels, SaturatedInt(m_overflowSize.cx), SaturatedInt(m_overflowSize.cy),
             frostRadius);
@@ -7349,7 +7370,7 @@ void DockApp::PaintOverflowPopup() {
             // shared with GlassPS via DockTheme.hlsli.
             // Same liquid-glass face as the dock (calibrated tone map + rim).
             ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
-                blurredCoverage, m_config.FrostAmount(), true);
+                blurredCoverage, m_config.FrostAmount(), true, m_config.LightPanels());
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
@@ -7387,7 +7408,11 @@ void DockApp::PaintOverflowPopup() {
         return hasHover && hoveredHit.kind == kind && hoveredHit.index == index;
     };
 
-    SetFlyoutChromeInkForGlass(pixels, width, height);
+    if (m_config.LightPanels()) {
+        SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
+    } else {
+        SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
+    }
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - gearSize - 8, y + headerHeight};
@@ -7405,6 +7430,19 @@ void DockApp::PaintOverflowPopup() {
     m_overflowGearX = SaturatedInt(gearBounds.left);
     m_overflowGearY = SaturatedInt(gearBounds.top);
     m_overflowGearExtent = gearExtent;
+    {
+        const LONG plate = gearSize + std::max(6L, std::lround(8.0F * scale));
+        const LONG plateLeft = gearBounds.left + gearSize / 2L - plate / 2L;
+        const LONG plateTop = gearBounds.top + gearSize / 2L - plate / 2L;
+        const RECT gearPlate{plateLeft, plateTop, plateLeft + plate, plateTop + plate};
+        if (m_config.LightPanels()) {
+            FillSquircleColorPremul(pixels, width, height, gearPlate,
+                static_cast<float>(plate) * 0.5F, 0.82F, 255, 255, 255);
+        } else {
+            FillSquircleColorPremul(pixels, width, height, gearPlate,
+                static_cast<float>(plate) * 0.5F, 0.72F, 22, 24, 28);
+        }
+    }
     if (!m_overflowGlyphGear.empty()) {
         CompositePremul(pixels, width, height, m_overflowGearX, m_overflowGearY,
             m_overflowGlyphGear.data(), SaturatedInt(gearExtent), SaturatedInt(gearExtent));
@@ -7461,18 +7499,22 @@ void DockApp::PaintOverflowPopup() {
         const bool isFullAmber = tiles[index].kind == TrayFlyoutHitKind::Boost ||
             (tiles[index].kind == TrayFlyoutHitKind::Wifi &&
                 trayStatus.network != TrayNetworkKind::Disconnected);
+        if (m_config.LightPanels()) {
+            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.90F, 250, 250, 248);
+        } else {
+            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.92F, 28, 30, 36);
+        }
         if (isSlider) {
-            // Light #98A869 squircle plus stronger fill rising with progress.
-            // Hover stroke is applied later in ApplyOverflowHoverHighlight.
-            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.50F, kQuickAccentB,
+            // Dark squircle, then a sage wash and a level fill rising with progress.
+            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.55F, kQuickAccentB,
                 kQuickAccentG, kQuickAccentR);
-            FillSquircleLevelColorPremul(pixels, width, height, disc, discRadius, level, 0.88F,
+            FillSquircleLevelColorPremul(pixels, width, height, disc, discRadius, level, 0.94F,
                 kQuickAccentB, kQuickAccentG, kQuickAccentR);
         } else if (isFullAmber) {
-            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.70F, kQuickAccentB,
+            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.82F, kQuickAccentB,
                 kQuickAccentG, kQuickAccentR);
         } else {
-            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.50F, kQuickAccentB,
+            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.42F, kQuickAccentB,
                 kQuickAccentG, kQuickAccentR);
         }
         // Glyph bitmaps are cached by EnsureOverflowGlyphs above; hover repaints only composite.
@@ -7495,7 +7537,7 @@ void DockApp::PaintOverflowPopup() {
             DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
         RECT statusBounds{left, labelBounds.bottom, left + tileWidth, labelBounds.bottom + statusHeight};
         DrawFlyoutText(pixels, width, height, statusBounds, statusFont, tiles[index].status,
-            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
+            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
         pushHit(tiles[index].kind, tileBounds);
     }
     y += tileBlock + dividerGap;
@@ -7513,7 +7555,7 @@ void DockApp::PaintOverflowPopup() {
 
     RECT notifyRow{padding, y, panelWidth - padding, y + notificationRow};
     FillSquirclePremul(pixels, width, height, notifyRow, ContentSquircleRadius(notifyRow, scale),
-        0.07F);
+        0.10F);
     if (!m_overflowGlyphBell.empty()) {
         CompositePremul(pixels, width, height, SaturatedInt(padding + 4),
             SaturatedInt(y + (notificationRow - static_cast<LONG>(notifyGlyph)) / 2L),
@@ -7550,7 +7592,7 @@ void DockApp::PaintOverflowPopup() {
             const RECT cell{left, top, left + cellWidth, top + otherIconHeight};
             const LONG chipInset = std::max(4L, std::lround(5.0F * scale));
             const RECT chip = InsetContentRect(cell, chipInset);
-            FillSquirclePremul(pixels, width, height, chip, ContentSquircleRadius(chip, scale), 0.06F);
+            FillSquirclePremul(pixels, width, height, chip, ContentSquircleRadius(chip, scale), 0.10F);
             if (m_overflowIcons[index].icon != nullptr) {
                 const LONG iconLeft = left + (cellWidth - otherIconSize) / 2L;
                 const LONG iconTop = top + 6;
@@ -7598,7 +7640,7 @@ void DockApp::PaintOverflowPopup() {
             const std::wstring status = NotifyIconStatus(m_overflowIcons[index]);
             if (!status.empty()) {
                 DrawFlyoutText(pixels, width, height, statusBounds, statusFont, status,
-                    DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
+                    DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
             }
             pushHit(TrayFlyoutHitKind::NotifyIcon, cell, static_cast<int>(index));
         }
@@ -8790,7 +8832,7 @@ void DockApp::PaintContextMenu() {
                 std::max(1, static_cast<int>(std::lround(2.6F * scale))));
             // Same liquid-glass face as the dock (calibrated tone map + rim).
             ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
-                blurredCoverage, m_config.FrostAmount(), false);
+                blurredCoverage, m_config.FrostAmount(), false, false);
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);
