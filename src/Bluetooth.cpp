@@ -29,6 +29,7 @@ using ABI::Windows::Foundation::IAsyncInfo;
 namespace {
 
 constexpr DWORD kOpTimeoutMs = 20000;
+constexpr DWORD kStatusTimeoutMs = 2500;
 constexpr DWORD kPairTimeoutMs = 180000;
 constexpr size_t kMaxPaired = 6;
 constexpr size_t kMaxDiscovered = 4;
@@ -37,10 +38,6 @@ constexpr size_t kMaxTracked = 32;
 constexpr wchar_t kBluetoothAqs[] =
     L"(System.Devices.Aep.ProtocolId:=\"{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\" OR "
     L"System.Devices.Aep.ProtocolId:=\"{bb7bb05e-5972-42b5-94fc-76eaa7084d49}\")";
-constexpr wchar_t kPairedAqs[] =
-    L"(System.Devices.Aep.ProtocolId:=\"{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\" OR "
-    L"System.Devices.Aep.ProtocolId:=\"{bb7bb05e-5972-42b5-94fc-76eaa7084d49}\") AND "
-    L"System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#True";
 
 #ifndef FILE_DEVICE_BLUETOOTH
 #define FILE_DEVICE_BLUETOOTH 0x00000041
@@ -60,6 +57,7 @@ using AddedHandler =
 using UpdatedHandler =
     __FITypedEventHandler_2_Windows__CDevices__CEnumeration__CDeviceWatcher_Windows__CDevices__CEnumeration__CDeviceInformationUpdate;
 using StoppedHandler = __FITypedEventHandler_2_Windows__CDevices__CEnumeration__CDeviceWatcher_IInspectable;
+using ClassicDeviceAsync = __FIAsyncOperation_1_Windows__CDevices__CBluetooth__CBluetoothDevice;
 using LeDeviceAsync = __FIAsyncOperation_1_Windows__CDevices__CBluetooth__CBluetoothLEDevice;
 using GattAsync =
     __FIAsyncOperation_1_Windows__CDevices__CBluetooth__CGenericAttributeProfile__CGattDeviceServicesResult;
@@ -161,6 +159,53 @@ uint64_t ParseBluetoothAddress(const std::wstring& text) {
     return 0;
 }
 
+uint64_t AddressFromTwelveHex(const wchar_t* hex) {
+    if (hex == nullptr) {
+        return 0;
+    }
+    unsigned bytes[6]{};
+    for (int index = 0; index < 6; ++index) {
+        const int high = HexValue(hex[index * 2]);
+        const int low = HexValue(hex[index * 2 + 1]);
+        if (high < 0 || low < 0) {
+            return 0;
+        }
+        bytes[index] = static_cast<unsigned>((high << 4) | low);
+    }
+    BLUETOOTH_ADDRESS address{};
+    for (int index = 0; index < 6; ++index) {
+        address.rgBytes[index] = static_cast<BYTE>(bytes[5 - index]);
+    }
+    return address.ullLong;
+}
+
+uint64_t AddressFromTaggedId(const std::wstring& text) {
+    const wchar_t* tags[] = {L"BLUETOOTHDEVICE_", L"DEV_"};
+    for (const wchar_t* tag : tags) {
+        const size_t tagLength = wcslen(tag);
+        if (text.size() < tagLength + 12) {
+            continue;
+        }
+        for (size_t start = 0; start + tagLength + 12 <= text.size(); ++start) {
+            bool matched = true;
+            for (size_t index = 0; index < tagLength; ++index) {
+                if (towlower(text[start + index]) != towlower(tag[index])) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (!matched) {
+                continue;
+            }
+            const uint64_t address = AddressFromTwelveHex(text.c_str() + start + tagLength);
+            if (address != 0) {
+                return address;
+            }
+        }
+    }
+    return 0;
+}
+
 bool LooksLikeAddress(const std::wstring& name) {
     if (name.size() != 17) {
         return false;
@@ -176,6 +221,30 @@ bool ContainsInsensitive(const std::wstring& text, const wchar_t* needle) {
                [](wchar_t left, wchar_t right) {
                    return towlower(left) == towlower(right);
                }) != text.end();
+}
+
+bool IsProfileName(const std::wstring& name) {
+    return ContainsInsensitive(name, L"Hands-Free") || ContainsInsensitive(name, L"Avrcp") ||
+           ContainsInsensitive(name, L"Transport");
+}
+
+std::wstring StripProfileSuffix(std::wstring name) {
+    const wchar_t* suffixes[] = {L" Avrcp Transport", L" Hands-Free", L" Hands Free"};
+    bool stripped = true;
+    while (stripped) {
+        stripped = false;
+        for (const wchar_t* suffix : suffixes) {
+            const size_t length = wcslen(suffix);
+            if (name.size() <= length) {
+                continue;
+            }
+            if (ContainsInsensitive(name.substr(name.size() - length), suffix)) {
+                name.resize(name.size() - length);
+                stripped = true;
+            }
+        }
+    }
+    return name;
 }
 
 class HStringIterator : public Microsoft::WRL::RuntimeClass<
@@ -890,6 +959,9 @@ struct BluetoothService::Impl {
             std::wstring addressText;
             if (ReadProperty(properties.Get(), L"System.Devices.Aep.DeviceAddress", addressText)) {
                 device.address = ParseBluetoothAddress(addressText);
+                if (device.address == 0 && addressText.size() == 12) {
+                    device.address = AddressFromTwelveHex(addressText.c_str());
+                }
             }
             bool connected = false;
             if (ReadProperty(properties.Get(), L"System.Devices.Aep.IsConnected", connected)) {
@@ -906,6 +978,9 @@ struct BluetoothService::Impl {
         }
         if (device.address == 0) {
             device.address = ParseBluetoothAddress(device.id);
+        }
+        if (device.address == 0) {
+            device.address = AddressFromTaggedId(device.id);
         }
         ComPtr<ABI::Windows::Devices::Enumeration::IDeviceInformation2> info2;
         if (SUCCEEDED(info->QueryInterface(IID_PPV_ARGS(&info2))) && info2 != nullptr) {
@@ -961,6 +1036,11 @@ struct BluetoothService::Impl {
         if (candidateNamed != currentNamed) {
             return candidateNamed;
         }
+        const bool candidateProfile = IsProfileName(candidate.name);
+        const bool currentProfile = IsProfileName(current.name);
+        if (candidateProfile != currentProfile) {
+            return !candidateProfile;
+        }
         if (candidate.lowEnergy != current.lowEnergy) {
             return !candidate.lowEnergy;
         }
@@ -982,6 +1062,7 @@ struct BluetoothService::Impl {
                 if (device.address == 0) {
                     device.address = existing.address;
                 }
+                device.connected = device.connected || existing.connected;
                 existing = std::move(device);
             } else {
                 if (existing.name.empty()) {
@@ -1082,31 +1163,136 @@ struct BluetoothService::Impl {
         }
     }
 
-    void RefreshPaired() {
-        auto statics = DeviceStatics();
-        if (statics == nullptr) {
+    void ApplyClassicConnection(RadioDevice& device) {
+        ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothDeviceStatics> statics;
+        Microsoft::WRL::Wrappers::HStringReference className(
+            RuntimeClass_Windows_Devices_Bluetooth_BluetoothDevice);
+        if (FAILED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics))) || statics == nullptr) {
             return;
         }
+        ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothDevice> bt;
+        if (device.address != 0) {
+            ComPtr<ClassicDeviceAsync> operation;
+            if (SUCCEEDED(statics->FromBluetoothAddressAsync(device.address, operation.GetAddressOf())) &&
+                operation != nullptr) {
+                WaitResult(operation.Get(), bt.GetAddressOf(), kStatusTimeoutMs);
+            }
+        }
+        if (bt == nullptr && !device.id.empty()) {
+            Microsoft::WRL::Wrappers::HStringReference id(device.id.c_str());
+            ComPtr<ClassicDeviceAsync> operation;
+            if (FAILED(statics->FromIdAsync(id.Get(), operation.GetAddressOf())) || operation == nullptr) {
+                return;
+            }
+            if (FAILED(WaitResult(operation.Get(), bt.GetAddressOf(), kStatusTimeoutMs)) || bt == nullptr) {
+                return;
+            }
+        }
+        if (bt == nullptr) {
+            return;
+        }
+        ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus status =
+            ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Disconnected;
+        if (SUCCEEDED(bt->get_ConnectionStatus(&status)) &&
+            status == ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Connected) {
+            device.connected = true;
+        }
+        if (device.address == 0) {
+            UINT64 address = 0;
+            if (SUCCEEDED(bt->get_BluetoothAddress(&address))) {
+                device.address = address;
+            }
+        }
+    }
+
+    void ApplyLeConnection(RadioDevice& device) {
+        ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothLEDeviceStatics> statics;
+        Microsoft::WRL::Wrappers::HStringReference className(
+            RuntimeClass_Windows_Devices_Bluetooth_BluetoothLEDevice);
+        if (FAILED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics))) || statics == nullptr) {
+            return;
+        }
+        ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothLEDevice> bt;
+        if (device.address != 0) {
+            ComPtr<LeDeviceAsync> operation;
+            if (SUCCEEDED(statics->FromBluetoothAddressAsync(device.address, operation.GetAddressOf())) &&
+                operation != nullptr) {
+                WaitResult(operation.Get(), bt.GetAddressOf(), kStatusTimeoutMs);
+            }
+        }
+        if (bt == nullptr && !device.id.empty()) {
+            Microsoft::WRL::Wrappers::HStringReference id(device.id.c_str());
+            ComPtr<LeDeviceAsync> operation;
+            if (FAILED(statics->FromIdAsync(id.Get(), operation.GetAddressOf())) || operation == nullptr) {
+                return;
+            }
+            if (FAILED(WaitResult(operation.Get(), bt.GetAddressOf(), kStatusTimeoutMs)) || bt == nullptr) {
+                return;
+            }
+        }
+        if (bt == nullptr) {
+            return;
+        }
+        ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus status =
+            ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Disconnected;
+        if (SUCCEEDED(bt->get_ConnectionStatus(&status)) &&
+            status == ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Connected) {
+            device.connected = true;
+        }
+        if (device.address == 0) {
+            UINT64 address = 0;
+            if (SUCCEEDED(bt->get_BluetoothAddress(&address))) {
+                device.address = address;
+            }
+        }
+    }
+
+    bool CollectPaired(bool lowEnergy, std::vector<RadioDevice>& dest) {
+        HSTRING selector = nullptr;
+        if (lowEnergy) {
+            ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothLEDeviceStatics2> statics;
+            Microsoft::WRL::Wrappers::HStringReference className(
+                RuntimeClass_Windows_Devices_Bluetooth_BluetoothLEDevice);
+            if (FAILED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics))) || statics == nullptr ||
+                FAILED(statics->GetDeviceSelectorFromPairingState(TRUE, &selector))) {
+                return false;
+            }
+        } else {
+            ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothDeviceStatics2> statics;
+            Microsoft::WRL::Wrappers::HStringReference className(
+                RuntimeClass_Windows_Devices_Bluetooth_BluetoothDevice);
+            if (FAILED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics))) || statics == nullptr ||
+                FAILED(statics->GetDeviceSelectorFromPairingState(TRUE, &selector))) {
+                return false;
+            }
+        }
+        if (selector == nullptr) {
+            return false;
+        }
+        ComPtr<ABI::Windows::Devices::Enumeration::IDeviceInformationStatics> enumeration;
+        Microsoft::WRL::Wrappers::HStringReference deviceClass(
+            RuntimeClass_Windows_Devices_Enumeration_DeviceInformation);
         auto properties = PropertyList(false);
-        if (properties == nullptr) {
-            return;
+        if (FAILED(RoGetActivationFactory(deviceClass.Get(), IID_PPV_ARGS(&enumeration))) ||
+            enumeration == nullptr || properties == nullptr) {
+            WindowsDeleteString(selector);
+            return false;
         }
-        Microsoft::WRL::Wrappers::HStringReference filter(kPairedAqs);
+        // PairingState(true) includes IssueInquiry:=False. IsPaired alone returns nothing.
         ComPtr<DeviceListAsync> operation;
-        if (FAILED(statics->FindAllAsyncWithKindAqsFilterAndAdditionalProperties(filter.Get(),
-                properties.Get(),
-                ABI::Windows::Devices::Enumeration::DeviceInformationKind_AssociationEndpoint,
-                &operation))) {
-            return;
+        const HRESULT queried = enumeration->FindAllAsyncAqsFilterAndAdditionalProperties(
+            selector, properties.Get(), operation.GetAddressOf());
+        WindowsDeleteString(selector);
+        if (FAILED(queried) || operation == nullptr) {
+            return false;
         }
         ComPtr<DeviceList> list;
         if (FAILED(WaitResult(operation.Get(), list.GetAddressOf(), kOpTimeoutMs)) || list == nullptr) {
-            return;
+            return false;
         }
-        std::vector<RadioDevice> next;
         unsigned count = 0;
         if (FAILED(list->get_Size(&count))) {
-            return;
+            return false;
         }
         for (unsigned index = 0; index < count; ++index) {
             ComPtr<ABI::Windows::Devices::Enumeration::IDeviceInformation> info;
@@ -1117,9 +1303,26 @@ struct BluetoothService::Impl {
             if (device.id.empty()) {
                 continue;
             }
-            Upsert(next, std::move(device));
+            device.lowEnergy = lowEnergy || device.lowEnergy;
+            device.canPair = false;
+            device.name = StripProfileSuffix(std::move(device.name));
+            if (lowEnergy) {
+                ApplyLeConnection(device);
+            } else {
+                ApplyClassicConnection(device);
+            }
+            Upsert(dest, std::move(device));
         }
-        paired = std::move(next);
+        return true;
+    }
+
+    void RefreshPaired() {
+        std::vector<RadioDevice> next;
+        const bool classicOk = CollectPaired(false, next);
+        const bool leOk = CollectPaired(true, next);
+        if (classicOk || leOk) {
+            paired = std::move(next);
+        }
     }
 
     void StopWatcher() {
