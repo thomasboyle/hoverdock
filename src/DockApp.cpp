@@ -448,8 +448,8 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
     if (!dockFace) {
         plateMix = (std::max)(plateMix, DOCK_PANEL_PLATE_MIX_FLOOR);
     }
-    const float alpha =
-        DOCK_PANEL_GLASS_ALPHA + (1.0F - DOCK_PANEL_GLASS_ALPHA) * frost;
+    const float alpha = dockFace ? DOCK_QS_SETTINGS_GLASS_ALPHA
+                                : DOCK_PANEL_GLASS_ALPHA + (1.0F - DOCK_PANEL_GLASS_ALPHA) * frost;
     constexpr float kChannelK[3] = {0.99F, 0.985F, 0.98F}; // DIB B,G,R
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
@@ -5916,13 +5916,16 @@ bool DockApp::TickLivePopupGlass()
     }
 
     const float frostAmount = m_config.FrostAmount();
-    const float glassAlpha = DOCK_PANEL_GLASS_ALPHA + (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
+    const float settingsAlpha = DOCK_QS_SETTINGS_GLASS_ALPHA;
+    const float contextAlpha =
+        DOCK_PANEL_GLASS_ALPHA + (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
     const UINT dockFaceFlags = PackPopupGlassFxFlags(true);
     const UINT contextFlags = PackPopupGlassFxFlags(false);
 
     for (int target = 0; target < 3; ++target) {
         const UINT fxFlags = target == 2 ? contextFlags : dockFaceFlags;
+        const float glassAlpha = target == 2 ? contextAlpha : settingsAlpha;
         POINT origin{};
         LONG width = 0;
         LONG height = 0;
@@ -5987,7 +5990,9 @@ bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* 
     }
     const RECT screenRect{origin.x, origin.y, origin.x + width, origin.y + height};
     const float frostAmount = m_config.FrostAmount();
-    const float glassAlpha = DOCK_PANEL_GLASS_ALPHA + (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
+    const float glassAlpha = dockFace ? DOCK_QS_SETTINGS_GLASS_ALPHA
+                                      : DOCK_PANEL_GLASS_ALPHA +
+            (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
     std::vector<uint8_t> glass;
     if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(width), static_cast<UINT>(height),

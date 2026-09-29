@@ -42,8 +42,8 @@
 // Panel (Quick Settings / Dock Settings / context) - neutral dark glass.
 // Charcoal plate (pre-sage Concept A+D) so live capture+blur reads without a
 // sage wash. Dock bar keeps DOCK_FACE_* above; GlassPS branches on DOCK_FX_PANEL.
-// Alpha 1.0: layered ULW must be fully opaque so the one-shot/live bake is the
-// only backdrop (alpha < 1 composited a frozen snapshot OVER live desktop).
+// Context stays opaque (DOCK_PANEL_GLASS_ALPHA). Quick Settings and Dock
+// Settings are DOCK_QS_SETTINGS_GLASS_ALPHA.
 #define DOCK_PANEL_FACE_OVER_BLACK (26.0f / 255.0f)  // ~#1a1a1a charcoal
 #define DOCK_PANEL_FACE_OVER_WHITE (68.0f / 255.0f)  // ~#444444 over light WP
 // Light chrome ink on dark plate (forest sage ink is unreadable here).
@@ -62,8 +62,10 @@
 #define DOCK_PANEL_PLATE_MIX_FLOOR 0.62f
 // Floor frost for mica radii / blur so wallpaper detail dissolves under glyphs.
 #define DOCK_PANEL_FROST_BLUR_FLOOR 0.45f
-// Fully opaque plate: live look comes only from TickLivePopupGlass rebakes.
+// Context menu stays fully opaque. Quick Settings and Dock Settings use
+// DOCK_QS_SETTINGS_GLASS_ALPHA so a little of the live desktop shows through.
 #define DOCK_PANEL_GLASS_ALPHA 1.0f
+#define DOCK_QS_SETTINGS_GLASS_ALPHA 0.95f
 
 // Drop-shadow margin around the dock pill, shared by layout (window
 // inflation, input-region inset, popup anchors) and the glass shader (pill
