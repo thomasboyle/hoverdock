@@ -204,6 +204,7 @@ private:
         DepthShade,
         CheckNow,
         PerfProfile,
+        PerfLog,
         Close,
     };
 
@@ -767,6 +768,8 @@ private:
     std::atomic<bool> m_updateInstalling{false};
     PerfProfiler m_perfProfiler;
     std::wstring m_perfStatus;
+    // Set only after a profile finishes writing. Clicking the path opens it.
+    std::wstring m_perfSavedLog;
     double m_lastUpdateCheck = 0.0;
     std::wstring m_overflowGlyphKey;
     std::vector<uint8_t> m_overflowGlyphGear;

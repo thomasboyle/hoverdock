@@ -597,7 +597,7 @@ void LinearCoverageToPremulInk(uint8_t* pixels, int width, int height, int strid
 }
 
 bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
-    HFONT font, const std::wstring& text, UINT format, uint8_t gray) {
+    HFONT font, const std::wstring& text, UINT format, uint8_t gray, int underlineFrom) {
     IDWriteFactory* factory = FlyoutDWriteFactory();
     if (factory == nullptr) {
         return false;
@@ -664,6 +664,12 @@ bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, REC
         layout == nullptr) {
         textFormat->Release();
         return false;
+    }
+    if (underlineFrom >= 0 && static_cast<size_t>(underlineFrom) < text.size()) {
+        const DWRITE_TEXT_RANGE range{
+            static_cast<UINT32>(underlineFrom),
+            static_cast<UINT32>(text.size() - static_cast<size_t>(underlineFrom))};
+        layout->SetUnderline(TRUE, range);
     }
 
     IDWriteGdiInterop* interop = nullptr;
@@ -770,7 +776,7 @@ bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, REC
 }
 
 void DrawFlyoutTextGdiFallback(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
-    HFONT font, const std::wstring& text, UINT format, uint8_t gray) {
+    HFONT font, const std::wstring& text, UINT format, uint8_t gray, int underlineFrom) {
     // 1x ANTIALIASED + linear coverage (no box downsample). Used only if DWrite fails.
     const int width = std::max(1L, bounds.right - bounds.left);
     const int height = std::max(1L, bounds.bottom - bounds.top);
@@ -803,8 +809,20 @@ void DrawFlyoutTextGdiFallback(uint8_t* dest, int destWidth, int destHeight, REC
         DeleteDC(memory);
         return;
     }
+    HFONT underlineFont = nullptr;
+    HFONT drawFont = font;
+    if (underlineFrom >= 0) {
+        LOGFONTW logFont{};
+        if (GetObjectW(font, sizeof(logFont), &logFont) != 0) {
+            logFont.lfUnderline = TRUE;
+            underlineFont = CreateFontIndirectW(&logFont);
+            if (underlineFont != nullptr) {
+                drawFont = underlineFont;
+            }
+        }
+    }
     HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
-    HGDIOBJ previousFont = SelectObject(memory, font);
+    HGDIOBJ previousFont = SelectObject(memory, drawFont);
     {
         auto* px = static_cast<uint8_t*>(bits);
         const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
@@ -839,20 +857,26 @@ void DrawFlyoutTextGdiFallback(uint8_t* dest, int destWidth, int destHeight, REC
     CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, src, width, height);
     SelectObject(memory, previousFont);
     SelectObject(memory, previousBitmap);
+    if (underlineFont != nullptr) {
+        DeleteObject(underlineFont);
+    }
     DeleteObject(bitmap);
     DeleteDC(memory);
 }
 
 void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, HFONT font,
-    const std::wstring& text, UINT format, uint8_t gray) {
+    const std::wstring& text, UINT format, uint8_t gray, int underlineFrom = -1) {
     if (dest == nullptr || font == nullptr || text.empty()) {
         return;
     }
     // Device-pixel DirectWrite grayscale alpha mask: sharp at HostDpi without
     // ClearType RGB fringes and without the soft 2x box-downsample of 1.1.38.
     // Flyout HWND sizes already match the layered DIB (PerMonitorV2); no DIP stretch.
-    if (!DrawFlyoutTextDirectWrite(dest, destWidth, destHeight, bounds, font, text, format, gray)) {
-        DrawFlyoutTextGdiFallback(dest, destWidth, destHeight, bounds, font, text, format, gray);
+    // underlineFrom is a character index; negative leaves the run plain.
+    if (!DrawFlyoutTextDirectWrite(dest, destWidth, destHeight, bounds, font, text, format, gray,
+            underlineFrom)) {
+        DrawFlyoutTextGdiFallback(dest, destWidth, destHeight, bounds, font, text, format, gray,
+            underlineFrom);
     }
 }
 
@@ -5391,6 +5415,20 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
         }
         return 0;
 
+    case WM_SETCURSOR:
+        if (app != nullptr) {
+            POINT cursor{};
+            if (GetCursorPos(&cursor) && ScreenToClient(window, &cursor)) {
+                const int hit = app->SettingsHitIndex(cursor);
+                if (hit >= 0 &&
+                    app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::PerfLog) {
+                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    return TRUE;
+                }
+            }
+        }
+        break;
+
     default:
         break;
     }
@@ -5527,6 +5565,9 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         // Olive sage bar (#98A869) + light chrome label ink. Extra white overlay
         // brightens toward hover; forest ink stays readable on pressed too.
         FillRectPremul(pixels, width, height, hit.bounds, 0.14F);
+        break;
+    case SettingsHitKind::PerfLog:
+        FillRectPremul(pixels, width, height, hit.bounds, 0.10F);
         break;
     case SettingsHitKind::Startup:
     case SettingsHitKind::Updates:
@@ -6062,12 +6103,15 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
             m_perfProfiler.Stop();
             const std::wstring logPath = m_perfProfiler.LogPath();
             if (!logPath.empty()) {
+                m_perfSavedLog = logPath;
                 m_perfStatus = L"Saved " + logPath;
                 Log(L"Performance profile saved: " + logPath);
             } else {
+                m_perfSavedLog.clear();
                 m_perfStatus = L"Profiling stopped.";
             }
         } else {
+            m_perfSavedLog.clear();
             if (m_perfProfiler.Start()) {
                 m_perfStatus = L"Profiling... " + m_perfProfiler.LogPath();
                 Log(L"Performance profile started: " + m_perfProfiler.LogPath());
@@ -6077,6 +6121,18 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
             }
         }
         PaintSettingsPopup();
+        break;
+    }
+    case SettingsHitKind::PerfLog: {
+        if (m_perfSavedLog.empty()) {
+            break;
+        }
+        const std::wstring logPath = m_perfSavedLog;
+        std::thread([logPath]() {
+            const std::wstring parameters = L"/select,\"" + logPath + L"\"";
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", parameters.c_str(), nullptr,
+                SW_SHOWNORMAL);
+        }).detach();
         break;
     }
     }
@@ -6521,8 +6577,16 @@ void DockApp::PaintSettingsPopup() {
         }
         RECT perfStatusBounds{padding, statusBounds.bottom, panelWidth - padding,
             y + statusHeight + subHeight};
+        const bool savedLink = !profiling && !m_perfSavedLog.empty();
+        const std::wstring savedPrefix = L"Saved ";
+        const int underlineFrom = savedLink && perfLine.starts_with(savedPrefix)
+            ? static_cast<int>(savedPrefix.size())
+            : -1;
         DrawFlyoutText(pixels, width, height, perfStatusBounds, statusFont, perfLine,
-            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 225);
+            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 225, underlineFrom);
+        if (savedLink) {
+            pushHit(SettingsHitKind::PerfLog, perfStatusBounds);
+        }
     }
 
     const size_t bytes = pixelCount * 4U;
@@ -7023,7 +7087,7 @@ void DockApp::PaintOverflowPopup() {
     const LONG caretWidth = std::max(16L, std::lround(18.0F * scale));
     const LONG radius =
         std::max(16L, std::lround(DOCK_CORNER_RADIUS_PT * scale));
-    const LONG gearSize = std::max(36L, std::lround(44.0F * scale));
+    const LONG gearSize = std::max(18L, std::lround(22.0F * scale));
     const LONG headerHeight = std::max(gearSize, std::max(28L, std::lround(32.0F * scale)));
     const LONG circle = std::max(44L, std::lround(52.0F * scale));
     const LONG tileGap = std::max(8L, std::lround(10.0F * scale));
