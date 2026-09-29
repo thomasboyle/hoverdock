@@ -84,6 +84,11 @@ public:
     [[nodiscard]] static std::vector<uint8_t> ExtractIconPixels(
         const std::vector<std::wstring>& candidates, UINT iconPixelExtent);
     [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle, bool* changed = nullptr);
+    // One DXGI duplication acquire for this tick. Dock strip and open menu plates
+    // share it so a 120 Hz backdrop tick does not consume the frame twice.
+    void PollDesktopChanges() noexcept;
+    void FinishDesktopChangePoll() noexcept;
+    [[nodiscard]] bool DesktopRegionChanged(const RECT& region) const noexcept;
     // One-shot: the next CaptureBackdrop BitBlts even if the strip looks idle.
     // Used for focus changes. Does not allocate.
     void RequestBackdropRefresh() noexcept;
@@ -109,10 +114,13 @@ public:
     // current DWM composed frame (cursor motion advances cFrame without
     // changing wallpaper under the menu).
     [[nodiscard]] bool ShouldSkipLivePanelBitBlt(UINT width, UINT height) noexcept;
+    // tag is the caller's plate id (0 settings, 1 quick settings, 2 context) so two
+    // plates can be in flight and taken independently. skippedUnchanged is set when
+    // the BitBlt matched the last bake and no GPU work was submitted.
     [[nodiscard]] bool BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT height,
         UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB,
-        HWND excludeC);
-    [[nodiscard]] bool TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra);
+        HWND excludeC, int tag = -1, bool* skippedUnchanged = nullptr);
+    [[nodiscard]] bool TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra, int* tag = nullptr);
     [[nodiscard]] bool IsLiveGlassPanelPending() const noexcept;
     void CancelLiveGlassPanelBake() noexcept;
     // Increments only when CaptureBackdrop uploads new pixels (desktop changed).
@@ -258,6 +266,15 @@ private:
     // Last BitBlt of a "dirty" frame did not change pixels. Further dirty-rect
     // spam must not BitBlt again until a quiet frame or an explicit refresh.
     bool m_stripConfirmedClean = false;
+    bool m_stripDirtyPending = false;
+    ULONGLONG m_lastStripReadMs = 0;
+    // While the backdrop timer is on the 120 Hz cadence, re-read a dirty strip
+    // on the next tick instead of holding a stale plate for 200 ms.
+    static constexpr ULONGLONG kStripRecheckMs = 8;
+    uint8_t m_stripRechecksLeft = 0;
+    static constexpr uint8_t kStripRechecks = 3;
+    uint8_t m_stripPendingTicks = 0;
+    static constexpr uint8_t kStripPendingMaxTicks = 4;
     // Sparse probe DIB (width x kBackdropProbeRows) + reference from last commit.
     HDC m_backdropProbeDc = nullptr;
     HBITMAP m_backdropProbeBitmap = nullptr;
@@ -270,7 +287,6 @@ private:
     // change detection after a full BitBlt).
     std::vector<uint32_t> m_backdropCommittedSamples;
     ULONGLONG m_lastBackdropSerialBumpMs = 0;
-    static constexpr ULONGLONG kBackdropSerialMinIntervalMs = 100;
     UINT64 m_backdropCopyFenceValue = 0;
     HANDLE m_fenceEvent = nullptr;
 
@@ -281,7 +297,8 @@ private:
     void ReleasePanelCapturePool() noexcept;
     [[nodiscard]] uint64_t HashPanelCapturePixels(UINT width, UINT height) const noexcept;
     void ReleasePanelGlassPool() noexcept;
-    void StashActivePanelGlass() noexcept;
+    [[nodiscard]] bool StashActivePanelGlass() noexcept;
+    [[nodiscard]] bool ParkInFlightPanelBake() noexcept;
     [[nodiscard]] bool CreatePanelGlassResourcesExact(UINT width, UINT height);
 
     // Exact-size D3D panel glass pool. Live menus round-robin different sizes;
@@ -305,6 +322,11 @@ private:
         bool blurTempIsSrv = false;
         bool blurTemp2IsSrv = false;
         UINT64 lastUsed = 0;
+        // Set when this set was parked mid-frame so a second plate can bake
+        // without waiting. Resources stay alive until gpuFence completes.
+        bool gpuPending = false;
+        UINT64 gpuFence = 0;
+        int gpuTag = -1;
     };
     std::array<PanelGlassPoolEntry, kPanelGlassPoolSize> m_panelPool{};
     UINT64 m_panelPoolClock = 0;
@@ -356,11 +378,17 @@ private:
     UINT m_panelCaptureIdleSkips = 0;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_panelAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_panelCommandList;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_panelAllocator2;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_panelCommandList2;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_panelConstants;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_panelConstants2;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_panelIconInstances;
     FrameConstants* m_panelMappedConstants = nullptr;
+    FrameConstants* m_panelMappedConstants2 = nullptr;
+    UINT64 m_panelListFence[2] = {};
     UINT64 m_panelFenceValue = 0;
     bool m_panelBakePending = false;
+    int m_panelBakeTag = -1;
     UINT m_panelBakeWidth = 0;
     UINT m_panelBakeHeight = 0;
 

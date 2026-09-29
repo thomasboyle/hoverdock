@@ -17,6 +17,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "glass_ps_60.h"
@@ -1143,6 +1144,7 @@ void Renderer::InvalidateBackdrop() noexcept {
     m_backdropDwmFrame = 0;
     m_backdropRefreshRequested = false;
     m_stripConfirmedClean = false;
+    m_stripDirtyPending = false;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();
@@ -1328,14 +1330,28 @@ bool EnsureStripWatch(HMONITOR monitor) {
     return true;
 }
 
-enum class StripDirt { Clean, Dirty };
+enum class StripDirt { Clean, Dirty, Pending };
 
-// Desktop duplication metadata only: no Map, no BitBlt. A static strip returns
-// Clean and must not touch GDI (BitBlt demand-zeros a fresh mirror every call).
-StripDirt QueryStripDirt(const RECT& strip) {
-    const HMONITOR monitor = MonitorFromRect(&strip, MONITOR_DEFAULTTONEAREST);
+// One duplication acquire per backdrop tick, shared by the dock strip and any
+// open menu plate. A second AcquireNextFrame in the same tick would time out
+// and the plates would miss the frame the dock just consumed.
+struct DesktopDirtPoll {
+    bool valid = false;
+    bool fresh = false;
+    bool failed = false;
+    bool overflow = false;
+    RECT rects[32]{};
+    UINT count = 0;
+};
+
+DesktopDirtPoll g_desktopDirt{};
+
+void PollDesktopDirt(HMONITOR monitor) noexcept {
+    g_desktopDirt = {};
+    g_desktopDirt.valid = true;
     if (!EnsureStripWatch(monitor)) {
-        return StripDirt::Clean;
+        g_desktopDirt.failed = true;
+        return;
     }
 
     DXGI_OUTDUPL_FRAME_INFO frame{};
@@ -1343,66 +1359,95 @@ StripDirt QueryStripDirt(const RECT& strip) {
     const HRESULT acquired =
         g_stripWatch.duplication->AcquireNextFrame(0, &frame, resource.GetAddressOf());
     if (acquired == DXGI_ERROR_WAIT_TIMEOUT) {
-        return StripDirt::Clean;
+        return;
     }
     if (FAILED(acquired)) {
         g_stripWatch.duplication.Reset();
         if (acquired != DXGI_ERROR_ACCESS_LOST) {
             g_stripWatch.retryAfter = GetTickCount64() + 30000ULL;
         }
-        return StripDirt::Clean;
+        g_desktopDirt.failed = true;
+        return;
     }
     resource.Reset();
+    g_desktopDirt.fresh = true;
 
-    bool dirty = false;
-    RECT dirtyRects[16]{};
+    auto pushRect = [](const RECT& virtualRect) {
+        if (g_desktopDirt.count >= 32) {
+            g_desktopDirt.overflow = true;
+            return;
+        }
+        g_desktopDirt.rects[g_desktopDirt.count++] = virtualRect;
+    };
+
+    RECT dirtyRects[32]{};
     UINT dirtyBytes = 0;
     const HRESULT dirtyHr = g_stripWatch.duplication->GetFrameDirtyRects(sizeof(dirtyRects),
         dirtyRects, &dirtyBytes);
     if (dirtyHr == DXGI_ERROR_MORE_DATA) {
-        dirty = true;
+        g_desktopDirt.overflow = true;
     } else if (SUCCEEDED(dirtyHr)) {
         const UINT count = dirtyBytes / static_cast<UINT>(sizeof(RECT));
         for (UINT index = 0; index < count; ++index) {
             const RECT& local = dirtyRects[index];
-            const RECT virtualRect{
+            pushRect(RECT{
                 g_stripWatch.desktop.left + local.left,
                 g_stripWatch.desktop.top + local.top,
                 g_stripWatch.desktop.left + local.right,
-                g_stripWatch.desktop.top + local.bottom};
-            if (RectsIntersect(virtualRect, strip)) {
-                dirty = true;
-                break;
-            }
+                g_stripWatch.desktop.top + local.bottom});
         }
     }
 
-    if (!dirty) {
-        DXGI_OUTDUPL_MOVE_RECT moves[16]{};
-        UINT moveBytes = 0;
-        const HRESULT moveHr = g_stripWatch.duplication->GetFrameMoveRects(sizeof(moves), moves,
-            &moveBytes);
-        if (moveHr == DXGI_ERROR_MORE_DATA) {
-            dirty = true;
-        } else if (SUCCEEDED(moveHr)) {
-            const UINT count = moveBytes / static_cast<UINT>(sizeof(DXGI_OUTDUPL_MOVE_RECT));
-            for (UINT index = 0; index < count; ++index) {
-                const RECT& local = moves[index].DestinationRect;
-                const RECT virtualRect{
-                    g_stripWatch.desktop.left + local.left,
-                    g_stripWatch.desktop.top + local.top,
-                    g_stripWatch.desktop.left + local.right,
-                    g_stripWatch.desktop.top + local.bottom};
-                if (RectsIntersect(virtualRect, strip)) {
-                    dirty = true;
-                    break;
-                }
-            }
+    DXGI_OUTDUPL_MOVE_RECT moves[32]{};
+    UINT moveBytes = 0;
+    const HRESULT moveHr = g_stripWatch.duplication->GetFrameMoveRects(sizeof(moves), moves,
+        &moveBytes);
+    if (moveHr == DXGI_ERROR_MORE_DATA) {
+        g_desktopDirt.overflow = true;
+    } else if (SUCCEEDED(moveHr)) {
+        const UINT count = moveBytes / static_cast<UINT>(sizeof(DXGI_OUTDUPL_MOVE_RECT));
+        for (UINT index = 0; index < count; ++index) {
+            const RECT& local = moves[index].DestinationRect;
+            pushRect(RECT{
+                g_stripWatch.desktop.left + local.left,
+                g_stripWatch.desktop.top + local.top,
+                g_stripWatch.desktop.left + local.right,
+                g_stripWatch.desktop.top + local.bottom});
         }
     }
 
     g_stripWatch.duplication->ReleaseFrame();
-    return dirty ? StripDirt::Dirty : StripDirt::Clean;
+}
+
+StripDirt DirtForRegion(const RECT& region) noexcept {
+    if (!g_desktopDirt.valid || g_desktopDirt.failed || g_desktopDirt.overflow) {
+        return StripDirt::Dirty;
+    }
+    if (!g_desktopDirt.fresh) {
+        return StripDirt::Pending;
+    }
+    for (UINT index = 0; index < g_desktopDirt.count; ++index) {
+        if (RectsIntersect(g_desktopDirt.rects[index], region)) {
+            return StripDirt::Dirty;
+        }
+    }
+    return StripDirt::Clean;
+}
+
+// Desktop duplication metadata only: no Map, no BitBlt. A static strip returns
+// Clean and must not touch GDI (BitBlt demand-zeros a fresh mirror every call).
+// Uses the tick's shared poll when one is active so the menu plates see the
+// same frame as the dock strip.
+StripDirt QueryStripDirt(const RECT& strip) {
+    const bool shared = g_desktopDirt.valid;
+    if (!shared) {
+        PollDesktopDirt(MonitorFromRect(&strip, MONITOR_DEFAULTTONEAREST));
+    }
+    const StripDirt dirt = DirtForRegion(strip);
+    if (!shared) {
+        g_desktopDirt.valid = false;
+    }
+    return dirt;
 }
 
 }  // namespace
@@ -1410,6 +1455,21 @@ StripDirt QueryStripDirt(const RECT& strip) {
 void Renderer::RequestBackdropRefresh() noexcept {
     m_backdropRefreshRequested = true;
     m_stripConfirmedClean = false;
+}
+
+void Renderer::PollDesktopChanges() noexcept {
+    const HMONITOR monitor = m_window != nullptr
+        ? MonitorFromWindow(m_window, MONITOR_DEFAULTTONEAREST)
+        : nullptr;
+    PollDesktopDirt(monitor);
+}
+
+void Renderer::FinishDesktopChangePoll() noexcept {
+    g_desktopDirt.valid = false;
+}
+
+bool Renderer::DesktopRegionChanged(const RECT& region) const noexcept {
+    return DirtForRegion(region) == StripDirt::Dirty;
 }
 
 bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
@@ -1436,31 +1496,61 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
             }
             return true;
         }
-        if (m_backdropDwmFrameValid && timing.cFrame == m_backdropDwmFrame) {
-            if (changed != nullptr) {
-                *changed = false;
+        const bool frameAdvanced =
+            !m_backdropDwmFrameValid || timing.cFrame != m_backdropDwmFrame;
+        if (!frameAdvanced && !m_stripDirtyPending) {
+            // A shared poll can see new dirty rects before our cached cFrame
+            // moves. Fall through and BitBlt only then; cursor motion advances
+            // cFrame without dirty rects and stays on this early return.
+            if (!g_desktopDirt.valid || DirtForRegion(screenRectangle) != StripDirt::Dirty) {
+                if (changed != nullptr) {
+                    *changed = false;
+                }
+                return true;
             }
-            return true;
         }
+        // Duplication frames trail DWM frames: a timeout means the change is not
+        // delivered yet, so keep the DWM frame unconsumed and ask again.
+        StripDirt dirt = QueryStripDirt(screenRectangle);
+        if (dirt == StripDirt::Pending) {
+            if (m_stripDirtyPending) {
+                dirt = StripDirt::Dirty;
+            } else if (++m_stripPendingTicks < kStripPendingMaxTicks) {
+                if (changed != nullptr) {
+                    *changed = false;
+                }
+                return true;
+            } else {
+                dirt = StripDirt::Clean;
+            }
+        }
+        m_stripPendingTicks = 0;
         m_backdropDwmFrame = timing.cFrame;
         m_backdropDwmFrameValid = true;
-        const StripDirt dirt = QueryStripDirt(screenRectangle);
-        if (dirt != StripDirt::Dirty) {
-            // A quiet frame means the next dirty rect is a real change.
+        if (dirt == StripDirt::Dirty) {
+            m_stripRechecksLeft = kStripRechecks;
+        }
+        if (dirt != StripDirt::Dirty && !m_stripDirtyPending) {
             m_stripConfirmedClean = false;
             if (changed != nullptr) {
                 *changed = false;
             }
             return true;
         }
-        if (m_stripConfirmedClean) {
+        // A read that found nothing meaningful may have caught the first frame of
+        // a fade or move, so dirty frames are re-read at a bounded rate instead
+        // of being ignored until a clean frame.
+        if (m_stripConfirmedClean && GetTickCount64() - m_lastStripReadMs < kStripRecheckMs) {
+            m_stripDirtyPending = true;
             if (changed != nullptr) {
                 *changed = false;
             }
             return true;
         }
+        m_stripDirtyPending = false;
     } else {
         m_backdropRefreshRequested = false;
+        m_stripDirtyPending = false;
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
         if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
@@ -1486,6 +1576,7 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     if (copied == FALSE || released == 0) {
         return false;
     }
+    m_lastStripReadMs = GetTickCount64();
 
     // Noise-tolerant change check (preferred over raw FNV hash): a few flapping
     // pixels must not upload or advance BackdropChangeSerial.
@@ -1494,6 +1585,10 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         !m_backdropValid || sampleDiffs > kBackdropChangeMinSamples;
     if (!meaningfullyChanged) {
         m_stripConfirmedClean = true;
+        if (m_stripRechecksLeft > 0) {
+            --m_stripRechecksLeft;
+            m_stripDirtyPending = true;
+        }
         CommitBackdropProbeFromDib();
         m_backdropHash = HashBackdropPixels();
         if (changed != nullptr) {
@@ -1516,14 +1611,8 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     m_backdropValid = true;
     CommitBackdropSamplesFromDib();
     CommitBackdropProbeFromDib();
-    // Cap menu-glass wakeups at ~10 Hz even when wallpaper/video is busy so a
-    // 200 ms CPU sample cannot stack dock BitBlt + large panel rebake + hover.
-    const ULONGLONG nowMs = GetTickCount64();
-    if (m_lastBackdropSerialBumpMs == 0 ||
-        nowMs - m_lastBackdropSerialBumpMs >= kBackdropSerialMinIntervalMs) {
-        ++m_backdropChangeSerial;
-        m_lastBackdropSerialBumpMs = nowMs;
-    }
+    ++m_backdropChangeSerial;
+    m_lastBackdropSerialBumpMs = GetTickCount64();
     if (changed != nullptr) {
         *changed = true;
     }
@@ -2114,6 +2203,14 @@ void Renderer::CreateBackdropResources() {
                   IID_PPV_ARGS(&m_panelCommandList)),
             "Create panel glass command list");
         Check(m_panelCommandList->Close(), "Close initial panel glass command list");
+        Check(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  IID_PPV_ARGS(&m_panelAllocator2)),
+            "Create second panel glass command allocator");
+        Check(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                  m_panelAllocator2.Get(), nullptr,
+                  IID_PPV_ARGS(&m_panelCommandList2)),
+            "Create second panel glass command list");
+        Check(m_panelCommandList2->Close(), "Close initial second panel glass command list");
         {
             const D3D12_HEAP_PROPERTIES panelUploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
             const D3D12_RESOURCE_DESC constantBuffer = BufferDescription(sizeof(FrameConstants));
@@ -2122,6 +2219,11 @@ void Renderer::CreateBackdropResources() {
                 "Create panel constant buffer");
             Check(m_panelConstants->Map(0, nullptr, reinterpret_cast<void**>(&m_panelMappedConstants)),
                 "Map panel constant buffer");
+            Check(m_device->CreateCommittedResource(&panelUploadHeap, D3D12_HEAP_FLAG_NONE, &constantBuffer,
+                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_panelConstants2)),
+                "Create second panel constant buffer");
+            Check(m_panelConstants2->Map(0, nullptr, reinterpret_cast<void**>(&m_panelMappedConstants2)),
+                "Map second panel constant buffer");
             const D3D12_RESOURCE_DESC instanceBuffer =
                 BufferDescription(sizeof(IconInstanceConstants) * 1U);
             Check(m_device->CreateCommittedResource(&panelUploadHeap, D3D12_HEAP_FLAG_NONE, &instanceBuffer,
@@ -2215,6 +2317,7 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropDwmFrameValid = false;
     m_backdropRefreshRequested = false;
     m_stripConfirmedClean = false;
+    m_stripDirtyPending = false;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();
@@ -2802,6 +2905,39 @@ void Renderer::ReleasePanelGlassResources() noexcept
     m_panelBlurTemp2IsSrv = false;
 }
 
+bool Renderer::ParkInFlightPanelBake() noexcept
+{
+    if (!m_panelBakePending || m_panelWidth == 0 || m_panelBackdrop == nullptr) {
+        return false;
+    }
+    const UINT64 fence = m_panelFenceValue;
+    const int tag = m_panelBakeTag;
+    if (!StashActivePanelGlass()) {
+        return false;
+    }
+    PanelGlassPoolEntry* parked = nullptr;
+    for (auto& entry : m_panelPool) {
+        if (entry.backdrop == nullptr) {
+            continue;
+        }
+        if (parked == nullptr || entry.lastUsed > parked->lastUsed) {
+            parked = &entry;
+        }
+    }
+    if (parked == nullptr) {
+        return false;
+    }
+    parked->gpuPending = true;
+    parked->gpuFence = fence;
+    parked->gpuTag = tag;
+    m_panelBakePending = false;
+    m_panelFenceValue = 0;
+    m_panelBakeTag = -1;
+    m_panelBakeWidth = 0;
+    m_panelBakeHeight = 0;
+    return true;
+}
+
 void Renderer::ReleasePanelGlassPool() noexcept
 {
     for (auto& entry : m_panelPool) {
@@ -2824,15 +2960,18 @@ void Renderer::ReleasePanelGlassPool() noexcept
         entry.blurTempIsSrv = false;
         entry.blurTemp2IsSrv = false;
         entry.lastUsed = 0;
+        entry.gpuPending = false;
+        entry.gpuFence = 0;
+        entry.gpuTag = -1;
     }
     m_panelPoolClock = 0;
 }
 
-void Renderer::StashActivePanelGlass() noexcept
+bool Renderer::StashActivePanelGlass() noexcept
 {
     if (m_panelWidth == 0 || m_panelHeight == 0 || m_panelBackdrop == nullptr) {
         ReleasePanelGlassResources();
-        return;
+        return true;
     }
 
     size_t slot = kPanelGlassPoolSize;
@@ -2843,11 +2982,18 @@ void Renderer::StashActivePanelGlass() noexcept
         }
     }
     if (slot == kPanelGlassPoolSize) {
-        slot = 0;
-        for (size_t i = 1; i < kPanelGlassPoolSize; ++i) {
-            if (m_panelPool[i].lastUsed < m_panelPool[slot].lastUsed) {
-                slot = i;
+        bool found = false;
+        for (size_t i = 0; i < kPanelGlassPoolSize; ++i) {
+            if (m_panelPool[i].gpuPending) {
+                continue;
             }
+            if (!found || m_panelPool[i].lastUsed < m_panelPool[slot].lastUsed) {
+                slot = i;
+                found = true;
+            }
+        }
+        if (!found) {
+            return false;
         }
         auto& victim = m_panelPool[slot];
         if (victim.backdropUpload != nullptr && victim.uploadPixels != nullptr) {
@@ -2869,6 +3015,9 @@ void Renderer::StashActivePanelGlass() noexcept
         victim.blurTempIsSrv = false;
         victim.blurTemp2IsSrv = false;
         victim.lastUsed = 0;
+        victim.gpuPending = false;
+        victim.gpuFence = 0;
+        victim.gpuTag = -1;
     }
 
     auto& entry = m_panelPool[slot];
@@ -2888,6 +3037,9 @@ void Renderer::StashActivePanelGlass() noexcept
     entry.blurTempIsSrv = m_panelBlurTempIsSrv;
     entry.blurTemp2IsSrv = m_panelBlurTemp2IsSrv;
     entry.lastUsed = ++m_panelPoolClock;
+    entry.gpuPending = false;
+    entry.gpuFence = 0;
+    entry.gpuTag = -1;
 
     m_panelBackdropUploadPixels = nullptr;
     m_panelWidth = 0;
@@ -2896,6 +3048,7 @@ void Renderer::StashActivePanelGlass() noexcept
     m_panelBackdropRowCount = 0;
     m_panelBlurTempIsSrv = false;
     m_panelBlurTemp2IsSrv = false;
+    return true;
 }
 
 bool Renderer::CreatePanelGlassResourcesExact(UINT width, UINT height)
@@ -3004,9 +3157,14 @@ bool Renderer::EnsurePanelGlassResources(UINT width, UINT height)
 
     // Exact-size pool hit: pull that set into active without CreateCommittedResource.
     for (size_t i = 0; i < kPanelGlassPoolSize; ++i) {
+        if (m_panelPool[i].gpuPending) {
+            continue;
+        }
         if (m_panelPool[i].width == width && m_panelPool[i].height == height &&
             m_panelPool[i].backdrop != nullptr && m_panelPool[i].uploadPixels != nullptr) {
-            CancelLiveGlassPanelBake();
+            if (m_panelBakePending) {
+                CancelLiveGlassPanelBake();
+            }
             PanelGlassPoolEntry hit{};
             hit.width = m_panelPool[i].width;
             hit.height = m_panelPool[i].height;
@@ -3031,8 +3189,14 @@ bool Renderer::EnsurePanelGlassResources(UINT width, UINT height)
             m_panelPool[i].blurTempIsSrv = false;
             m_panelPool[i].blurTemp2IsSrv = false;
             m_panelPool[i].lastUsed = 0;
+            m_panelPool[i].gpuPending = false;
+            m_panelPool[i].gpuFence = 0;
+            m_panelPool[i].gpuTag = -1;
 
-            StashActivePanelGlass();
+            if (!StashActivePanelGlass()) {
+                m_panelPool[i] = std::move(hit);
+                return false;
+            }
 
             m_panelWidth = hit.width;
             m_panelHeight = hit.height;
@@ -3053,9 +3217,13 @@ bool Renderer::EnsurePanelGlassResources(UINT width, UINT height)
         }
     }
 
-    CancelLiveGlassPanelBake();
+    if (m_panelBakePending) {
+        CancelLiveGlassPanelBake();
+    }
     WaitForAllFrames();
-    StashActivePanelGlass();
+    if (!StashActivePanelGlass()) {
+        return false;
+    }
     return CreatePanelGlassResourcesExact(width, height);
 }
 
@@ -3360,65 +3528,100 @@ void Renderer::CancelLiveGlassPanelBake() noexcept
     }
     m_panelCaptureDwmFrameValid = false;
     m_panelCaptureIdleSkips = 0;
-    if (!m_panelBakePending) {
-        if (m_panelFenceValue != 0 && m_fence != nullptr &&
-            m_fence->GetCompletedValue() < m_panelFenceValue && m_fenceEvent != nullptr) {
-            try {
-                Check(m_fence->SetEventOnCompletion(m_panelFenceValue, m_fenceEvent),
-                    "Cancel panel fence event");
-                WaitForSingleObject(m_fenceEvent, INFINITE);
-            } catch (...) {
-            }
+    auto waitFence = [this](UINT64 fence) {
+        if (fence == 0 || m_fence == nullptr || m_fenceEvent == nullptr ||
+            m_fence->GetCompletedValue() >= fence) {
+            return;
         }
-        return;
-    }
-    if (m_fence != nullptr && m_fenceEvent != nullptr &&
-        m_fence->GetCompletedValue() < m_panelFenceValue) {
         try {
-            Check(m_fence->SetEventOnCompletion(m_panelFenceValue, m_fenceEvent),
-                "Cancel live panel fence event");
+            Check(m_fence->SetEventOnCompletion(fence, m_fenceEvent), "Cancel panel fence event");
             WaitForSingleObject(m_fenceEvent, INFINITE);
         } catch (...) {
         }
-    }
+    };
+    waitFence(m_panelFenceValue);
     m_panelBakePending = false;
+    m_panelBakeTag = -1;
+    for (auto& entry : m_panelPool) {
+        if (!entry.gpuPending) {
+            continue;
+        }
+        waitFence(entry.gpuFence);
+        entry.gpuPending = false;
+    }
 }
 
 bool Renderer::IsLiveGlassPanelPending() const noexcept
 {
-    return m_panelBakePending;
+    if (m_panelBakePending) {
+        return true;
+    }
+    for (const auto& entry : m_panelPool) {
+        if (entry.gpuPending) {
+            return true;
+        }
+    }
+    return false;
 }
 
-bool Renderer::TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra)
+bool Renderer::TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra, int* tag)
 {
     outBgra.clear();
-    if (!m_panelBakePending || m_panelReadback == nullptr || m_panelBakeWidth == 0 ||
-        m_panelBakeHeight == 0) {
-        return false;
+    if (tag != nullptr) {
+        *tag = -1;
     }
-    if (m_fence == nullptr || m_fence->GetCompletedValue() < m_panelFenceValue) {
+    if (m_fence == nullptr) {
         return false;
     }
 
-    try {
+    auto copyReadback = [&](ID3D12Resource* readback, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,
+                             UINT width, UINT height) -> bool {
+        if (readback == nullptr || width == 0 || height == 0) {
+            return false;
+        }
         uint8_t* mapped = nullptr;
-        Check(m_panelReadback->Map(0, nullptr, reinterpret_cast<void**>(&mapped)),
-            "Map live panel readback");
-        const UINT width = m_panelBakeWidth;
-        const UINT height = m_panelBakeHeight;
+        Check(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map live panel readback");
         outBgra.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
         for (UINT row = 0; row < height; ++row) {
             std::memcpy(outBgra.data() + static_cast<size_t>(row) * width * 4U,
-                mapped + m_panelBackdropFootprint.Offset +
-                    static_cast<size_t>(row) * m_panelBackdropFootprint.Footprint.RowPitch,
+                mapped + footprint.Offset + static_cast<size_t>(row) * footprint.Footprint.RowPitch,
                 static_cast<size_t>(width) * 4U);
         }
-        m_panelReadback->Unmap(0, nullptr);
-        m_panelBakePending = false;
+        readback->Unmap(0, nullptr);
         return true;
+    };
+
+    try {
+        if (m_panelBakePending && m_panelReadback != nullptr && m_fence->GetCompletedValue() >= m_panelFenceValue) {
+            if (!copyReadback(m_panelReadback.Get(), m_panelBackdropFootprint, m_panelBakeWidth,
+                    m_panelBakeHeight)) {
+                return false;
+            }
+            if (tag != nullptr) {
+                *tag = m_panelBakeTag;
+            }
+            m_panelBakePending = false;
+            m_panelBakeTag = -1;
+            return true;
+        }
+        for (auto& entry : m_panelPool) {
+            if (!entry.gpuPending || entry.readback == nullptr ||
+                m_fence->GetCompletedValue() < entry.gpuFence) {
+                continue;
+            }
+            if (!copyReadback(entry.readback.Get(), entry.footprint, entry.width, entry.height)) {
+                entry.gpuPending = false;
+                return false;
+            }
+            if (tag != nullptr) {
+                *tag = entry.gpuTag;
+            }
+            entry.gpuPending = false;
+            return true;
+        }
+        return false;
     } catch (...) {
         outBgra.clear();
-        m_panelBakePending = false;
         return false;
     }
 }
@@ -3463,10 +3666,11 @@ bool Renderer::ShouldSkipLivePanelBitBlt(UINT width, UINT height) noexcept
 }
 
 bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT height,
-    UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC)
+    UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC,
+    int tag, bool* skippedUnchanged)
 {
-    if (m_panelBakePending) {
-        return false;
+    if (skippedUnchanged != nullptr) {
+        *skippedUnchanged = false;
     }
     if (m_device == nullptr || m_queue == nullptr || m_panelCommandList == nullptr ||
         m_panelAllocator == nullptr || m_glassPipeline == nullptr || m_blurPipeline == nullptr ||
@@ -3479,17 +3683,30 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         (screenRect.bottom - screenRect.top) != static_cast<LONG>(height)) {
         return false;
     }
-    // Prior panel GPU work still in flight (blocking bake just finished submitting
-    // elsewhere, or a take was skipped): do not reset the allocator yet.
-    if (m_panelFenceValue != 0 && m_fence->GetCompletedValue() < m_panelFenceValue) {
+    if (m_panelBakePending && (m_panelBakeTag == tag ||
+            (m_panelWidth == width && m_panelHeight == height))) {
         return false;
     }
-
-    try {
-        if (!EnsurePanelGlassResources(width, height)) {
+    for (const auto& entry : m_panelPool) {
+        if (entry.gpuPending && (entry.gpuTag == tag ||
+                (entry.width == width && entry.height == height))) {
             return false;
         }
+    }
 
+    bool swappedList = false;
+    auto unswapList = [&]() {
+        if (!swappedList) {
+            return;
+        }
+        std::swap(m_panelAllocator, m_panelAllocator2);
+        std::swap(m_panelCommandList, m_panelCommandList2);
+        std::swap(m_panelConstants, m_panelConstants2);
+        std::swap(m_panelMappedConstants, m_panelMappedConstants2);
+        swappedList = false;
+    };
+
+    try {
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
@@ -3548,18 +3765,53 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
                 dwmFrame = timing.cFrame;
             }
         }
+        PanelCapturePoolEntry* hashed = nullptr;
         for (auto& entry : m_panelCapturePool) {
             if (entry.bitmap == m_panelCaptureBitmap && entry.width == width &&
                 entry.height == height) {
                 if (entry.hashValid && entry.contentHash == captureHash) {
                     entry.dwmAtHash = dwmFrame;
+                    if (skippedUnchanged != nullptr) {
+                        *skippedUnchanged = true;
+                    }
                     return false;
                 }
-                entry.contentHash = captureHash;
-                entry.hashValid = true;
-                entry.dwmAtHash = dwmFrame;
+                hashed = &entry;
                 break;
             }
+        }
+
+        int listSlot = -1;
+        const UINT64 completed = m_fence->GetCompletedValue();
+        for (int slot = 0; slot < 2; ++slot) {
+            const bool haveList = slot == 0
+                ? (m_panelCommandList != nullptr && m_panelAllocator != nullptr &&
+                    m_panelMappedConstants != nullptr)
+                : (m_panelCommandList2 != nullptr && m_panelAllocator2 != nullptr &&
+                    m_panelMappedConstants2 != nullptr);
+            if (!haveList) {
+                continue;
+            }
+            if (m_panelListFence[slot] == 0 || completed >= m_panelListFence[slot]) {
+                listSlot = slot;
+                break;
+            }
+        }
+        if (listSlot < 0) {
+            return false;
+        }
+        if (m_panelBakePending && !ParkInFlightPanelBake()) {
+            return false;
+        }
+        if (!EnsurePanelGlassResources(width, height)) {
+            return false;
+        }
+        if (listSlot == 1) {
+            std::swap(m_panelAllocator, m_panelAllocator2);
+            std::swap(m_panelCommandList, m_panelCommandList2);
+            std::swap(m_panelConstants, m_panelConstants2);
+            std::swap(m_panelMappedConstants, m_panelMappedConstants2);
+            swappedList = true;
         }
 
         // Single CPU copy: pooled capture DIB -> mapped upload (no staging vector).
@@ -3723,12 +3975,20 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         m_queue->ExecuteCommandLists(1, lists);
         m_panelFenceValue = ++m_fenceValue;
         Check(m_queue->Signal(m_fence.Get(), m_panelFenceValue), "Signal live panel fence");
+        m_panelListFence[listSlot] = m_panelFenceValue;
         m_panelBakePending = true;
+        m_panelBakeTag = tag;
         m_panelBakeWidth = width;
         m_panelBakeHeight = height;
+        if (hashed != nullptr) {
+            hashed->contentHash = captureHash;
+            hashed->hashValid = true;
+            hashed->dwmAtHash = dwmFrame;
+        }
+        unswapList();
         return true;
     } catch (...) {
-        m_panelBakePending = false;
+        unswapList();
         return false;
     }
 }

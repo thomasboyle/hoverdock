@@ -268,6 +268,37 @@ void CompositePremul(uint8_t* dest, int destWidth, int destHeight, int destX, in
 }
 
 
+// CompositePremul of one constant BGRA pixel over a clamped rect. Per-channel
+// tables evaluate the exact CompositePremul expression once per dest value.
+void CompositeConstantPremulRect(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
+    const uint8_t (&pixel)[4]) {
+    const int left = std::max(0L, bounds.left);
+    const int top = std::max(0L, bounds.top);
+    const int right = std::min(static_cast<LONG>(destWidth), bounds.right);
+    const int bottom = std::min(static_cast<LONG>(destHeight), bounds.bottom);
+    const float srcA = static_cast<float>(pixel[3]) / 255.0F;
+    if (srcA <= 0.0F || left >= right || top >= bottom) {
+        return;
+    }
+    const float inv = 1.0F - srcA;
+    uint8_t table[4][256];
+    for (int channel = 0; channel < 4; ++channel) {
+        for (int value = 0; value < 256; ++value) {
+            table[channel][value] = static_cast<uint8_t>(std::lround(
+                static_cast<float>(pixel[channel]) + static_cast<float>(value) * inv));
+        }
+    }
+    for (int y = top; y < bottom; ++y) {
+        uint8_t* dst = dest + (static_cast<size_t>(y) * destWidth + left) * 4U;
+        for (int x = left; x < right; ++x, dst += 4) {
+            dst[0] = table[0][dst[0]];
+            dst[1] = table[1][dst[1]];
+            dst[2] = table[2][dst[2]];
+            dst[3] = table[3][dst[3]];
+        }
+    }
+}
+
 std::vector<uint8_t> ScalePremultipliedNearest(const std::vector<uint8_t>& source, int sourceWidth,
     int sourceHeight, int destWidth, int destHeight) {
     std::vector<uint8_t> dest(static_cast<size_t>(destWidth) * static_cast<size_t>(destHeight) * 4U, 0);
@@ -980,42 +1011,26 @@ void FillCircleLevelPremul(uint8_t* dest, int destWidth, int destHeight, float c
 }
 
 void FillRectPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, float alpha) {
-    const int left = std::max(0L, bounds.left);
-    const int top = std::max(0L, bounds.top);
-    const int right = std::min(static_cast<LONG>(destWidth), bounds.right);
-    const int bottom = std::min(static_cast<LONG>(destHeight), bounds.bottom);
     const float a = std::clamp(alpha, 0.0F, 1.0F);
-    uint8_t pixel[4] = {
+    const uint8_t pixel[4] = {
         static_cast<uint8_t>(std::lround(static_cast<float>(g_flyoutInkB) * a)),
         static_cast<uint8_t>(std::lround(static_cast<float>(g_flyoutInkG) * a)),
         static_cast<uint8_t>(std::lround(static_cast<float>(g_flyoutInkR) * a)),
         static_cast<uint8_t>(std::lround(255.0F * a)),
     };
-    for (int y = top; y < bottom; ++y) {
-        for (int x = left; x < right; ++x) {
-            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
-        }
-    }
+    CompositeConstantPremulRect(dest, destWidth, destHeight, bounds, pixel);
 }
 
 void FillRectColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, float alpha,
     uint8_t blue, uint8_t green, uint8_t red) {
-    const int left = std::max(0L, bounds.left);
-    const int top = std::max(0L, bounds.top);
-    const int right = std::min(static_cast<LONG>(destWidth), bounds.right);
-    const int bottom = std::min(static_cast<LONG>(destHeight), bounds.bottom);
     const float a = std::clamp(alpha, 0.0F, 1.0F);
-    uint8_t pixel[4] = {
+    const uint8_t pixel[4] = {
         static_cast<uint8_t>(std::lround(static_cast<float>(blue) * a)),
         static_cast<uint8_t>(std::lround(static_cast<float>(green) * a)),
         static_cast<uint8_t>(std::lround(static_cast<float>(red) * a)),
         static_cast<uint8_t>(std::lround(255.0F * a)),
     };
-    for (int y = top; y < bottom; ++y) {
-        for (int x = left; x < right; ++x) {
-            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
-        }
-    }
+    CompositeConstantPremulRect(dest, destWidth, destHeight, bounds, pixel);
 }
 
 // Concept D Minimal Sage — panel toggles/slider (#98A869).
@@ -1969,6 +1984,11 @@ DockApp::~DockApp() {
     if (m_singleInstanceMutex != nullptr) {
         CloseHandle(m_singleInstanceMutex);
     }
+    if (m_backdropWaitable != nullptr) {
+        CancelWaitableTimer(m_backdropWaitable);
+        CloseHandle(m_backdropWaitable);
+        m_backdropWaitable = nullptr;
+    }
     if (s_instance == this) {
         s_instance = nullptr;
     }
@@ -2083,7 +2103,18 @@ int DockApp::Run() {
         const bool slideAnimating = m_visibility == VisibilityState::Showing ||
             m_visibility == VisibilityState::Hiding;
         HANDLE frameWaitable = slideAnimating ? m_renderer.FrameLatencyWaitableObject() : nullptr;
-        const DWORD count = frameWaitable == nullptr ? 0 : 1;
+        HANDLE waits[2]{};
+        DWORD waitCount = 0;
+        DWORD frameSlot = static_cast<DWORD>(-1);
+        DWORD backdropSlot = static_cast<DWORD>(-1);
+        if (frameWaitable != nullptr) {
+            frameSlot = waitCount;
+            waits[waitCount++] = frameWaitable;
+        }
+        if (m_backdropFastArmed && m_backdropWaitable != nullptr) {
+            backdropSlot = waitCount;
+            waits[waitCount++] = m_backdropWaitable;
+        }
         const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
         // WH_MOUSE_LL is delivered by a sent message, which sets QS_SENDMESSAGE.
         // That bit is in QS_ALLINPUT but not QS_INPUT, so an idle wait missed the
@@ -2092,10 +2123,14 @@ int DockApp::Run() {
         const DWORD wakeMask = (slideAnimating || m_dragSnapAnimating)
             ? QS_ALLINPUT
             : (QS_SENDMESSAGE | QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT);
-        const DWORD wait = MsgWaitForMultipleObjectsEx(count, &frameWaitable, timeout, wakeMask,
-            MWMO_INPUTAVAILABLE);
+        const DWORD wait = MsgWaitForMultipleObjectsEx(waitCount,
+            waitCount == 0 ? nullptr : waits, timeout, wakeMask, MWMO_INPUTAVAILABLE);
 
-        if (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT) {
+        const bool objectSignaled = waitCount > 0 && wait >= WAIT_OBJECT_0 &&
+            wait < WAIT_OBJECT_0 + waitCount;
+        if (wait == WAIT_TIMEOUT ||
+            (objectSignaled && frameSlot != static_cast<DWORD>(-1) &&
+                wait == WAIT_OBJECT_0 + frameSlot)) {
             if (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Hiding) {
                 AdvanceAnimation();
             }
@@ -2103,8 +2138,13 @@ int DockApp::Run() {
                 AdvanceDragSnapBack();
             }
         }
+        if (objectSignaled && backdropSlot != static_cast<DWORD>(-1) &&
+            wait == WAIT_OBJECT_0 + backdropSlot) {
+            OnBackdropTick();
+        }
 
-        if (wait == WAIT_OBJECT_0 + count || wait == WAIT_FAILED) {
+        if (wait == WAIT_OBJECT_0 + waitCount || wait == WAIT_FAILED || objectSignaled ||
+            wait == WAIT_TIMEOUT) {
             MSG message{};
             while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != FALSE) {
                 if (message.message == WM_QUIT) {
@@ -2930,83 +2970,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         } else if (wParam == kGlintTimerId) {
             TickGlint();
         } else if (wParam == kBackdropTimerId) {
-            // A timer that outlives hide must not keep BitBlt/Present running.
-            if (m_visibility == VisibilityState::Hidden ||
-                m_visibility == VisibilityState::Hiding) {
-                StopBackdropTimer();
-                return 0;
-            }
-            // The dock glass stays live while popups are open: the capture is
-            // SRCCOPY without CAPTUREBLT, so layered popups and hover bubbles
-            // never bake into the backdrop (no feedback loop). Pausing here
-            // froze the dock background behind Quick Settings.
-            // Adaptive cadence: stay at ~8 ms while DWM/content changes (dock
-            // backdrop or live menu glass). Menus no longer force 120 Hz when
-            // the wallpaper is static — TickLivePopupGlass + BeginLiveGlass
-            // skip BitBlt/GPU on unchanged DWM frames; after hysteresis the
-            // timer backs off to ~33 ms. Moving wallpaper / video still keeps
-            // the fast cadence so frost stays live.
-            bool wantFast = false;
-            // 1.1.49 gated the settle skip on hit-testing dock / open menus. With
-            // the dock open and the pointer on empty desktop, mouse moves still
-            // advanced DWM cFrame and CaptureLiveBackdrop + TickLivePopupGlass
-            // kept BitBlt/GPU on the UI/hook thread -> system-wide low cursor FPS.
-            // Skip while dock or menus are open and the pointer is moving
-            // *anywhere*; resume when it settles (~80 ms). Do not force wantFast
-            // under motion (that reintroduces BitBlt-on-move). Glass look when
-            // idle/settled is unchanged.
-            constexpr double kUiCaptureMotionSkipSeconds = 0.080;
-            const double nowQpc = QpcSeconds();
-            const bool pointerMovingRecently = m_lastPointerMotionAt > 0.0 &&
-                (nowQpc - m_lastPointerMotionAt) < kUiCaptureMotionSkipSeconds;
-            const bool menusOpen = IsDockSettingsOpen() || IsOverflowOpen() ||
-                IsContextMenuOpen();
-            const bool dockOpen =
-                m_visibility == VisibilityState::Visible ||
-                m_visibility == VisibilityState::Showing;
-            const bool pointerMovingOverUi =
-                !IsDragActive() && pointerMovingRecently && (dockOpen || menusOpen);
-            if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
-                nowQpc >= m_suppressBackdropUntil) {
-                if (pointerMovingOverUi) {
-                    // Leave glass frozen for a few frames; hook stays responsive.
-                } else if (CaptureLiveBackdrop()) {
-                    QueueRenderFrame(false);
-                    wantFast = true;
-                    m_backdropIdleStreak = 0;
-                } else if (m_backdropCaptureWasIdle) {
-                    ++m_backdropIdleStreak;
-                } else {
-                    // Capture failed (GPU busy, etc.): keep fast so we retry soon.
-                    wantFast = true;
-                    m_backdropIdleStreak = 0;
-                }
-            }
-            // Open menus: non-blocking GlassPS rebake. BeginLiveGlassPanelBake
-            // never waits on the GPU fence; TakeLiveGlassPanelResult applies
-            // when ready. didGlassWork keeps the fast timer while content moves.
-            // Skip entirely while pointer moves with dock/menus open so BitBlt
-            // + GPU submit cannot stall WH_MOUSE_LL; resume when it settles.
-            if (pointerMovingOverUi) {
-                // Glass stays at last good frame for ~80 ms of motion.
-            } else if (TickLivePopupGlass()) {
-                wantFast = true;
-                m_backdropIdleStreak = 0;
-            }
-            // With menus open and the pointer elsewhere, skip idle hysteresis:
-            // stay at ~33 ms unless this tick observed a real backdrop/glass change.
-            if (pointerMovingOverUi) {
-                // Prefer idle cadence while moving so settle ticks are not stacked
-                // on an 8 ms capture storm.
-                SyncBackdropTimerInterval(false);
-            } else if (menusOpen) {
-                SyncBackdropTimerInterval(wantFast);
-            } else {
-                const bool wantResting =
-                    !wantFast && m_backdropIdleStreak >= kBackdropRestingHysteresisTicks;
-                SyncBackdropTimerInterval(
-                    wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks, wantResting);
-            }
+            OnBackdropTick();
         } else if (wParam == kPerfOpenSettingsTimerId) {
             KillTimer(window, kPerfOpenSettingsTimerId);
             if (!IsDockSettingsOpen()) {
@@ -5831,11 +5795,9 @@ bool DockApp::TickLivePopupGlass()
 
     bool didWork = false;
 
-    // 1) Complete a prior bake without blocking.
     std::vector<uint8_t> glass;
-    if (m_renderer.TakeLiveGlassPanelResult(glass)) {
-        const int done = m_livePopupGlassPending;
-        m_livePopupGlassPending = -1;
+    int done = -1;
+    while (m_renderer.TakeLiveGlassPanelResult(glass, &done)) {
         if (done == 0 && settingsOpen && !m_settingsBaseBits.empty()) {
             POINT origin{};
             if (SettingsScreenOrigin(origin) &&
@@ -5849,8 +5811,6 @@ bool DockApp::TickLivePopupGlass()
                     PaintSettingsHoverFast();
                     didWork = true;
                 } else if (m_settingsHover >= 0 || m_settingsHoverDirtyValid) {
-                    // Identical glass bake: still refresh hover highlight so
-                    // skip-identical cannot leave magnification/highlight stale.
                     PaintSettingsHoverFast();
                 }
             }
@@ -5885,48 +5845,23 @@ bool DockApp::TickLivePopupGlass()
         }
     }
 
-    if (m_renderer.IsLiveGlassPanelPending()) {
-        return didWork;
+    if (!settingsOpen) {
+        m_popupGlassDirty[0] = false;
+    }
+    if (!overflowOpen) {
+        m_popupGlassDirty[1] = false;
+    }
+    if (!contextOpen) {
+        m_popupGlassDirty[2] = false;
     }
 
-
-
-    // 2) Kick the next open menu (round-robin) â€” BitBlt + GPU submit only.
-        if (m_renderer.ShouldSkipLivePanelCapture()) {
-        m_livePopupGlassStatic = true;
-        return didWork;
-    }
-    // Gate live menu capture on dock backdrop change detection. The dock strip
-    // BitBlt already knows when the composed desktop moved; menus sit on the
-    // same desktop. When static, skip BitBlt/GPU entirely. When wallpaper/video
-    // moves, serial advances and live glass stays responsive.
-    {
-        const uint64_t serial = m_renderer.BackdropChangeSerial();
-        // No timed forced rebake while menus are open: confirm BitBlts were the
-        // mid-run >1% spikes under busy hover (serial already covers live
-        // wallpaper / moving content under the dock strip).
-        if (serial == m_livePopupBackdropSerial) {
-            m_livePopupGlassStatic = true;
-            return didWork;
-        }
-        m_livePopupBackdropSerial = serial;
-    }
-    // Static menus: at most ~30 Hz confirm BitBlts even after a forced tick.
-    if (m_livePopupGlassStatic) {
-        const ULONGLONG now = GetTickCount64();
-        if (now - m_lastPopupGlassRefreshMs < kLivePopupStaticIntervalMs) {
-            return didWork;
-        }
-    }
-
-const float frostAmount = m_config.FrostAmount();
+    const float frostAmount = m_config.FrostAmount();
     const float glassAlpha = DOCK_PANEL_GLASS_ALPHA + (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
     const UINT dockFaceFlags = PackPopupGlassFxFlags(true);
     const UINT contextFlags = PackPopupGlassFxFlags(false);
 
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        const int target = (m_livePopupGlassTarget + attempt) % 3;
+    for (int target = 0; target < 3; ++target) {
         const UINT fxFlags = target == 2 ? contextFlags : dockFaceFlags;
         POINT origin{};
         LONG width = 0;
@@ -5955,26 +5890,28 @@ const float frostAmount = m_config.FrostAmount();
             }
         }
         if (!ready) {
+            m_popupGlassDirty[target] = false;
             continue;
         }
         const RECT screenRect{origin.x, origin.y, origin.x + width, origin.y + height};
+        if (m_renderer.DesktopRegionChanged(screenRect)) {
+            m_popupGlassDirty[target] = true;
+        }
+        if (!m_popupGlassDirty[target]) {
+            continue;
+        }
+        bool unchanged = false;
         if (m_renderer.BeginLiveGlassPanelBake(screenRect, static_cast<UINT>(width),
                 static_cast<UINT>(height), fxFlags, glassAlpha, dpiScale, m_settingsWindow,
-                m_overflowWindow, m_contextWindow)) {
-            m_livePopupGlassPending = target;
-            m_livePopupGlassTarget = (target + 1) % 3;
+                m_overflowWindow, m_contextWindow, target, &unchanged)) {
+            m_popupGlassDirty[target] = false;
             m_lastPopupGlassRefreshMs = GetTickCount64();
-            m_livePopupGlassStatic = false;
             didWork = true;
-            break;
+        } else if (unchanged) {
+            m_popupGlassDirty[target] = false;
+        } else {
+            didWork = true;
         }
-    }
-    if (!didWork) {
-        // No bake submitted: captures were unchanged or GPU busy. Treat as static
-        // so the next confirm waits kLivePopupStaticIntervalMs (moving content
-        // clears this on the next successful Begin).
-        m_livePopupGlassStatic = true;
-        m_lastPopupGlassRefreshMs = GetTickCount64();
     }
     return didWork;
 }
@@ -7912,26 +7849,106 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     return m_renderer.Render(state);
 }
 
+void DockApp::OnBackdropTick() {
+    if (m_visibility == VisibilityState::Hidden ||
+        m_visibility == VisibilityState::Hiding) {
+        StopBackdropTimer();
+        return;
+    }
+    if (m_rendererInitialized) {
+        m_renderer.PollDesktopChanges();
+    }
+    bool wantFast = false;
+    if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
+        QpcSeconds() >= m_suppressBackdropUntil) {
+        if (CaptureLiveBackdrop()) {
+            QueueRenderFrame(false);
+            wantFast = true;
+            m_backdropIdleStreak = 0;
+        } else if (m_backdropCaptureWasIdle) {
+            ++m_backdropIdleStreak;
+        } else {
+            wantFast = true;
+            m_backdropIdleStreak = 0;
+        }
+    }
+    if (TickLivePopupGlass()) {
+        wantFast = true;
+        m_backdropIdleStreak = 0;
+    }
+    if (m_rendererInitialized) {
+        m_renderer.FinishDesktopChangePoll();
+    }
+    const bool holdFast = wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks;
+    SyncBackdropTimerInterval(holdFast, !holdFast);
+}
+
 void DockApp::StartBackdropTimer() noexcept {
     m_backdropIdleStreak = 0;
     m_backdropTimerAppliedMs = 0;
+    if (m_backdropFastArmed) {
+        DisarmBackdropFastTimer();
+    }
     SyncBackdropTimerInterval(true);
 }
 
 void DockApp::StopBackdropTimer() noexcept {
     m_backdropTimerAppliedMs = 0;
     m_backdropIdleStreak = 0;
+    DisarmBackdropFastTimer();
     if (m_window != nullptr) {
         KillTimer(m_window, kBackdropTimerId);
     }
+}
+
+bool DockApp::ArmBackdropFastTimer() noexcept {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    if (m_backdropWaitable == nullptr) {
+        m_backdropWaitable = CreateWaitableTimerExW(nullptr, nullptr,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    }
+    if (m_backdropWaitable == nullptr) {
+        return false;
+    }
+    LARGE_INTEGER due{};
+    due.QuadPart = -80000LL;
+    if (SetWaitableTimer(m_backdropWaitable, &due, 8, nullptr, nullptr, FALSE) == FALSE) {
+        return false;
+    }
+    m_backdropFastArmed = true;
+    return true;
+}
+
+void DockApp::DisarmBackdropFastTimer() noexcept {
+    if (m_backdropWaitable != nullptr) {
+        CancelWaitableTimer(m_backdropWaitable);
+    }
+    m_backdropFastArmed = false;
 }
 
 void DockApp::SyncBackdropTimerInterval(bool wantFast, bool wantResting) noexcept {
     if (m_window == nullptr) {
         return;
     }
-    const UINT desired = wantFast ? kBackdropIntervalMs
-        : (wantResting ? kBackdropRestingIntervalMs : kBackdropIdleIntervalMs);
+    if (wantFast) {
+        if (m_backdropFastArmed) {
+            return;
+        }
+        KillTimer(m_window, kBackdropTimerId);
+        m_backdropTimerAppliedMs = kBackdropIntervalMs;
+        if (!ArmBackdropFastTimer()) {
+            m_backdropFastArmed = false;
+            SetTimer(m_window, kBackdropTimerId, kBackdropIntervalMs, nullptr);
+        }
+        return;
+    }
+    if (m_backdropFastArmed) {
+        DisarmBackdropFastTimer();
+        m_backdropTimerAppliedMs = 0;
+    }
+    const UINT desired = wantResting ? kBackdropRestingIntervalMs : kBackdropIdleIntervalMs;
     if (desired == m_backdropTimerAppliedMs) {
         return;
     }

@@ -142,14 +142,16 @@ private:
     static constexpr UINT kCursorWatchHiddenIntervalMs = 0;
     static constexpr UINT kDeferredRefreshDelayMs = 400;
     static constexpr UINT kBackdropIntervalMs = 8;
-    // Idle DWM / unchanged-capture backoff for the backdrop timer. Live menus
-    // force the fast cadence so TickLivePopupGlass stays ~120 Hz.
+    // Idle DWM / unchanged-capture backoff. Moving wallpaper under the dock,
+    // Quick Settings, or Dock Settings holds the 8 ms (~120 Hz) cadence.
     static constexpr UINT kBackdropIdleIntervalMs = 250;
-    // Static desktop + resting dock: 2 s DWM cFrame query, no BitBlt or Present
-    // while that frame is frozen.
-    static constexpr UINT kBackdropRestingIntervalMs = 2000;
-    static constexpr UINT kBackdropIdleHysteresisTicks = 1;
-    static constexpr UINT kBackdropRestingHysteresisTicks = 2;
+    // Static desktop: duplication poll only, no BitBlt. Short enough that motion
+    // is picked up and the fast cadence resumes within a frame or two.
+    static constexpr UINT kBackdropRestingIntervalMs = 100;
+    // Clean ticks required before leaving 120 Hz. One unchanged frame must not
+    // drop a moving wallpaper to the resting poll.
+    static constexpr UINT kBackdropIdleHysteresisTicks = 15;
+    static constexpr UINT kBackdropRestingHysteresisTicks = 15;
     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
     static constexpr UINT kTaskbarMonitorSlowIntervalMs = 5000;
     static constexpr int kTaskbarMonitorCalmPasses = 5;
@@ -373,8 +375,11 @@ private:
     void AdvanceAnimation();
     bool RenderFrame(bool allowBlockingGpuWait = true);
     void QueueRenderFrame(bool allowBlockingGpuWait = true);
+    void OnBackdropTick();
     void StartBackdropTimer() noexcept;
     void StopBackdropTimer() noexcept;
+    [[nodiscard]] bool ArmBackdropFastTimer() noexcept;
+    void DisarmBackdropFastTimer() noexcept;
     void SyncBackdropTimerInterval(bool wantFast, bool wantResting = false) noexcept;
     void HandlePointer(POINT cursor);
     void UpdateGlintTarget(POINT cursor);
@@ -699,6 +704,11 @@ private:
     bool m_shellFlyoutSeen = false;
     double m_suppressBackdropUntil = 0.0;
     UINT m_backdropTimerAppliedMs = 0;
+    // High-resolution waitable timer for the 8 ms backdrop cadence. SetTimer
+    // cannot fire faster than USER_TIMER_MINIMUM (10 ms), so it never reaches
+    // 120 Hz. Armed only while the dock or an open plate is tracking motion.
+    HANDLE m_backdropWaitable = nullptr;
+    bool m_backdropFastArmed = false;
     UINT m_backdropIdleStreak = 0;
     bool m_backdropCaptureWasIdle = false;
     bool m_dropPresentPending = false;
@@ -757,6 +767,9 @@ private:
     // Round-robin target for async menu glass rebakes (0=settings,1=overflow,2=context).
     int m_livePopupGlassTarget = 0;
     int m_livePopupGlassPending = -1;
+    // Plate still owes a GPU bake after a dirty desktop frame (0 settings, 1 quick
+    // settings, 2 context). Cleared when the bake is submitted or the pixels match.
+    bool m_popupGlassDirty[3] = {};
     RECT m_frostSliderTrack{};
     SIZE m_settingsSize{};
     std::vector<uint8_t> m_settingsGlass;
