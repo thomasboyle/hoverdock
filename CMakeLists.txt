@@ -86,6 +86,7 @@ set_property(TARGET Dock PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
 target_link_libraries(Dock PRIVATE
     d3d12
+    d3d11
     dxgi
     dcomp
     dwmapi

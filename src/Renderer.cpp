@@ -6,6 +6,7 @@
 #include <ShObjIdl.h>
 #include <ShlObj.h>
 #include <CommonControls.h>
+#include <d3d11.h>
 #include <dwmapi.h>
 #include <wincodec.h>
 
@@ -1140,6 +1141,8 @@ void Renderer::InvalidateBackdrop() noexcept {
     m_backdropChangeSerial = 0;
     m_backdropDwmFrameValid = false;
     m_backdropDwmFrame = 0;
+    m_backdropRefreshRequested = false;
+    m_stripConfirmedClean = false;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();
@@ -1228,7 +1231,186 @@ BOOL BitBltDesktopExcluding(HWND exclude, HDC destDc, LONG width, LONG height, H
     return copied;
 }
 
+struct StripWatchState {
+    ComPtr<ID3D11Device> device;
+    ComPtr<IDXGIOutputDuplication> duplication;
+    RECT desktop{};
+    HMONITOR monitor = nullptr;
+    ULONGLONG retryAfter = 0;
+};
+
+StripWatchState g_stripWatch{};
+
+void ResetStripWatch() noexcept {
+    g_stripWatch.duplication.Reset();
+    g_stripWatch.device.Reset();
+    g_stripWatch.monitor = nullptr;
+    g_stripWatch.desktop = {};
+    g_stripWatch.retryAfter = 0;
+}
+
+bool RectsIntersect(const RECT& left, const RECT& right) noexcept {
+    RECT intersection{};
+    return IntersectRect(&intersection, &left, &right) != FALSE;
+}
+
+bool EnsureStripWatch(HMONITOR monitor) {
+    if (monitor == nullptr) {
+        return false;
+    }
+    if (g_stripWatch.duplication != nullptr && g_stripWatch.monitor == monitor) {
+        return true;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (g_stripWatch.duplication == nullptr && g_stripWatch.monitor == monitor &&
+        g_stripWatch.retryAfter != 0 && now < g_stripWatch.retryAfter) {
+        return false;
+    }
+
+    g_stripWatch.duplication.Reset();
+    g_stripWatch.device.Reset();
+    g_stripWatch.monitor = monitor;
+    g_stripWatch.desktop = {};
+
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        g_stripWatch.retryAfter = now + 30000ULL;
+        return false;
+    }
+
+    ComPtr<IDXGIAdapter1> matchAdapter;
+    ComPtr<IDXGIOutput> matchOutput;
+    DXGI_OUTPUT_DESC matchDesc{};
+    bool found = false;
+    for (UINT adapterIndex = 0; !found; ++adapterIndex) {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(adapterIndex, adapter.GetAddressOf()) == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        for (UINT outputIndex = 0; !found; ++outputIndex) {
+            ComPtr<IDXGIOutput> output;
+            if (adapter->EnumOutputs(outputIndex, output.GetAddressOf()) == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            DXGI_OUTPUT_DESC desc{};
+            if (FAILED(output->GetDesc(&desc)) || desc.Monitor != monitor) {
+                continue;
+            }
+            matchAdapter = adapter;
+            matchOutput = output;
+            matchDesc = desc;
+            found = true;
+        }
+    }
+    if (!found) {
+        g_stripWatch.retryAfter = now + 30000ULL;
+        return false;
+    }
+
+    if (FAILED(D3D11CreateDevice(matchAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+            g_stripWatch.device.GetAddressOf(), nullptr, nullptr))) {
+        g_stripWatch.retryAfter = now + 30000ULL;
+        return false;
+    }
+
+    ComPtr<IDXGIOutput1> output1;
+    if (FAILED(matchOutput.As(&output1)) ||
+        FAILED(output1->DuplicateOutput(g_stripWatch.device.Get(),
+            g_stripWatch.duplication.GetAddressOf()))) {
+        g_stripWatch.device.Reset();
+        g_stripWatch.duplication.Reset();
+        g_stripWatch.retryAfter = now + 30000ULL;
+        return false;
+    }
+    g_stripWatch.desktop = matchDesc.DesktopCoordinates;
+    g_stripWatch.retryAfter = 0;
+    return true;
+}
+
+enum class StripDirt { Clean, Dirty };
+
+// Desktop duplication metadata only: no Map, no BitBlt. A static strip returns
+// Clean and must not touch GDI (BitBlt demand-zeros a fresh mirror every call).
+StripDirt QueryStripDirt(const RECT& strip) {
+    const HMONITOR monitor = MonitorFromRect(&strip, MONITOR_DEFAULTTONEAREST);
+    if (!EnsureStripWatch(monitor)) {
+        return StripDirt::Clean;
+    }
+
+    DXGI_OUTDUPL_FRAME_INFO frame{};
+    ComPtr<IDXGIResource> resource;
+    const HRESULT acquired =
+        g_stripWatch.duplication->AcquireNextFrame(0, &frame, resource.GetAddressOf());
+    if (acquired == DXGI_ERROR_WAIT_TIMEOUT) {
+        return StripDirt::Clean;
+    }
+    if (FAILED(acquired)) {
+        g_stripWatch.duplication.Reset();
+        if (acquired != DXGI_ERROR_ACCESS_LOST) {
+            g_stripWatch.retryAfter = GetTickCount64() + 30000ULL;
+        }
+        return StripDirt::Clean;
+    }
+    resource.Reset();
+
+    bool dirty = false;
+    RECT dirtyRects[16]{};
+    UINT dirtyBytes = 0;
+    const HRESULT dirtyHr = g_stripWatch.duplication->GetFrameDirtyRects(sizeof(dirtyRects),
+        dirtyRects, &dirtyBytes);
+    if (dirtyHr == DXGI_ERROR_MORE_DATA) {
+        dirty = true;
+    } else if (SUCCEEDED(dirtyHr)) {
+        const UINT count = dirtyBytes / static_cast<UINT>(sizeof(RECT));
+        for (UINT index = 0; index < count; ++index) {
+            const RECT& local = dirtyRects[index];
+            const RECT virtualRect{
+                g_stripWatch.desktop.left + local.left,
+                g_stripWatch.desktop.top + local.top,
+                g_stripWatch.desktop.left + local.right,
+                g_stripWatch.desktop.top + local.bottom};
+            if (RectsIntersect(virtualRect, strip)) {
+                dirty = true;
+                break;
+            }
+        }
+    }
+
+    if (!dirty) {
+        DXGI_OUTDUPL_MOVE_RECT moves[16]{};
+        UINT moveBytes = 0;
+        const HRESULT moveHr = g_stripWatch.duplication->GetFrameMoveRects(sizeof(moves), moves,
+            &moveBytes);
+        if (moveHr == DXGI_ERROR_MORE_DATA) {
+            dirty = true;
+        } else if (SUCCEEDED(moveHr)) {
+            const UINT count = moveBytes / static_cast<UINT>(sizeof(DXGI_OUTDUPL_MOVE_RECT));
+            for (UINT index = 0; index < count; ++index) {
+                const RECT& local = moves[index].DestinationRect;
+                const RECT virtualRect{
+                    g_stripWatch.desktop.left + local.left,
+                    g_stripWatch.desktop.top + local.top,
+                    g_stripWatch.desktop.left + local.right,
+                    g_stripWatch.desktop.top + local.bottom};
+                if (RectsIntersect(virtualRect, strip)) {
+                    dirty = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    g_stripWatch.duplication->ReleaseFrame();
+    return dirty ? StripDirt::Dirty : StripDirt::Clean;
+}
+
 }  // namespace
+
+void Renderer::RequestBackdropRefresh() noexcept {
+    m_backdropRefreshRequested = true;
+    m_stripConfirmedClean = false;
+}
 
 bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     ProfileScope scope("Renderer::CaptureBackdrop");
@@ -1239,36 +1421,46 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         return false;
     }
 
-    // Resting path: a static desktop does not advance DWM cFrame. The query
-    // fills a stack struct and does not allocate, BitBlt, or Present. A frozen
-    // cFrame never falls through to a "heal" BitBlt — that periodic full-strip
-    // read allocated a fresh GDI mirror (soft page faults) and, when alpha
-    // noise looked like a change, restarted the 8 ms upload/Present loop.
-    // A stale pre-composition cache heals on the next real cFrame (logon and
-    // resume both compose). cFrame also advances from our own Present and from
-    // cursor motion elsewhere; the reused probe DIB distinguishes that from
-    // wallpaper or video under the strip without a full-size BitBlt.
-    if (m_backdropValid) {
+    // Resting path must not BitBlt. A screen read demand-zeros a fresh GDI
+    // mirror on every call, which is a soft page fault per page even when the
+    // destination DIB is reused. DWM cFrame also advances for cursor motion and
+    // unrelated presents, so probing on that signal faulted at the timer rate.
+    // Dirty rects come from duplication metadata (no map). A clean strip
+    // returns here. Focus changes request one real read.
+    if (m_backdropValid && !m_backdropRefreshRequested) {
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
-        if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
-            if (m_backdropDwmFrameValid && timing.cFrame == m_backdropDwmFrame) {
-                if (changed != nullptr) {
-                    *changed = false;
-                }
-                return true;
+        if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
+            if (changed != nullptr) {
+                *changed = false;
             }
-            m_backdropDwmFrame = timing.cFrame;
-            m_backdropDwmFrameValid = true;
-            if (m_backdropProbeValid && ProbeBackdropUnchanged(screenRectangle)) {
-                if (changed != nullptr) {
-                    *changed = false;
-                }
-                return true;
-            }
+            return true;
         }
-        // DWM timing unavailable (composition off): fall through to BitBlt.
+        if (m_backdropDwmFrameValid && timing.cFrame == m_backdropDwmFrame) {
+            if (changed != nullptr) {
+                *changed = false;
+            }
+            return true;
+        }
+        m_backdropDwmFrame = timing.cFrame;
+        m_backdropDwmFrameValid = true;
+        const StripDirt dirt = QueryStripDirt(screenRectangle);
+        if (dirt != StripDirt::Dirty) {
+            // A quiet frame means the next dirty rect is a real change.
+            m_stripConfirmedClean = false;
+            if (changed != nullptr) {
+                *changed = false;
+            }
+            return true;
+        }
+        if (m_stripConfirmedClean) {
+            if (changed != nullptr) {
+                *changed = false;
+            }
+            return true;
+        }
     } else {
+        m_backdropRefreshRequested = false;
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
         if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
@@ -1301,6 +1493,7 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     const bool meaningfullyChanged =
         !m_backdropValid || sampleDiffs > kBackdropChangeMinSamples;
     if (!meaningfullyChanged) {
+        m_stripConfirmedClean = true;
         CommitBackdropProbeFromDib();
         m_backdropHash = HashBackdropPixels();
         if (changed != nullptr) {
@@ -1308,6 +1501,7 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         }
         return true;
     }
+    m_stripConfirmedClean = false;
 
     {
         ProfileScope uploadScope("Renderer::UploadBackdropPixels");
@@ -2019,10 +2213,13 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropChangeSerial = 0;
     m_backdropDwmFrame = 0;
     m_backdropDwmFrameValid = false;
+    m_backdropRefreshRequested = false;
+    m_stripConfirmedClean = false;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();
     ReleaseBackdropProbe();
+    ResetStripWatch();
 
     if (m_backdropDc != nullptr && m_backdropPreviousBitmap != nullptr &&
         m_backdropPreviousBitmap != HGDI_ERROR) {
@@ -3234,10 +3431,11 @@ bool Renderer::ShouldSkipLivePanelCapture() noexcept
     if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
         return false;
     }
+    // Same composed frame: never BitBlt. A periodic "heal" read faulted the
+    // same way the dock probe did. A new frame still has to pass the backdrop
+    // serial gate before any panel BitBlt.
     if (m_panelCaptureDwmFrameValid && timing.cFrame == m_panelCaptureDwmFrame) {
-        if (++m_panelCaptureIdleSkips < kPanelForcedCaptureSkips) {
-            return true;
-        }
+        return true;
     }
     m_panelCaptureDwmFrame = timing.cFrame;
     m_panelCaptureDwmFrameValid = true;

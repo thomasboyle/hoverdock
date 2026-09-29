@@ -11008,6 +11008,7 @@ void CALLBACK DockApp::ForegroundWinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG, 
     if (s_instance == nullptr || s_instance->m_window == nullptr) {
         return;
     }
+    s_instance->m_renderer.RequestBackdropRefresh();
     PostMessageW(s_instance->m_window, kCursorWatchSyncMessage, 0, 0);
 }
 

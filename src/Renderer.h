@@ -84,6 +84,9 @@ public:
     [[nodiscard]] static std::vector<uint8_t> ExtractIconPixels(
         const std::vector<std::wstring>& candidates, UINT iconPixelExtent);
     [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle, bool* changed = nullptr);
+    // One-shot: the next CaptureBackdrop BitBlts even if the strip looks idle.
+    // Used for focus changes. Does not allocate.
+    void RequestBackdropRefresh() noexcept;
     [[nodiscard]] bool NeedsBackdropBitBlt(const RECT& screenRectangle) const noexcept;
     [[nodiscard]] bool BackdropValid() const noexcept;
     void InvalidateBackdrop() noexcept;
@@ -251,6 +254,10 @@ private:
     // pixels cannot have changed and the BitBlt is skipped (timer still fires).
     uint64_t m_backdropDwmFrame = 0;
     bool m_backdropDwmFrameValid = false;
+    bool m_backdropRefreshRequested = false;
+    // Last BitBlt of a "dirty" frame did not change pixels. Further dirty-rect
+    // spam must not BitBlt again until a quiet frame or an explicit refresh.
+    bool m_stripConfirmedClean = false;
     // Sparse probe DIB (width x kBackdropProbeRows) + reference from last commit.
     HDC m_backdropProbeDc = nullptr;
     HBITMAP m_backdropProbeBitmap = nullptr;
@@ -322,7 +329,6 @@ private:
     // and CreateDIBSection+ICM'd every tick. Active slot is mirrored in the
     // m_panelCapture* aliases below for BitBlt/upload call sites.
     static constexpr size_t kPanelCapturePoolSize = 3;
-    static constexpr UINT kPanelForcedCaptureSkips = 60;
     struct PanelCapturePoolEntry {
         HDC dc = nullptr;
         HBITMAP bitmap = nullptr;
