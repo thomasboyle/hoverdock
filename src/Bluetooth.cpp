@@ -458,35 +458,78 @@ bool WaitForLink(uint64_t address, DWORD timeoutMs, const std::atomic<bool>& run
     }
 }
 
-std::vector<GUID> ConnectServices(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
-    const GUID preferred[] = {
-        ServiceUuid(0x110B),
-        ServiceUuid(0x1108),
-        ServiceUuid(0x111E),
-        ServiceUuid(0x1124),
-        ServiceUuid(0x110A),
-    };
-    std::vector<GUID> services(std::begin(preferred), std::end(preferred));
+void SetService(HANDLE radio, BLUETOOTH_DEVICE_INFO& info, unsigned short id, DWORD state) {
+    const GUID service = ServiceUuid(id);
+    BluetoothSetServiceState(radio, &info, &service, state);
+}
+
+std::vector<GUID> InstalledServices(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
+    std::vector<GUID> services;
     DWORD count = 0;
-    if (BluetoothEnumerateInstalledServices(radio, &info, &count, nullptr) == ERROR_SUCCESS && count > 0) {
-        std::vector<GUID> installed(count);
-        if (BluetoothEnumerateInstalledServices(radio, &info, &count, installed.data()) == ERROR_SUCCESS) {
-            installed.resize(count);
-            for (const GUID& service : installed) {
-                const bool known = std::any_of(services.begin(), services.end(),
-                    [&](const GUID& item) { return IsEqualGUID(item, service) != FALSE; });
-                if (!known) {
-                    services.push_back(service);
-                }
-            }
-        }
+    if (BluetoothEnumerateInstalledServices(radio, &info, &count, nullptr) != ERROR_SUCCESS || count == 0) {
+        return services;
     }
+    services.resize(count);
+    if (BluetoothEnumerateInstalledServices(radio, &info, &count, services.data()) != ERROR_SUCCESS) {
+        services.clear();
+        return services;
+    }
+    services.resize(count);
     return services;
 }
 
-void SetServices(HANDLE radio, BLUETOOTH_DEVICE_INFO& info, DWORD state) {
-    for (const GUID& service : ConnectServices(radio, info)) {
-        BluetoothSetServiceState(radio, &info, &service, state);
+bool IsVoiceService(const GUID& service) {
+    return IsEqualGUID(service, ServiceUuid(0x1108)) != FALSE ||
+           IsEqualGUID(service, ServiceUuid(0x111E)) != FALSE;
+}
+
+bool UsesAudio(HANDLE radio, const BLUETOOTH_DEVICE_INFO& info) {
+    const ULONG majorClass = (info.ulClassofDevice >> 8) & 0x1Fu;
+    if (majorClass == 0x04u || ContainsInsensitive(info.szName, L"AirPod")) {
+        return true;
+    }
+    BLUETOOTH_DEVICE_INFO mutableInfo = info;
+    for (const GUID& service : InstalledServices(radio, mutableInfo)) {
+        if (IsEqualGUID(service, ServiceUuid(0x110B)) != FALSE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DisableVoice(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
+    SetService(radio, info, 0x111E, BLUETOOTH_SERVICE_DISABLE);
+    SetService(radio, info, 0x1108, BLUETOOTH_SERVICE_DISABLE);
+}
+
+void EnableAudio(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
+    DisableVoice(radio, info);
+    SetService(radio, info, 0x110B, BLUETOOTH_SERVICE_ENABLE);
+    SetService(radio, info, 0x110E, BLUETOOTH_SERVICE_ENABLE);
+}
+
+void EnableGeneral(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
+    bool enabled = false;
+    for (const GUID& service : InstalledServices(radio, info)) {
+        if (IsVoiceService(service) || IsEqualGUID(service, ServiceUuid(0x110B)) != FALSE ||
+            IsEqualGUID(service, ServiceUuid(0x110A)) != FALSE) {
+            continue;
+        }
+        BluetoothSetServiceState(radio, &info, &service, BLUETOOTH_SERVICE_ENABLE);
+        enabled = true;
+    }
+    if (!enabled) {
+        SetService(radio, info, 0x1124, BLUETOOTH_SERVICE_ENABLE);
+    }
+}
+
+void DisableProfiles(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
+    const unsigned short ids[] = {0x110B, 0x110E, 0x1108, 0x111E, 0x1124, 0x110A};
+    for (unsigned short id : ids) {
+        SetService(radio, info, id, BLUETOOTH_SERVICE_DISABLE);
+    }
+    for (const GUID& service : InstalledServices(radio, info)) {
+        BluetoothSetServiceState(radio, &info, &service, BLUETOOTH_SERVICE_DISABLE);
     }
 }
 
@@ -497,25 +540,21 @@ bool RememberedClassic(uint64_t address) {
     });
 }
 
-bool PageClassic(uint64_t address) {
+bool PageAudio(uint64_t address) {
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         return false;
     }
-    const unsigned short profiles[] = {0x111E, 0x1108};
     bool paged = false;
-    for (unsigned short profile : profiles) {
-        const SOCKET sock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
-        if (sock == INVALID_SOCKET) {
-            break;
-        }
+    const SOCKET sock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_L2CAP);
+    if (sock != INVALID_SOCKET) {
         u_long nonblocking = 1;
         ioctlsocket(sock, FIONBIO, &nonblocking);
         SOCKADDR_BTH remote{};
         remote.addressFamily = AF_BTH;
         remote.btAddr = address;
-        remote.serviceClassId = ServiceUuid(profile);
-        remote.port = 0;
+        remote.serviceClassId = ServiceUuid(0x110B);
+        remote.port = 0x0019;
         const int started = connect(sock, reinterpret_cast<SOCKADDR*>(&remote), sizeof(remote));
         if (started == 0) {
             paged = true;
@@ -541,14 +580,11 @@ bool PageClassic(uint64_t address) {
                 if (!LoadDeviceInfo(radio, address, info)) {
                     return false;
                 }
-                SetServices(radio, info, BLUETOOTH_SERVICE_ENABLE);
+                EnableAudio(radio, info);
                 return RadioConnected(radio, address);
             });
         }
         closesocket(sock);
-        if (paged) {
-            break;
-        }
     }
     WSACleanup();
     return paged;
@@ -591,36 +627,40 @@ bool ConnectClassic(uint64_t address, const std::atomic<bool>& running) {
     if (address == 0 || !running.load()) {
         return false;
     }
-    ForEachRadio([&](HANDLE radio) {
+    bool audio = false;
+    const auto applyProfile = [&](HANDLE radio) {
         BLUETOOTH_DEVICE_INFO info{};
         if (!LoadDeviceInfo(radio, address, info)) {
             return false;
         }
-        SetServices(radio, info, BLUETOOTH_SERVICE_ENABLE);
+        if (UsesAudio(radio, info)) {
+            audio = true;
+            EnableAudio(radio, info);
+        } else {
+            EnableGeneral(radio, info);
+        }
         return RadioConnected(radio, address);
-    });
-    if (WaitForLink(address, 2500, running, true)) {
-        return true;
+    };
+    ForEachRadio(applyProfile);
+    if (!WaitForLink(address, 2500, running, true) && running.load() && audio) {
+        PageAudio(address);
+        ForEachRadio(applyProfile);
     }
-    // Service flags do not page a device that was dropped with a hard disconnect.
-    if (running.load()) {
-        PageClassic(address);
+    if (!WaitForLink(address, 4000, running, true) && running.load() && RestartPairedDevnode(address)) {
+        WaitForLink(address, 5000, running, true);
+    }
+    if (audio && running.load()) {
         ForEachRadio([&](HANDLE radio) {
             BLUETOOTH_DEVICE_INFO info{};
             if (!LoadDeviceInfo(radio, address, info)) {
                 return false;
             }
-            SetServices(radio, info, BLUETOOTH_SERVICE_ENABLE);
-            return RadioConnected(radio, address);
+            EnableAudio(radio, info);
+            return true;
         });
+        return WaitForLink(address, 3000, running, true);
     }
-    if (WaitForLink(address, 4000, running, true)) {
-        return true;
-    }
-    if (running.load() && RestartPairedDevnode(address)) {
-        return WaitForLink(address, 5000, running, true);
-    }
-    return false;
+    return AnyRadioConnected(address);
 }
 
 bool DisconnectClassic(uint64_t address, const std::atomic<bool>& running) {
@@ -632,7 +672,7 @@ bool DisconnectClassic(uint64_t address, const std::atomic<bool>& running) {
         if (!LoadDeviceInfo(radio, address, info)) {
             return false;
         }
-        SetServices(radio, info, BLUETOOTH_SERVICE_DISABLE);
+        DisableProfiles(radio, info);
         return !RadioConnected(radio, address);
     });
     if (WaitForLink(address, 2500, running, false)) {
