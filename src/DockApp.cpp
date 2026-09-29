@@ -1039,7 +1039,7 @@ constexpr uint8_t kAmberB = DOCK_PANEL_TOGGLE_B;
 constexpr uint8_t kAmberG = DOCK_PANEL_TOGGLE_G;
 constexpr uint8_t kAmberR = DOCK_PANEL_TOGGLE_R;
 
-// Quick Settings control circles (#98A869 olive sage — same as Dock Settings).
+// Quick Settings control squircles (#98A869 olive sage — same as Dock Settings).
 // DIB order: B, G, R.
 constexpr uint8_t kQuickAccentB = DOCK_PANEL_TOGGLE_B;
 constexpr uint8_t kQuickAccentG = DOCK_PANEL_TOGGLE_G;
@@ -1086,111 +1086,164 @@ void FillPillColorPremul(uint8_t* dest, int destWidth, int destHeight, float cxL
     }
 }
 
-void FillCircleColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
-    float radius, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
-    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - 1.0F)));
-    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 1.0F)));
-    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 1.0F)));
-    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 1.0F)));
-    const float aa = 1.15F;
-    for (int y = top; y < bottom; ++y) {
-        for (int x = left; x < right; ++x) {
-            const float dx = static_cast<float>(x) + 0.5F - cx;
-            const float dy = static_cast<float>(y) + 0.5F - cy;
-            const float coverage =
-                1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / aa + 0.5F, 0.0F, 1.0F);
-            if (coverage <= 0.0F) {
-                continue;
-            }
-            const float srcA = coverage * alpha;
-            uint8_t pixel[4] = {
-                static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
-                static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
-                static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-            };
-            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
-        }
-    }
+// Same superellipse as SdSquircleBox in Shaders.hlsl (n = 4). Negative inside.
+float SdSquircleBox(float px, float py, float cx, float cy, float halfW, float halfH,
+    float radius) noexcept {
+    const float cap = std::min(halfW, halfH);
+    radius = std::clamp(radius, 0.0F, std::max(0.0F, cap));
+    const float qx = std::abs(px - cx) - (halfW - radius);
+    const float qy = std::abs(py - cy) - (halfH - radius);
+    const float ax = std::max(qx, 0.0F);
+    const float ay = std::max(qy, 0.0F);
+    const float quartic = ax * ax * ax * ax + ay * ay * ay * ay;
+    const float outside = std::sqrt(std::sqrt(std::max(quartic, 0.0F)));
+    const float inside = std::min(std::max(qx, qy), 0.0F);
+    return outside + inside - radius;
 }
 
-void StrokeCircleColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
-    float radius, float halfWidth, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
-    // Thin anti-aliased ring; interior stays clear so glyphs remain readable on hover.
-    if (radius <= 0.0F || halfWidth <= 0.0F || alpha <= 0.0F) {
+float SquircleCoverage(float signedDistance) noexcept {
+    constexpr float aa = 1.15F;
+    return 1.0F - std::clamp(signedDistance / aa + 0.5F, 0.0F, 1.0F);
+}
+
+void CompositeCoverage(uint8_t* dest, int destWidth, int destHeight, int x, int y,
+    float coverage, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
+    if (coverage <= 0.0F || alpha <= 0.0F) {
         return;
     }
-    const float pad = halfWidth + 2.0F;
-    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - pad)));
-    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - pad)));
-    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + pad)));
-    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + pad)));
-    const float aa = 1.15F;
+    const float srcA = coverage * alpha;
+    uint8_t pixel[4] = {
+        static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
+        static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
+        static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
+        static_cast<uint8_t>(std::lround(255.0F * srcA)),
+    };
+    CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+}
+
+// Nested panel controls. The plate uses DOCK_CORNER_RADIUS_PT (20); chips inside
+// it use 12pt so corners stay in the same family without swallowing a short row.
+float ContentSquircleRadius(const RECT& bounds, float scale) noexcept {
+    const float w = static_cast<float>(std::max(1L, bounds.right - bounds.left));
+    const float h = static_cast<float>(std::max(1L, bounds.bottom - bounds.top));
+    const float cap = 0.5F * std::min(w, h);
+    return std::min(cap, std::max(6.0F * scale, 12.0F * scale));
+}
+
+RECT InsetContentRect(RECT bounds, LONG inset) noexcept {
+    bounds.left += inset;
+    bounds.top += inset;
+    bounds.right -= inset;
+    bounds.bottom -= inset;
+    if (bounds.right - bounds.left < 8 || bounds.bottom - bounds.top < 8) {
+        bounds.left -= inset;
+        bounds.top -= inset;
+        bounds.right += inset;
+        bounds.bottom += inset;
+    }
+    return bounds;
+}
+
+// Square control that used to be a circle, now a full superellipse in that box.
+RECT QuickControlDisc(const RECT& tile, float scale) noexcept {
+    const LONG side = std::max(44L, std::lround(52.0F * scale));
+    const LONG cx = (tile.left + tile.right) / 2L;
+    const LONG left = cx - side / 2L;
+    return RECT{left, tile.top, left + side, tile.top + side};
+}
+
+void FillSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
+    float radius, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
+    if (alpha <= 0.0F || bounds.right <= bounds.left || bounds.bottom <= bounds.top) {
+        return;
+    }
+    const float halfW = 0.5F * static_cast<float>(bounds.right - bounds.left);
+    const float halfH = 0.5F * static_cast<float>(bounds.bottom - bounds.top);
+    const float cx = 0.5F * static_cast<float>(bounds.left + bounds.right);
+    const float cy = 0.5F * static_cast<float>(bounds.top + bounds.bottom);
+    const int left = std::max(0, static_cast<int>(bounds.left) - 1);
+    const int top = std::max(0, static_cast<int>(bounds.top) - 1);
+    const int right = std::min(destWidth, static_cast<int>(bounds.right) + 1);
+    const int bottom = std::min(destHeight, static_cast<int>(bounds.bottom) + 1);
     for (int y = top; y < bottom; ++y) {
         for (int x = left; x < right; ++x) {
-            const float dx = static_cast<float>(x) + 0.5F - cx;
-            const float dy = static_cast<float>(y) + 0.5F - cy;
-            const float ringDist = std::abs(std::sqrt(dx * dx + dy * dy) - radius);
-            const float coverage =
-                1.0F - std::clamp((ringDist - halfWidth) / aa + 0.5F, 0.0F, 1.0F);
-            if (coverage <= 0.0F) {
-                continue;
-            }
-            const float srcA = coverage * alpha;
-            uint8_t pixel[4] = {
-                static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
-                static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
-                static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-            };
-            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+            const float dist = SdSquircleBox(static_cast<float>(x) + 0.5F,
+                static_cast<float>(y) + 0.5F, cx, cy, halfW, halfH, radius);
+            CompositeCoverage(dest, destWidth, destHeight, x, y, SquircleCoverage(dist), alpha,
+                blue, green, red);
         }
     }
 }
 
-void GlowRingColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
-    float radius, uint8_t blue, uint8_t green, uint8_t red) {
-    // Soft outer halo then a sharper core stroke â€” reads as edge glow, not a fill.
-    StrokeCircleColorPremul(dest, destWidth, destHeight, cx, cy, radius, 3.2F, 0.28F, blue, green,
-        red);
-    StrokeCircleColorPremul(dest, destWidth, destHeight, cx, cy, radius, 1.35F, 0.92F, blue, green,
-        red);
+void FillSquirclePremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, float radius,
+    float alpha) {
+    FillSquircleColorPremul(dest, destWidth, destHeight, bounds, radius, alpha, g_flyoutInkB,
+        g_flyoutInkG, g_flyoutInkR);
 }
 
-void FillCircleLevelColorPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
+void FillSquircleLevelColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
     float radius, float level, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
     level = std::clamp(level, 0.0F, 1.0F);
-    if (level <= 0.0F || radius <= 0.0F) {
+    if (level <= 0.0F || alpha <= 0.0F || bounds.right <= bounds.left ||
+        bounds.bottom <= bounds.top) {
         return;
     }
-    const float fillTop = cy + radius - 2.0F * radius * level;
-    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - 1.0F)));
-    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 1.0F)));
-    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 1.0F)));
-    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 1.0F)));
-    const float aa = 1.15F;
+    const float halfW = 0.5F * static_cast<float>(bounds.right - bounds.left);
+    const float halfH = 0.5F * static_cast<float>(bounds.bottom - bounds.top);
+    const float cx = 0.5F * static_cast<float>(bounds.left + bounds.right);
+    const float cy = 0.5F * static_cast<float>(bounds.top + bounds.bottom);
+    const float fillTop = static_cast<float>(bounds.bottom) -
+        static_cast<float>(bounds.bottom - bounds.top) * level;
+    const int left = std::max(0, static_cast<int>(bounds.left) - 1);
+    const int top = std::max(0, static_cast<int>(std::floor(fillTop)));
+    const int right = std::min(destWidth, static_cast<int>(bounds.right) + 1);
+    const int bottom = std::min(destHeight, static_cast<int>(bounds.bottom) + 1);
     for (int y = top; y < bottom; ++y) {
         if (static_cast<float>(y) + 0.5F < fillTop) {
             continue;
         }
         for (int x = left; x < right; ++x) {
-            const float dx = static_cast<float>(x) + 0.5F - cx;
-            const float dy = static_cast<float>(y) + 0.5F - cy;
-            const float coverage =
-                1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / aa + 0.5F, 0.0F, 1.0F);
-            if (coverage <= 0.0F) {
-                continue;
-            }
-            const float srcA = coverage * alpha;
-            uint8_t levelPixel[4] = {
-                static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
-                static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
-                static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-            };
-            CompositePremul(dest, destWidth, destHeight, x, y, levelPixel, 1, 1);
+            const float dist = SdSquircleBox(static_cast<float>(x) + 0.5F,
+                static_cast<float>(y) + 0.5F, cx, cy, halfW, halfH, radius);
+            CompositeCoverage(dest, destWidth, destHeight, x, y, SquircleCoverage(dist), alpha,
+                blue, green, red);
         }
     }
+}
+
+void StrokeSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
+    float radius, float halfWidth, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
+    if (halfWidth <= 0.0F || alpha <= 0.0F || bounds.right <= bounds.left ||
+        bounds.bottom <= bounds.top) {
+        return;
+    }
+    const float halfW = 0.5F * static_cast<float>(bounds.right - bounds.left);
+    const float halfH = 0.5F * static_cast<float>(bounds.bottom - bounds.top);
+    const float cx = 0.5F * static_cast<float>(bounds.left + bounds.right);
+    const float cy = 0.5F * static_cast<float>(bounds.top + bounds.bottom);
+    const int pad = static_cast<int>(std::ceil(halfWidth + 2.0F));
+    const int left = std::max(0, static_cast<int>(bounds.left) - pad);
+    const int top = std::max(0, static_cast<int>(bounds.top) - pad);
+    const int right = std::min(destWidth, static_cast<int>(bounds.right) + pad);
+    const int bottom = std::min(destHeight, static_cast<int>(bounds.bottom) + pad);
+    constexpr float aa = 1.15F;
+    for (int y = top; y < bottom; ++y) {
+        for (int x = left; x < right; ++x) {
+            const float dist = SdSquircleBox(static_cast<float>(x) + 0.5F,
+                static_cast<float>(y) + 0.5F, cx, cy, halfW, halfH, radius);
+            const float coverage =
+                1.0F - std::clamp((std::abs(dist) - halfWidth) / aa + 0.5F, 0.0F, 1.0F);
+            CompositeCoverage(dest, destWidth, destHeight, x, y, coverage, alpha, blue, green, red);
+        }
+    }
+}
+
+void GlowSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
+    float radius, uint8_t blue, uint8_t green, uint8_t red) {
+    StrokeSquircleColorPremul(dest, destWidth, destHeight, bounds, radius, 3.2F, 0.28F, blue,
+        green, red);
+    StrokeSquircleColorPremul(dest, destWidth, destHeight, bounds, radius, 1.35F, 0.92F, blue,
+        green, red);
 }
 
 std::wstring NotifyIconTitle(const TrayNotifyIcon& icon) {
@@ -4905,7 +4958,11 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
     if (!EnsureLayerPresentDib(slot, width, height) || slot.bits == nullptr || slot.dc == nullptr) {
         return false;
     }
-    if (dirty != nullptr && slot.contentValid) {
+    // A dirty rect is only valid when the DIB already matches the screen except
+    // for that rect. Live glass clears contentValid; clipping the composite to
+    // the hover highlight would leave the rest of the plate frozen.
+    const bool partial = dirty != nullptr && slot.contentValid;
+    if (partial) {
         const LONG left = (std::max)(0L, dirty->left);
         const LONG top = (std::max)(0L, dirty->top);
         const LONG right = (std::min)(width, dirty->right);
@@ -4927,7 +4984,7 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
     POINT destination{origin.x, origin.y};
     SIZE present{width, height};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    if (dirty != nullptr) {
+    if (partial) {
         UPDATELAYEREDWINDOWINFO info{};
         info.cbSize = sizeof(info);
         info.pptDst = &destination;
@@ -5553,26 +5610,22 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     }
     switch (hit.kind) {
     case SettingsHitKind::Close: {
-        // Match the full paint's close bubble: centered on the X glyph area.
-        // The hit rect is wider than the glyph, so center on its right portion
-        // where the glyph lives rather than the whole hit.
+        // Squircle behind the X, centered on the glyph rather than the wide hit.
         const UINT dpi = HostDpi();
         const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
         const float closeExtent = static_cast<float>(std::max(22L, std::lround(24.0F * scale)));
         const float cx = static_cast<float>(hit.bounds.right) - closeExtent * 0.5F - 4.0F;
         const float cy = 0.5F * static_cast<float>(hit.bounds.top + hit.bounds.bottom);
-        FillCirclePremul(pixels, width, height, cx, cy, closeExtent * 0.62F, 0.55F, true);
+        const LONG side = std::max(8L, std::lround(closeExtent * 1.24F));
+        const LONG left = std::lround(cx) - side / 2L;
+        const LONG top = std::lround(cy) - side / 2L;
+        const RECT bubble{left, top, left + side, top + side};
+        FillSquirclePremul(pixels, width, height, bubble, static_cast<float>(side) * 0.5F, 0.55F);
         break;
     }
     case SettingsHitKind::CheckNow:
     case SettingsHitKind::PerfProfile:
-        // Olive sage bar (#98A869) + light chrome label ink. Extra white overlay
-        // brightens toward hover; forest ink stays readable on pressed too.
-        FillRectPremul(pixels, width, height, hit.bounds, 0.14F);
-        break;
     case SettingsHitKind::PerfLog:
-        FillRectPremul(pixels, width, height, hit.bounds, 0.10F);
-        break;
     case SettingsHitKind::Startup:
     case SettingsHitKind::Updates:
     case SettingsHitKind::RimLight:
@@ -5581,9 +5634,16 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     case SettingsHitKind::Frost:
     case SettingsHitKind::Specular:
     case SettingsHitKind::DropShadow:
-    case SettingsHitKind::DepthShade:
-        FillRectPremul(pixels, width, height, hit.bounds, 0.10F);
+    case SettingsHitKind::DepthShade: {
+        const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+        const float wash = (hit.kind == SettingsHitKind::CheckNow ||
+                               hit.kind == SettingsHitKind::PerfProfile)
+            ? 0.14F
+            : 0.10F;
+        FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
+            wash);
         break;
+    }
     case SettingsHitKind::None:
         break;
     }
@@ -6486,6 +6546,8 @@ void DockApp::PaintSettingsPopup() {
     const LONG subHeight = std::max(14L, std::lround(16.0F * scale));
     for (const SettingsRow& row : rows) {
         const RECT rowBounds{padding, y, panelWidth - padding, y + rowHeight};
+        FillSquirclePremul(pixels, width, height, rowBounds, ContentSquircleRadius(rowBounds, scale),
+            0.07F);
         if (row.slider) {
             const LONG sliderLeft = padding + 4L;
             const LONG sliderRight = panelWidth - padding - 4L;
@@ -6519,10 +6581,10 @@ void DockApp::PaintSettingsPopup() {
 
     const bool checking = m_updateInFlight.load() || m_updateInstalling.load();
     RECT buttonBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    // #98A869 wash plate + light chrome label ink (already set).
-    // Idle alpha kept soft so empty buttons read clearly on charcoal glass.
-    FillRectColorPremul(pixels, width, height, buttonBounds, 0.50F,
-        DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
+    // #98A869 squircle + light chrome label ink (already set).
+    FillSquircleColorPremul(pixels, width, height, buttonBounds,
+        ContentSquircleRadius(buttonBounds, scale), 0.50F, DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G,
+        DOCK_PANEL_TOGGLE_R);
     DrawFlyoutText(pixels, width, height, buttonBounds, labelFont,
         checking ? L"Checking..." : L"Check for updates now",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 170 : 245);
@@ -6531,9 +6593,9 @@ void DockApp::PaintSettingsPopup() {
 
     const bool profiling = m_perfProfiler.IsRunning();
     RECT perfBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    // Slightly stronger #98A869 wash while active; idle stays a light plate.
-    FillRectColorPremul(pixels, width, height, perfBounds, profiling ? 0.70F : 0.50F,
-        DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
+    FillSquircleColorPremul(pixels, width, height, perfBounds,
+        ContentSquircleRadius(perfBounds, scale), profiling ? 0.70F : 0.50F, DOCK_PANEL_TOGGLE_B,
+        DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
     DrawFlyoutText(pixels, width, height, perfBounds, labelFont,
         profiling ? L"Stop profiling" : L"Start performance profile",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, profiling ? 250 : 245);
@@ -6906,8 +6968,9 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
             static_cast<float>(idle) * kGearHoverScale)));
         const int centerX = m_overflowGearX + idle / 2;
         const int centerY = m_overflowGearY + idle / 2;
-        // Wipe the idle glyph (and room for the larger one) back to glass.
-        const int half = (std::max)(idle, hoverExt) / 2 + 1;
+        // Wipe the idle glyph and the squircle plate back to glass.
+        const int plateSide = hoverExt + 4;
+        const int half = plateSide / 2 + 2;
         const int left = (std::max)(0, centerX - half);
         const int top = (std::max)(0, centerY - half);
         const int right = (std::min)(width, centerX + half + 1);
@@ -6924,6 +6987,11 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         } else {
             RemapPremulInkColor(scaled, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
         }
+        const LONG plate = hoverExt + 4;
+        const LONG plateLeft = centerX - plate / 2;
+        const LONG plateTop = centerY - plate / 2;
+        const RECT gearPlate{plateLeft, plateTop, plateLeft + plate, plateTop + plate};
+        FillSquirclePremul(pixels, width, height, gearPlate, static_cast<float>(plate) * 0.5F, 0.16F);
         CompositePremul(pixels, width, height, centerX - hoverExt / 2, centerY - hoverExt / 2,
             scaled.data(), hoverExt, hoverExt);
         break;
@@ -6932,26 +7000,39 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::Sound:
     case TrayFlyoutHitKind::Boost:
     case TrayFlyoutHitKind::Brightness: {
-        // Edge ring glow at the tile disc radius. A solid hover fill used to
-        // paint over the cached glyph and wash it out; the ring leaves the
-        // interior clear so the icon stays crisp.
-        const float scale = static_cast<float>(HostDpi()) / 96.0F;
-        const float circle =
-            static_cast<float>(std::max(44L, std::lround(52.0F * scale)));
-        const float radius = circle * 0.5F;
-        const float cx = 0.5F * static_cast<float>(hit.bounds.left + hit.bounds.right);
-        const float cy = static_cast<float>(hit.bounds.top) + radius;
-        GlowRingColorPremul(pixels, width, height, cx, cy, radius, kQuickAccentB, kQuickAccentG,
+        // Squircle edge glow. A solid hover fill paints over the cached glyph;
+        // the stroke leaves the interior clear so the icon stays crisp.
+        const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+        const RECT disc = QuickControlDisc(hit.bounds, scale);
+        const float radius = 0.5F * static_cast<float>(disc.right - disc.left);
+        GlowSquircleColorPremul(pixels, width, height, disc, radius, kQuickAccentB, kQuickAccentG,
             kQuickAccentR);
         break;
     }
-    case TrayFlyoutHitKind::ClearAll:
-        FillRectPremul(pixels, width, height, hit.bounds, 0.08F);
+    case TrayFlyoutHitKind::ClearAll: {
+        const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+        const LONG insetY = std::max(2L, std::lround(3.0F * scale));
+        RECT chip = hit.bounds;
+        chip.top += insetY;
+        chip.bottom -= insetY;
+        const LONG hug = std::min(chip.right - chip.left, std::max(72L, std::lround(92.0F * scale)));
+        chip.left = chip.right - hug;
+        FillSquirclePremul(pixels, width, height, chip, ContentSquircleRadius(chip, scale), 0.10F);
         break;
-    case TrayFlyoutHitKind::NotificationCenter:
-    case TrayFlyoutHitKind::NotifyIcon:
-        FillRectPremul(pixels, width, height, hit.bounds, 0.10F);
+    }
+    case TrayFlyoutHitKind::NotificationCenter: {
+        const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+        FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
+            0.10F);
         break;
+    }
+    case TrayFlyoutHitKind::NotifyIcon: {
+        const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+        const LONG inset = std::max(4L, std::lround(5.0F * scale));
+        const RECT chip = InsetContentRect(hit.bounds, inset);
+        FillSquirclePremul(pixels, width, height, chip, ContentSquircleRadius(chip, scale), 0.12F);
+        break;
+    }
     default:
         break;
     }
@@ -7009,7 +7090,7 @@ void DockApp::PaintOverflowHoverFast() {
         const int idle = static_cast<int>(m_overflowGearExtent);
         const int hoverExt = std::max(1, static_cast<int>(std::lround(
             static_cast<float>(idle) * kGearHoverScale)));
-        const int half = (std::max)(idle, hoverExt) / 2 + 2;
+        const int half = (std::max)(idle, hoverExt) / 2 + 4;
         const int centerX = m_overflowGearX + idle / 2;
         const int centerY = m_overflowGearY + idle / 2;
         RECT r{
@@ -7352,9 +7433,10 @@ void DockApp::PaintOverflowPopup() {
     for (int index = 0; index < 4; ++index) {
         const LONG left = padding + index * (tileWidth + tileGap);
         const RECT tileBounds{left, y, left + tileWidth, y + tileBlock};
-        const float cx = static_cast<float>(left) + static_cast<float>(tileWidth) * 0.5F;
-        const float cy = static_cast<float>(y) + static_cast<float>(circle) * 0.5F;
-        const float tileRadius = static_cast<float>(circle) * 0.5F;
+        const RECT disc = QuickControlDisc(tileBounds, scale);
+        const float discRadius = 0.5F * static_cast<float>(disc.right - disc.left);
+        const float cx = 0.5F * static_cast<float>(disc.left + disc.right);
+        const float cy = 0.5F * static_cast<float>(disc.top + disc.bottom);
         const bool isSlider = tiles[index].kind == TrayFlyoutHitKind::Sound ||
             tiles[index].kind == TrayFlyoutHitKind::Brightness;
         // Level meter source of truth (also drives the sage accent state): muted
@@ -7375,20 +7457,18 @@ void DockApp::PaintOverflowPopup() {
             (tiles[index].kind == TrayFlyoutHitKind::Wifi &&
                 trayStatus.network != TrayNetworkKind::Disconnected);
         if (isSlider) {
-            // Light #98A869 wash plate plus stronger fill rising with progress.
-            // Hover ring is applied later in ApplyOverflowHoverHighlight.
-            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.50F,
-                kQuickAccentB, kQuickAccentG, kQuickAccentR);
-            FillCircleLevelColorPremul(pixels, width, height, cx, cy, tileRadius, level, 0.88F,
+            // Light #98A869 squircle plus stronger fill rising with progress.
+            // Hover stroke is applied later in ApplyOverflowHoverHighlight.
+            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.50F, kQuickAccentB,
+                kQuickAccentG, kQuickAccentR);
+            FillSquircleLevelColorPremul(pixels, width, height, disc, discRadius, level, 0.88F,
                 kQuickAccentB, kQuickAccentG, kQuickAccentR);
         } else if (isFullAmber) {
-            // Stronger #98A869 disc when the toggle is on (Wi-Fi connected / Boost).
-            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.70F,
-                kQuickAccentB, kQuickAccentG, kQuickAccentR);
+            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.70F, kQuickAccentB,
+                kQuickAccentG, kQuickAccentR);
         } else {
-            // Idle plate: lighter wash so empty tiles read clearly (match Dock Settings).
-            FillCircleColorPremul(pixels, width, height, cx, cy, tileRadius, 0.50F,
-                kQuickAccentB, kQuickAccentG, kQuickAccentR);
+            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.50F, kQuickAccentB,
+                kQuickAccentG, kQuickAccentR);
         }
         // Glyph bitmaps are cached by EnsureOverflowGlyphs above; hover repaints only composite.
         const std::vector<uint8_t>* glyph = &m_overflowGlyphBrightness;
@@ -7427,9 +7507,8 @@ void DockApp::PaintOverflowPopup() {
     y += sectionHeader;
 
     RECT notifyRow{padding, y, panelWidth - padding, y + notificationRow};
-    if (hoveredKind(TrayFlyoutHitKind::NotificationCenter)) {
-        FillRectPremul(pixels, width, height, notifyRow, 0.10F);
-    }
+    FillSquirclePremul(pixels, width, height, notifyRow, ContentSquircleRadius(notifyRow, scale),
+        0.07F);
     if (!m_overflowGlyphBell.empty()) {
         CompositePremul(pixels, width, height, SaturatedInt(padding + 4),
             SaturatedInt(y + (notificationRow - static_cast<LONG>(notifyGlyph)) / 2L),
@@ -7464,9 +7543,9 @@ void DockApp::PaintOverflowPopup() {
             const LONG left = padding + column * cellWidth;
             const LONG top = y + row * otherIconHeight;
             const RECT cell{left, top, left + cellWidth, top + otherIconHeight};
-            if (hoveredKind(TrayFlyoutHitKind::NotifyIcon, static_cast<int>(index))) {
-                FillRectPremul(pixels, width, height, cell, 0.10F);
-            }
+            const LONG chipInset = std::max(4L, std::lround(5.0F * scale));
+            const RECT chip = InsetContentRect(cell, chipInset);
+            FillSquirclePremul(pixels, width, height, chip, ContentSquircleRadius(chip, scale), 0.06F);
             if (m_overflowIcons[index].icon != nullptr) {
                 const LONG iconLeft = left + (cellWidth - otherIconSize) / 2L;
                 const LONG iconTop = top + 6;
