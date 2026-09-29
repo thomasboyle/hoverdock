@@ -1,6 +1,5 @@
 #include "DockApp.h"
 #include "DockTheme.hlsli"
-#include "SettingsIconData.h"
 #include "PerfBoost.h"
 #include "Profile.h"
 #include "RecycleBin.h"
@@ -4800,31 +4799,6 @@ void DockApp::ScrollBrightness(int delta) {
     }
 }
 
-std::vector<uint8_t> RasterizeSettingsGear(UINT extent) {
-    struct Master {
-        std::vector<uint8_t> pixels;
-        UINT extent = 0;
-    };
-    static const Master master = [] {
-        Master loaded;
-        UINT width = 0;
-        UINT height = 0;
-        loaded.pixels = WeatherService::DecodePngToPremul(SettingsIconData::kPng,
-            SettingsIconData::kPngSize, 0, &width, &height);
-        if (width == height && width > 0 &&
-            loaded.pixels.size() == static_cast<size_t>(width) * width * 4U) {
-            loaded.extent = width;
-        } else {
-            loaded.pixels.clear();
-        }
-        return loaded;
-    }();
-    if (master.pixels.empty() || master.extent == 0 || extent == 0) {
-        return {};
-    }
-    return BoxDownsamplePremultiplied(master.pixels, master.extent, extent);
-}
-
 void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notifyExtent) {
     const TrayStatus& status = m_tray.Status();
     std::wstring key = std::to_wstring(gearExtent) + L"|" + std::to_wstring(tileExtent) + L"|" +
@@ -4837,10 +4811,7 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent, UINT notify
         return;
     }
     m_overflowGlyphKey = std::move(key);
-    m_overflowGlyphGear = RasterizeSettingsGear(gearExtent);
-    if (m_overflowGlyphGear.empty()) {
-        m_overflowGlyphGear = m_tray.RasterizeSymbol(L'\uE713', gearExtent);
-    }
+    m_overflowGlyphGear = m_tray.RasterizeSymbol(L'\uE713', gearExtent);
     m_overflowGlyphWifi = m_tray.RasterizeGlyph(TraySlot::Network, tileExtent);
     m_overflowGlyphSound = m_tray.RasterizeGlyph(TraySlot::Volume, tileExtent);
     m_overflowGlyphBrightness = m_tray.RasterizeSymbol(L'\uE706', tileExtent);
@@ -6981,47 +6952,10 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         return;
     }
     switch (hit.kind) {
-    case TrayFlyoutHitKind::Settings: {
-        // Enlarge the cog ~30%; no accent ring glow (tiles keep the ring).
-        constexpr float kGearHoverScale = 1.30F;
-        if (m_overflowGlyphGear.empty() || m_overflowGearExtent == 0U ||
-            m_overflowGlass.empty() || m_overflowGlassSize.cx != width ||
-            m_overflowGlassSize.cy != height) {
-            break;
-        }
-        const int idle = static_cast<int>(m_overflowGearExtent);
-        const int hoverExt = std::max(1, static_cast<int>(std::lround(
-            static_cast<float>(idle) * kGearHoverScale)));
-        const int centerX = m_overflowGearX + idle / 2;
-        const int centerY = m_overflowGearY + idle / 2;
-        // Wipe the idle glyph and the squircle plate back to glass.
-        const int plateSide = hoverExt + 4;
-        const int half = plateSide / 2 + 2;
-        const int left = (std::max)(0, centerX - half);
-        const int top = (std::max)(0, centerY - half);
-        const int right = (std::min)(width, centerX + half + 1);
-        const int bottom = (std::min)(height, centerY + half + 1);
-        for (int y = top; y < bottom; ++y) {
-            const size_t row = static_cast<size_t>(y) * static_cast<size_t>(width) * 4U;
-            std::memcpy(pixels + row + static_cast<size_t>(left) * 4U,
-                m_overflowGlass.data() + row + static_cast<size_t>(left) * 4U,
-                static_cast<size_t>(right - left) * 4U);
-        }
-        std::vector<uint8_t> scaled = RasterizeSettingsGear(static_cast<UINT>(hoverExt));
-        if (scaled.empty()) {
-            scaled = ScalePremultipliedNearest(m_overflowGlyphGear, idle, idle, hoverExt, hoverExt);
-        } else {
-            RemapPremulInkColor(scaled, g_flyoutInkR, g_flyoutInkG, g_flyoutInkB);
-        }
-        const LONG plate = hoverExt + 4;
-        const LONG plateLeft = centerX - plate / 2;
-        const LONG plateTop = centerY - plate / 2;
-        const RECT gearPlate{plateLeft, plateTop, plateLeft + plate, plateTop + plate};
-        FillSquirclePremul(pixels, width, height, gearPlate, static_cast<float>(plate) * 0.5F, 0.16F);
-        CompositePremul(pixels, width, height, centerX - hoverExt / 2, centerY - hoverExt / 2,
-            scaled.data(), hoverExt, hoverExt);
+    case TrayFlyoutHitKind::Settings:
+        // The cog stays its idle size. A hover plate or scale-up covered the
+        // tile underneath.
         break;
-    }
     case TrayFlyoutHitKind::Wifi:
     case TrayFlyoutHitKind::Sound:
     case TrayFlyoutHitKind::Boost:
@@ -7430,19 +7364,6 @@ void DockApp::PaintOverflowPopup() {
     m_overflowGearX = SaturatedInt(gearBounds.left);
     m_overflowGearY = SaturatedInt(gearBounds.top);
     m_overflowGearExtent = gearExtent;
-    {
-        const LONG plate = gearSize + std::max(6L, std::lround(8.0F * scale));
-        const LONG plateLeft = gearBounds.left + gearSize / 2L - plate / 2L;
-        const LONG plateTop = gearBounds.top + gearSize / 2L - plate / 2L;
-        const RECT gearPlate{plateLeft, plateTop, plateLeft + plate, plateTop + plate};
-        if (m_config.LightPanels()) {
-            FillSquircleColorPremul(pixels, width, height, gearPlate,
-                static_cast<float>(plate) * 0.5F, 0.82F, 255, 255, 255);
-        } else {
-            FillSquircleColorPremul(pixels, width, height, gearPlate,
-                static_cast<float>(plate) * 0.5F, 0.72F, 22, 24, 28);
-        }
-    }
     if (!m_overflowGlyphGear.empty()) {
         CompositePremul(pixels, width, height, m_overflowGearX, m_overflowGearY,
             m_overflowGlyphGear.data(), SaturatedInt(gearExtent), SaturatedInt(gearExtent));
