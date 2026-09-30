@@ -1,4 +1,4 @@
-<h1 align="center">Hoverdock ✨</h1>
+<h1 align="center">Hoverdock</h1>
 
 <p align="center">
   <b>The liquid glass dock your Windows desktop has been missing.</b><br>
