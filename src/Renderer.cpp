@@ -997,13 +997,36 @@ void Renderer::UploadIcons(const std::vector<std::wstring>& targets,
             m_iconPixelCache[targets[index]] = pixelBuffers[index];
         }
     }
+    // Publish the high-water mark before a deferred rebuild. Tray and trash
+    // icons are appended while the batch is open, and they must not reuse
+    // slices 0..N-1 that the app icons already own.
+    m_iconCount = targets.empty() ? 1U : static_cast<UINT>(targets.size());
     RequestIconAtlasRebuild();
 }
 
+UINT Renderer::NextFreeIconSlot() const noexcept {
+    UINT next = m_iconCount;
+    for (const auto& entry : m_iconTextureByTarget) {
+        next = std::max(next, entry.second + 1U);
+    }
+    return next;
+}
+
 void Renderer::RebuildIconAtlasFromCache() {
-    m_iconCount = m_iconTextureByTarget.empty()
-        ? 1U
-        : static_cast<UINT>(m_iconTextureByTarget.size());
+    // Size from the highest assigned slice, not the key count. Duplicate keys
+    // leave holes, and a stale count used to alias tray glyphs onto Start/Search.
+    UINT iconCount = 1U;
+    if (!m_iconTextureByTarget.empty()) {
+        UINT maxSlot = 0;
+        for (const auto& entry : m_iconTextureByTarget) {
+            maxSlot = std::max(maxSlot, entry.second);
+        }
+        iconCount = maxSlot + 1U;
+    }
+    if (iconCount > kMaximumIcons) {
+        throw std::runtime_error("The dock supports at most 512 visible icons.");
+    }
+    m_iconCount = iconCount;
 
     ComApartment apartment;
     WaitForAllFrames();
@@ -1077,19 +1100,21 @@ void Renderer::AppendMissingIcons(const std::vector<std::wstring>& targets,
     }
 
     bool added = false;
+    UINT slot = NextFreeIconSlot();
     for (size_t index = 0; index < targets.size(); ++index) {
         if (m_iconPixelCache.contains(targets[index])) {
             continue;
         }
-        if (m_iconCount >= kMaximumIcons) {
+        if (slot >= kMaximumIcons) {
             throw std::runtime_error("The dock supports at most 512 visible icons.");
         }
-        const UINT slot = m_iconCount++;
         m_iconPixelCache.emplace(targets[index], pixelBuffers[index]);
         m_iconTextureByTarget[targets[index]] = slot;
+        ++slot;
         added = true;
     }
     if (added) {
+        m_iconCount = std::max(m_iconCount, slot);
         RequestIconAtlasRebuild();
     }
 }

@@ -206,6 +206,10 @@ private:
     void WaitForAllFrames();
     void RebuildIconAtlasFromCache();
     void RequestIconAtlasRebuild();
+    // Next atlas slice that does not collide with a key already assigned.
+    // m_iconCount stays 0 until the deferred batch rebuild, so callers must
+    // not hand out slices from that stale counter alone.
+    [[nodiscard]] UINT NextFreeIconSlot() const noexcept;
     void UploadIcon(UINT textureIndex, const std::wstring& target,
         ID3D12GraphicsCommandList* commandList);
     void CreateFallbackIcon(UINT textureIndex, ID3D12GraphicsCommandList* commandList);

@@ -2201,6 +2201,10 @@ int DockApp::Run() {
             if (m_dragSnapAnimating) {
                 AdvanceDragSnapBack();
             }
+        } else if (m_dragSnapAnimating && wait != WAIT_FAILED) {
+            // The 8 ms backdrop timer wakes this wait before the 16 ms snap
+            // timeout, so the ghost would otherwise stay at the drop point.
+            AdvanceDragSnapBack();
         }
         if (objectSignaled && backdropSlot != static_cast<DWORD>(-1) &&
             wait == WAIT_OBJECT_0 + backdropSlot) {
