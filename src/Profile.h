@@ -63,8 +63,13 @@ private:
         static FILE* file = nullptr;
         static LARGE_INTEGER origin{};
         if (file == nullptr) {
-            if (fopen_s(&file, "D:\\C++\\hoverdock\\.system-analysis\\profile.log", "a") != 0 ||
-                file == nullptr) {
+            wchar_t tempPath[MAX_PATH]{};
+            const DWORD tempLength = GetTempPathW(MAX_PATH, tempPath);
+            if (tempLength == 0 || tempLength >= MAX_PATH) {
+                return;
+            }
+            std::wstring logPath = std::wstring(tempPath, tempLength) + L"hoverdock-profile.log";
+            if (_wfopen_s(&file, logPath.c_str(), L"a") != 0 || file == nullptr) {
                 return;
             }
             QueryPerformanceCounter(&origin);
