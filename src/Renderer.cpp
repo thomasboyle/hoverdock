@@ -1440,16 +1440,188 @@ bool SampleWithMagnifier(const RECT& screen, uint8_t* destBits, const HWND* excl
     return sample();
 }
 
+// Screen samples run on a private thread. The UI thread owns WH_MOUSE_LL, so a
+// magnifier or BitBlt there drops cursor rate for the whole sample. While the
+// sample runs, this thread only dispatches sent messages, which is how the
+// hook is delivered.
+enum class ScreenSampleKind : uint8_t { Magnifier, BitBlt };
+enum class ScreenSampleStatus : uint8_t { Ok, Failed, Busy };
+
+struct ScreenSampleJob {
+    RECT screen{};
+    HWND exclude[8]{};
+    UINT excludeCount = 0;
+    uint8_t* dest = nullptr;
+    ScreenSampleKind kind = ScreenSampleKind::Magnifier;
+    bool ok = false;
+};
+
+struct WorkerBlitTarget {
+    HDC dc = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ previous = nullptr;
+    uint8_t* bits = nullptr;
+    int width = 0;
+    int height = 0;
+};
+
+ScreenSampleJob g_sampleJob{};
+WorkerBlitTarget g_workerBlit{};
+HANDLE g_sampleRequest = nullptr;
+HANDLE g_sampleDone = nullptr;
+HANDLE g_sampleThread = nullptr;
+int g_sampleWaitDepth = 0;
+
+bool EnsureWorkerBlitTarget(int width, int height) noexcept {
+    if (g_workerBlit.bits != nullptr && g_workerBlit.width == width && g_workerBlit.height == height) {
+        return true;
+    }
+    if (g_workerBlit.dc != nullptr && g_workerBlit.previous != nullptr) {
+        SelectObject(g_workerBlit.dc, g_workerBlit.previous);
+        g_workerBlit.previous = nullptr;
+    }
+    if (g_workerBlit.bitmap != nullptr) {
+        DeleteObject(g_workerBlit.bitmap);
+        g_workerBlit.bitmap = nullptr;
+    }
+    g_workerBlit.bits = nullptr;
+    g_workerBlit.width = 0;
+    g_workerBlit.height = 0;
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) {
+        return false;
+    }
+    SetICMMode(screen, ICM_OFF);
+    if (g_workerBlit.dc == nullptr) {
+        g_workerBlit.dc = CreateCompatibleDC(screen);
+    }
+    BITMAPV5HEADER header = CaptureDibHeader(static_cast<UINT>(width), static_cast<UINT>(height));
+    void* bits = nullptr;
+    g_workerBlit.bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (g_workerBlit.dc == nullptr || g_workerBlit.bitmap == nullptr || bits == nullptr) {
+        return false;
+    }
+    g_workerBlit.previous = SelectObject(g_workerBlit.dc, g_workerBlit.bitmap);
+    g_workerBlit.bits = static_cast<uint8_t*>(bits);
+    g_workerBlit.width = width;
+    g_workerBlit.height = height;
+    return true;
+}
+
+bool BlitScreenToBuffer(const RECT& screen, uint8_t* dest, const HWND* exclude,
+    UINT excludeCount) noexcept {
+    const int width = static_cast<int>(screen.right - screen.left);
+    const int height = static_cast<int>(screen.bottom - screen.top);
+    if (dest == nullptr || width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+        return false;
+    }
+    if (!EnsureWorkerBlitTarget(width, height)) {
+        return false;
+    }
+    if (BitBltExcludingByAffinity(g_workerBlit.dc, width, height, static_cast<int>(screen.left),
+            static_cast<int>(screen.top), exclude, excludeCount) == FALSE) {
+        return false;
+    }
+    std::memcpy(dest, g_workerBlit.bits,
+        static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
+    return true;
+}
+
+DWORD WINAPI ScreenSampleThread(void*) noexcept {
+    MSG queue{};
+    PeekMessageW(&queue, nullptr, 0, 0, PM_NOREMOVE);
+    for (;;) {
+        if (WaitForSingleObject(g_sampleRequest, INFINITE) != WAIT_OBJECT_0) {
+            return 0;
+        }
+        const bool ok = g_sampleJob.kind == ScreenSampleKind::Magnifier
+            ? SampleWithMagnifier(g_sampleJob.screen, g_sampleJob.dest, g_sampleJob.exclude,
+                  g_sampleJob.excludeCount)
+            : BlitScreenToBuffer(g_sampleJob.screen, g_sampleJob.dest, g_sampleJob.exclude,
+                  g_sampleJob.excludeCount);
+        g_sampleJob.ok = ok;
+        SetEvent(g_sampleDone);
+    }
+}
+
+bool EnsureSampleThread() noexcept {
+    if (g_sampleThread != nullptr) {
+        return true;
+    }
+    g_sampleRequest = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_sampleDone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_sampleRequest == nullptr || g_sampleDone == nullptr) {
+        return false;
+    }
+    g_sampleThread = CreateThread(nullptr, 0, ScreenSampleThread, nullptr, 0, nullptr);
+    return g_sampleThread != nullptr;
+}
+
+bool WaitForSampleDone() noexcept {
+    for (;;) {
+        const DWORD wake = MsgWaitForMultipleObjects(1, &g_sampleDone, FALSE, INFINITE, QS_SENDMESSAGE);
+        if (wake == WAIT_OBJECT_0) {
+            return true;
+        }
+        if (wake != WAIT_OBJECT_0 + 1) {
+            return false;
+        }
+        bool pumped = false;
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE | PM_QS_SENDMESSAGE) != FALSE) {
+            DispatchMessageW(&message);
+            pumped = true;
+        }
+        if (!pumped) {
+            if (WaitForSingleObject(g_sampleDone, 0) == WAIT_OBJECT_0) {
+                return true;
+            }
+            SwitchToThread();
+        }
+    }
+}
+
+ScreenSampleStatus RunScreenSample(ScreenSampleKind kind, const RECT& screen, uint8_t* dest,
+    const HWND* exclude, UINT excludeCount) noexcept {
+    if (g_sampleWaitDepth > 0 || dest == nullptr) {
+        return ScreenSampleStatus::Busy;
+    }
+    if (!EnsureSampleThread()) {
+        return ScreenSampleStatus::Failed;
+    }
+    g_sampleJob = {};
+    g_sampleJob.screen = screen;
+    g_sampleJob.dest = dest;
+    g_sampleJob.kind = kind;
+    g_sampleJob.excludeCount = excludeCount < 8U ? excludeCount : 8U;
+    if (exclude != nullptr) {
+        std::memcpy(g_sampleJob.exclude, exclude, static_cast<size_t>(g_sampleJob.excludeCount) * sizeof(HWND));
+    }
+    SetEvent(g_sampleRequest);
+    ++g_sampleWaitDepth;
+    const bool finished = WaitForSampleDone();
+    --g_sampleWaitDepth;
+    if (!finished) {
+        return ScreenSampleStatus::Failed;
+    }
+    return g_sampleJob.ok ? ScreenSampleStatus::Ok : ScreenSampleStatus::Failed;
+}
+
 // Desktop pixels for `screen`, with exclude[] omitted, written top-down into
 // destBits (stride = width * 4). Does not change display affinity, so video
 // and Snipping Tool keep seeing those windows. Falls back to an affinity
 // BitBlt only if the magnifier cannot sample.
 bool CaptureScreenExcluding(const RECT& screen, uint8_t* destBits, HDC fallbackDc,
     const HWND* exclude, UINT excludeCount) noexcept {
-    if (SampleWithMagnifier(screen, destBits, exclude, excludeCount)) {
+    const ScreenSampleStatus magnified =
+        RunScreenSample(ScreenSampleKind::Magnifier, screen, destBits, exclude, excludeCount);
+    if (magnified == ScreenSampleStatus::Ok) {
         return true;
     }
-    if (fallbackDc == nullptr) {
+    if (magnified == ScreenSampleStatus::Busy || fallbackDc == nullptr) {
         return false;
     }
     const int width = static_cast<int>(screen.right - screen.left);
@@ -1457,8 +1629,8 @@ bool CaptureScreenExcluding(const RECT& screen, uint8_t* destBits, HDC fallbackD
     if (width <= 0 || height <= 0) {
         return false;
     }
-    return BitBltExcludingByAffinity(fallbackDc, width, height, static_cast<int>(screen.left),
-               static_cast<int>(screen.top), exclude, excludeCount) != FALSE;
+    return RunScreenSample(ScreenSampleKind::BitBlt, screen, destBits, exclude, excludeCount) ==
+        ScreenSampleStatus::Ok;
 }
 
 struct StripWatchState {
@@ -3031,9 +3203,10 @@ bool Renderer::CapturePanelScreen(const RECT& screen, uint8_t* destBits, HDC des
     }
     // Layered menus sample themselves if left in the blit. The dock stays at
     // WDA_NONE; any overlap is replaced from the magnifier backdrop below.
+    // The blit runs off the mouse-hook thread. destDc addresses the same DIB as destBits.
     const HWND popups[] = {excludeA, excludeB, excludeC};
-    if (BitBltExcludingByAffinity(destDc, width, height, static_cast<int>(screen.left),
-            static_cast<int>(screen.top), popups, 3) == FALSE) {
+    if (RunScreenSample(ScreenSampleKind::BitBlt, screen, destBits, popups, 3) !=
+        ScreenSampleStatus::Ok) {
         return false;
     }
     StampDockBackdropInto(screen, destBits);
