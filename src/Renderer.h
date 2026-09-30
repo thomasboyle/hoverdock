@@ -96,6 +96,9 @@ public:
     [[nodiscard]] bool BackdropValid() const noexcept;
     void InvalidateBackdrop() noexcept;
     [[nodiscard]] bool Render(const DockRenderState& state);
+    // Slide the swap chain inside the HWND. Moving the window itself drops it
+    // from desktop capture for the whole reveal/hide.
+    void SetContentOffsetY(float offsetY) noexcept;
     // Bake the dock GlassPS stack into a BGRA8 buffer for layered menus
     // (Quick Settings / Dock Settings / context). Uses DOCK_FX_PANEL so the
     // plate fills the surface (no dock shadow margin ring).
@@ -214,6 +217,8 @@ private:
     Microsoft::WRL::ComPtr<IDCompositionDevice> m_compositionDevice;
     Microsoft::WRL::ComPtr<IDCompositionTarget> m_compositionTarget;
     Microsoft::WRL::ComPtr<IDCompositionVisual> m_compositionVisual;
+    float m_contentOffsetY = 0.0F;
+    bool m_contentOffsetValid = false;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_rtvHeap;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_srvHeap;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;

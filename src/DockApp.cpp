@@ -3642,8 +3642,27 @@ void DockApp::PositionOverlayWindows() {
     // below still runs every time.
     const LONG width = static_cast<LONG>(m_dockWidth);
     const LONG height = static_cast<LONG>(m_dockHeight);
-    if (!m_overlayPosValid || m_overlayX != m_windowX || m_overlayY != m_currentY ||
-        m_overlayW != width || m_overlayH != height || m_inputWindow == nullptr) {
+    // Desktop capture omits a WS_EX_NOREDIRECTIONBITMAP window for as long as
+    // its HWND is moving. Keep the renderer parked over the whole slide and
+    // move only the composition visual. The input window still tracks the pill.
+    const bool sliding = m_visibility == VisibilityState::Showing ||
+        m_visibility == VisibilityState::Hiding;
+    LONG renderY = m_currentY;
+    LONG renderH = height;
+    float contentOffsetY = 0.0F;
+    if (sliding) {
+        const LONG top = std::min(m_visibleY, m_hiddenY);
+        const LONG bottom = std::max(m_visibleY, m_hiddenY) + height;
+        renderY = top;
+        renderH = std::max(height, bottom - top);
+        contentOffsetY = static_cast<float>(m_currentY - top);
+    }
+    const bool renderMoved = !m_overlayPosValid || m_overlayX != m_windowX ||
+        m_overlayW != width || m_overlayRenderY != renderY || m_overlayRenderH != renderH;
+    const bool inputMoved = !m_overlayPosValid || m_inputWindow == nullptr ||
+        m_overlayX != m_windowX || m_overlayY != m_currentY || m_overlayW != width ||
+        m_overlayH != height;
+    if (renderMoved || inputMoved) {
         // One DWM round-trip for both windows instead of two: DeferWindowPos
         // batches the topmost renderer + layered input moves atomically.
         // NOREDRAW + NOCOPYBITS: frames come from the D3D present, so GDI
@@ -3656,8 +3675,8 @@ void DockApp::PositionOverlayWindows() {
         // OLE WindowFromPoint then resolves to the same window that owns mouse
         // input and RegisterDragDrop (divider handling already lives on input).
         if (HDWP batch = BeginDeferWindowPos(m_inputWindow != nullptr ? 2 : 1)) {
-            if (DeferWindowPos(batch, m_window, HWND_TOPMOST, m_windowX, m_currentY, width,
-                    height, kMoveFlags) != nullptr &&
+            if (DeferWindowPos(batch, m_window, HWND_TOPMOST, m_windowX, renderY, width,
+                    renderH, kMoveFlags) != nullptr &&
                 (m_inputWindow == nullptr ||
                     DeferWindowPos(batch, m_inputWindow, HWND_TOPMOST, m_windowX, m_currentY,
                         width, height, kMoveFlags) != nullptr) &&
@@ -3667,7 +3686,7 @@ void DockApp::PositionOverlayWindows() {
         }
         if (!positioned) {
             // Batch unavailable: fall back to direct moves (previous behavior).
-            if (SetWindowPos(m_window, HWND_TOPMOST, m_windowX, m_currentY, width, height,
+            if (SetWindowPos(m_window, HWND_TOPMOST, m_windowX, renderY, width, renderH,
                     kMoveFlags) == FALSE) {
                 Log(L"Could not position the renderer window.");
             } else if (m_inputWindow != nullptr &&
@@ -3680,7 +3699,12 @@ void DockApp::PositionOverlayWindows() {
         m_overlayY = m_currentY;
         m_overlayW = width;
         m_overlayH = height;
+        m_overlayRenderY = renderY;
+        m_overlayRenderH = renderH;
         m_overlayPosValid = true;
+    }
+    if (m_rendererInitialized) {
+        m_renderer.SetContentOffsetY(contentOffsetY);
     }
     if (IsDragActive()) {
         BringDragGhostToFront();
@@ -7916,6 +7940,9 @@ void DockApp::BeginShow() {
     // Tray COM/IPC refresh stays deferred (can be 2-12ms); first paint only
     // needs the backdrop above.
     m_visibility = VisibilityState::Showing;
+    // Park the renderer over the slide before it is shown, so capture sees the
+    // reveal instead of a moving HWND.
+    PositionOverlayWindows();
     ShowWindow(m_window, SW_SHOWNOACTIVATE);
     ShowWindow(m_inputWindow, SW_SHOWNOACTIVATE);
     m_animationFromY = m_currentY;
@@ -7952,6 +7979,9 @@ void DockApp::BeginHide() {
     StopGlint();
     m_visibility = VisibilityState::Hiding;
     ShowWindow(m_inputWindow, SW_HIDE);
+    // Grow the renderer downward before the first tick so the slide is an
+    // offset inside a stationary window.
+    PositionOverlayWindows();
     m_animationFromY = m_currentY;
     m_animationToY = m_hiddenY;
     m_animationStartedAt = QpcSeconds();
@@ -7977,6 +8007,7 @@ void DockApp::AdvanceAnimation() {
     if (m_visibility == VisibilityState::Showing) {
         m_visibility = VisibilityState::Visible;
         m_currentY = m_visibleY;
+        PositionOverlayWindows();
         StartRefreshTimer();
         StartTrayTimer();
         StartBackdropTimer();
@@ -7998,6 +8029,7 @@ void DockApp::AdvanceAnimation() {
     HideHoverLabel();
     ShowWindow(m_inputWindow, SW_HIDE);
     ShowWindow(m_window, SW_HIDE);
+    PositionOverlayWindows();
     SyncCursorWatchInterval();
 }
 

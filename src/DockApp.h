@@ -699,6 +699,10 @@ private:
     LONG m_overlayY = 0;
     LONG m_overlayW = 0;
     LONG m_overlayH = 0;
+    // Render HWND during a slide: fixed rect covering the travel, while the
+    // swap chain offset follows m_currentY. Input HWND stays pill-sized.
+    LONG m_overlayRenderY = 0;
+    LONG m_overlayRenderH = 0;
     UINT m_loadedIconExtent = 0;
     UINT m_shellFlyoutAttempts = 0;
     bool m_shellFlyoutIsSearch = false;

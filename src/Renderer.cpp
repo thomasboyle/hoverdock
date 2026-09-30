@@ -2163,6 +2163,21 @@ void Renderer::CreateCompositionSwapChain(HWND window, UINT width, UINT height) 
     Check(m_compositionDevice->Commit(), "Commit DirectComposition tree");
 }
 
+void Renderer::SetContentOffsetY(float offsetY) noexcept {
+    if (m_compositionVisual == nullptr || m_compositionDevice == nullptr) {
+        return;
+    }
+    if (m_contentOffsetValid && m_contentOffsetY == offsetY) {
+        return;
+    }
+    if (FAILED(m_compositionVisual->SetOffsetY(offsetY)) ||
+        FAILED(m_compositionDevice->Commit())) {
+        return;
+    }
+    m_contentOffsetY = offsetY;
+    m_contentOffsetValid = true;
+}
+
 void Renderer::CreateFrameResources() {
     for (FrameResource& frame : m_frames) {
         Check(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
