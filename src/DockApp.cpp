@@ -8312,20 +8312,16 @@ void DockApp::HandlePointer(POINT cursor) {
 
     const int hovered = IconAtScreenPoint(cursor);
     const int hoveredDivider = DividerAtScreenPoint(cursor);
-    if (hoveredDivider >= 0 && m_hoveredIcon >= 0) {
-        m_hoveredIcon = -1;
-        HideHoverLabel();
-        // No dock Present: icon.hovered is unused by the GPU path; a blocking
-        // Present here was the main cursor-FPS stall after the backdrop timer
-        // stopped driving sticky non-blocking frames at 120 Hz.
+    if (hovered == m_hoveredIcon && hoveredDivider == m_hoveredDivider) {
+        return;
     }
-    if (hovered != m_hoveredIcon) {
-        m_hoveredIcon = hovered;
-        UpdateHoverLabel();
-    }
-    if (hoveredDivider != m_hoveredDivider) {
-        m_hoveredDivider = hoveredDivider;
-    }
+    // Commit both hits before the label decision. Unpinned icons sit past the
+    // separator, so the event that enters one still had the divider hovered;
+    // UpdateHoverLabel bails while that flag is set, and a later event with
+    // the same icon never retries.
+    m_hoveredIcon = hovered;
+    m_hoveredDivider = hoveredDivider;
+    UpdateHoverLabel();
 }
 
 void DockApp::UpdateGlintTarget(POINT cursor) {
