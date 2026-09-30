@@ -17,17 +17,12 @@ constexpr size_t kCpuSampleCap = 60;
 constexpr DWORD kCpuSampleDelayMs = 400;
 
 std::wstring ToLower(std::wstring value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
-        return static_cast<wchar_t>(std::towlower(character));
-    });
+    _wcslwr_s(value.data(), value.size() + 1);
     return value;
 }
 
 bool EqualInsensitive(const std::wstring& left, const std::wstring& right) {
-    return left.size() == right.size() &&
-        std::equal(left.begin(), left.end(), right.begin(), [](wchar_t lhs, wchar_t rhs) {
-            return std::towlower(lhs) == std::towlower(rhs);
-        });
+    return left.size() == right.size() && _wcsicmp(left.c_str(), right.c_str()) == 0;
 }
 
 std::wstring FileNameOf(const std::wstring& path) {

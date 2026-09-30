@@ -23,10 +23,7 @@ constexpr wchar_t kAppsFolderPrefix[] = L"shell:AppsFolder\\";
 constexpr size_t kMaximumPathLength = 32768;
 
 bool EqualInsensitive(const std::wstring& left, const std::wstring& right) {
-    return left.size() == right.size() &&
-        std::equal(left.begin(), left.end(), right.begin(), [](wchar_t lhs, wchar_t rhs) {
-            return std::towlower(lhs) == std::towlower(rhs);
-        });
+    return left.size() == right.size() && _wcsicmp(left.c_str(), right.c_str()) == 0;
 }
 
 std::wstring FileNameWithoutExtension(const std::wstring& path) {
@@ -39,24 +36,31 @@ bool IsTitleWordCharacter(wchar_t character) {
 }
 
 bool IsPictureInPictureTitle(const std::wstring& title) {
-    std::wstring lowercase(title);
-    std::transform(lowercase.begin(), lowercase.end(), lowercase.begin(), [](wchar_t character) {
-        return static_cast<wchar_t>(std::towlower(character));
-    });
-    if (lowercase.find(L"picture-in-picture") != std::wstring::npos ||
-        lowercase.find(L"picture in picture") != std::wstring::npos) {
-        return true;
+    if (title.size() < 3) {
+        return false;
     }
-
-    size_t position = lowercase.find(L"pip");
-    while (position != std::wstring::npos) {
-        const bool startsWord = position == 0 || !IsTitleWordCharacter(lowercase[position - 1]);
-        const size_t after = position + 3;
-        const bool endsWord = after == lowercase.size() || !IsTitleWordCharacter(lowercase[after]);
-        if (startsWord && endsWord) {
-            return true;
+    const wchar_t* const data = title.c_str();
+    const size_t length = title.size();
+    
+    for (size_t i = 0; i + 3 <= length; ++i) {
+        const wchar_t c1 = static_cast<wchar_t>(std::towlower(data[i]));
+        const wchar_t c2 = static_cast<wchar_t>(std::towlower(data[i + 1]));
+        const wchar_t c3 = static_cast<wchar_t>(std::towlower(data[i + 2]));
+        
+        if (c1 == L'p' && c2 == L'i') {
+            if (c3 == L'p') {
+                const bool startsWord = i == 0 || !IsTitleWordCharacter(data[i - 1]);
+                const bool endsWord = i + 3 == length || !IsTitleWordCharacter(data[i + 3]);
+                if (startsWord && endsWord) {
+                    return true;
+                }
+            } else if (c3 == L'c' && i + 18 <= length) {
+                if (_wcsnicmp(data + i, L"picture-in-picture", 18) == 0 ||
+                    _wcsnicmp(data + i, L"picture in picture", 18) == 0) {
+                    return true;
+                }
+            }
         }
-        position = lowercase.find(L"pip", after);
     }
     return false;
 }
@@ -86,8 +90,10 @@ bool IsSmallAuxiliaryWindow(HWND window, LONG_PTR style, LONG_PTR extendedStyle)
 }
 
 bool EndsWithInsensitive(const std::wstring& value, std::wstring_view suffix) {
-    return value.size() >= suffix.size() &&
-        EqualInsensitive(value.substr(value.size() - suffix.size()), std::wstring(suffix));
+    if (value.size() < suffix.size()) {
+        return false;
+    }
+    return _wcsnicmp(value.c_str() + (value.size() - suffix.size()), suffix.data(), suffix.size()) == 0;
 }
 
 bool ContainsInsensitive(const std::wstring& haystack, const std::wstring& needle) {
@@ -99,7 +105,7 @@ bool ContainsInsensitive(const std::wstring& haystack, const std::wstring& needl
     }
 
     for (size_t index = 0; index + needle.size() <= haystack.size(); ++index) {
-        if (EqualInsensitive(haystack.substr(index, needle.size()), needle)) {
+        if (_wcsnicmp(haystack.c_str() + index, needle.c_str(), needle.size()) == 0) {
             return true;
         }
     }
@@ -342,9 +348,7 @@ void AppendProcessStartCandidates(std::vector<std::wstring>& candidates, const P
 // duplicate instead of activating.
 
 std::wstring Lowercased(std::wstring value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
-        return static_cast<wchar_t>(std::towlower(character));
-    });
+    _wcslwr_s(value.data(), value.size() + 1);
     return value;
 }
 
