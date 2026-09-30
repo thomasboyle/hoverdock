@@ -2,8 +2,8 @@
 
 A macOS-style dock for Windows, with real liquid glass.
 <img width="867" height="98" alt="image" src="https://github.com/user-attachments/assets/beab2db1-44ce-4fe2-b770-e97ed119394a" />
+<img width="1004" height="98" alt="explorer_B267BIk1YO_trim" src="https://github.com/user-attachments/assets/f30daee5-0351-4000-933a-89997eb8a3c2" />
 
-https://github.com/user-attachments/assets/37fdadce-e1e1-4fec-b66a-861a147ab0f7
 
 
 
