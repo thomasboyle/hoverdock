@@ -7262,7 +7262,7 @@ void DockApp::PaintOverflowPopup() {
     const LONG otherIconSize = std::max(20L, std::lround(22.0F * scale));
     const LONG dividerGap = std::max(10L, std::lround(12.0F * scale));
     const LONG panelWidth = std::max(320L, std::lround(348.0F * scale));
-    const size_t otherCount = std::min(m_overflowIcons.size(), static_cast<size_t>(12));
+    const size_t otherCount = std::min(m_overflowIcons.size(), static_cast<size_t>(24));
     const LONG otherColumns = otherCount == 0 ? 1L : std::min(4L, static_cast<LONG>(otherCount));
     const LONG otherRows = otherCount == 0 ? 1L :
         (static_cast<LONG>(otherCount) + otherColumns - 1L) / otherColumns;
@@ -7741,12 +7741,12 @@ void DockApp::PaintOverflowPopup() {
         y - dividerGap / 2L + 1}, 0.16F);
 
     RECT otherHeader{padding, y, panelWidth - padding, y + sectionHeader};
-    DrawFlyoutText(pixels, width, height, otherHeader, sectionFont, L"Other Icons",
+    DrawFlyoutText(pixels, width, height, otherHeader, sectionFont, L"System Tray",
         DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
     y += sectionHeader;
     if (otherCount == 0) {
         RECT empty{padding, y, panelWidth - padding, y + otherIconHeight};
-        DrawFlyoutText(pixels, width, height, empty, statusFont, L"No other icons",
+        DrawFlyoutText(pixels, width, height, empty, statusFont, L"No tray icons",
             DT_CENTER | DT_VCENTER | DT_SINGLELINE, 240);
     } else {
         const LONG cellWidth = (panelWidth - padding * 2L) / otherColumns;

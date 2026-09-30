@@ -45,6 +45,9 @@ struct TrayNotifyIcon {
     std::wstring exeName;
     std::wstring executablePath;
     int preference = 0;
+    // Real shell notification icon. Clicks go through that icon in place.
+    bool shellButton = false;
+    std::wstring shellName;
 
     TrayNotifyIcon() = default;
     TrayNotifyIcon(const TrayNotifyIcon&) = delete;

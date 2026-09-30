@@ -114,6 +114,7 @@ target_link_libraries(Dock PRIVATE
     runtimeobject
     powrprof
     dxva2
+    UIAutomationCore
 )
 
 set(DOCK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.hlsl")
