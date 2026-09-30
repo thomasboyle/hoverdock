@@ -716,7 +716,7 @@ bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, REC
         IDWriteInlineObject* ellipsis = nullptr;
         if (SUCCEEDED(factory->CreateEllipsisTrimmingSign(textFormat, &ellipsis)) &&
             ellipsis != nullptr) {
-            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_WORD, 0, 0};
             textFormat->SetTrimming(&trimming, ellipsis);
             ellipsis->Release();
         }
@@ -1270,19 +1270,42 @@ std::wstring NotifyIconTitle(const TrayNotifyIcon& icon) {
 }
 
 std::wstring NotifyIconStatus(const TrayNotifyIcon& icon) {
+    std::wstring status;
     const size_t cut = icon.tip.find_first_of(L"\r\n");
     if (cut != std::wstring::npos && cut + 1 < icon.tip.size()) {
         size_t start = cut + 1;
-        if (start < icon.tip.size() && icon.tip[start] == L'\n') {
+        while (start < icon.tip.size() &&
+            (icon.tip[start] == L'\n' || icon.tip[start] == L'\r' ||
+                std::iswspace(icon.tip[start]) != 0)) {
             ++start;
         }
-        return icon.tip.substr(start);
+        status = icon.tip.substr(start);
+    } else {
+        const size_t dash = icon.tip.find(L" - ");
+        if (dash != std::wstring::npos && dash + 3 < icon.tip.size()) {
+            status = icon.tip.substr(dash + 3);
+        }
     }
-    const size_t dash = icon.tip.find(L" - ");
-    if (dash != std::wstring::npos && dash + 3 < icon.tip.size()) {
-        return icon.tip.substr(dash + 3);
+    const size_t line = status.find_first_of(L"\r\n");
+    if (line != std::wstring::npos) {
+        status.resize(line);
     }
-    return {};
+    const size_t paren = status.find(L" (");
+    if (paren != std::wstring::npos && paren > 0) {
+        status.resize(paren);
+    }
+    const size_t end = status.find_last_not_of(L" \t");
+    if (end == std::wstring::npos) {
+        return {};
+    }
+    status.resize(end + 1);
+    return status;
+}
+
+RECT TrayIconPlate(RECT cell, float scale) {
+    const LONG plate = std::max(28L, std::lround(32.0F * scale));
+    const LONG left = cell.left + ((cell.right - cell.left) - plate) / 2L;
+    return {left, cell.top, left + plate, cell.top + plate};
 }
 
 HWND FindNamedCoreWindow(const wchar_t* title) {
@@ -7115,9 +7138,8 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     }
     case TrayFlyoutHitKind::NotifyIcon: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
-        const LONG inset = std::max(4L, std::lround(5.0F * scale));
-        const RECT chip = InsetContentRect(hit.bounds, inset);
-        FillSquirclePremul(pixels, width, height, chip, ContentSquircleRadius(chip, scale), 0.12F);
+        const RECT plate = TrayIconPlate(hit.bounds, scale);
+        FillSquirclePremul(pixels, width, height, plate, ContentSquircleRadius(plate, scale), 0.16F);
         break;
     }
     default:
@@ -7258,12 +7280,18 @@ void DockApp::PaintOverflowPopup() {
             (bluetooth.hiddenPaired > 0 ? 1L : 0L);
     const LONG bluetoothBlock = bluetoothRows * deviceRow +
         (bluetoothRows > 1 ? (bluetoothRows - 1) * bluetoothGap : 0L);
-    const LONG otherIconHeight = std::max(62L, std::lround(70.0F * scale));
-    const LONG otherIconSize = std::max(20L, std::lround(22.0F * scale));
+    const LONG trayPlate = std::max(28L, std::lround(32.0F * scale));
+    const LONG trayGlyph = std::max(16L, std::lround(18.0F * scale));
+    const LONG trayNameHeight = std::max(14L, std::lround(15.0F * scale));
+    const LONG trayStatusHeight = std::max(13L, std::lround(14.0F * scale));
+    const LONG trayTextGap = std::max(3L, std::lround(4.0F * scale));
+    const LONG otherIconHeight = trayPlate + trayTextGap + trayNameHeight + trayStatusHeight + trayTextGap;
     const LONG dividerGap = std::max(10L, std::lround(12.0F * scale));
-    const LONG panelWidth = std::max(320L, std::lround(348.0F * scale));
+    LONG panelWidth = std::max(320L, std::lround(348.0F * scale));
     const size_t otherCount = std::min(m_overflowIcons.size(), static_cast<size_t>(24));
-    const LONG otherColumns = otherCount == 0 ? 1L : std::min(4L, static_cast<LONG>(otherCount));
+    const LONG otherColumns = otherCount == 0 ? 1L : std::min(3L, static_cast<LONG>(otherCount));
+    const LONG trayMinCell = std::max(112L, std::lround(124.0F * scale));
+    panelWidth = std::max(panelWidth, padding * 2L + otherColumns * trayMinCell);
     const LONG otherRows = otherCount == 0 ? 1L :
         (static_cast<LONG>(otherCount) + otherColumns - 1L) / otherColumns;
 
@@ -7749,22 +7777,29 @@ void DockApp::PaintOverflowPopup() {
         DrawFlyoutText(pixels, width, height, empty, statusFont, L"No tray icons",
             DT_CENTER | DT_VCENTER | DT_SINGLELINE, 240);
     } else {
-        const LONG cellWidth = (panelWidth - padding * 2L) / otherColumns;
+        const LONG innerWidth = panelWidth - padding * 2L;
+        const LONG cellWidth = innerWidth / otherColumns;
+        const LONG gridWidth = cellWidth * otherColumns;
+        const LONG gridLeft = padding + (innerWidth - gridWidth) / 2L;
+        HGDIOBJ previousMeasureFont = SelectObject(memory, statusFont);
         for (size_t index = 0; index < otherCount; ++index) {
             const LONG column = static_cast<LONG>(index) % otherColumns;
             const LONG row = static_cast<LONG>(index) / otherColumns;
-            const LONG left = padding + column * cellWidth;
+            const LONG rowStart = row * otherColumns;
+            const LONG rowCount = std::min(otherColumns,
+                static_cast<LONG>(otherCount) - rowStart);
+            const LONG rowLeft = gridLeft + (gridWidth - cellWidth * rowCount) / 2L;
+            const LONG left = rowLeft + column * cellWidth;
             const LONG top = y + row * otherIconHeight;
             const RECT cell{left, top, left + cellWidth, top + otherIconHeight};
-            const LONG chipInset = std::max(4L, std::lround(5.0F * scale));
-            const RECT chip = InsetContentRect(cell, chipInset);
-            FillSquirclePremul(pixels, width, height, chip, ContentSquircleRadius(chip, scale), 0.10F);
+            const RECT plate = TrayIconPlate(cell, scale);
+            FillSquirclePremul(pixels, width, height, plate, ContentSquircleRadius(plate, scale), 0.10F);
             if (m_overflowIcons[index].icon != nullptr) {
-                const LONG iconLeft = left + (cellWidth - otherIconSize) / 2L;
-                const LONG iconTop = top + 6;
+                const LONG iconLeft = plate.left + (trayPlate - trayGlyph) / 2L;
+                const LONG iconTop = plate.top + (trayPlate - trayGlyph) / 2L;
                 BITMAPV5HEADER iconHeader = header;
-                iconHeader.bV5Width = SaturatedInt(otherIconSize);
-                iconHeader.bV5Height = -SaturatedInt(otherIconSize);
+                iconHeader.bV5Width = SaturatedInt(trayGlyph);
+                iconHeader.bV5Height = -SaturatedInt(trayGlyph);
                 void* iconBits = nullptr;
                 HBITMAP iconBitmap = CreateDIBSection(memory,
                     reinterpret_cast<const BITMAPINFO*>(&iconHeader), DIB_RGB_COLORS, &iconBits,
@@ -7774,13 +7809,12 @@ void DockApp::PaintOverflowPopup() {
                     if (iconDc != nullptr) {
                         HGDIOBJ previousIcon = SelectObject(iconDc, iconBitmap);
                         std::memset(iconBits, 0,
-                            static_cast<size_t>(otherIconSize) * otherIconSize * 4U);
+                            static_cast<size_t>(trayGlyph) * trayGlyph * 4U);
                         DrawIconEx(iconDc, 0, 0, m_overflowIcons[index].icon,
-                            SaturatedInt(otherIconSize), SaturatedInt(otherIconSize), 0, nullptr,
+                            SaturatedInt(trayGlyph), SaturatedInt(trayGlyph), 0, nullptr,
                             DI_NORMAL);
                         auto* iconPixels = static_cast<uint8_t*>(iconBits);
-                        const size_t iconCount =
-                            static_cast<size_t>(otherIconSize) * otherIconSize;
+                        const size_t iconCount = static_cast<size_t>(trayGlyph) * trayGlyph;
                         for (size_t pixel = 0; pixel < iconCount; ++pixel) {
                             uint8_t* sample = iconPixels + pixel * 4U;
                             if ((sample[0] | sample[1] | sample[2]) != 0 && sample[3] == 0) {
@@ -7788,28 +7822,49 @@ void DockApp::PaintOverflowPopup() {
                             }
                         }
                         CompositePremul(pixels, width, height, SaturatedInt(iconLeft),
-                            SaturatedInt(iconTop), iconPixels, SaturatedInt(otherIconSize),
-                            SaturatedInt(otherIconSize));
+                            SaturatedInt(iconTop), iconPixels, SaturatedInt(trayGlyph),
+                            SaturatedInt(trayGlyph));
                         SelectObject(iconDc, previousIcon);
                         DeleteDC(iconDc);
                     }
                     DeleteObject(iconBitmap);
                 }
             }
-            RECT nameBounds{left + 4, top + otherIconSize + 10, left + cellWidth - 4,
-                top + otherIconSize + 10 + labelHeight};
-            RECT statusBounds{left + 4, nameBounds.bottom, left + cellWidth - 4,
-                top + otherIconHeight - 4};
-            DrawFlyoutText(pixels, width, height, nameBounds, labelFont,
-                NotifyIconTitle(m_overflowIcons[index]),
-                DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            const std::wstring status = NotifyIconStatus(m_overflowIcons[index]);
-            if (!status.empty()) {
-                DrawFlyoutText(pixels, width, height, statusBounds, statusFont, status,
-                    DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
+            std::wstring title = NotifyIconTitle(m_overflowIcons[index]);
+            const size_t paren = title.find(L" (");
+            if (paren != std::wstring::npos && paren > 0) {
+                title.resize(paren);
+            }
+            const size_t andWord = title.find(L" and ");
+            if (andWord != std::wstring::npos && andWord > 0) {
+                title.resize(andWord);
+            }
+            SIZE titleSize{};
+            if (!title.empty()) {
+                GetTextExtentPoint32W(memory, title.c_str(), static_cast<int>(title.size()),
+                    &titleSize);
+            }
+            const RECT nameBounds{left, plate.bottom + trayTextGap, left + cellWidth,
+                plate.bottom + trayTextGap + trayNameHeight};
+            const RECT statusBounds{left, nameBounds.bottom, left + cellWidth,
+                nameBounds.bottom + trayStatusHeight};
+            const bool titleFits = titleSize.cx <= cellWidth;
+            if (titleFits) {
+                DrawFlyoutText(pixels, width, height, nameBounds, statusFont, title,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
+                const std::wstring status = NotifyIconStatus(m_overflowIcons[index]);
+                if (!status.empty()) {
+                    DrawFlyoutText(pixels, width, height, statusBounds, statusFont, status,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 230);
+                }
+            } else {
+                const RECT wrapBounds{left, nameBounds.top, left + cellWidth, statusBounds.bottom};
+                DrawFlyoutText(pixels, width, height, wrapBounds, statusFont, title,
+                    DT_CENTER | DT_TOP | DT_WORDBREAK, 255);
             }
             pushHit(TrayFlyoutHitKind::NotifyIcon, cell, static_cast<int>(index));
         }
+        SelectObject(memory, previousMeasureFont);
     }
 
     const size_t bytes = pixelCount * 4U;
