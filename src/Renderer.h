@@ -258,6 +258,11 @@ private:
     HBITMAP m_backdropBitmap = nullptr;
     HGDIOBJ m_backdropPreviousBitmap = nullptr;
     uint8_t* m_backdropDibPixels = nullptr;
+    // Screen origin of the pixels in m_backdropDibPixels. Menu captures paste
+    // this over the dock so the plate does not sample the dock's swap chain.
+    LONG m_backdropOriginX = 0;
+    LONG m_backdropOriginY = 0;
+    bool m_backdropOriginValid = false;
     bool m_backdropInitialized = false;
     bool m_backdropValid = false;
     uint64_t m_backdropHash = 0;
@@ -298,6 +303,13 @@ private:
     void ReleasePanelGlassResources() noexcept;
     [[nodiscard]] bool EnsurePanelGlassResources(UINT width, UINT height);
     [[nodiscard]] bool EnsurePanelCaptureDib(UINT width, UINT height);
+    // Menu plates are much larger than the dock strip. Sampling them with the
+    // magnifier blocks the UI thread (and the low-level mouse hook) long enough
+    // to hitch the cursor. BitBlt the plate, hide only the layered popups, and
+    // paste the dock strip from the magnifier backdrop where they overlap.
+    [[nodiscard]] bool CapturePanelScreen(const RECT& screen, uint8_t* destBits, HDC destDc,
+        HWND excludeA, HWND excludeB, HWND excludeC) noexcept;
+    void StampDockBackdropInto(const RECT& panel, uint8_t* panelPixels) const noexcept;
     void ReleasePanelCaptureDib() noexcept;
     void ReleasePanelCapturePool() noexcept;
     [[nodiscard]] uint64_t HashPanelCapturePixels(UINT width, UINT height) const noexcept;

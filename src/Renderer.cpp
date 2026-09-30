@@ -1139,6 +1139,7 @@ void Renderer::InvalidateBackdrop() noexcept {
     // Drop the cached frost source so the next CaptureBackdrop BitBlts again and
     // Render cannot sample a desktop frame from a previous reveal.
     m_backdropValid = false;
+    m_backdropOriginValid = false;
     m_backdropHash = 0;
     m_backdropChangeSerial = 0;
     m_backdropDwmFrameValid = false;
@@ -1215,9 +1216,10 @@ bool BackdropRgbDiffers(uint32_t left, uint32_t right) noexcept {
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
-// Last-resort GDI sample. Toggling WDA_EXCLUDEFROMCAPTURE hides those HWNDs from
-// every capturer for a frame, which flickers the dock in recordings. Used only
-// when the magnifier path cannot run. POD-only so __try is legal (C2712).
+// GDI sample. Toggling WDA_EXCLUDEFROMCAPTURE hides those HWNDs from every
+// capturer for a frame, which flickers them in recordings. The dock strip must
+// not pass the dock HWND here. Menu plates pass only their layered popups.
+// POD-only so __try is legal (C2712).
 BOOL BitBltExcludingByAffinity(HDC destDc, int width, int height, int left, int top,
     const HWND* exclude, UINT excludeCount) noexcept {
     constexpr UINT kMaxExclude = 8;
@@ -1793,6 +1795,9 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     if (!CaptureScreenExcluding(screenRectangle, m_backdropDibPixels, m_backdropDc, excludeDock, 1)) {
         return false;
     }
+    m_backdropOriginX = screenRectangle.left;
+    m_backdropOriginY = screenRectangle.top;
+    m_backdropOriginValid = true;
     m_lastStripReadMs = GetTickCount64();
 
     // Noise-tolerant change check (preferred over raw FNV hash): a few flapping
@@ -2986,6 +2991,55 @@ uint64_t Renderer::HashPanelCapturePixels(UINT width, UINT height) const noexcep
     return hash;
 }
 
+void Renderer::StampDockBackdropInto(const RECT& panel, uint8_t* panelPixels) const noexcept {
+    if (!m_backdropOriginValid || !m_backdropValid || m_backdropDibPixels == nullptr ||
+        panelPixels == nullptr || m_width == 0 || m_height == 0) {
+        return;
+    }
+    const RECT dock{
+        m_backdropOriginX,
+        m_backdropOriginY,
+        m_backdropOriginX + static_cast<LONG>(m_width),
+        m_backdropOriginY + static_cast<LONG>(m_height)};
+    RECT overlap{};
+    if (IntersectRect(&overlap, &panel, &dock) == FALSE) {
+        return;
+    }
+    const int panelWidth = static_cast<int>(panel.right - panel.left);
+    const int byteCount = static_cast<int>(overlap.right - overlap.left) * 4;
+    if (panelWidth <= 0 || byteCount <= 0) {
+        return;
+    }
+    for (LONG y = overlap.top; y < overlap.bottom; ++y) {
+        const int panelRow = static_cast<int>(y - panel.top);
+        const int dockRow = static_cast<int>(y - dock.top);
+        const int panelCol = static_cast<int>(overlap.left - panel.left);
+        const int dockCol = static_cast<int>(overlap.left - dock.left);
+        std::memcpy(
+            panelPixels + (static_cast<size_t>(panelRow) * static_cast<size_t>(panelWidth) + panelCol) * 4U,
+            m_backdropDibPixels + (static_cast<size_t>(dockRow) * m_width + static_cast<size_t>(dockCol)) * 4U,
+            static_cast<size_t>(byteCount));
+    }
+}
+
+bool Renderer::CapturePanelScreen(const RECT& screen, uint8_t* destBits, HDC destDc, HWND excludeA,
+    HWND excludeB, HWND excludeC) noexcept {
+    const int width = static_cast<int>(screen.right - screen.left);
+    const int height = static_cast<int>(screen.bottom - screen.top);
+    if (destBits == nullptr || destDc == nullptr || width <= 0 || height <= 0) {
+        return false;
+    }
+    // Layered menus sample themselves if left in the blit. The dock stays at
+    // WDA_NONE; any overlap is replaced from the magnifier backdrop below.
+    const HWND popups[] = {excludeA, excludeB, excludeC};
+    if (BitBltExcludingByAffinity(destDc, width, height, static_cast<int>(screen.left),
+            static_cast<int>(screen.top), popups, 3) == FALSE) {
+        return false;
+    }
+    StampDockBackdropInto(screen, destBits);
+    return true;
+}
+
 bool Renderer::EnsurePanelCaptureDib(UINT width, UINT height)
 {
     if (width == 0 || height == 0) {
@@ -3501,8 +3555,8 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         if (!EnsurePanelCaptureDib(width, height)) {
             return false;
         }
-        const HWND exclude[] = {excludeA, excludeB, excludeC, m_window};
-        if (!CaptureScreenExcluding(screenRect, m_panelCapturePixels, m_panelCaptureDc, exclude, 4)) {
+        if (!CapturePanelScreen(screenRect, m_panelCapturePixels, m_panelCaptureDc, excludeA, excludeB,
+                excludeC)) {
             return false;
         }
 
@@ -3899,13 +3953,16 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
 
     try {
         if (ShouldSkipLivePanelBitBlt(width, height)) {
+            if (skippedUnchanged != nullptr) {
+                *skippedUnchanged = true;
+            }
             return false;
         }
         if (!EnsurePanelCaptureDib(width, height)) {
             return false;
         }
-        const HWND exclude[] = {excludeA, excludeB, excludeC, m_window};
-        if (!CaptureScreenExcluding(screenRect, m_panelCapturePixels, m_panelCaptureDc, exclude, 4)) {
+        if (!CapturePanelScreen(screenRect, m_panelCapturePixels, m_panelCaptureDc, excludeA, excludeB,
+                excludeC)) {
             return false;
         }
 
