@@ -8,6 +8,7 @@
 #include <CommonControls.h>
 #include <d3d11.h>
 #include <dwmapi.h>
+#include <magnification.h>
 #include <wincodec.h>
 
 #include <algorithm>
@@ -1211,26 +1212,251 @@ bool BackdropRgbDiffers(uint32_t left, uint32_t right) noexcept {
     return (left & kBackdropRgbMask) != (right & kBackdropRgbMask);
 }
 
-// Reads the desktop into a memory DC while hiding one window from legacy GDI
-// capture. POD-only so __try is legal here (C2712): __finally restores the
-// affinity even on fault, so an exception can never leave the dock stuck
-// invisible to Snipping Tool / Game Bar (which a naive toggle did before).
-BOOL BitBltDesktopExcluding(HWND exclude, HDC destDc, LONG width, LONG height, HDC screen,
-    LONG left, LONG top) noexcept {
-    DWORD previousAffinity = WDA_NONE;
-    const BOOL affinityRead = GetWindowDisplayAffinity(exclude, &previousAffinity) != FALSE;
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+// Last-resort GDI sample. Toggling WDA_EXCLUDEFROMCAPTURE hides those HWNDs from
+// every capturer for a frame, which flickers the dock in recordings. Used only
+// when the magnifier path cannot run. POD-only so __try is legal (C2712).
+BOOL BitBltExcludingByAffinity(HDC destDc, int width, int height, int left, int top,
+    const HWND* exclude, UINT excludeCount) noexcept {
+    constexpr UINT kMaxExclude = 8;
+    HWND windows[kMaxExclude]{};
+    DWORD previous[kMaxExclude]{};
+    bool armed[kMaxExclude]{};
+    UINT count = 0;
+    for (UINT index = 0; index < excludeCount && count < kMaxExclude; ++index) {
+        if (exclude == nullptr || exclude[index] == nullptr) {
+            continue;
+        }
+        bool duplicate = false;
+        for (UINT seen = 0; seen < count; ++seen) {
+            if (windows[seen] == exclude[index]) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        windows[count] = exclude[index];
+        if (GetWindowDisplayAffinity(windows[count], &previous[count]) != FALSE) {
+            SetWindowDisplayAffinity(windows[count], WDA_EXCLUDEFROMCAPTURE);
+            armed[count] = true;
+        }
+        ++count;
+    }
+
+    HDC screen = GetDC(nullptr);
     BOOL copied = FALSE;
     __try {
-        if (affinityRead != FALSE) {
-            SetWindowDisplayAffinity(exclude, WDA_EXCLUDEFROMCAPTURE);
+        if (screen != nullptr) {
+            copied = BitBlt(destDc, 0, 0, width, height, screen, left, top, SRCCOPY);
         }
-        copied = BitBlt(destDc, 0, 0, width, height, screen, left, top, SRCCOPY);
     } __finally {
-        if (affinityRead != FALSE) {
-            SetWindowDisplayAffinity(exclude, previousAffinity);
+        for (UINT index = 0; index < count; ++index) {
+            if (armed[index]) {
+                SetWindowDisplayAffinity(windows[index], previous[index]);
+            }
+        }
+        if (screen != nullptr) {
+            ReleaseDC(nullptr, screen);
         }
     }
     return copied;
+}
+
+struct MagFrameTarget {
+    uint8_t* pixels = nullptr;
+    UINT width = 0;
+    UINT height = 0;
+    bool copied = false;
+};
+
+MagFrameTarget g_magFrame{};
+
+BOOL CALLBACK OnMagnifierFrame(HWND, void* srcdata, MAGIMAGEHEADER srcheader, void*, MAGIMAGEHEADER,
+    RECT, RECT, HRGN) {
+    if (srcdata == nullptr || g_magFrame.pixels == nullptr || srcheader.width != g_magFrame.width ||
+        srcheader.height != g_magFrame.height || srcheader.stride < srcheader.width * 4U) {
+        return FALSE;
+    }
+    const auto* src = static_cast<const uint8_t*>(srcdata) + srcheader.offset;
+    const size_t rowBytes = static_cast<size_t>(srcheader.width) * 4U;
+    for (UINT row = 0; row < srcheader.height; ++row) {
+        std::memcpy(g_magFrame.pixels + static_cast<size_t>(row) * rowBytes,
+            src + static_cast<size_t>(row) * srcheader.stride, rowBytes);
+    }
+    g_magFrame.copied = true;
+    // TRUE skips the magnifier's own paint. The host is layered at alpha 0.
+    return TRUE;
+}
+
+struct MagnifierSampler {
+    HWND host = nullptr;
+    HWND magnifier = nullptr;
+    bool unavailable = false;
+    bool placed = false;
+    RECT source{};
+    HWND filters[8]{};
+    int filterCount = -1;
+};
+
+MagnifierSampler g_magnifier{};
+
+bool EnsureMagnifierSampler() noexcept {
+    if (g_magnifier.magnifier != nullptr) {
+        return true;
+    }
+    if (g_magnifier.unavailable) {
+        return false;
+    }
+    if (MagInitialize() == FALSE) {
+        g_magnifier.unavailable = true;
+        return false;
+    }
+
+    WNDCLASSEXW windowClass{sizeof(windowClass)};
+    windowClass.lpfnWndProc = DefWindowProcW;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.lpszClassName = L"LiquidGlassDockMagHost";
+    if (RegisterClassExW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        g_magnifier.unavailable = true;
+        return false;
+    }
+
+    g_magnifier.host = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+        windowClass.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, windowClass.hInstance,
+        nullptr);
+    if (g_magnifier.host == nullptr ||
+        SetLayeredWindowAttributes(g_magnifier.host, 0, 0, LWA_ALPHA) == FALSE) {
+        g_magnifier.unavailable = true;
+        return false;
+    }
+
+    g_magnifier.magnifier = CreateWindowW(WC_MAGNIFIER, L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
+        g_magnifier.host, nullptr, windowClass.hInstance, nullptr);
+    if (g_magnifier.magnifier == nullptr) {
+        g_magnifier.unavailable = true;
+        return false;
+    }
+
+    MAGTRANSFORM identity{};
+    identity.v[0][0] = 1.0F;
+    identity.v[1][1] = 1.0F;
+    identity.v[2][2] = 1.0F;
+    if (MagSetWindowTransform(g_magnifier.magnifier, &identity) == FALSE ||
+        MagSetImageScalingCallback(g_magnifier.magnifier, OnMagnifierFrame) == FALSE) {
+        g_magnifier.unavailable = true;
+        return false;
+    }
+    return true;
+}
+
+bool SampleWithMagnifier(const RECT& screen, uint8_t* destBits, const HWND* exclude,
+    UINT excludeCount) noexcept {
+    const LONG width = screen.right - screen.left;
+    const LONG height = screen.bottom - screen.top;
+    if (destBits == nullptr || width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+        return false;
+    }
+    if (!EnsureMagnifierSampler()) {
+        return false;
+    }
+
+    const bool sameRect = g_magnifier.placed && g_magnifier.source.left == screen.left &&
+        g_magnifier.source.top == screen.top && g_magnifier.source.right == screen.right &&
+        g_magnifier.source.bottom == screen.bottom;
+    if (!sameRect) {
+        // The scaling callback returns `screen` only when the magnifier child's
+        // screen origin is (0, 0): host at -origin, child at +origin. The host
+        // stays hidden, so that child is not visible and does not take clicks,
+        // while the exclude list still omits the dock from the sample.
+        if (SetWindowPos(g_magnifier.host, HWND_TOPMOST, -static_cast<int>(screen.left),
+                -static_cast<int>(screen.top), static_cast<int>(width), static_cast<int>(height),
+                SWP_NOACTIVATE | SWP_HIDEWINDOW) == FALSE) {
+            return false;
+        }
+        if (SetWindowPos(g_magnifier.magnifier, nullptr, static_cast<int>(screen.left),
+                static_cast<int>(screen.top), static_cast<int>(width), static_cast<int>(height),
+                SWP_NOACTIVATE | SWP_NOZORDER) == FALSE) {
+            return false;
+        }
+        g_magnifier.source = screen;
+        g_magnifier.placed = true;
+    }
+
+    HWND filters[8]{};
+    int filterCount = 0;
+    auto pushFilter = [&](HWND window) noexcept {
+        if (window == nullptr || filterCount >= 8) {
+            return;
+        }
+        for (int index = 0; index < filterCount; ++index) {
+            if (filters[index] == window) {
+                return;
+            }
+        }
+        filters[filterCount++] = window;
+    };
+    for (UINT index = 0; index < excludeCount; ++index) {
+        pushFilter(exclude == nullptr ? nullptr : exclude[index]);
+    }
+    pushFilter(g_magnifier.host);
+
+    const bool sameFilter = g_magnifier.filterCount == filterCount &&
+        (filterCount == 0 ||
+            std::memcmp(g_magnifier.filters, filters, static_cast<size_t>(filterCount) * sizeof(HWND)) ==
+                0);
+    if (!sameFilter) {
+        if (MagSetWindowFilterList(g_magnifier.magnifier, MW_FILTERMODE_EXCLUDE, filterCount,
+                filterCount > 0 ? filters : nullptr) == FALSE) {
+            return false;
+        }
+        std::memcpy(g_magnifier.filters, filters, sizeof(filters));
+        g_magnifier.filterCount = filterCount;
+    }
+
+    auto sample = [&]() noexcept {
+        g_magFrame.pixels = destBits;
+        g_magFrame.width = static_cast<UINT>(width);
+        g_magFrame.height = static_cast<UINT>(height);
+        g_magFrame.copied = false;
+        if (MagSetWindowSource(g_magnifier.magnifier, screen) == FALSE) {
+            return false;
+        }
+        return g_magFrame.copied;
+    };
+    // The first sample after a move or a new exclude list still contains the
+    // previous frame. Discard it.
+    if (!sameRect || !sameFilter) {
+        if (!sample()) {
+            return false;
+        }
+    }
+    return sample();
+}
+
+// Desktop pixels for `screen`, with exclude[] omitted, written top-down into
+// destBits (stride = width * 4). Does not change display affinity, so video
+// and Snipping Tool keep seeing those windows. Falls back to an affinity
+// BitBlt only if the magnifier cannot sample.
+bool CaptureScreenExcluding(const RECT& screen, uint8_t* destBits, HDC fallbackDc,
+    const HWND* exclude, UINT excludeCount) noexcept {
+    if (SampleWithMagnifier(screen, destBits, exclude, excludeCount)) {
+        return true;
+    }
+    if (fallbackDc == nullptr) {
+        return false;
+    }
+    const int width = static_cast<int>(screen.right - screen.left);
+    const int height = static_cast<int>(screen.bottom - screen.top);
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    return BitBltExcludingByAffinity(fallbackDc, width, height, static_cast<int>(screen.left),
+               static_cast<int>(screen.top), exclude, excludeCount) != FALSE;
 }
 
 struct StripWatchState {
@@ -1559,21 +1785,12 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         }
     }
 
-    HDC screen = GetDC(nullptr);
-    if (screen == nullptr) {
-        return false;
-    }
-
-    // SRCCOPY only (CAPTUREBLT forces sync composition of layered windows and
-    // measured 2-10 ms per 8 ms tick; layered content under the dock is rare).
-    // The render window is excluded for exactly this BitBlt: despite
-    // WS_EX_NOREDIRECTIONBITMAP its swapchain otherwise leaks into the legacy
-    // GDI surface, and captured icons refract back through the glass as
-    // ghost smears. Affinity is restored in __finally (see helper above).
-    const BOOL copied = BitBltDesktopExcluding(m_window, m_backdropDc, width, height, screen,
-        screenRectangle.left, screenRectangle.top);
-    const int released = ReleaseDC(nullptr, screen);
-    if (copied == FALSE || released == 0) {
+    // SRCCOPY-equivalent sample of the composed desktop. The render window is
+    // omitted here so its swapchain does not refract back through the glass.
+    // Magnifier exclusion leaves display affinity at WDA_NONE, so a recording
+    // still sees the dock on every frame.
+    HWND excludeDock[] = {m_window};
+    if (!CaptureScreenExcluding(screenRectangle, m_backdropDibPixels, m_backdropDc, excludeDock, 1)) {
         return false;
     }
     m_lastStripReadMs = GetTickCount64();
@@ -2428,12 +2645,6 @@ bool Renderer::ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept {
     if (screen == nullptr) {
         return false;
     }
-    DWORD previousAffinity = WDA_NONE;
-    const BOOL affinityRead = m_window != nullptr &&
-        GetWindowDisplayAffinity(m_window, &previousAffinity) != FALSE;
-    if (affinityRead != FALSE) {
-        SetWindowDisplayAffinity(m_window, WDA_EXCLUDEFROMCAPTURE);
-    }
     BOOL ok = TRUE;
     for (UINT row = 0; row < kBackdropProbeRows; ++row) {
         const LONG srcY = screenRectangle.top +
@@ -2445,9 +2656,6 @@ bool Renderer::ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept {
             ok = FALSE;
             break;
         }
-    }
-    if (affinityRead != FALSE) {
-        SetWindowDisplayAffinity(m_window, previousAffinity);
     }
     ReleaseDC(nullptr, screen);
     if (ok == FALSE) {
@@ -3275,46 +3483,11 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
             return false;
         }
 
-#ifndef WDA_EXCLUDEFROMCAPTURE
-#define WDA_EXCLUDEFROMCAPTURE 0x00000011
-#endif
-        auto pushAffinity = [](HWND window, DWORD* previous, bool* armed) {
-            *armed = false;
-            if (window == nullptr) {
-                return;
-            }
-            if (GetWindowDisplayAffinity(window, previous) != FALSE) {
-                SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE);
-                *armed = true;
-            }
-        };
-        auto popAffinity = [](HWND window, DWORD previous, bool armed) {
-            if (armed && window != nullptr) {
-                SetWindowDisplayAffinity(window, previous);
-            }
-        };
-
         if (!EnsurePanelCaptureDib(width, height)) {
             return false;
         }
-        HDC screen = GetDC(nullptr);
-        if (screen == nullptr) {
-            return false;
-        }
-        DWORD affA = 0, affB = 0, affC = 0, affDock = 0;
-        bool armA = false, armB = false, armC = false, armDock = false;
-        pushAffinity(excludeA, &affA, &armA);
-        pushAffinity(excludeB, &affB, &armB);
-        pushAffinity(excludeC, &affC, &armC);
-        pushAffinity(m_window, &affDock, &armDock);
-        const BOOL copied = BitBlt(m_panelCaptureDc, 0, 0, static_cast<int>(width),
-            static_cast<int>(height), screen, screenRect.left, screenRect.top, SRCCOPY);
-        popAffinity(m_window, affDock, armDock);
-        popAffinity(excludeC, affC, armC);
-        popAffinity(excludeB, affB, armB);
-        popAffinity(excludeA, affA, armA);
-        ReleaseDC(nullptr, screen);
-        if (copied == FALSE) {
+        const HWND exclude[] = {excludeA, excludeB, excludeC, m_window};
+        if (!CaptureScreenExcluding(screenRect, m_panelCapturePixels, m_panelCaptureDc, exclude, 4)) {
             return false;
         }
 
@@ -3710,49 +3883,14 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
     };
 
     try {
-#ifndef WDA_EXCLUDEFROMCAPTURE
-#define WDA_EXCLUDEFROMCAPTURE 0x00000011
-#endif
-        auto pushAffinity = [](HWND window, DWORD* previous, bool* armed) {
-            *armed = false;
-            if (window == nullptr) {
-                return;
-            }
-            if (GetWindowDisplayAffinity(window, previous) != FALSE) {
-                SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE);
-                *armed = true;
-            }
-        };
-        auto popAffinity = [](HWND window, DWORD previous, bool armed) {
-            if (armed && window != nullptr) {
-                SetWindowDisplayAffinity(window, previous);
-            }
-        };
-
-                        if (ShouldSkipLivePanelBitBlt(width, height)) {
+        if (ShouldSkipLivePanelBitBlt(width, height)) {
             return false;
         }
         if (!EnsurePanelCaptureDib(width, height)) {
             return false;
         }
-        HDC screen = GetDC(nullptr);
-        if (screen == nullptr) {
-            return false;
-        }
-        DWORD affA = 0, affB = 0, affC = 0, affDock = 0;
-        bool armA = false, armB = false, armC = false, armDock = false;
-        pushAffinity(excludeA, &affA, &armA);
-        pushAffinity(excludeB, &affB, &armB);
-        pushAffinity(excludeC, &affC, &armC);
-        pushAffinity(m_window, &affDock, &armDock);
-        const BOOL copied = BitBlt(m_panelCaptureDc, 0, 0, static_cast<int>(width),
-            static_cast<int>(height), screen, screenRect.left, screenRect.top, SRCCOPY);
-        popAffinity(m_window, affDock, armDock);
-        popAffinity(excludeC, affC, armC);
-        popAffinity(excludeB, affB, armB);
-        popAffinity(excludeA, affA, armA);
-        ReleaseDC(nullptr, screen);
-        if (copied == FALSE) {
+        const HWND exclude[] = {excludeA, excludeB, excludeC, m_window};
+        if (!CaptureScreenExcluding(screenRect, m_panelCapturePixels, m_panelCaptureDc, exclude, 4)) {
             return false;
         }
 

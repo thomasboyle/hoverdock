@@ -213,10 +213,10 @@ bool IsLayoutOnlyTarget(const std::wstring& target) {
 }
 
 bool EnsureWindowCapturable(HWND window) {
-    // Always WDA_NONE. The render HWND uses WS_EX_NOREDIRECTIONBITMAP, so GDI
-    // backdrop BitBlt does not pick up the DComp glass; Snipping Tool / Game Bar
-    // still see it. Toggling WDA_EXCLUDEFROMCAPTURE on the 8 ms backdrop tick left
-    // the dock excluded for a large fraction of frames and blanked screenshots.
+    // Stay WDA_NONE so Snipping Tool, Game Bar, and desktop capture see the
+    // window on every frame. The glass sample excludes it with the magnifier
+    // filter list instead of toggling WDA_EXCLUDEFROMCAPTURE (that toggle
+    // blanked the dock in recordings).
     return window != nullptr && SetWindowDisplayAffinity(window, WDA_NONE) != FALSE;
 }
 
@@ -7881,9 +7881,8 @@ bool DockApp::CaptureLiveBackdrop() {
         m_windowX + static_cast<LONG>(m_dockWidth),
         m_currentY + static_cast<LONG>(m_dockHeight)};
 
-    // No WDA_EXCLUDEFROMCAPTURE here: flipping it around BitBlt left Snipping Tool
-    // seeing a blank dock. WS_EX_NOREDIRECTIONBITMAP already keeps DComp glass out
-    // of the GDI desktop BitBlt used for the frosted backdrop.
+    // Affinity stays WDA_NONE so a recording sees the dock. CaptureBackdrop
+    // omits this HWND from the glass sample without toggling that.
     bool changed = true;
     const bool captured = m_renderer.CaptureBackdrop(captureBounds, &changed);
     m_backdropCaptureWasIdle = captured && !changed;

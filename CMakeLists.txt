@@ -101,6 +101,7 @@ target_link_libraries(Dock PRIVATE
     propsys
     windowscodecs
     gdi32
+    magnification
     version
     wtsapi32
     psapi
