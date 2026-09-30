@@ -45,26 +45,27 @@ private:
 };
 
 std::wstring ToLower(std::wstring value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
-        return static_cast<wchar_t>(std::towlower(character));
-    });
+    _wcslwr_s(value.data(), value.size() + 1);
     return value;
 }
 
 bool EqualInsensitive(std::wstring_view left, std::wstring_view right) {
-    return left.size() == right.size() &&
-        std::equal(left.begin(), left.end(), right.begin(), [](wchar_t lhs, wchar_t rhs) {
-            return std::towlower(lhs) == std::towlower(rhs);
-        });
+    return left.size() == right.size() && _wcsnicmp(left.data(), right.data(), left.size()) == 0;
 }
 
 bool ContainsInsensitive(std::wstring_view value, std::wstring_view needle) {
-    if (needle.empty() || value.size() < needle.size()) {
+    if (needle.empty()) {
+        return true;
+    }
+    if (value.size() < needle.size()) {
         return false;
     }
-    const std::wstring haystack = ToLower(std::wstring(value));
-    const std::wstring find = ToLower(std::wstring(needle));
-    return haystack.find(find) != std::wstring::npos;
+    for (size_t i = 0; i + needle.size() <= value.size(); ++i) {
+        if (_wcsnicmp(value.data() + i, needle.data(), needle.size()) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::wstring Trim(std::wstring value) {

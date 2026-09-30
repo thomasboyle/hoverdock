@@ -58,26 +58,21 @@ std::wstring Trim(std::wstring value) {
 }
 
 std::wstring ToLower(std::wstring value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t character) {
-        return static_cast<wchar_t>(std::towlower(character));
-    });
+    _wcslwr_s(value.data(), value.size() + 1);
     return value;
 }
 
 bool EqualInsensitive(std::wstring_view left, std::wstring_view right) {
-    return left.size() == right.size() &&
-        std::equal(left.begin(), left.end(), right.begin(), [](wchar_t lhs, wchar_t rhs) {
-            return std::towlower(lhs) == std::towlower(rhs);
-        });
+    return left.size() == right.size() && _wcsnicmp(left.data(), right.data(), left.size()) == 0;
 }
 
 bool EndsWithInsensitive(std::wstring_view value, std::wstring_view suffix) {
     return value.size() >= suffix.size() &&
-        EqualInsensitive(value.substr(value.size() - suffix.size()), suffix);
+        _wcsnicmp(value.data() + (value.size() - suffix.size()), suffix.data(), suffix.size()) == 0;
 }
 
 bool StartsWithInsensitive(std::wstring_view value, std::wstring_view prefix) {
-    return value.size() >= prefix.size() && EqualInsensitive(value.substr(0, prefix.size()), prefix);
+    return value.size() >= prefix.size() && _wcsnicmp(value.data(), prefix.data(), prefix.size()) == 0;
 }
 
 std::wstring Utf8ToWide(const std::string& text) {
