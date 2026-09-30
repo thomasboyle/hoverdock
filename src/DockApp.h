@@ -277,7 +277,15 @@ private:
     std::unordered_map<std::wstring, HoverLabelBits> m_hoverLabelCache;
     void DestroyHoverLabelFont() noexcept;
     [[nodiscard]] HFONT HoverLabelFont();
+    struct IconLoadRequest {
+        std::vector<std::wstring> cacheKeys;
+        std::vector<std::vector<std::wstring>> candidates;
+        UINT extent = 0;
+    };
     void LoadIconTextures();
+    [[nodiscard]] IconLoadRequest PrepareIconLoad();
+    void ApplyIconLoad(const IconLoadRequest& request,
+        const std::vector<std::vector<uint8_t>>& pixels);
     void AssignIconTextureIndices();
     void EnsureTrayIcons();
     void RefreshTray(bool forceLayout);

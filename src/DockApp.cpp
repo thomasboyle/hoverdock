@@ -28,6 +28,7 @@
 #include <cstring>
 #include <cwctype>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -2077,6 +2078,7 @@ int DockApp::Run() {
     if (const std::optional<int> handOff = HandOffToNewerInstalledCopy()) {
         return *handOff;
     }
+    m_renderer.BeginDeviceCreation();
     // Startup entries are authoritative for logon launch, but the toggle owns
     // them: repair a stale path (portable copy moved) or clear leftover
     // entries so the persisted setting and the system never disagree after
@@ -2116,10 +2118,17 @@ int DockApp::Run() {
     RebuildDisplayApps();
     RebuildLayout(false);
 
+    // Shell icon extraction and D3D12 device creation are each a few hundred
+    // ms and independent, so extract on a worker while the device comes up.
+    const IconLoadRequest iconLoad = PrepareIconLoad();
+    std::future<std::vector<std::vector<uint8_t>>> iconPixels =
+        std::async(std::launch::async, [&iconLoad] {
+            return Renderer::ExtractIconPixelBuffers(iconLoad.candidates, iconLoad.extent);
+        });
     try {
         m_renderer.Initialize(m_window, m_dockWidth, m_dockHeight);
         m_rendererInitialized = true;
-        LoadIconTextures();
+        ApplyIconLoad(iconLoad, iconPixels.get());
         AssignIconTextureIndices();
     } catch (...) {
         DestroyWindow(m_window);
@@ -4017,6 +4026,11 @@ void DockApp::HideHoverLabel() noexcept {
 }
 
 void DockApp::LoadIconTextures() {
+    const IconLoadRequest request = PrepareIconLoad();
+    ApplyIconLoad(request, Renderer::ExtractIconPixelBuffers(request.candidates, request.extent));
+}
+
+DockApp::IconLoadRequest DockApp::PrepareIconLoad() {
     // A full reload supersedes any in-flight incremental pin-icon work, which
     // was extracted for a possibly different extent.
     ++m_pinIconGeneration;
@@ -4024,23 +4038,35 @@ void DockApp::LoadIconTextures() {
         const std::lock_guard lock(m_pinIconMutex);
         m_pinIconPending.reset();
     }
-    std::vector<std::wstring> cacheKeys;
-    std::vector<std::vector<std::wstring>> iconCandidates;
-    cacheKeys.reserve(m_displayApps.size());
-    iconCandidates.reserve(m_displayApps.size());
+    IconLoadRequest request;
+    request.cacheKeys.reserve(m_displayApps.size());
+    request.candidates.reserve(m_displayApps.size());
     for (const DisplayApp& app : m_displayApps) {
         if (IsLayoutOnlyTarget(app.app.target)) {
             continue;
         }
-        cacheKeys.push_back(WindowCatalog::IconCacheKey(app.app));
-        iconCandidates.push_back(
+        request.cacheKeys.push_back(WindowCatalog::IconCacheKey(app.app));
+        request.candidates.push_back(
             WindowCatalog::IconResolutionCandidates(app.app, app.runningWindow));
     }
     m_loadedIconExtent = IconPixelExtent();
-    m_renderer.LoadIcons(cacheKeys, iconCandidates, m_loadedIconExtent);
-    m_trayVisualKey.clear();
-    EnsureTrayIcons();
-    EnsureTrashIcons();
+    request.extent = m_loadedIconExtent;
+    return request;
+}
+
+void DockApp::ApplyIconLoad(const IconLoadRequest& request,
+    const std::vector<std::vector<uint8_t>>& pixels) {
+    m_renderer.BeginIconBatch();
+    try {
+        m_renderer.LoadIcons(request.cacheKeys, pixels, request.extent);
+        m_trayVisualKey.clear();
+        EnsureTrayIcons();
+        EnsureTrashIcons();
+    } catch (...) {
+        m_renderer.CancelIconBatch();
+        throw;
+    }
+    m_renderer.EndIconBatch();
     RefreshTrash(true);
 }
 

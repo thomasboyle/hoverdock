@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -65,10 +66,20 @@ class Renderer {
 public:
     ~Renderer();
 
+    // Starts D3D12 device creation on a worker; Initialize joins it.
+    void BeginDeviceCreation();
     void Initialize(HWND window, UINT width, UINT height);
     void Resize(UINT width, UINT height);
     void LoadIcons(const std::vector<std::wstring>& cacheKeys,
+        const std::vector<std::vector<uint8_t>>& pixelBuffers, UINT iconPixelExtent);
+    // Thread-safe; runs shell icon extraction for LoadIcons off the UI thread.
+    [[nodiscard]] static std::vector<std::vector<uint8_t>> ExtractIconPixelBuffers(
         const std::vector<std::vector<std::wstring>>& iconCandidates, UINT iconPixelExtent);
+    // Between Begin and End, icon cache updates defer the atlas rebuild so a
+    // full reload uploads and flushes once instead of once per icon group.
+    void BeginIconBatch() noexcept;
+    void EndIconBatch();
+    void CancelIconBatch() noexcept;
     void UploadIcons(const std::vector<std::wstring>& targets,
         const std::vector<std::vector<uint8_t>>& pixelBuffers);
     [[nodiscard]] UINT TextureIndexForTarget(const std::wstring& target) const noexcept;
@@ -194,6 +205,7 @@ private:
     [[nodiscard]] bool WaitForFrame(FrameResource& frame, DWORD timeoutMs = INFINITE);
     void WaitForAllFrames();
     void RebuildIconAtlasFromCache();
+    void RequestIconAtlasRebuild();
     void UploadIcon(UINT textureIndex, const std::wstring& target,
         ID3D12GraphicsCommandList* commandList);
     void CreateFallbackIcon(UINT textureIndex, ID3D12GraphicsCommandList* commandList);
@@ -247,6 +259,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_backdropCopyCommandList;
     UINT m_iconCount = 0;
     UINT m_iconPixelExtent = 56;
+    bool m_iconBatchActive = false;
+    bool m_iconAtlasRebuildPending = false;
     float m_dpiScale = 1.0F;
     std::unordered_map<std::wstring, UINT> m_iconTextureByTarget;
     std::unordered_map<std::wstring, std::vector<uint8_t>> m_iconPixelCache;
@@ -410,4 +424,5 @@ private:
     UINT m_panelBakeHeight = 0;
 
     HANDLE m_frameLatencyWaitableObject = nullptr;
+    std::future<void> m_deviceCreation;
 };

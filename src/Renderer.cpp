@@ -856,7 +856,16 @@ const D3D12_SHADER_BYTECODE Shader(const unsigned char* bytes, size_t size) {
 
 }  // namespace
 
+void Renderer::BeginDeviceCreation() {
+    if (!m_deviceCreation.valid() && m_device == nullptr) {
+        m_deviceCreation = std::async(std::launch::async, [this] { CreateDevice(); });
+    }
+}
+
 Renderer::~Renderer() {
+    if (m_deviceCreation.valid()) {
+        m_deviceCreation.wait();
+    }
     try {
         Flush();
     } catch (...) {
@@ -878,7 +887,11 @@ void Renderer::Initialize(HWND window, UINT width, UINT height) {
     m_width = std::max(width, 1U);
     m_height = std::max(height, 1U);
     m_dpiScale = static_cast<float>(std::max(GetDpiForWindow(window), 96U)) / 96.0F;
-    CreateDevice();
+    if (m_deviceCreation.valid()) {
+        m_deviceCreation.get();
+    } else {
+        CreateDevice();
+    }
     CreateCompositionSwapChain(window, m_width, m_height);
     CreateFrameResources();
     CreateRootSignatureAndPipelines();
@@ -910,27 +923,58 @@ void Renderer::Resize(UINT width, UINT height) {
 }
 
 void Renderer::LoadIcons(const std::vector<std::wstring>& cacheKeys,
-    const std::vector<std::vector<std::wstring>>& iconCandidates, UINT iconPixelExtent) {
+    const std::vector<std::vector<uint8_t>>& pixelBuffers, UINT iconPixelExtent) {
     static_assert(kMaximumIcons <= UINT16_MAX,
         "The maximum icon count must fit in a D3D12 texture array.");
 
-    if (cacheKeys.size() != iconCandidates.size()) {
-        throw std::runtime_error("Icon cache keys do not match candidate lists.");
+    if (cacheKeys.size() != pixelBuffers.size()) {
+        throw std::runtime_error("Icon cache keys do not match pixel buffers.");
     }
     if (cacheKeys.size() > kMaximumIcons) {
         throw std::runtime_error("The dock supports at most 512 visible icons.");
     }
 
+    m_iconPixelExtent = IconAtlasExtent(std::max(1U, iconPixelExtent));
+    UploadIcons(cacheKeys, pixelBuffers);
+}
+
+std::vector<std::vector<uint8_t>> Renderer::ExtractIconPixelBuffers(
+    const std::vector<std::vector<std::wstring>>& iconCandidates, UINT iconPixelExtent) {
+    ComApartment apartment;
     const UINT displayExtent = std::max(1U, iconPixelExtent);
-    m_iconPixelExtent = IconAtlasExtent(displayExtent);
+    const UINT atlasExtent = IconAtlasExtent(displayExtent);
     const UINT sourceExtent = IconSourceExtent(displayExtent);
     std::vector<std::vector<uint8_t>> pixelBuffers;
-    pixelBuffers.reserve(cacheKeys.size());
+    pixelBuffers.reserve(iconCandidates.size());
     for (const std::vector<std::wstring>& candidates : iconCandidates) {
-        pixelBuffers.push_back(
-            ExtractIconPixelsFromCandidates(candidates, sourceExtent, m_iconPixelExtent));
+        pixelBuffers.push_back(ExtractIconPixelsFromCandidates(candidates, sourceExtent, atlasExtent));
     }
-    UploadIcons(cacheKeys, pixelBuffers);
+    return pixelBuffers;
+}
+
+void Renderer::BeginIconBatch() noexcept {
+    m_iconBatchActive = true;
+}
+
+void Renderer::EndIconBatch() {
+    m_iconBatchActive = false;
+    if (m_iconAtlasRebuildPending) {
+        m_iconAtlasRebuildPending = false;
+        RebuildIconAtlasFromCache();
+    }
+}
+
+void Renderer::CancelIconBatch() noexcept {
+    m_iconBatchActive = false;
+    m_iconAtlasRebuildPending = false;
+}
+
+void Renderer::RequestIconAtlasRebuild() {
+    if (m_iconBatchActive) {
+        m_iconAtlasRebuildPending = true;
+        return;
+    }
+    RebuildIconAtlasFromCache();
 }
 
 void Renderer::UploadIcons(const std::vector<std::wstring>& targets,
@@ -953,7 +997,7 @@ void Renderer::UploadIcons(const std::vector<std::wstring>& targets,
             m_iconPixelCache[targets[index]] = pixelBuffers[index];
         }
     }
-    RebuildIconAtlasFromCache();
+    RequestIconAtlasRebuild();
 }
 
 void Renderer::RebuildIconAtlasFromCache() {
@@ -1046,13 +1090,14 @@ void Renderer::AppendMissingIcons(const std::vector<std::wstring>& targets,
         added = true;
     }
     if (added) {
-        RebuildIconAtlasFromCache();
+        RequestIconAtlasRebuild();
     }
 }
 
 void Renderer::UpdateCachedIcons(const std::vector<std::wstring>& targets,
     const std::vector<std::vector<uint8_t>>& pixelBuffers) {
-    if (targets.size() != pixelBuffers.size() || m_device == nullptr || m_iconAtlas == nullptr) {
+    if (targets.size() != pixelBuffers.size() || m_device == nullptr ||
+        (m_iconAtlas == nullptr && !m_iconBatchActive)) {
         return;
     }
 
@@ -1079,6 +1124,10 @@ void Renderer::UpdateCachedIcons(const std::vector<std::wstring>& targets,
         return;
     }
     if (replaceSlots.empty()) {
+        return;
+    }
+    if (m_iconBatchActive) {
+        m_iconAtlasRebuildPending = true;
         return;
     }
 
@@ -2260,25 +2309,24 @@ void Renderer::CreateDevice() {
     Check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
     Check(factory.As(&m_factory), "Query IDXGIFactory6");
 
+    // One creation at the 12_0 minimum, then query the ceiling: a failed
+    // higher-level attempt still pays the full driver initialization.
+    const HRESULT created = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&m_device));
+    if (FAILED(created) || m_device == nullptr) {
+        ThrowFailure(created, "D3D12CreateDevice for feature levels 12_2, 12_1, or 12_0");
+    }
     constexpr std::array featureLevels = {
         D3D_FEATURE_LEVEL_12_2,
         D3D_FEATURE_LEVEL_12_1,
         D3D_FEATURE_LEVEL_12_0,
     };
-    HRESULT lastError = E_FAIL;
-    for (const D3D_FEATURE_LEVEL level : featureLevels) {
-        ComPtr<ID3D12Device> device;
-        const HRESULT result = D3D12CreateDevice(nullptr, level, IID_PPV_ARGS(&device));
-        if (SUCCEEDED(result)) {
-            m_device = device;
-            m_featureLevel = level;
-            break;
-        }
-        lastError = result;
-    }
-    if (m_device == nullptr) {
-        ThrowFailure(lastError, "D3D12CreateDevice for feature levels 12_2, 12_1, or 12_0");
-    }
+    D3D12_FEATURE_DATA_FEATURE_LEVELS levels{};
+    levels.NumFeatureLevels = static_cast<UINT>(featureLevels.size());
+    levels.pFeatureLevelsRequested = featureLevels.data();
+    m_featureLevel = SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &levels,
+                         sizeof(levels)))
+        ? levels.MaxSupportedFeatureLevel
+        : D3D_FEATURE_LEVEL_12_0;
 
     D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{D3D_SHADER_MODEL_6_6};
     const HRESULT shaderQuery = m_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,
