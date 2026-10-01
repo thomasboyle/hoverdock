@@ -11710,6 +11710,15 @@ bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
         if (_wcsnicmp(className, L"LiquidGlassDock", 15) == 0) {
             return false;
         }
+        // Explorer desktop hosts (Progman / WorkerW / DefView) are popup-sized to
+        // the virtual desktop with no caption. Treating them as borderless
+        // fullscreen permanently suppressed edge-show after a desktop right-click
+        // (FG stays on Progman once the context menu closes).
+        if (_wcsicmp(className, L"Progman") == 0 ||
+            _wcsicmp(className, L"WorkerW") == 0 ||
+            _wcsicmp(className, L"SHELLDLL_DefView") == 0) {
+            return false;
+        }
     }
 
     const LONG_PTR style = GetWindowLongPtrW(foreground, GWL_STYLE);
