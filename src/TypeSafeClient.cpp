@@ -1162,6 +1162,93 @@ std::string BuildBoostRequestBody(const std::vector<BoostCandidate>& candidates)
     return body;
 }
 
+
+std::string BuildStartupBoostRequestBody(const std::vector<BoostCandidate>& candidates) {
+    std::string body = "{\"model\":\"jev-latest\",\"state\":{\"surface\":";
+    AppendEscaped(body,
+        "Windows Quick Settings Boost performance in a desktop dock. Code enumerated "
+        "currently enabled Windows startup apps (Run keys and Startup folder). Code "
+        "hard-protects only the dock itself and Windows SecurityHealthSystray; Jev "
+        "decides which other startup entries are safe to disable via StartupApproved "
+        "and end if running. Code owns every registry write and process end.");
+    body += ",\"focus\":";
+    AppendEscaped(body,
+        "Speed up logon and free RAM by disabling non-essential startup apps that are "
+        "safe to turn off for a gaming/performance boost, without harming security or "
+        "the shell.");
+    body += ',';
+    AppendEscaped(body, "policy");
+    body += ':';
+    AppendEscaped(body,
+        "Never approve disabling operating-system security, shell hosts, accessibility "
+        "helpers the user relies on, disk encryption agents, or anything whose absence "
+        "would break Windows stability. When evidence is ambiguous, answer no. Chat "
+        "apps, browsers auto-launch, game launchers, and vendor updaters are typical "
+        "yes candidates when nothing indicates they are critical.");
+    body += ",\"startup_apps\":[";
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        if (index > 0) {
+            body += ',';
+        }
+        const BoostCandidate& candidate = candidates[index];
+        body += '{';
+        AppendEscaped(body, "id");
+        body += ':';
+        AppendEscaped(body, candidate.id);
+        body += ',';
+        AppendUtf8Field(body, "name", candidate.name);
+        body += ',';
+        AppendUtf8Field(body, "exe", candidate.exePath);
+        body += ",\"running\":";
+        body += candidate.ageSeconds > 0 || candidate.memoryMb > 0.0 || candidate.hasWindow
+            ? "true"
+            : "false";
+        body += ",\"has_window\":";
+        body += candidate.hasWindow ? "true" : "false";
+        body += ",\"memory_mb\":";
+        AppendJsonDouble(body, candidate.memoryMb);
+        body += ",\"cpu_pct\":";
+        AppendJsonDouble(body, candidate.cpuPercent);
+        body += '}';
+    }
+    body += "]},\"questions\":{";
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        if (index > 0) {
+            body += ',';
+        }
+        const std::string ref = "`startup_apps[" + std::to_string(index) + "]`";
+        AppendEscaped(body, "safe_" + candidates[index].id);
+        body += ":{\"type\":\"noul\",\"instructions\":";
+        AppendEscaped(body,
+            "Is " + ref + " safe to disable from Windows startup right now for a "
+            "performance boost? `policy` forbids harming Windows security, shell "
+            "stability, or critical system agents. Answer yes only for ordinary user "
+            "software that can be re-enabled later without risk.");
+        body += ",\"criteria\":{\"true\":";
+        AppendEscaped(body,
+            "Ordinary chat, browser, game launcher, updater, or similar; safe to disable.");
+        body += ",\"false\":";
+        AppendEscaped(body,
+            "OS security, shell, accessibility, encryption, or other critical agent.");
+        body += "}},";
+        AppendEscaped(body, "idle_" + candidates[index].id);
+        body += ":{\"type\":\"noul\",\"instructions\":";
+        AppendEscaped(body,
+            "Is " + ref + " non-essential for day-to-day system health — i.e. optional "
+            "background/chat/browser/game-launcher startup rather than something the "
+            "user likely needs at every logon for security or core workflow?");
+        body += ",\"criteria\":{\"true\":";
+        AppendEscaped(body,
+            "Optional launcher, chat, browser auto-start, or vendor updater.");
+        body += ",\"false\":";
+        AppendEscaped(body,
+            "Likely important tray/security/workflow agent the user would miss.");
+        body += "}}";
+    }
+    body += "}}";
+    return body;
+}
+
 // Generic Noul map: every answer object carrying a "noul" number is
 // collected under its question id. Choice/Score answers are ignored.
 bool ParseNoulAnswers(const std::string& body, std::map<std::string, double>& out) {
@@ -1332,6 +1419,52 @@ BoostResult TypeSafeClient::ClassifyForBoost(const std::wstring& apiKey,
             const auto idle = reply.values.find("idle_" + candidate.id);
             if (safe == reply.values.end() || idle == reply.values.end()) {
                 continue;  // Unanswered: treat as uncertain, never close.
+            }
+            merged.emplace(candidate.id, BoostJudgment{candidate.id, safe->second, idle->second});
+        }
+    }
+
+    result.ok = true;
+    result.items.reserve(merged.size());
+    for (const BoostCandidate& candidate : candidates) {
+        const auto judgment = merged.find(candidate.id);
+        if (judgment != merged.end()) {
+            result.items.push_back(judgment->second);
+        }
+    }
+    return result;
+}
+
+BoostResult TypeSafeClient::ClassifyForStartupBoost(const std::wstring& apiKey,
+    const std::vector<BoostCandidate>& candidates) {
+    BoostResult result;
+    const std::wstring cleanKey = SanitizeApiKey(apiKey);
+    if (cleanKey.empty()) {
+        result.error = L"Set TYPESAFE_API_KEY or TypeSafeApiKey in dock.ini.";
+        return result;
+    }
+    if (candidates.empty()) {
+        result.ok = true;
+        return result;
+    }
+
+    std::map<std::string, BoostJudgment> merged;
+    for (size_t start = 0; start < candidates.size(); start += kBoostBatchSize) {
+        const size_t end = std::min(candidates.size(), start + kBoostBatchSize);
+        const std::vector<BoostCandidate> batch(candidates.begin() +
+                static_cast<std::ptrdiff_t>(start),
+            candidates.begin() + static_cast<std::ptrdiff_t>(end));
+        const NoulBatchResult reply =
+            PostNoulBatch(cleanKey, BuildStartupBoostRequestBody(batch));
+        if (!reply.ok) {
+            result.error = reply.error;
+            return result;
+        }
+        for (const BoostCandidate& candidate : batch) {
+            const auto safe = reply.values.find("safe_" + candidate.id);
+            const auto idle = reply.values.find("idle_" + candidate.id);
+            if (safe == reply.values.end() || idle == reply.values.end()) {
+                continue;
             }
             merged.emplace(candidate.id, BoostJudgment{candidate.id, safe->second, idle->second});
         }

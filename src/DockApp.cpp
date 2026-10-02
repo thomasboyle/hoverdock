@@ -4749,12 +4749,70 @@ void DockApp::RunPerformanceBoost() {
         // Profiling (enumeration + CPU sample) runs here, off the UI thread.
         // Guarded: an uncaught throw in a detached thread terminates the dock.
         try {
+            // Startup apps: enumerate → Jev classifies safe/nonessential to
+            // disable → code applies StartupApproved + ends processes.
+            // Without an API key, a soft chat/browser/game-launcher name
+            // heuristic runs (not a personal allow/deny list).
             postStatus(L"Startup apps...", false);
-            const BoostStartupResult startup = PerfBoost::ApplyStartupAppsBoost();
-            if (startup.disabled > 0 || startup.ended > 0) {
-                Log(L"Boost startup: disabled " + std::to_wstring(startup.disabled) +
-                    L", ended " + std::to_wstring(startup.ended) + L", freed " +
-                    PerfBoost::FormatMegabytes(startup.freedBytes));
+            BoostStartupResult startup{};
+            const std::vector<BoostStartupEntry> startupCandidates =
+                PerfBoost::EnumerateStartupCandidates();
+            if (!startupCandidates.empty()) {
+                std::vector<BoostStartupEntry> startupSelected;
+                if (apiKey.empty()) {
+                    startupSelected = PerfBoost::SelectStartupHeuristic(startupCandidates);
+                    Log(L"Boost startup heuristic: " +
+                        std::to_wstring(startupSelected.size()) + L" of " +
+                        std::to_wstring(startupCandidates.size()) + L" candidates.");
+                } else {
+                    std::vector<BoostCandidate> startupInputs;
+                    startupInputs.reserve(startupCandidates.size());
+                    for (size_t index = 0; index < startupCandidates.size(); ++index) {
+                        const BoostStartupEntry& entry = startupCandidates[index];
+                        BoostCandidate input;
+                        input.id = "s" + std::to_string(index);
+                        input.name = entry.valueName;
+                        input.exePath = entry.exePath.empty() ? entry.exeName : entry.exePath;
+                        input.hasWindow = entry.hasWindow;
+                        input.memoryMb =
+                            static_cast<double>(entry.memoryBytes) / 1048576.0;
+                        input.cpuPercent = entry.cpuPercent;
+                        input.ageSeconds = entry.hasRunningProcess && entry.ageSeconds == 0
+                            ? 1ULL
+                            : entry.ageSeconds;
+                        startupInputs.push_back(std::move(input));
+                    }
+                    const BoostResult startupJudged =
+                        TypeSafeClient::ClassifyForStartupBoost(apiKey, startupInputs);
+                    if (!startupJudged.ok) {
+                        Log(L"Boost startup judgment failed: " + startupJudged.error);
+                        startupSelected = PerfBoost::SelectStartupHeuristic(startupCandidates);
+                    } else {
+                        for (const BoostJudgment& judgment : startupJudged.items) {
+                            if (judgment.safe >= kBoostSafeClose &&
+                                judgment.idle >= kBoostIdleClose) {
+                                try {
+                                    const size_t index =
+                                        static_cast<size_t>(std::stoul(judgment.id.substr(1)));
+                                    if (index < startupCandidates.size()) {
+                                        startupSelected.push_back(startupCandidates[index]);
+                                    }
+                                } catch (...) {
+                                    continue;
+                                }
+                            }
+                        }
+                        Log(L"Boost startup judgments: " +
+                            std::to_wstring(startupJudged.items.size()) + L" judged, " +
+                            std::to_wstring(startupSelected.size()) + L" selected.");
+                    }
+                }
+                if (!startupSelected.empty()) {
+                    startup = PerfBoost::DisableStartupTargets(startupSelected);
+                    Log(L"Boost startup: disabled " + std::to_wstring(startup.disabled) +
+                        L", ended " + std::to_wstring(startup.ended) + L", freed " +
+                        PerfBoost::FormatMegabytes(startup.freedBytes));
+                }
             }
 
             const std::vector<BoostProcess> candidates = PerfBoost::EnumerateClosableCandidates();
@@ -4773,8 +4831,17 @@ void DockApp::RunPerformanceBoost() {
             bool allowTerminate = false;
             if (apiKey.empty()) {
                 selected = selectHeuristic(candidates);
-                if (selected.empty()) {
+                if (selected.empty() && startup.disabled <= 0 && startup.ended <= 0) {
                     postStatus(L"Need API key", true);
+                    return;
+                }
+                if (selected.empty()) {
+                    if (startup.ended > 0) {
+                        postStatus(L"Freed " + PerfBoost::FormatMegabytes(startup.freedBytes),
+                            true);
+                    } else {
+                        postStatus(L"Startup cleared", true);
+                    }
                     return;
                 }
             } else {
@@ -4798,8 +4865,17 @@ void DockApp::RunPerformanceBoost() {
                 if (!judged.ok) {
                     Log(L"Boost judgment failed: " + judged.error);
                     selected = selectHeuristic(candidates);
-                    if (selected.empty()) {
+                    if (selected.empty() && startup.disabled <= 0 && startup.ended <= 0) {
                         postStatus(L"Unavailable", true);
+                        return;
+                    }
+                    if (selected.empty()) {
+                        if (startup.ended > 0) {
+                            postStatus(
+                                L"Freed " + PerfBoost::FormatMegabytes(startup.freedBytes), true);
+                        } else {
+                            postStatus(L"Startup cleared", true);
+                        }
                         return;
                     }
                 } else {
@@ -4821,7 +4897,14 @@ void DockApp::RunPerformanceBoost() {
                         L" judged, " + std::to_wstring(selected.size()) + L" selected.");
                     allowTerminate = true;
                     if (selected.empty()) {
-                        postStatus(L"All clear", true);
+                        if (startup.ended > 0) {
+                            postStatus(
+                                L"Freed " + PerfBoost::FormatMegabytes(startup.freedBytes), true);
+                        } else if (startup.disabled > 0) {
+                            postStatus(L"Startup cleared", true);
+                        } else {
+                            postStatus(L"All clear", true);
+                        }
                         return;
                     }
                 }

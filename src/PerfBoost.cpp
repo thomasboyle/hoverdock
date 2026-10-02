@@ -66,8 +66,6 @@ bool IsCriticalFileName(const std::wstring& lowerName) {
         L"searchapp.exe", L"textinputhost.exe", L"applicationframehost.exe",
         L"audiodg.exe", L"wudfhost.exe", L"smartscreen.exe", L"msmpeng.exe",
         L"nissrv.exe", L"spoolsv.exe", L"registry",
-        // Essential startup keeps: never closed by boost process enumeration.
-        L"blip.exe", L"screeni.exe", L"screen.exe", L"vgtray.exe",
         L"securityhealthsystray.exe",
     };
     for (const wchar_t* critical : kCritical) {
@@ -500,21 +498,39 @@ BoostCloseResult PerfBoost::CloseTargets(const std::vector<BoostProcess>& target
     return result;
 }
 
+
 namespace {
 
-// Startup value names and exe basenames the user wants to keep enabled and
-// running across boost. Matching is case-insensitive substring-free exact
-// compare on the registry value name or the executable file name.
-bool IsEssentialStartupKeep(const std::wstring& lowerToken) {
-    static const wchar_t* const kKeeps[] = {
+// Hard-protected startup entries only: the dock itself and Windows Security
+// health tray. Everything else is classified by Jev (or a soft heuristic).
+bool IsHardProtectedStartup(const std::wstring& lowerToken) {
+    static const wchar_t* const kProtected[] = {
         L"hoverdock", L"dock.exe",
         L"securityhealth", L"securityhealthsystray.exe",
-        L"blip", L"blip.exe",
-        L"screeni", L"screeni.exe", L"screen", L"screen.exe",
-        L"riot vanguard", L"vgtray.exe",
     };
-    for (const wchar_t* keep : kKeeps) {
-        if (lowerToken == keep) {
+    for (const wchar_t* name : kProtected) {
+        if (lowerToken == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Soft heuristic categories when the TypeSafe API key is missing. Substring
+// match on startup value name or exe basename — chat, browsers, and game
+// launchers only. Not a personal allow/deny list.
+bool LooksLikeOptionalStartupSoftHeuristic(const std::wstring& lowerValue,
+    const std::wstring& lowerExe) {
+    static const wchar_t* const kSoft[] = {
+        L"discord", L"teams", L"slack", L"skype", L"telegram", L"whatsapp", L"signal",
+        L"msedge", L"chrome", L"firefox", L"opera", L"brave", L"vivaldi",
+        L"overwolf", L"zwift", L"lghub", L"steam", L"epicgames", L"epic games",
+        L"battle.net", L"battlenet", L"origin", L"eadesktop", L"uplay", L"ubiquity",
+        L"riotclient", L"xbox", L"gamebar", L"spotify", L"applemusic",
+    };
+    for (const wchar_t* token : kSoft) {
+        if (lowerValue.find(token) != std::wstring::npos ||
+            lowerExe.find(token) != std::wstring::npos) {
             return true;
         }
     }
@@ -534,12 +550,10 @@ std::wstring ExpandEnv(const std::wstring& value) {
     if (written == 0 || written > needed) {
         return value;
     }
-    // ExpandEnvironmentStrings includes the trailing null in the count.
     expanded.resize(written > 0 ? written - 1U : 0);
     return expanded;
 }
 
-// Pull the executable path from a Run command: quoted path, or first token.
 std::wstring ExecutableFromCommand(std::wstring command) {
     while (!command.empty() && iswspace(command.front())) {
         command.erase(command.begin());
@@ -568,7 +582,7 @@ bool StartupApprovedIsEnabled(HKEY root, const wchar_t* approvedPath, const std:
     REGSAM wowAccess) {
     HKEY key = nullptr;
     if (RegOpenKeyExW(root, approvedPath, 0, KEY_QUERY_VALUE | wowAccess, &key) != ERROR_SUCCESS) {
-        return true;  // No approved key yet: Task Manager treats as enabled.
+        return true;
     }
     BYTE data[16]{};
     DWORD dataSize = sizeof(data);
@@ -579,7 +593,6 @@ bool StartupApprovedIsEnabled(HKEY root, const wchar_t* approvedPath, const std:
     if (queried != ERROR_SUCCESS || type != REG_BINARY || dataSize < 1) {
         return true;
     }
-    // 0x02 = enabled. 0x03 / 0x01 = disabled (user / Windows).
     return data[0] == 0x02;
 }
 
@@ -591,7 +604,7 @@ bool DisableStartupApproved(HKEY root, const wchar_t* approvedPath, const std::w
         return false;
     }
     BYTE blob[12]{};
-    blob[0] = 0x03;  // Disabled by user (Task Manager style).
+    blob[0] = 0x03;
     FILETIME now{};
     GetSystemTimeAsFileTime(&now);
     std::memcpy(blob + 4, &now, sizeof(now));
@@ -601,19 +614,8 @@ bool DisableStartupApproved(HKEY root, const wchar_t* approvedPath, const std::w
     return written == ERROR_SUCCESS;
 }
 
-struct StartupEntry {
-    std::wstring valueName;
-    std::wstring exePath;
-    std::wstring exeName;
-    HKEY approvedRoot = HKEY_CURRENT_USER;
-    std::wstring approvedPath;
-    REGSAM wowAccess = 0;
-    bool keep = false;
-    bool enabled = true;
-};
-
 void CollectRunEntries(HKEY root, const wchar_t* runPath, const wchar_t* approvedPath,
-    REGSAM wowAccess, std::vector<StartupEntry>& out) {
+    REGSAM wowAccess, std::vector<BoostStartupEntry>& out) {
     HKEY key = nullptr;
     if (RegOpenKeyExW(root, runPath, 0, KEY_QUERY_VALUE | wowAccess, &key) != ERROR_SUCCESS) {
         return;
@@ -642,11 +644,10 @@ void CollectRunEntries(HKEY root, const wchar_t* runPath, const wchar_t* approve
             name.assign(maxName + 1U, L'\0');
             continue;
         }
-        // dataSize is in bytes and includes the trailing null for REG_SZ.
         const size_t charCount = dataSize / sizeof(wchar_t);
         std::wstring command(
             reinterpret_cast<wchar_t*>(data.data()), charCount > 0 ? charCount - 1U : 0);
-        StartupEntry entry;
+        BoostStartupEntry entry;
         entry.valueName = name;
         entry.exePath = ExecutableFromCommand(command);
         entry.exeName = FileNameOf(ToLower(entry.exePath));
@@ -654,9 +655,16 @@ void CollectRunEntries(HKEY root, const wchar_t* runPath, const wchar_t* approve
         entry.approvedPath = approvedPath;
         entry.wowAccess = wowAccess;
         const std::wstring lowerName = ToLower(entry.valueName);
-        entry.keep = IsEssentialStartupKeep(lowerName) || IsEssentialStartupKeep(entry.exeName);
+        if (IsHardProtectedStartup(lowerName) || IsHardProtectedStartup(entry.exeName)) {
+            name.assign(maxName + 1U, L'\0');
+            continue;
+        }
         entry.enabled =
             StartupApprovedIsEnabled(root, approvedPath, entry.valueName, wowAccess);
+        if (!entry.enabled) {
+            name.assign(maxName + 1U, L'\0');
+            continue;  // Already disabled: nothing for startup boost to do.
+        }
         out.push_back(std::move(entry));
         name.assign(maxName + 1U, L'\0');
     }
@@ -664,7 +672,7 @@ void CollectRunEntries(HKEY root, const wchar_t* runPath, const wchar_t* approve
 }
 
 void CollectStartupFolderEntries(HKEY approvedRoot, const wchar_t* approvedPath,
-    const std::wstring& folderPath, std::vector<StartupEntry>& out) {
+    const std::wstring& folderPath, std::vector<BoostStartupEntry>& out) {
     const std::wstring pattern = folderPath + L"\\*";
     WIN32_FIND_DATAW findData{};
     HANDLE find = FindFirstFileW(pattern.c_str(), &findData);
@@ -679,7 +687,7 @@ void CollectStartupFolderEntries(HKEY approvedRoot, const wchar_t* approvedPath,
         if (fileName == L"." || fileName == L"..") {
             continue;
         }
-        StartupEntry entry;
+        BoostStartupEntry entry;
         entry.valueName = fileName;
         entry.exePath = folderPath + L"\\" + fileName;
         entry.exeName = ToLower(fileName);
@@ -690,9 +698,14 @@ void CollectStartupFolderEntries(HKEY approvedRoot, const wchar_t* approvedPath,
             const size_t dot = entry.exeName.find_last_of(L'.');
             return dot == std::wstring::npos ? entry.exeName : entry.exeName.substr(0, dot);
         }();
-        entry.keep = IsEssentialStartupKeep(ToLower(fileName)) || IsEssentialStartupKeep(stem);
+        if (IsHardProtectedStartup(ToLower(fileName)) || IsHardProtectedStartup(stem)) {
+            continue;
+        }
         entry.enabled =
             StartupApprovedIsEnabled(approvedRoot, approvedPath, entry.valueName, 0);
+        if (!entry.enabled) {
+            continue;
+        }
         out.push_back(std::move(entry));
     } while (FindNextFileW(find, &findData) != FALSE);
     FindClose(find);
@@ -719,12 +732,146 @@ bool ProcessHasVisibleWindow(DWORD pid) {
     return walk.found;
 }
 
+void AttachRunningSignals(std::vector<BoostStartupEntry>& entries) {
+    std::unordered_map<std::wstring, size_t> byExe;
+    for (size_t index = 0; index < entries.size(); ++index) {
+        if (!entries[index].exeName.empty()) {
+            byExe.emplace(entries[index].exeName, index);
+        }
+    }
+    if (byExe.empty()) {
+        return;
+    }
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    const DWORD selfPid = GetCurrentProcessId();
+    DWORD selfSession = 0;
+    ProcessIdToSessionId(selfPid, &selfSession);
+    PROCESSENTRY32W proc{sizeof(proc)};
+    for (BOOL more = Process32FirstW(snapshot, &proc); more != FALSE;
+         more = Process32NextW(snapshot, &proc)) {
+        const DWORD pid = proc.th32ProcessID;
+        if (pid == 0 || pid == 4 || pid == selfPid) {
+            continue;
+        }
+        DWORD session = 0;
+        if (ProcessIdToSessionId(pid, &session) == FALSE || session != selfSession) {
+            continue;
+        }
+        const std::wstring lowerName = ToLower(proc.szExeFile);
+        const auto found = byExe.find(lowerName);
+        if (found == byExe.end()) {
+            continue;
+        }
+        BoostStartupEntry& entry = entries[found->second];
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process == nullptr) {
+            continue;
+        }
+        entry.hasRunningProcess = true;
+        entry.hasWindow = ProcessHasVisibleWindow(pid);
+        entry.memoryBytes = ProcessMemoryBytes(process);
+        entry.ageSeconds = ProcessAgeSeconds(process);
+        CloseHandle(process);
+    }
+    CloseHandle(snapshot);
+}
+
+BoostStartupResult EndAssociatedProcesses(const std::unordered_set<std::wstring>& endExeNames) {
+    BoostStartupResult result;
+    if (endExeNames.empty()) {
+        return result;
+    }
+    const DWORD selfPid = GetCurrentProcessId();
+    DWORD selfSession = 0;
+    ProcessIdToSessionId(selfPid, &selfSession);
+    const DWORD foregroundPid = ForegroundProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return result;
+    }
+    PROCESSENTRY32W proc{sizeof(proc)};
+    for (BOOL more = Process32FirstW(snapshot, &proc); more != FALSE;
+         more = Process32NextW(snapshot, &proc)) {
+        const DWORD pid = proc.th32ProcessID;
+        if (pid == 0 || pid == 4 || pid == selfPid || pid == foregroundPid) {
+            continue;
+        }
+        DWORD session = 0;
+        if (ProcessIdToSessionId(pid, &session) == FALSE || session != selfSession) {
+            continue;
+        }
+        const std::wstring lowerName = ToLower(proc.szExeFile);
+        if (endExeNames.find(lowerName) == endExeNames.end()) {
+            continue;
+        }
+        if (IsHardProtectedStartup(lowerName) || IsCriticalFileName(lowerName) ||
+            IsUiHelperProcess(lowerName)) {
+            continue;
+        }
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process == nullptr) {
+            continue;
+        }
+        const std::wstring exePath = ProcessImagePath(process);
+        const uint64_t memory = ProcessMemoryBytes(process);
+        CloseHandle(process);
+        if (exePath.empty()) {
+            continue;
+        }
+        if (ProcessHasVisibleWindow(pid)) {
+            struct CloseList {
+                DWORD pid = 0;
+                std::vector<HWND>* windows = nullptr;
+            };
+            std::vector<HWND> windows;
+            CloseList walk{pid, &windows};
+            EnumWindows(
+                [](HWND window, LPARAM data) -> BOOL {
+                    auto* state = reinterpret_cast<CloseList*>(data);
+                    if (GetWindow(window, GW_OWNER) != nullptr) {
+                        return TRUE;
+                    }
+                    DWORD windowPid = 0;
+                    GetWindowThreadProcessId(window, &windowPid);
+                    if (windowPid == state->pid) {
+                        state->windows->push_back(window);
+                    }
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(&walk));
+            for (HWND window : windows) {
+                if (IsWindow(window) != FALSE) {
+                    PostMessageW(window, WM_CLOSE, 0, 0);
+                }
+            }
+            result.ended += 1;
+            result.freedBytes += memory;
+            continue;
+        }
+        HANDLE terminable =
+            OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (terminable == nullptr) {
+            continue;
+        }
+        const BOOL ended = TerminateProcess(terminable, 1);
+        CloseHandle(terminable);
+        if (ended != FALSE) {
+            result.ended += 1;
+            result.freedBytes += memory;
+        }
+    }
+    CloseHandle(snapshot);
+    return result;
+}
+
 }  // namespace
 
-BoostStartupResult PerfBoost::ApplyStartupAppsBoost() {
-    BoostStartupResult result;
+std::vector<BoostStartupEntry> PerfBoost::EnumerateStartupCandidates() {
+    std::vector<BoostStartupEntry> entries;
     try {
-        std::vector<StartupEntry> entries;
         CollectRunEntries(HKEY_CURRENT_USER,
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
             L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run", 0,
@@ -739,7 +886,8 @@ BoostStartupResult PerfBoost::ApplyStartupAppsBoost() {
             KEY_WOW64_64KEY, entries);
 
         wchar_t appData[MAX_PATH]{};
-        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_STARTUP, nullptr, SHGFP_TYPE_CURRENT, appData))) {
+        if (SUCCEEDED(
+                SHGetFolderPathW(nullptr, CSIDL_STARTUP, nullptr, SHGFP_TYPE_CURRENT, appData))) {
             CollectStartupFolderEntries(HKEY_CURRENT_USER,
                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder",
                 appData, entries);
@@ -751,115 +899,50 @@ BoostStartupResult PerfBoost::ApplyStartupAppsBoost() {
                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder",
                 commonStartup, entries);
         }
+        AttachRunningSignals(entries);
+    } catch (...) {
+        return {};
+    }
+    return entries;
+}
 
+std::vector<BoostStartupEntry> PerfBoost::SelectStartupHeuristic(
+    const std::vector<BoostStartupEntry>& candidates) {
+    std::vector<BoostStartupEntry> selected;
+    for (const BoostStartupEntry& candidate : candidates) {
+        if (LooksLikeOptionalStartupSoftHeuristic(ToLower(candidate.valueName),
+                ToLower(candidate.exeName))) {
+            selected.push_back(candidate);
+        }
+    }
+    return selected;
+}
+
+BoostStartupResult PerfBoost::DisableStartupTargets(
+    const std::vector<BoostStartupEntry>& targets) {
+    BoostStartupResult result;
+    try {
         std::unordered_set<std::wstring> endExeNames;
-        for (const StartupEntry& entry : entries) {
-            if (entry.keep) {
+        for (const BoostStartupEntry& entry : targets) {
+            const std::wstring lowerName = ToLower(entry.valueName);
+            const std::wstring lowerExe = ToLower(entry.exeName);
+            if (IsHardProtectedStartup(lowerName) || IsHardProtectedStartup(lowerExe)) {
                 continue;
             }
-            if (entry.enabled) {
-                if (DisableStartupApproved(entry.approvedRoot, entry.approvedPath.c_str(),
-                        entry.valueName, entry.wowAccess)) {
-                    result.disabled += 1;
-                }
+            if (DisableStartupApproved(entry.approvedRoot, entry.approvedPath.c_str(),
+                    entry.valueName, entry.wowAccess)) {
+                result.disabled += 1;
             }
             if (!entry.exeName.empty() && entry.exeName.find(L'.') != std::wstring::npos &&
-                !entry.exeName.ends_with(L".lnk") && !entry.exeName.ends_with(L".cmd") &&
-                !entry.exeName.ends_with(L".bat")) {
-                endExeNames.insert(entry.exeName);
+                !lowerExe.ends_with(L".lnk") && !lowerExe.ends_with(L".cmd") &&
+                !lowerExe.ends_with(L".bat")) {
+                endExeNames.insert(lowerExe);
             }
         }
-
-        if (endExeNames.empty()) {
-            return result;
-        }
-
-        const DWORD selfPid = GetCurrentProcessId();
-        DWORD selfSession = 0;
-        ProcessIdToSessionId(selfPid, &selfSession);
-        const DWORD foregroundPid = ForegroundProcessId();
-
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot == INVALID_HANDLE_VALUE) {
-            return result;
-        }
-        PROCESSENTRY32W proc{sizeof(proc)};
-        for (BOOL more = Process32FirstW(snapshot, &proc); more != FALSE;
-             more = Process32NextW(snapshot, &proc)) {
-            const DWORD pid = proc.th32ProcessID;
-            if (pid == 0 || pid == 4 || pid == selfPid || pid == foregroundPid) {
-                continue;
-            }
-            DWORD session = 0;
-            if (ProcessIdToSessionId(pid, &session) == FALSE || session != selfSession) {
-                continue;
-            }
-            const std::wstring lowerName = ToLower(proc.szExeFile);
-            if (endExeNames.find(lowerName) == endExeNames.end()) {
-                continue;
-            }
-            if (IsEssentialStartupKeep(lowerName) || IsCriticalFileName(lowerName) ||
-                IsUiHelperProcess(lowerName)) {
-                continue;
-            }
-
-            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (process == nullptr) {
-                continue;
-            }
-            const std::wstring exePath = ProcessImagePath(process);
-            const uint64_t memory = ProcessMemoryBytes(process);
-            CloseHandle(process);
-            if (exePath.empty()) {
-                continue;
-            }
-            // Prefer ending windowless / background startup helpers. Visible
-            // windows get a graceful WM_CLOSE instead of TerminateProcess.
-            if (ProcessHasVisibleWindow(pid)) {
-                struct CloseList {
-                    DWORD pid = 0;
-                    std::vector<HWND>* windows = nullptr;
-                };
-                std::vector<HWND> windows;
-                CloseList walk{pid, &windows};
-                EnumWindows(
-                    [](HWND window, LPARAM data) -> BOOL {
-                        auto* state = reinterpret_cast<CloseList*>(data);
-                        if (GetWindow(window, GW_OWNER) != nullptr) {
-                            return TRUE;
-                        }
-                        DWORD windowPid = 0;
-                        GetWindowThreadProcessId(window, &windowPid);
-                        if (windowPid == state->pid) {
-                            state->windows->push_back(window);
-                        }
-                        return TRUE;
-                    },
-                    reinterpret_cast<LPARAM>(&walk));
-                for (HWND window : windows) {
-                    if (IsWindow(window) != FALSE) {
-                        PostMessageW(window, WM_CLOSE, 0, 0);
-                    }
-                }
-                result.ended += 1;
-                result.freedBytes += memory;
-                continue;
-            }
-            HANDLE terminable = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-                FALSE, pid);
-            if (terminable == nullptr) {
-                continue;
-            }
-            const BOOL ended = TerminateProcess(terminable, 1);
-            CloseHandle(terminable);
-            if (ended != FALSE) {
-                result.ended += 1;
-                result.freedBytes += memory;
-            }
-        }
-        CloseHandle(snapshot);
+        const BoostStartupResult ended = EndAssociatedProcesses(endExeNames);
+        result.ended = ended.ended;
+        result.freedBytes = ended.freedBytes;
     } catch (...) {
-        // Best-effort: leave whatever progress we made.
     }
     return result;
 }

@@ -25,10 +25,12 @@
 //      near 0.5 (uncertain) never act.
 //   6. Targets are re-validated immediately before closing in case the
 //      foreground or process set changed during the Jev round-trip.
-//   7. Startup-apps boost disables non-essential Run/StartupFolder entries
-//      via StartupApproved (Task Manager style) and ends their associated
-//      processes, while keeping Dock / SecurityHealthSystray / Blip /
-//      Screeni / vgtray enabled and alive.
+//   7. Startup-apps boost enumerates Run/StartupFolder entries, hard-protects
+//      only Dock and Windows SecurityHealthSystray, then asks Jev which
+//      enabled entries are safe to disable. Code applies StartupApproved
+//      disables and ends associated processes for Jev-selected targets.
+//      Without an API key, a soft chat/browser/game-launcher name heuristic
+//      is used (not a personal allow/deny list).
 
 struct BoostProcess {
     DWORD pid = 0;
@@ -46,10 +48,30 @@ struct BoostCloseResult {
     uint64_t freedBytes = 0;
 };
 
+// One Windows startup entry (Run key or Startup folder) eligible for Jev
+// to consider disabling. Registry coordinates stay with the entry so code
+// can apply StartupApproved without re-resolving names.
+struct BoostStartupEntry {
+    std::wstring valueName;
+    std::wstring exePath;
+    std::wstring exeName;
+    bool enabled = true;
+    bool hasRunningProcess = false;
+    bool hasWindow = false;
+    uint64_t memoryBytes = 0;
+    double cpuPercent = 0.0;
+    uint64_t ageSeconds = 0;
+    // Opaque registry coordinates for DisableStartupTargets.
+    HKEY approvedRoot = HKEY_CURRENT_USER;
+    std::wstring approvedPath;
+    REGSAM wowAccess = 0;
+};
+
 struct BoostStartupResult {
     int disabled = 0;
     int ended = 0;
     uint64_t freedBytes = 0;
+    bool skippedNoClassifier = false;
 };
 
 class PerfBoost {
@@ -66,9 +88,21 @@ public:
     [[nodiscard]] static BoostCloseResult CloseTargets(
         const std::vector<BoostProcess>& targets, bool allowTerminateWindowless);
 
-    // Disable non-essential Windows startup apps (StartupApproved) and end
-    // their associated running processes. Essential keeps stay enabled.
-    [[nodiscard]] static BoostStartupResult ApplyStartupAppsBoost();
+    // Currently enabled startup entries that are not hard-protected (Dock /
+    // SecurityHealthSystray). Soft-attaches running-process signals when the
+    // exe is alive so Jev can judge better.
+    [[nodiscard]] static std::vector<BoostStartupEntry> EnumerateStartupCandidates();
+
+    // Soft heuristic when Jev is unavailable: only entries whose value/exe
+    // name looks like chat, browser, or game-launcher software. Not a
+    // personal allowlist.
+    [[nodiscard]] static std::vector<BoostStartupEntry> SelectStartupHeuristic(
+        const std::vector<BoostStartupEntry>& candidates);
+
+    // Apply StartupApproved disable + end associated processes for the
+    // Jev/heuristic-selected entries. UI helpers stay protected.
+    [[nodiscard]] static BoostStartupResult DisableStartupTargets(
+        const std::vector<BoostStartupEntry>& targets);
 
     [[nodiscard]] static bool IsProtectedExecutable(const std::wstring& exePath) noexcept;
     [[nodiscard]] static std::wstring FormatMegabytes(uint64_t bytes);

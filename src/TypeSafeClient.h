@@ -66,4 +66,9 @@ public:
         const std::wstring& request, const std::vector<LaunchCandidate>& candidates);
     [[nodiscard]] static BoostResult ClassifyForBoost(const std::wstring& apiKey,
         const std::vector<BoostCandidate>& candidates);
+    // Same Jev/Noul path as ClassifyForBoost, but questions ask whether each
+    // Windows startup entry is safe to disable for a performance boost.
+    // Reuses BoostCandidate/BoostJudgment: safe=disable-safe, idle=nonessential.
+    [[nodiscard]] static BoostResult ClassifyForStartupBoost(const std::wstring& apiKey,
+        const std::vector<BoostCandidate>& candidates);
 };
