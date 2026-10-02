@@ -4750,83 +4750,79 @@ void DockApp::RunPerformanceBoost() {
         // Guarded: an uncaught throw in a detached thread terminates the dock.
         try {
             const std::vector<BoostProcess> candidates = PerfBoost::EnumerateClosableCandidates();
-        if (candidates.empty()) {
-            postStatus(L"All clear", true);
-            return;
-        }
-
-        std::vector<BoostProcess> selected;
-        bool allowTerminate = false;
-        if (apiKey.empty()) {
-            selected = selectHeuristic(candidates);
-            if (selected.empty()) {
-                postStatus(L"Need API key", true);
+            if (candidates.empty()) {
+                postStatus(L"All clear", true);
                 return;
             }
-        } else {
-            postStatus(std::to_wstring(candidates.size()) + L" apps...", false);
-            std::vector<BoostCandidate> inputs;
-            inputs.reserve(candidates.size());
-            for (size_t index = 0; index < candidates.size(); ++index) {
-                const BoostProcess& candidate = candidates[index];
-                BoostCandidate input;
-                input.id = "p" + std::to_string(index);
-                input.name = candidate.name;
-                input.exePath = candidate.exePath;
-                input.windowTitle = candidate.windowTitle;
-                input.hasWindow = candidate.hasWindow;
-                input.memoryMb = static_cast<double>(candidate.memoryBytes) / 1048576.0;
-                input.cpuPercent = candidate.cpuPercent;
-                input.ageSeconds = candidate.ageSeconds;
-                inputs.push_back(std::move(input));
-            }
-            const BoostResult judged = TypeSafeClient::ClassifyForBoost(apiKey, inputs);
-            if (!judged.ok) {
-                Log(L"Boost judgment failed: " + judged.error);
+
+            std::vector<BoostProcess> selected;
+            bool allowTerminate = false;
+            if (apiKey.empty()) {
                 selected = selectHeuristic(candidates);
                 if (selected.empty()) {
-                    // Full error is in the log above; the tile only fits key info.
-                    postStatus(L"Unavailable", true);
+                    postStatus(L"Need API key", true);
                     return;
                 }
             } else {
-                for (const BoostJudgment& judgment : judged.items) {
-                    if (judgment.safe >= kBoostSafeClose && judgment.idle >= kBoostIdleClose) {
-                        try {
-                            const size_t index =
-                                static_cast<size_t>(std::stoul(judgment.id.substr(1)));
-                            if (index < candidates.size() &&
-                                selected.size() < kBoostMaxCloses) {
-                                selected.push_back(candidates[index]);
+                postStatus(std::to_wstring(candidates.size()) + L" apps...", false);
+                std::vector<BoostCandidate> inputs;
+                inputs.reserve(candidates.size());
+                for (size_t index = 0; index < candidates.size(); ++index) {
+                    const BoostProcess& candidate = candidates[index];
+                    BoostCandidate input;
+                    input.id = "p" + std::to_string(index);
+                    input.name = candidate.name;
+                    input.exePath = candidate.exePath;
+                    input.windowTitle = candidate.windowTitle;
+                    input.hasWindow = candidate.hasWindow;
+                    input.memoryMb = static_cast<double>(candidate.memoryBytes) / 1048576.0;
+                    input.cpuPercent = candidate.cpuPercent;
+                    input.ageSeconds = candidate.ageSeconds;
+                    inputs.push_back(std::move(input));
+                }
+                const BoostResult judged = TypeSafeClient::ClassifyForBoost(apiKey, inputs);
+                if (!judged.ok) {
+                    Log(L"Boost judgment failed: " + judged.error);
+                    selected = selectHeuristic(candidates);
+                    if (selected.empty()) {
+                        postStatus(L"Unavailable", true);
+                        return;
+                    }
+                } else {
+                    for (const BoostJudgment& judgment : judged.items) {
+                        if (judgment.safe >= kBoostSafeClose && judgment.idle >= kBoostIdleClose) {
+                            try {
+                                const size_t index =
+                                    static_cast<size_t>(std::stoul(judgment.id.substr(1)));
+                                if (index < candidates.size() &&
+                                    selected.size() < kBoostMaxCloses) {
+                                    selected.push_back(candidates[index]);
+                                }
+                            } catch (...) {
+                                continue;
                             }
-                        } catch (...) {
-                            continue;
                         }
                     }
-                }
-                Log(L"Boost judgments: " + std::to_wstring(judged.items.size()) +
-                    L" judged, " + std::to_wstring(selected.size()) + L" selected.");
-                allowTerminate = true;
-                if (selected.empty()) {
-                    postStatus(L"All clear", true);
-                    return;
+                    Log(L"Boost judgments: " + std::to_wstring(judged.items.size()) +
+                        L" judged, " + std::to_wstring(selected.size()) + L" selected.");
+                    allowTerminate = true;
+                    if (selected.empty()) {
+                        postStatus(L"All clear", true);
+                        return;
+                    }
                 }
             }
-        }
 
-        postStatus(L"Closing...", false);
-        // Freshness is re-checked inside: the foreground and the process set
-        // may have changed during the Jev round-trip.
-        const BoostCloseResult closed =
-            PerfBoost::CloseTargets(selected, allowTerminate);
-        if (closed.closed <= 0) {
-            postStatus(L"All clear", true);
-            return;
-        }
-        // Full detail goes to the log; the tile only fits the freed total.
-        Log(L"Boost closed " + std::to_wstring(closed.closed) + L", freed " +
-            PerfBoost::FormatMegabytes(closed.freedBytes));
-        postStatus(L"Freed " + PerfBoost::FormatMegabytes(closed.freedBytes), true);
+            postStatus(L"Closing...", false);
+            const BoostCloseResult closed =
+                PerfBoost::CloseTargets(selected, allowTerminate);
+            if (closed.closed <= 0) {
+                postStatus(L"All clear", true);
+                return;
+            }
+            Log(L"Boost closed " + std::to_wstring(closed.closed) + L", freed " +
+                PerfBoost::FormatMegabytes(closed.freedBytes));
+            postStatus(L"Freed " + PerfBoost::FormatMegabytes(closed.freedBytes), true);
         } catch (...) {
             postStatus(L"Unavailable", true);
         }

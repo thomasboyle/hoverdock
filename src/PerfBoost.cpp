@@ -72,6 +72,28 @@ bool IsCriticalFileName(const std::wstring& lowerName) {
     return false;
 }
 
+bool IsUiHelperProcess(const std::wstring& lowerName) {
+    static const wchar_t* const kHelperSubstrings[] = {
+        L"webhelper", L"crashpad", L"crashhandler", L"crashreporter",
+        L"gpu-process", L"renderer", L"utility", L"plugin-container",
+        L"sandbox", L"subprocess", L"subproc",
+    };
+    for (const wchar_t* substring : kHelperSubstrings) {
+        if (lowerName.find(substring) != std::wstring::npos) {
+            return true;
+        }
+    }
+    static const wchar_t* const kHelperSuffixes[] = {
+        L" helper", L" helper.exe", L"helper.exe",
+    };
+    for (const wchar_t* suffix : kHelperSuffixes) {
+        if (lowerName.ends_with(suffix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 DWORD ForegroundProcessId() {
     const HWND foreground = GetForegroundWindow();
     DWORD pid = 0;
@@ -195,7 +217,11 @@ bool PerfBoost::IsProtectedExecutable(const std::wstring& exePath) noexcept {
             return true;
         }
         const std::wstring lower = ToLower(exePath);
-        if (IsCriticalFileName(FileNameOf(lower))) {
+        const std::wstring lowerName = FileNameOf(lower);
+        if (IsCriticalFileName(lowerName)) {
+            return true;
+        }
+        if (IsUiHelperProcess(lowerName)) {
             return true;
         }
         static const std::wstring systemRoot = SystemRootDirectory();
