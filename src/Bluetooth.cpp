@@ -1,7 +1,8 @@
-#include <winsock2.h>
+﻿#include <winsock2.h>
 #include <ws2bth.h>
 
 #include "Bluetooth.h"
+#include "Profile.h"
 
 #include <winioctl.h>
 #include <bluetoothapis.h>
@@ -211,20 +212,28 @@ uint64_t AddressFromTaggedId(const std::wstring& text) {
 }
 
 bool LooksLikeAddress(const std::wstring& name) {
-    if (name.size() != 17) {
+    if (name.size() != 17 || name[2] != L':' || name[5] != L':' || name[8] != L':' ||
+        name[11] != L':' || name[14] != L':') {
         return false;
     }
-    return ParseBluetoothAddress(name) != 0 && name.find(L':') != std::wstring::npos;
+    return ParseBluetoothAddress(name) != 0;
 }
 
 bool ContainsInsensitive(const std::wstring& text, const wchar_t* needle) {
-    if (needle == nullptr || needle[0] == L'\0') {
+    if (needle == nullptr || needle[0] == L'\0' || text.empty()) {
         return false;
     }
-    return std::search(text.begin(), text.end(), needle, needle + wcslen(needle),
-               [](wchar_t left, wchar_t right) {
-                   return towlower(left) == towlower(right);
-               }) != text.end();
+    const size_t needleLength = wcslen(needle);
+    if (needleLength > text.size()) {
+        return false;
+    }
+    const size_t last = text.size() - needleLength;
+    for (size_t start = 0; start <= last; ++start) {
+        if (_wcsnicmp(text.c_str() + start, needle, needleLength) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool IsProfileName(const std::wstring& name) {
@@ -242,7 +251,7 @@ std::wstring StripProfileSuffix(std::wstring name) {
             if (name.size() <= length) {
                 continue;
             }
-            if (ContainsInsensitive(name.substr(name.size() - length), suffix)) {
+            if (_wcsnicmp(name.c_str() + (name.size() - length), suffix, length) == 0) {
                 name.resize(name.size() - length);
                 stripped = true;
             }
@@ -445,6 +454,7 @@ bool AnyRadioConnected(uint64_t address) {
 }
 
 bool WaitForLink(uint64_t address, DWORD timeoutMs, const std::atomic<bool>& running, bool wantConnected) {
+    ProfileScope profileScope("Bluetooth::WaitForLink");
     const ULONGLONG deadline = GetTickCount64() + timeoutMs;
     for (;;) {
         if (AnyRadioConnected(address) == wantConnected) {
@@ -537,6 +547,7 @@ bool RememberedClassic(uint64_t address) {
 }
 
 bool PageAudio(uint64_t address) {
+    ProfileScope profileScope("Bluetooth::PageAudio");
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         return false;
@@ -587,6 +598,7 @@ bool PageAudio(uint64_t address) {
 }
 
 bool ConnectClassic(uint64_t address, const std::atomic<bool>& running) {
+    ProfileScope profileScope("Bluetooth::ConnectClassic");
     if (address == 0 || !running.load()) {
         return false;
     }
@@ -637,31 +649,28 @@ bool ConnectClassic(uint64_t address, const std::atomic<bool>& running) {
 }
 
 bool DisconnectClassic(uint64_t address, const std::atomic<bool>& running) {
+    ProfileScope profileScope("Bluetooth::DisconnectClassic");
     if (address == 0) {
         return false;
     }
     // Issue the radio disconnect IOCTL first so the link drops immediately,
-    // then disable profiles. Avoid long WaitForLink polls that made Disconnect
-    // feel stuck for multiple seconds.
+    // then disable profiles on the same radio pass. Avoid long WaitForLink
+    // polls that made Disconnect feel stuck for multiple seconds.
     ForEachRadio([&](HANDLE radio) {
         DWORD returned = 0;
         DeviceIoControl(radio, kDisconnectIoctl, &address, sizeof(address), nullptr, 0, &returned,
             nullptr);
-        return false;
-    });
-    ForEachRadio([&](HANDLE radio) {
         BLUETOOTH_DEVICE_INFO info{};
-        if (!LoadDeviceInfo(radio, address, info)) {
-            return false;
+        if (LoadDeviceInfo(radio, address, info)) {
+            DisableProfiles(radio, info);
         }
-        DisableProfiles(radio, info);
-        return !RadioConnected(radio, address);
+        return false; // IOCTL + disable on every radio (same coverage as prior two passes)
     });
     if (!running.load()) {
         return !AnyRadioConnected(address);
     }
     // Brief confirmation only. If the stack is still settling, treat the force
-    // attempt as success — Windows finishes the drop asynchronously.
+    // attempt as success â€” Windows finishes the drop asynchronously.
     if (WaitForLink(address, 700, running, false)) {
         return true;
     }
@@ -726,6 +735,7 @@ struct BluetoothService::Impl {
     bool radioOn = false;
     bool discovering = false;
     bool enumerationCompleted = false;
+    ULONGLONG lastRadioRefreshMs = 0;
     std::wstring hint;
     std::wstring busyId;
     std::wstring busyText;
@@ -901,6 +911,7 @@ struct BluetoothService::Impl {
     }
 
     void Publish() {
+    ProfileScope profileScope("Bluetooth::Publish");
         BluetoothSnapshot next;
         next.ready = ready;
         next.radioPresent = radioPresent;
@@ -1016,14 +1027,39 @@ struct BluetoothService::Impl {
         return accessAllowed;
     }
 
-    void RefreshRadio() {
-        radioPresent = false;
-        radioOn = false;
-        radios.clear();
+    void RefreshRadio(bool force = false) {
+    ProfileScope profileScope("Bluetooth::RefreshRadio");
         if (!EnsureAccess()) {
+            radioPresent = false;
+            radioOn = false;
+            radios.clear();
             hint = L"Bluetooth access was denied";
             return;
         }
+        // Soft path: poll cached IRadio::get_State when a full GetRadiosAsync
+        // ran recently. Avoids ~20-30ms WinRT enum on every 4s QS timer tick.
+        constexpr ULONGLONG kRadioCacheMs = 3000;
+        const ULONGLONG now = GetTickCount64();
+        if (!force && !radios.empty() && lastRadioRefreshMs != 0 &&
+            now - lastRadioRefreshMs < kRadioCacheMs) {
+            radioPresent = true;
+            radioOn = false;
+            for (const ComPtr<ABI::Windows::Devices::Radios::IRadio>& radio : radios) {
+                if (radio == nullptr) {
+                    continue;
+                }
+                ABI::Windows::Devices::Radios::RadioState state =
+                    ABI::Windows::Devices::Radios::RadioState_Unknown;
+                if (SUCCEEDED(radio->get_State(&state)) &&
+                    state == ABI::Windows::Devices::Radios::RadioState_On) {
+                    radioOn = true;
+                }
+            }
+            return;
+        }
+        radioPresent = false;
+        radioOn = false;
+        radios.clear();
         ComPtr<ABI::Windows::Devices::Radios::IRadioStatics> statics;
         Microsoft::WRL::Wrappers::HStringReference className(
             RuntimeClass_Windows_Devices_Radios_Radio);
@@ -1062,6 +1098,7 @@ struct BluetoothService::Impl {
             }
             radios.push_back(std::move(radio));
         }
+        lastRadioRefreshMs = GetTickCount64();
         if (radioOn && hint == L"Bluetooth access was denied") {
             hint.clear();
         }
@@ -1069,7 +1106,7 @@ struct BluetoothService::Impl {
 
     bool SetRadioState(bool enabled) {
         if (radios.empty()) {
-            RefreshRadio();
+            RefreshRadio(true);
         }
         bool changed = false;
         const ABI::Windows::Devices::Radios::RadioState target = enabled
@@ -1090,7 +1127,7 @@ struct BluetoothService::Impl {
                 changed = true;
             }
         }
-        RefreshRadio();
+        RefreshRadio(true);
         return changed || radioOn == enabled;
     }
 
@@ -1330,91 +1367,8 @@ struct BluetoothService::Impl {
         }
     }
 
-    void ApplyClassicConnection(RadioDevice& device) {
-        ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothDeviceStatics> statics;
-        Microsoft::WRL::Wrappers::HStringReference className(
-            RuntimeClass_Windows_Devices_Bluetooth_BluetoothDevice);
-        if (FAILED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics))) || statics == nullptr) {
-            return;
-        }
-        ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothDevice> bt;
-        if (device.address != 0) {
-            ComPtr<ClassicDeviceAsync> operation;
-            if (SUCCEEDED(statics->FromBluetoothAddressAsync(device.address, operation.GetAddressOf())) &&
-                operation != nullptr) {
-                WaitResult(operation.Get(), bt.GetAddressOf(), kStatusTimeoutMs);
-            }
-        }
-        if (bt == nullptr && !device.id.empty()) {
-            Microsoft::WRL::Wrappers::HStringReference id(device.id.c_str());
-            ComPtr<ClassicDeviceAsync> operation;
-            if (FAILED(statics->FromIdAsync(id.Get(), operation.GetAddressOf())) || operation == nullptr) {
-                return;
-            }
-            if (FAILED(WaitResult(operation.Get(), bt.GetAddressOf(), kStatusTimeoutMs)) || bt == nullptr) {
-                return;
-            }
-        }
-        if (bt == nullptr) {
-            return;
-        }
-        ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus status =
-            ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Disconnected;
-        if (SUCCEEDED(bt->get_ConnectionStatus(&status))) {
-            device.connected =
-                status == ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Connected;
-        }
-        if (device.address == 0) {
-            UINT64 address = 0;
-            if (SUCCEEDED(bt->get_BluetoothAddress(&address))) {
-                device.address = address;
-            }
-        }
-    }
-
-    void ApplyLeConnection(RadioDevice& device) {
-        ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothLEDeviceStatics> statics;
-        Microsoft::WRL::Wrappers::HStringReference className(
-            RuntimeClass_Windows_Devices_Bluetooth_BluetoothLEDevice);
-        if (FAILED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics))) || statics == nullptr) {
-            return;
-        }
-        ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothLEDevice> bt;
-        if (device.address != 0) {
-            ComPtr<LeDeviceAsync> operation;
-            if (SUCCEEDED(statics->FromBluetoothAddressAsync(device.address, operation.GetAddressOf())) &&
-                operation != nullptr) {
-                WaitResult(operation.Get(), bt.GetAddressOf(), kStatusTimeoutMs);
-            }
-        }
-        if (bt == nullptr && !device.id.empty()) {
-            Microsoft::WRL::Wrappers::HStringReference id(device.id.c_str());
-            ComPtr<LeDeviceAsync> operation;
-            if (FAILED(statics->FromIdAsync(id.Get(), operation.GetAddressOf())) || operation == nullptr) {
-                return;
-            }
-            if (FAILED(WaitResult(operation.Get(), bt.GetAddressOf(), kStatusTimeoutMs)) || bt == nullptr) {
-                return;
-            }
-        }
-        if (bt == nullptr) {
-            return;
-        }
-        ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus status =
-            ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Disconnected;
-        if (SUCCEEDED(bt->get_ConnectionStatus(&status))) {
-            device.connected =
-                status == ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Connected;
-        }
-        if (device.address == 0) {
-            UINT64 address = 0;
-            if (SUCCEEDED(bt->get_BluetoothAddress(&address))) {
-                device.address = address;
-            }
-        }
-    }
-
     bool CollectPaired(bool lowEnergy, std::vector<RadioDevice>& dest) {
+    ProfileScope profileScope("Bluetooth::CollectPaired");
         HSTRING selector = nullptr;
         if (lowEnergy) {
             ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothLEDeviceStatics2> statics;
@@ -1473,21 +1427,52 @@ struct BluetoothService::Impl {
             device.lowEnergy = lowEnergy || device.lowEnergy;
             device.canPair = false;
             device.name = StripProfileSuffix(std::move(device.name));
-            if (lowEnergy) {
-                ApplyLeConnection(device);
-            } else {
-                ApplyClassicConnection(device);
-            }
+            // Trust AEP IsConnected from DeviceFromInformation. Per-device
+            // FromBluetoothAddressAsync (ApplyClassic/LeConnection) dominated
+            // RefreshPaired wall time and is not needed for list correctness.
             Upsert(dest, std::move(device));
         }
         return true;
     }
 
+    // One radio enumeration updates classic fConnected for all remembered addresses.
+    // Preserves connect/disconnect UI accuracy without N WinRT Async round-trips.
+    void ReconcileClassicLinks(std::vector<RadioDevice>& devices) {
+        bool anyClassic = false;
+        for (const RadioDevice& device : devices) {
+            if (device.address != 0 && !device.lowEnergy) {
+                anyClassic = true;
+                break;
+            }
+        }
+        if (!anyClassic) {
+            return;
+        }
+        for (RadioDevice& device : devices) {
+            if (device.address != 0 && !device.lowEnergy) {
+                device.connected = false;
+            }
+        }
+        ForEachRadio([&](HANDLE radio) {
+            for (RadioDevice& device : devices) {
+                if (device.address == 0 || device.lowEnergy) {
+                    continue;
+                }
+                if (RadioConnected(radio, device.address)) {
+                    device.connected = true;
+                }
+            }
+            return false; // visit every radio
+        });
+    }
+
     void RefreshPaired() {
+    ProfileScope profileScope("Bluetooth::RefreshPaired");
         std::vector<RadioDevice> next;
         const bool classicOk = CollectPaired(false, next);
         const bool leOk = CollectPaired(true, next);
         if (classicOk || leOk) {
+            ReconcileClassicLinks(next);
             paired = std::move(next);
         }
     }
@@ -1618,7 +1603,7 @@ struct BluetoothService::Impl {
             return false;
         }
         ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothLEDevice> device;
-        // Keep LE connect bounded — a 20s GATT wait made classic-fallback
+        // Keep LE connect bounded â€” a 20s GATT wait made classic-fallback
         // attempts feel like Connect did nothing.
         constexpr DWORD kLeConnectTimeoutMs = 5000;
         if (FAILED(WaitResult(operation.Get(), device.GetAddressOf(), kLeConnectTimeoutMs)) ||
@@ -1664,7 +1649,8 @@ struct BluetoothService::Impl {
 
     void Handle(const Job& job) {
         switch (job.kind) {
-        case JobKind::Refresh:
+        case JobKind::Refresh: {
+            ProfileScope profileScope("Bluetooth::HandleRefresh");
             RefreshRadio();
             if (!discovering && !pairing.load()) {
                 RefreshPaired();
@@ -1672,6 +1658,7 @@ struct BluetoothService::Impl {
             ready = true;
             Publish();
             break;
+        }
         case JobKind::SetRadio:
             if (!job.enableRadio) {
                 StopWatcher();
@@ -1729,7 +1716,7 @@ struct BluetoothService::Impl {
                 RememberError(job.id, connect ? L"Couldn't connect" : L"Couldn't disconnect", false);
             }
             Publish();
-            // Reconcile with the radio shortly after — do not block this job.
+            // Reconcile with the radio shortly after â€” do not block this job.
             if (ok && running.load()) {
                 Enqueue(Job{JobKind::Refresh, false, {}});
             }
