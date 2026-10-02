@@ -25,6 +25,10 @@
 //      near 0.5 (uncertain) never act.
 //   6. Targets are re-validated immediately before closing in case the
 //      foreground or process set changed during the Jev round-trip.
+//   7. Startup-apps boost disables non-essential Run/StartupFolder entries
+//      via StartupApproved (Task Manager style) and ends their associated
+//      processes, while keeping Dock / SecurityHealthSystray / Blip /
+//      Screeni / vgtray enabled and alive.
 
 struct BoostProcess {
     DWORD pid = 0;
@@ -42,6 +46,12 @@ struct BoostCloseResult {
     uint64_t freedBytes = 0;
 };
 
+struct BoostStartupResult {
+    int disabled = 0;
+    int ended = 0;
+    uint64_t freedBytes = 0;
+};
+
 class PerfBoost {
 public:
     // Snapshot of closable-in-principle processes: non-critical, same user
@@ -55,6 +65,10 @@ public:
     // fallback passes false and only ever closes windows gracefully.
     [[nodiscard]] static BoostCloseResult CloseTargets(
         const std::vector<BoostProcess>& targets, bool allowTerminateWindowless);
+
+    // Disable non-essential Windows startup apps (StartupApproved) and end
+    // their associated running processes. Essential keeps stay enabled.
+    [[nodiscard]] static BoostStartupResult ApplyStartupAppsBoost();
 
     [[nodiscard]] static bool IsProtectedExecutable(const std::wstring& exePath) noexcept;
     [[nodiscard]] static std::wstring FormatMegabytes(uint64_t bytes);

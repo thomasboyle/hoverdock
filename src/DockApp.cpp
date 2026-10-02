@@ -4749,9 +4749,23 @@ void DockApp::RunPerformanceBoost() {
         // Profiling (enumeration + CPU sample) runs here, off the UI thread.
         // Guarded: an uncaught throw in a detached thread terminates the dock.
         try {
+            postStatus(L"Startup apps...", false);
+            const BoostStartupResult startup = PerfBoost::ApplyStartupAppsBoost();
+            if (startup.disabled > 0 || startup.ended > 0) {
+                Log(L"Boost startup: disabled " + std::to_wstring(startup.disabled) +
+                    L", ended " + std::to_wstring(startup.ended) + L", freed " +
+                    PerfBoost::FormatMegabytes(startup.freedBytes));
+            }
+
             const std::vector<BoostProcess> candidates = PerfBoost::EnumerateClosableCandidates();
             if (candidates.empty()) {
-                postStatus(L"All clear", true);
+                if (startup.ended > 0) {
+                    postStatus(L"Freed " + PerfBoost::FormatMegabytes(startup.freedBytes), true);
+                } else if (startup.disabled > 0) {
+                    postStatus(L"Startup cleared", true);
+                } else {
+                    postStatus(L"All clear", true);
+                }
                 return;
             }
 
@@ -4816,13 +4830,19 @@ void DockApp::RunPerformanceBoost() {
             postStatus(L"Closing...", false);
             const BoostCloseResult closed =
                 PerfBoost::CloseTargets(selected, allowTerminate);
-            if (closed.closed <= 0) {
-                postStatus(L"All clear", true);
+            const uint64_t freedTotal = closed.freedBytes + startup.freedBytes;
+            if (closed.closed <= 0 && startup.ended <= 0) {
+                if (startup.disabled > 0) {
+                    postStatus(L"Startup cleared", true);
+                } else {
+                    postStatus(L"All clear", true);
+                }
                 return;
             }
-            Log(L"Boost closed " + std::to_wstring(closed.closed) + L", freed " +
-                PerfBoost::FormatMegabytes(closed.freedBytes));
-            postStatus(L"Freed " + PerfBoost::FormatMegabytes(closed.freedBytes), true);
+            Log(L"Boost closed " + std::to_wstring(closed.closed) + L", ended startup " +
+                std::to_wstring(startup.ended) + L", freed " +
+                PerfBoost::FormatMegabytes(freedTotal));
+            postStatus(L"Freed " + PerfBoost::FormatMegabytes(freedTotal), true);
         } catch (...) {
             postStatus(L"Unavailable", true);
         }
