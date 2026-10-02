@@ -16,11 +16,14 @@
 //   1. Enumeration skips PID 0/4, the dock itself, session-0 services,
 //      anything under %SystemRoot%, and a denylist of critical executables.
 //   2. The foreground process is never a candidate.
-//   3. Windowless processes that share their executable with a windowed
+//   3. UI helper processes (webhelper, crashpad, renderer, etc.) are
+//      filtered out to avoid closing app infrastructure like Steam Client
+//      WebHelper or browser helper processes.
+//   4. Windowless processes that share their executable with a windowed
 //      process (helpers, renderers) are never terminated.
-//   4. Jev judgments gate every close behind high thresholds; Noul values
+//   5. Jev judgments gate every close behind high thresholds; Noul values
 //      near 0.5 (uncertain) never act.
-//   5. Targets are re-validated immediately before closing in case the
+//   6. Targets are re-validated immediately before closing in case the
 //      foreground or process set changed during the Jev round-trip.
 
 struct BoostProcess {
