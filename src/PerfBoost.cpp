@@ -177,16 +177,18 @@ BOOL CALLBACK CollectTopWindows(HWND window, LPARAM data) {
     }
     auto& bucket = (*walk->buckets)[pid];
     bucket.hasWindow = true;
-    const int length = GetWindowTextLengthW(window);
-    if (length <= 0 || length > 512) {
+    // Never use GetWindowTextW / GetWindowTextLengthW: both send WM_GETTEXT
+    // cross-process and can block forever on a hung UI thread, which froze
+    // Boost on "Startup apps..." after startup Jev had already returned.
+    wchar_t titleBuf[513]{};
+    DWORD_PTR sent = 0;
+    if (SendMessageTimeoutW(window, WM_GETTEXT, static_cast<WPARAM>(std::size(titleBuf)),
+            reinterpret_cast<LPARAM>(titleBuf), SMTO_ABORTIFHUNG | SMTO_BLOCK, 50,
+            &sent) == 0 ||
+        sent == 0 || titleBuf[0] == 0) {
         return TRUE;
     }
-    std::wstring title(static_cast<size_t>(length) + 1U, L'\0');
-    const int copied = GetWindowTextW(window, title.data(), length + 1);
-    if (copied <= 0) {
-        return TRUE;
-    }
-    title.resize(static_cast<size_t>(copied));
+    const std::wstring title = titleBuf;
     if (bucket.anyTitle.empty()) {
         bucket.anyTitle = title;
     }

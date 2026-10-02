@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -28,10 +30,12 @@
 #include <cstring>
 #include <cwctype>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -4723,13 +4727,59 @@ void DockApp::RunPerformanceBoost() {
     const std::wstring apiKey = m_config.TypeSafeApiKey();
     const HWND replyWindow = m_window;
     std::thread([this, apiKey, replyWindow]() {
-        auto postStatus = [replyWindow](std::wstring status, bool finished) {
+        auto completed = std::make_shared<std::atomic<bool>>(false);
+        auto postStatus = [this, replyWindow, completed](std::wstring status, bool finished) {
+            if (finished) {
+                completed->store(true);
+            }
             auto* reply = new BoostReply{std::move(status), finished};
             if (replyWindow == nullptr ||
                 PostMessageW(replyWindow, kBoostResultMessage, 0,
                     reinterpret_cast<LPARAM>(reply)) == FALSE) {
                 delete reply;
+                // PostMessage failed: ApplyBoostResult will never clear the latch.
+                if (finished) {
+                    m_boostInFlight.store(false);
+                }
             }
+        };
+        // If the worker returns/throws without a finished postStatus, recover UI.
+        struct EnsureBoostFinished {
+            std::function<void(std::wstring, bool)> post;
+            std::shared_ptr<std::atomic<bool>> completed;
+            ~EnsureBoostFinished() {
+                if (completed && !completed->load()) {
+                    try {
+                        post(L"Unavailable", true);
+                    } catch (...) {
+                    }
+                }
+            }
+        } ensureFinished{postStatus, completed};
+
+        const auto waitForJudgment = [](std::chrono::milliseconds budget,
+                                          auto&& work) -> BoostResult {
+            auto state = std::make_shared<std::pair<std::mutex, BoostResult>>();
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            std::thread([state, done, work = std::forward<decltype(work)>(work)]() mutable {
+                BoostResult result = work();
+                {
+                    std::lock_guard<std::mutex> lock(state->first);
+                    state->second = std::move(result);
+                }
+                done->store(true);
+            }).detach();
+            const auto deadline = std::chrono::steady_clock::now() + budget;
+            while (!done->load()) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    BoostResult timedOut;
+                    timedOut.error = L"TypeSafe classification timed out.";
+                    return timedOut;
+                }
+                Sleep(50);
+            }
+            std::lock_guard<std::mutex> lock(state->first);
+            return state->second;
         };
 
         const auto selectHeuristic = [](const std::vector<BoostProcess>& candidates) {
@@ -4782,8 +4832,14 @@ void DockApp::RunPerformanceBoost() {
                             : entry.ageSeconds;
                         startupInputs.push_back(std::move(input));
                     }
-                    const BoostResult startupJudged =
-                        TypeSafeClient::ClassifyForStartupBoost(apiKey, startupInputs);
+                    // Hard budget so a hung/slow api.typesafe.ai cannot leave
+                    // the UI on "Startup apps..." forever (WinHTTP alone is not
+                    // enough when the server keeps the socket alive).
+                    const BoostResult startupJudged = waitForJudgment(
+                        std::chrono::seconds(12), [&]() {
+                            return TypeSafeClient::ClassifyForStartupBoost(
+                                apiKey, startupInputs);
+                        });
                     if (!startupJudged.ok) {
                         Log(L"Boost startup judgment failed: " + startupJudged.error);
                         startupSelected = PerfBoost::SelectStartupHeuristic(startupCandidates);
@@ -4815,6 +4871,9 @@ void DockApp::RunPerformanceBoost() {
                 }
             }
 
+            // Leave "Startup apps..." as soon as startup work finishes so a
+            // slow process snapshot cannot look like a startup hang.
+            postStatus(L"Profiling...", false);
             const std::vector<BoostProcess> candidates = PerfBoost::EnumerateClosableCandidates();
             if (candidates.empty()) {
                 if (startup.ended > 0) {
@@ -4861,7 +4920,9 @@ void DockApp::RunPerformanceBoost() {
                     input.ageSeconds = candidate.ageSeconds;
                     inputs.push_back(std::move(input));
                 }
-                const BoostResult judged = TypeSafeClient::ClassifyForBoost(apiKey, inputs);
+                const BoostResult judged = waitForJudgment(std::chrono::seconds(20), [&]() {
+                    return TypeSafeClient::ClassifyForBoost(apiKey, inputs);
+                });
                 if (!judged.ok) {
                     Log(L"Boost judgment failed: " + judged.error);
                     selected = selectHeuristic(candidates);
