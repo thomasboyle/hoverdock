@@ -5,7 +5,6 @@
 
 #include <winioctl.h>
 #include <bluetoothapis.h>
-#include <cfgmgr32.h>
 #include <roapi.h>
 
 #pragma warning(push)
@@ -497,13 +496,10 @@ bool UsesAudio(HANDLE radio, const BLUETOOTH_DEVICE_INFO& info) {
     return false;
 }
 
-void DisableVoice(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
-    SetService(radio, info, 0x111E, BLUETOOTH_SERVICE_DISABLE);
-    SetService(radio, info, 0x1108, BLUETOOTH_SERVICE_DISABLE);
-}
-
 void EnableAudio(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
-    DisableVoice(radio, info);
+    // Enable A2DP/AVRCP only. Do not DisableVoice/HFP here: flipping SCO
+    // profiles forces Windows to rebuild the audio graph and can glitch
+    // browser WASAPI playback even when the user is mid-video.
     SetService(radio, info, 0x110B, BLUETOOTH_SERVICE_ENABLE);
     SetService(radio, info, 0x110E, BLUETOOTH_SERVICE_ENABLE);
 }
@@ -561,7 +557,7 @@ bool PageAudio(uint64_t address) {
         } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
             const WSAEVENT ready = WSACreateEvent();
             if (ready != WSA_INVALID_EVENT && WSAEventSelect(sock, ready, FD_CONNECT) == 0) {
-                const DWORD waited = WSAWaitForMultipleEvents(1, &ready, FALSE, 6000, FALSE);
+                const DWORD waited = WSAWaitForMultipleEvents(1, &ready, FALSE, 3000, FALSE);
                 WSANETWORKEVENTS network{};
                 if (waited == WSA_WAIT_EVENT_0 &&
                     WSAEnumNetworkEvents(sock, ready, &network) == 0 &&
@@ -590,43 +586,13 @@ bool PageAudio(uint64_t address) {
     return paged;
 }
 
-bool RestartPairedDevnode(uint64_t address) {
-    BLUETOOTH_ADDRESS value{};
-    value.ullLong = address;
-    wchar_t token[13]{};
-    swprintf_s(token, L"%02X%02X%02X%02X%02X%02X", value.rgBytes[5], value.rgBytes[4], value.rgBytes[3],
-        value.rgBytes[2], value.rgBytes[1], value.rgBytes[0]);
-    ULONG length = 0;
-    if (CM_Get_Device_ID_List_SizeW(&length, L"BTHENUM", CM_GETIDLIST_FILTER_ENUMERATOR) != CR_SUCCESS ||
-        length < 2) {
-        return false;
-    }
-    std::vector<wchar_t> ids(length);
-    if (CM_Get_Device_ID_ListW(L"BTHENUM", ids.data(), length, CM_GETIDLIST_FILTER_ENUMERATOR) != CR_SUCCESS) {
-        return false;
-    }
-    bool restarted = false;
-    for (wchar_t* id = ids.data(); id != nullptr && *id != L'\0'; id += wcslen(id) + 1) {
-        if (!ContainsInsensitive(id, token) || !ContainsInsensitive(id, L"BLUETOOTHDEVICE_")) {
-            continue;
-        }
-        DEVINST node = 0;
-        if (CM_Locate_DevNodeW(&node, id, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) {
-            continue;
-        }
-        CM_Disable_DevNode(node, CM_DISABLE_UI_NOT_OK | CM_DISABLE_POLITE);
-        Sleep(300);
-        if (CM_Enable_DevNode(node, 0) == CR_SUCCESS) {
-            restarted = true;
-        }
-    }
-    return restarted;
-}
-
 bool ConnectClassic(uint64_t address, const std::atomic<bool>& running) {
     if (address == 0 || !running.load()) {
         return false;
     }
+    // Fast path: enable the right profiles once. Never CM_Disable Bluetooth
+    // device nodes - that tears down audio endpoints and breaks browser
+    // WASAPI render while a video is playing.
     bool audio = false;
     const auto applyProfile = [&](HANDLE radio) {
         BLUETOOTH_DEVICE_INFO info{};
@@ -641,32 +607,48 @@ bool ConnectClassic(uint64_t address, const std::atomic<bool>& running) {
         }
         return RadioConnected(radio, address);
     };
-    ForEachRadio(applyProfile);
-    if (!WaitForLink(address, 2500, running, true) && running.load() && audio) {
+    if (ForEachRadio(applyProfile) || AnyRadioConnected(address)) {
+        return true;
+    }
+    if (!running.load()) {
+        return false;
+    }
+    // Audio devices often need an L2CAP page to bring the ACL up; keep it brief.
+    if (audio) {
         PageAudio(address);
+        if (!running.load()) {
+            return false;
+        }
         ForEachRadio(applyProfile);
-    }
-    if (!WaitForLink(address, 4000, running, true) && running.load() && RestartPairedDevnode(address)) {
-        WaitForLink(address, 5000, running, true);
-    }
-    if (audio && running.load()) {
-        ForEachRadio([&](HANDLE radio) {
-            BLUETOOTH_DEVICE_INFO info{};
-            if (!LoadDeviceInfo(radio, address, info)) {
-                return false;
-            }
-            EnableAudio(radio, info);
+        if (AnyRadioConnected(address)) {
             return true;
-        });
-        return WaitForLink(address, 3000, running, true);
+        }
     }
-    return AnyRadioConnected(address);
+    // One short confirmation wait, then a single profile re-nudge. Total budget
+    // stays well under the old multi-stage ~15s path so Connect feels responsive.
+    if (WaitForLink(address, 3500, running, true)) {
+        return true;
+    }
+    if (!running.load()) {
+        return false;
+    }
+    ForEachRadio(applyProfile);
+    return WaitForLink(address, 2000, running, true) || AnyRadioConnected(address);
 }
 
 bool DisconnectClassic(uint64_t address, const std::atomic<bool>& running) {
     if (address == 0) {
         return false;
     }
+    // Issue the radio disconnect IOCTL first so the link drops immediately,
+    // then disable profiles. Avoid long WaitForLink polls that made Disconnect
+    // feel stuck for multiple seconds.
+    ForEachRadio([&](HANDLE radio) {
+        DWORD returned = 0;
+        DeviceIoControl(radio, kDisconnectIoctl, &address, sizeof(address), nullptr, 0, &returned,
+            nullptr);
+        return false;
+    });
     ForEachRadio([&](HANDLE radio) {
         BLUETOOTH_DEVICE_INFO info{};
         if (!LoadDeviceInfo(radio, address, info)) {
@@ -675,15 +657,15 @@ bool DisconnectClassic(uint64_t address, const std::atomic<bool>& running) {
         DisableProfiles(radio, info);
         return !RadioConnected(radio, address);
     });
-    if (WaitForLink(address, 2500, running, false)) {
+    if (!running.load()) {
+        return !AnyRadioConnected(address);
+    }
+    // Brief confirmation only. If the stack is still settling, treat the force
+    // attempt as success — Windows finishes the drop asynchronously.
+    if (WaitForLink(address, 700, running, false)) {
         return true;
     }
-    const bool forced = ForEachRadio([&](HANDLE radio) {
-        DWORD returned = 0;
-        return DeviceIoControl(radio, kDisconnectIoctl, &address, sizeof(address), nullptr, 0, &returned,
-                   nullptr) != FALSE;
-    });
-    return forced && WaitForLink(address, 2500, running, false);
+    return !AnyRadioConnected(address);
 }
 
 const wchar_t* PairFailureText(
@@ -1636,7 +1618,10 @@ struct BluetoothService::Impl {
             return false;
         }
         ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothLEDevice> device;
-        if (FAILED(WaitResult(operation.Get(), device.GetAddressOf(), kOpTimeoutMs)) ||
+        // Keep LE connect bounded — a 20s GATT wait made classic-fallback
+        // attempts feel like Connect did nothing.
+        constexpr DWORD kLeConnectTimeoutMs = 5000;
+        if (FAILED(WaitResult(operation.Get(), device.GetAddressOf(), kLeConnectTimeoutMs)) ||
             device == nullptr) {
             return false;
         }
@@ -1646,10 +1631,10 @@ struct BluetoothService::Impl {
         }
         ComPtr<GattAsync> services;
         if (FAILED(gatt->GetGattServicesWithCacheModeAsync(
-                ABI::Windows::Devices::Bluetooth::BluetoothCacheMode_Uncached, &services))) {
+                ABI::Windows::Devices::Bluetooth::BluetoothCacheMode_Cached, &services))) {
             return false;
         }
-        return SUCCEEDED(WaitDone(services.Get(), kOpTimeoutMs));
+        return SUCCEEDED(WaitDone(services.Get(), kLeConnectTimeoutMs));
     }
 
     bool ConnectDevice(const RadioDevice& device) {
@@ -1718,7 +1703,15 @@ struct BluetoothService::Impl {
             busyText = connect ? L"Connecting..." : L"Disconnecting...";
             errorId.clear();
             Publish();
-            const bool ok = connect ? ConnectDevice(copy) : DisconnectClassic(copy.address, running);
+            uint64_t address = copy.address;
+            if (address == 0) {
+                address = AddressFromTaggedId(copy.id);
+            }
+            if (address == 0) {
+                address = ParseBluetoothAddress(copy.id);
+            }
+            const bool ok =
+                connect ? ConnectDevice(copy) : DisconnectClassic(address, running);
             busyId.clear();
             busyText.clear();
             if (RadioDevice* current = FindMutable(job.id); current != nullptr) {
@@ -1736,6 +1729,10 @@ struct BluetoothService::Impl {
                 RememberError(job.id, connect ? L"Couldn't connect" : L"Couldn't disconnect", false);
             }
             Publish();
+            // Reconcile with the radio shortly after — do not block this job.
+            if (ok && running.load()) {
+                Enqueue(Job{JobKind::Refresh, false, {}});
+            }
             break;
         }
         case JobKind::StartDiscovery:
