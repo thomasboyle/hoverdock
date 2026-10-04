@@ -689,8 +689,10 @@ void ApplyPopupOuterShadow(uint8_t* pixels, int width, int height, int margin, f
     if (innerWidth <= 2 || innerHeight <= 2) {
         return;
     }
-    const float shadowWidth = std::max(1.0F, 16.0F * scale);
-    const float shadowOffset = 4.0F * scale;
+    // Softer than the old 16px/0.20 contact shade so the Quick Settings plate
+    // falls off the way the mock's outer shadow does.
+    const float shadowWidth = std::max(1.0F, 22.0F * scale);
+    const float shadowOffset = 3.0F * scale;
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             const float localX = static_cast<float>(x - margin) + 0.5F;
@@ -715,7 +717,7 @@ void ApplyPopupOuterShadow(uint8_t* pixels, int width, int height, int margin, f
                 pixel[0] = 0;
                 pixel[1] = 0;
                 pixel[2] = 0;
-                pixel[3] = static_cast<uint8_t>(std::lround(255.0F * 0.20F * smooth));
+                pixel[3] = static_cast<uint8_t>(std::lround(255.0F * 0.11F * smooth));
             }
         }
     }
@@ -7628,13 +7630,13 @@ void DockApp::EnsureOverflowFonts(float scale) {
     }
     DestroyOverflowFonts();
     m_overflowTitleFont = CreateFlyoutFont(std::max(16, static_cast<int>(std::lround(18.0F * scale))),
-        FW_NORMAL);
+        FW_SEMIBOLD);
     m_overflowSectionFont = CreateFlyoutFont(std::max(13, static_cast<int>(std::lround(14.0F * scale))),
         FW_SEMIBOLD);
-    m_overflowLabelFont = CreateFlyoutFont(std::max(12, static_cast<int>(std::lround(13.0F * scale))),
-        FW_NORMAL);
+    m_overflowLabelFont = CreateFlyoutFont(std::max(13, static_cast<int>(std::lround(14.0F * scale))),
+        FW_SEMIBOLD);
     m_overflowStatusFont = CreateFlyoutFont(std::max(11, static_cast<int>(std::lround(12.0F * scale))),
-        FW_MEDIUM);
+        FW_NORMAL);
     m_overflowFontScale = scale;
 }
 

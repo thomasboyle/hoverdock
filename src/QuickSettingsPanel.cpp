@@ -1707,39 +1707,85 @@ void FillAlbumDisc(uint8_t* dest, int destWidth, int destHeight, float cx, float
     const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 2.0F)));
     const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 2.0F)));
     constexpr float aa = 1.2F;
+    const float diameter = std::max(1.0F, radius * 2.0F);
     for (int y = top; y < bottom; ++y) {
-        const float v = std::clamp((static_cast<float>(y) + 0.5F - (cy - radius)) / (radius * 2.0F),
-            0.0F, 1.0F);
-        // Sunset stand-in: purple sky, warm horizon, dark foreground.
-        float red = 0.0F;
-        float green = 0.0F;
-        float blue = 0.0F;
-        if (v < 0.42F) {
-            const float t = v / 0.42F;
-            red = 88.0F + t * 150.0F;
-            green = 48.0F + t * 70.0F;
-            blue = 140.0F - t * 40.0F;
-        } else if (v < 0.68F) {
-            const float t = (v - 0.42F) / 0.26F;
-            red = 238.0F - t * 40.0F;
-            green = 118.0F - t * 30.0F;
-            blue = 100.0F - t * 40.0F;
-        } else {
-            const float t = (v - 0.68F) / 0.32F;
-            red = 198.0F - t * 170.0F;
-            green = 88.0F - t * 70.0F;
-            blue = 60.0F - t * 40.0F;
-        }
+        const float py = static_cast<float>(y) + 0.5F;
+        const float v = std::clamp((py - (cy - radius)) / diameter, 0.0F, 1.0F);
         for (int x = left; x < right; ++x) {
-            const float dx = static_cast<float>(x) + 0.5F - cx;
-            const float dy = static_cast<float>(y) + 0.5F - cy;
+            const float px = static_cast<float>(x) + 0.5F;
+            const float dx = px - cx;
+            const float dy = py - cy;
             const float dist = std::sqrt(dx * dx + dy * dy);
             const float coverage = 1.0F - std::clamp((dist - radius) / aa + 0.5F, 0.0F, 1.0F);
             if (coverage <= 0.0F) {
                 continue;
             }
+            const float u = std::clamp((px - (cx - radius)) / diameter, 0.0F, 1.0F);
+            // Stand-in for the mock's circular sunset: navy sky, warm horizon,
+            // ridge line, and a dark reflection. Not the source photo.
+            float red = 0.0F;
+            float green = 0.0F;
+            float blue = 0.0F;
+            if (v < 0.22F) {
+                const float t = v / 0.22F;
+                red = 18.0F + t * 40.0F;
+                green = 16.0F + t * 10.0F;
+                blue = 48.0F + t * 36.0F;
+            } else if (v < 0.48F) {
+                const float t = (v - 0.22F) / 0.26F;
+                red = 58.0F + t * 150.0F;
+                green = 26.0F + t * 40.0F;
+                blue = 84.0F + t * 40.0F;
+            } else if (v < 0.62F) {
+                const float t = (v - 0.48F) / 0.14F;
+                red = 208.0F + t * 40.0F;
+                green = 66.0F + t * 70.0F;
+                blue = 124.0F - t * 70.0F;
+            } else {
+                red = 36.0F;
+                green = 22.0F;
+                blue = 32.0F;
+            }
+            if (v < 0.28F) {
+                const unsigned h = static_cast<unsigned>(x * 374761393 + y * 668265263);
+                const unsigned n = (h ^ (h >> 13)) * 1274126177U;
+                if ((n & 1023U) > 1008U) {
+                    red = green = blue = 230.0F;
+                }
+            }
+            const float sunDx = u - 0.50F;
+            const float sunDy = (v - 0.575F) * 1.15F;
+            const float sun = std::sqrt(sunDx * sunDx + sunDy * sunDy);
+            if (sun < 0.055F) {
+                red = 255.0F;
+                green = 214.0F;
+                blue = 150.0F;
+            } else if (sun < 0.16F && v < 0.70F) {
+                const float g = 1.0F - (sun - 0.055F) / 0.105F;
+                red = red * (1.0F - g) + 255.0F * g;
+                green = green * (1.0F - g) + 140.0F * g;
+                blue = blue * (1.0F - g) + 70.0F * g;
+            }
+            const float ridge = 0.60F + 0.040F * std::sin(u * 10.5F) + 0.028F * std::sin(u * 18.0F + 1.1F);
+            if (v > ridge && v < 0.74F) {
+                const float depth = std::clamp((v - ridge) / 0.08F, 0.0F, 1.0F);
+                red = 28.0F + (1.0F - depth) * 50.0F;
+                green = 18.0F + (1.0F - depth) * 16.0F;
+                blue = 36.0F + (1.0F - depth) * 20.0F;
+            }
+            if (v >= 0.74F) {
+                const float t = (v - 0.74F) / 0.26F;
+                red = 70.0F - t * 48.0F;
+                green = 28.0F - t * 16.0F;
+                blue = 48.0F - t * 28.0F;
+                if (std::fabs(u - 0.50F) < 0.015F + (1.0F - t) * 0.01F) {
+                    red = 220.0F;
+                    green = 130.0F;
+                    blue = 80.0F;
+                }
+            }
             const float edge = std::clamp(dist / radius, 0.0F, 1.0F);
-            const float shade = 1.0F - 0.22F * edge * edge;
+            const float shade = 1.0F - 0.18F * edge * edge;
             const float srcA = coverage;
             uint8_t pixel[4] = {
                 static_cast<uint8_t>(std::lround(std::clamp(blue * shade, 0.0F, 255.0F) * srcA)),
@@ -2210,10 +2256,10 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         y += homeGap;
         const LONG inner = panelWidth - padding * 2L;
         const LONG tileGap = homeGap;
-        const LONG homeTileH = std::max(100L, std::lround(112.0F * scale));
-        const LONG homeCardH = std::max(118L, std::lround(128.0F * scale));
-        const LONG homeSmallH = std::max(78L, std::lround(88.0F * scale));
-        const LONG homeMediaH = std::max(80L, std::lround(92.0F * scale));
+        const LONG homeTileH = std::max(96L, std::lround(110.0F * scale));
+        const LONG homeCardH = std::max(112L, std::lround(124.0F * scale));
+        const LONG homeSmallH = std::max(74L, std::lround(86.0F * scale));
+        const LONG homeMediaH = std::max(78L, std::lround(90.0F * scale));
         const LONG tileCount = 5L;
         const LONG tileGaps = tileGap * (tileCount - 1L);
         const LONG tileBase = (inner - tileGaps) / tileCount;
@@ -2228,23 +2274,39 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             if (!draw) {
                 return;
             }
-            const float radius = std::min(ContentSquircleRadius(bounds, scale),
-                std::max(10.0F, 16.0F * scale));
-            RECT shadow = bounds;
-            const LONG drop = std::max(2L, std::lround(3.0F * scale));
-            shadow.top += drop;
-            shadow.bottom += drop + std::max(1L, std::lround(2.0F * scale));
-            FillSquircleColorPremul(pixels, width, height, shadow, radius, light ? 0.14F : 0.30F,
-                light ? 160 : 0, light ? 164 : 0, light ? 172 : 0);
-            FillSquircleColorPremul(pixels, width, height, bounds, radius, light ? 0.90F : 0.50F,
-                light ? 214 : 52, light ? 216 : 54, light ? 220 : 60);
+            // Mock tiles (1072px export of a ~600px panel) use ~8pt corners,
+            // a hairline cool rim, a 2px top inset, and a ~8pt soft drop.
+            const float shortest = static_cast<float>(std::min(bounds.right - bounds.left,
+                bounds.bottom - bounds.top));
+            const float radius = std::min(shortest * 0.22F, std::max(7.0F, 8.0F * scale));
+            const int blur = std::max(4, static_cast<int>(std::lround(7.0F * scale)));
+            for (int layer = blur; layer >= 1; --layer) {
+                const float t = static_cast<float>(layer) / static_cast<float>(blur);
+                RECT shadow = bounds;
+                const LONG expand = std::max(0L, std::lround(2.4F * scale * t));
+                InflateRect(&shadow, expand, 0);
+                const LONG drop = std::max(1L, std::lround((0.6F + 6.5F * t) * scale));
+                shadow.top += std::max(1L, drop / 5L);
+                shadow.bottom += drop;
+                const float falloff = (1.0F - t) * (1.0F - t);
+                const float alpha = (light ? 0.085F : 0.18F) * falloff;
+                if (alpha < 0.012F) {
+                    continue;
+                }
+                FillSquircleColorPremul(pixels, width, height, shadow,
+                    radius + static_cast<float>(expand), alpha, light ? 132 : 0, light ? 136 : 0,
+                    light ? 146 : 0);
+            }
+            FillSquircleColorPremul(pixels, width, height, bounds, radius, light ? 0.92F : 0.72F,
+                light ? 226 : 40, light ? 228 : 42, light ? 234 : 48);
             RECT face = bounds;
-            const LONG border = std::max(1L, std::lround(1.25F * scale));
+            const LONG border = std::max(1L, std::lround(1.0F * scale));
             InflateRect(&face, -border, -border);
+            face.top += border;
             if (face.right > face.left + 4 && face.bottom > face.top + 4) {
                 FillSquircleColorPremul(pixels, width, height, face,
-                    std::max(6.0F, radius - static_cast<float>(border)), light ? 0.96F : 0.94F,
-                    light ? 252 : 30, light ? 252 : 32, light ? 253 : 36);
+                    std::max(6.0F, radius - static_cast<float>(border)), light ? 0.985F : 0.94F,
+                    light ? 250 : 30, light ? 250 : 32, light ? 252 : 36);
             }
         };
         auto tile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
@@ -2261,11 +2323,11 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const LONG statusBottom = bounds.bottom - std::max(8L, std::lround(10.0F * scale));
             const LONG statusTop = statusBottom - std::max(16L, std::lround(18.0F * scale));
             text({bounds.left + inset, statusTop, bounds.right - inset - chevW, statusBottom},
-                statusFont, subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 158);
+                statusFont, subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 196);
             if (chevron) {
                 text({bounds.right - inset - chevW, statusTop, bounds.right - std::max(6L, std::lround(8.0F * scale)),
                          statusBottom},
-                    statusFont, L"\u203A", DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 145);
+                    statusFont, L"\u203A", DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 168);
             }
             push(kind, bounds);
         };
@@ -2279,32 +2341,42 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const float left = static_cast<float>(track.left) + radius;
             const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
             const float fill = left + (right - left) * level;
+            const float shadeY = cy + std::max(1.5F, 2.0F * scale);
             if (media) {
-                FillHGradientPill(pixels, width, height, left, right, cy, radius, light ? 0.22F : 0.28F,
-                    230, 226, 236, 214, 210, 224);
+                FillHGradientPill(pixels, width, height, left, right, shadeY, radius, light ? 0.16F : 0.22F,
+                    180, 170, 190, 170, 160, 184);
+                FillHGradientPill(pixels, width, height, left, right, cy, radius, light ? 0.40F : 0.34F,
+                    228, 220, 236, 210, 204, 226);
             } else {
-                FillHGradientPill(pixels, width, height, left, right, cy, radius, 1.0F, 232, 232, 234,
+                FillHGradientPill(pixels, width, height, left, right, shadeY, radius, light ? 0.14F : 0.22F,
+                    176, 180, 190, 168, 172, 182);
+                FillHGradientPill(pixels, width, height, left, right, cy, radius, 1.0F, 236, 236, 238,
                     226, 226, 230);
             }
             if (level > 0.01F) {
                 if (media) {
                     FillHGradientPill(pixels, width, height, left, std::max(left + radius, fill), cy, radius,
-                        1.0F, 250, 150, 70, 245, 96, 168);
+                        1.0F, 250, 140, 64, 245, 90, 176);
                 } else {
                     FillHGradientPill(pixels, width, height, left, std::max(left + radius, fill), cy, radius,
-                        1.0F, 255, 176, 96, 255, 124, 40);
+                        1.0F, 255, 168, 72, 255, 118, 36);
                 }
             }
-            const float thumb = radius + (media ? std::max(1.5F, 2.0F * scale) : std::max(3.0F, 4.0F * scale));
+            // Mock volume thumb is a hair larger than the track, with a soft
+            // contact shade. The media thumb is a larger saturated orb.
+            const float thumb = radius + (media ? std::max(3.5F, 5.0F * scale)
+                                                : std::max(2.0F, 2.5F * scale));
             if (media) {
-                FillSoftDisc(pixels, width, height, fill, cy, thumb + std::max(3.0F, 4.0F * scale), 0.45F,
-                    255, 170, 210);
-                FillSoftDisc(pixels, width, height, fill, cy, thumb, 1.0F, 250, 196, 232);
-                FillSoftDisc(pixels, width, height, fill, cy, thumb * 0.55F, 1.0F, 255, 236, 250);
+                FillSoftDisc(pixels, width, height, fill, cy, thumb + std::max(4.0F, 5.5F * scale), 0.55F,
+                    255, 150, 210);
+                FillSoftDisc(pixels, width, height, fill, cy, thumb, 1.0F, 245, 120, 210);
+                FillSoftDisc(pixels, width, height, fill, cy, thumb * 0.62F, 1.0F, 255, 236, 252);
             } else {
-                FillSoftDisc(pixels, width, height, fill, cy, thumb + std::max(2.0F, 3.0F * scale), 0.28F,
-                    210, 220, 235);
-                FillCirclePremul(pixels, width, height, fill, cy, thumb, 0.98F, false);
+                FillSoftDisc(pixels, width, height, fill, cy + std::max(1.0F, 1.6F * scale),
+                    thumb + std::max(1.5F, 2.0F * scale), 0.22F, 186, 196, 210);
+                FillCirclePremul(pixels, width, height, fill, cy, thumb, 0.99F, false);
+                FillSoftDisc(pixels, width, height, fill - thumb * 0.18F, cy, thumb * 0.72F, 0.35F,
+                    255, 255, 255);
             }
         };
 
@@ -2314,7 +2386,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         if (wifiOn) {
             wifiLabel = tray.networkName.empty() ? L"Connected" : tray.networkName;
         } else if (m_qsCache.wifiRadioOn) {
-            wifiLabel = L"Not connected";
+            // "Not connected" ellipsizes to "Not…" in this tile. The mock is
+            // the word "Not" with clear space before the chevron.
+            wifiLabel = L"Not";
         }
         tile({x, y, x + tileWidths[0], y + homeTileH}, L'\uE701', L"Wi-Fi", wifiLabel,
             TrayFlyoutHitKind::Wifi);
@@ -2343,7 +2417,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         const RECT sound{padding, y, padding + soundW, y + homeCardH};
         const RECT mic{sound.right + homeGap, y, panelWidth - padding, y + homeCardH};
         const LONG percentW = std::max(36L, std::lround(44.0F * scale));
-        const LONG sliderTrackH = std::max(16L, std::lround(22.0F * scale));
+        const LONG sliderTrackH = std::max(20L, std::lround(28.0F * scale));
         const RECT volumeTrack{sound.left + inset, sound.bottom - inset - sliderTrackH,
             sound.right - inset - percentW, sound.bottom - inset};
         push(TrayFlyoutHitKind::VolumeSlider, volumeTrack);
@@ -2355,9 +2429,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             labelFont, L"Sound", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
         text({titleLeft, sound.top + inset + static_cast<LONG>(tileIcon) - 2, sound.right - inset,
                  volumeTrack.top - 4},
-            statusFont, outputName, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+            statusFont, outputName, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
         text({sound.right - 26, sound.top + inset - 2, sound.right - 8, sound.top + inset + static_cast<LONG>(tileIcon)},
-            statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 145);
+            statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 168);
         gradientSlider(volumeTrack, volume, false);
         text({volumeTrack.right + 4, volumeTrack.top, sound.right - 8, volumeTrack.bottom}, statusFont,
             std::to_wstring(static_cast<int>(std::lround(volume * 100.0F))) + L"%",
@@ -2371,10 +2445,10 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             labelFont, L"Microphone", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
         const std::wstring micStatus = m_qsCache.inputNote.empty() ? inputName : m_qsCache.inputNote;
         text({micTitleLeft, mic.top + inset + static_cast<LONG>(tileIcon) - 2, mic.right - inset, mic.bottom - 36},
-            statusFont, micStatus, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+            statusFont, micStatus, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
         text({mic.right - 26, mic.top + inset - 2, mic.right - 8, mic.top + inset + static_cast<LONG>(tileIcon)},
-            statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 145);
-        const LONG barH = std::max(8L, std::lround(10.0F * scale));
+            statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 168);
+        const LONG barH = std::max(6L, std::lround(8.0F * scale));
         const RECT meter{mic.left + inset, mic.bottom - inset - barH, mic.right - inset, mic.bottom - inset};
         if (draw) {
             constexpr int segments = 12;
@@ -2382,7 +2456,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 ? 0
                 : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) *
                       static_cast<float>(segments)));
-            const LONG segGap = std::max(3L, std::lround(4.0F * scale));
+            const LONG segGap = std::max(2L, std::lround(3.0F * scale));
             const LONG segW = std::max(4L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
             const float segRadius = static_cast<float>(barH) * 0.5F;
             for (int index = 0; index < segments; ++index) {
@@ -2395,7 +2469,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                         1.0F, kBlueB, kBlueG, kBlueR, kBlueB, kBlueG, kBlueR);
                 } else {
                     FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
-                        1.0F, 186, 186, 190, 176, 176, 180);
+                        1.0F, 198, 198, 202, 188, 188, 192);
                 }
             }
         }
@@ -2416,10 +2490,10 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const LONG statusTop = statusBottom - std::max(16L, std::lround(18.0F * scale));
             const LONG chevW = std::max(12L, std::lround(14.0F * scale));
             text({bounds.left + inset, statusTop, bounds.right - inset - chevW, statusBottom}, statusFont,
-                subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 158);
+                subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 196);
             text({bounds.right - inset - chevW, statusTop, bounds.right - std::max(6L, std::lround(8.0F * scale)),
                      statusBottom},
-                statusFont, L"\u203A", DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 145);
+                statusFont, L"\u203A", DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 168);
             push(kind, bounds);
         };
         std::wstring displayStatus = L"On";
@@ -2450,7 +2524,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 static_cast<float>(art) * 0.5F);
         }
         const LONG scrubW = std::max(108L, std::lround(132.0F * scale));
-        const LONG scrubH = std::max(6L, std::lround(8.0F * scale));
+        const LONG scrubH = std::max(7L, std::lround(9.0F * scale));
         const LONG scrubRight = media.right - std::max(16L, std::lround(18.0F * scale));
         const LONG scrubLeft = scrubRight - scrubW;
         const LONG midY = media.top + homeMediaH / 2L;
@@ -2478,7 +2552,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             titleFont, mediaTitle, DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
         text({textLeft, media.top + homeMediaH / 2L, prev.left - 8,
                  media.top + homeMediaH / 2L + std::max(18L, std::lround(20.0F * scale))},
-            statusFont, mediaArtist, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+            statusFont, mediaArtist, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
         const UINT transportIcon = static_cast<UINT>(std::max(14L, std::lround(16.0F * scale)));
         icon(prev.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
             prev.top + (transport - static_cast<LONG>(transportIcon)) / 2L, L'\uE892', transportIcon, inkR, inkG,
