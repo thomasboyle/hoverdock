@@ -1402,7 +1402,8 @@ bool EnsureMagnifierSampler() noexcept {
     }
 
     g_magnifier.host = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST |
+            WS_EX_NOREDIRECTIONBITMAP,
         windowClass.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, windowClass.hInstance,
         nullptr);
     if (g_magnifier.host == nullptr ||
@@ -1417,6 +1418,20 @@ bool EnsureMagnifierSampler() noexcept {
         g_magnifier.unavailable = true;
         return false;
     }
+    // The magnifier child is an opaque HWND. Keep DWM from rounding it and
+    // filling the parent's corner wedges with black while it is on screen.
+    const DWORD magCorner = DWMWCP_DONOTROUND;
+    DwmSetWindowAttribute(g_magnifier.host, DWMWA_WINDOW_CORNER_PREFERENCE, &magCorner,
+        sizeof(magCorner));
+    DwmSetWindowAttribute(g_magnifier.magnifier, DWMWA_WINDOW_CORNER_PREFERENCE, &magCorner,
+        sizeof(magCorner));
+    const DWORD magBackdrop = DWMSBT_NONE;
+    DwmSetWindowAttribute(g_magnifier.host, DWMWA_SYSTEMBACKDROP_TYPE, &magBackdrop,
+        sizeof(magBackdrop));
+    DWM_BLURBEHIND magBlur{};
+    magBlur.dwFlags = DWM_BB_ENABLE;
+    magBlur.fEnable = FALSE;
+    DwmEnableBlurBehindWindow(g_magnifier.host, &magBlur);
 
     MAGTRANSFORM identity{};
     identity.v[0][0] = 1.0F;

@@ -13,6 +13,16 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <wlanapi.h>
+#include <audioclient.h>
+#include <mutex>
+
+#pragma warning(push)
+#pragma warning(disable : 4458 4996 26495)
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Media.Control.h>
+#pragma warning(pop)
+
 
 #include <algorithm>
 #include <cmath>
@@ -904,6 +914,554 @@ bool SetHdrEnabled(bool enabled) {
     return wrote;
 }
 
+void SendMediaKey(WORD key);
+
+bool NightLightEnabled(const BYTE* data, DWORD size) noexcept {
+    if (data == nullptr || size < 24) {
+        return false;
+    }
+    // CloudStore envelope, then an inner Bond struct that also starts with
+    // 43 42 01 00. Compact-binary field 0 is the two bytes 10 00 and is
+    // present only while Night Light is actually on (manual or schedule).
+    // Byte 18 is the inner payload length, not the switch: on current
+    // Windows 11 that length is 0x12 when the manual-transition field is
+    // absent, so the old 0x15/0x19 test reported an enabled light as Off.
+    DWORD payload = size;
+    for (DWORD index = 1; index + 4 <= size; ++index) {
+        if (data[index] == 0x43 && data[index + 1] == 0x42 && data[index + 2] == 0x01 &&
+            data[index + 3] == 0x00) {
+            payload = index + 4;
+            break;
+        }
+    }
+    if (payload + 1 >= size) {
+        return false;
+    }
+    return data[payload] == 0x10 && data[payload + 1] == 0x00;
+}
+
+std::wstring DescribeCaptureError(HRESULT hr) {
+    if (hr == E_ACCESSDENIED || hr == E_ACCESSDENIED) {
+        return L"Microphone blocked";
+    }
+    switch (hr) {
+    case E_ACCESSDENIED:
+        return L"Microphone blocked";
+    case AUDCLNT_E_DEVICE_IN_USE:
+        return L"Microphone in use";
+    case AUDCLNT_E_DEVICE_INVALIDATED:
+    case AUDCLNT_E_ENDPOINT_CREATE_FAILED:
+        return L"Microphone unavailable";
+    case AUDCLNT_E_SERVICE_NOT_RUNNING:
+        return L"Audio service stopped";
+    case AUDCLNT_E_UNSUPPORTED_FORMAT:
+        return L"Unsupported microphone";
+    default:
+        break;
+    }
+    if (HRESULT_CODE(hr) == ERROR_ACCESS_DENIED) {
+        return L"Microphone blocked";
+    }
+    return L"Microphone unavailable";
+}
+
+bool FormatIsFloat(const WAVEFORMATEX* format) noexcept {
+    if (format == nullptr) {
+        return false;
+    }
+    if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        return true;
+    }
+    if (format->wFormatTag != WAVE_FORMAT_EXTENSIBLE ||
+        format->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+        return false;
+    }
+    const auto* extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format);
+    const GUID kFloat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+    return IsEqualGUID(extensible->SubFormat, kFloat) != FALSE;
+}
+
+float PeakOfFrames(const BYTE* data, UINT32 frames, const WAVEFORMATEX* format) noexcept {
+    if (data == nullptr || format == nullptr || frames == 0 || format->nChannels <= 0) {
+        return 0.0F;
+    }
+    const int channels = format->nChannels;
+    float peak = 0.0F;
+    if (FormatIsFloat(format)) {
+        const auto* samples = reinterpret_cast<const float*>(data);
+        const size_t count = static_cast<size_t>(frames) * static_cast<size_t>(channels);
+        for (size_t index = 0; index < count; ++index) {
+            peak = std::max(peak, std::fabs(samples[index]));
+        }
+        return std::clamp(peak, 0.0F, 1.0F);
+    }
+    if (format->wBitsPerSample == 16) {
+        const auto* samples = reinterpret_cast<const int16_t*>(data);
+        const size_t count = static_cast<size_t>(frames) * static_cast<size_t>(channels);
+        for (size_t index = 0; index < count; ++index) {
+            peak = std::max(peak, std::fabs(static_cast<float>(samples[index])) / 32768.0F);
+        }
+        return std::clamp(peak, 0.0F, 1.0F);
+    }
+    if (format->wBitsPerSample == 32) {
+        const auto* samples = reinterpret_cast<const int32_t*>(data);
+        const size_t count = static_cast<size_t>(frames) * static_cast<size_t>(channels);
+        for (size_t index = 0; index < count; ++index) {
+            peak = std::max(peak, std::fabs(static_cast<float>(samples[index])) / 2147483648.0F);
+        }
+        return std::clamp(peak, 0.0F, 1.0F);
+    }
+    return 0.0F;
+}
+
+struct CaptureMeter {
+    IAudioClient* client = nullptr;
+    IAudioCaptureClient* capture = nullptr;
+    WAVEFORMATEX* format = nullptr;
+    std::wstring deviceId;
+    std::wstring note;
+    float level = 0.0F;
+    ULONGLONG retryAt = 0;
+    bool started = false;
+
+    void Close() noexcept {
+        if (client != nullptr && started) {
+            client->Stop();
+        }
+        started = false;
+        if (capture != nullptr) {
+            capture->Release();
+            capture = nullptr;
+        }
+        if (client != nullptr) {
+            client->Release();
+            client = nullptr;
+        }
+        if (format != nullptr) {
+            CoTaskMemFree(format);
+            format = nullptr;
+        }
+        deviceId.clear();
+    }
+
+    bool Open(IMMDevice* device) {
+        Close();
+        note.clear();
+        if (device == nullptr) {
+            note = L"No microphone";
+            retryAt = GetTickCount64() + 2000ULL;
+            return false;
+        }
+        const std::wstring id = DeviceId(device);
+        HRESULT hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+            reinterpret_cast<void**>(&client));
+        if (FAILED(hr) || client == nullptr) {
+            note = DescribeCaptureError(hr);
+            retryAt = GetTickCount64() + 2000ULL;
+            Close();
+            return false;
+        }
+        WAVEFORMATEX desired{};
+        desired.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        desired.nChannels = 2;
+        desired.nSamplesPerSec = 48000;
+        desired.wBitsPerSample = 32;
+        desired.nBlockAlign = 8;
+        desired.nAvgBytesPerSec = 48000 * 8;
+        const DWORD convertFlags =
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, convertFlags, 2000000, 0, &desired,
+            nullptr);
+        if (SUCCEEDED(hr)) {
+            format = static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+            if (format == nullptr) {
+                note = L"Microphone unavailable";
+                Close();
+                return false;
+            }
+            *format = desired;
+        } else {
+            client->Release();
+            client = nullptr;
+            hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(&client));
+            if (FAILED(hr) || client == nullptr) {
+                note = DescribeCaptureError(hr);
+                retryAt = GetTickCount64() + 2000ULL;
+                return false;
+            }
+            hr = client->GetMixFormat(&format);
+            if (FAILED(hr) || format == nullptr) {
+                note = L"Unsupported microphone";
+                retryAt = GetTickCount64() + 2000ULL;
+                Close();
+                return false;
+            }
+            hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 2000000, 0, format, nullptr);
+            if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED && format->nSamplesPerSec > 0) {
+                UINT32 frames = 0;
+                client->GetBufferSize(&frames);
+                client->Release();
+                client = nullptr;
+                hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                    reinterpret_cast<void**>(&client));
+                const REFERENCE_TIME aligned = static_cast<REFERENCE_TIME>(
+                    (10000000.0 * static_cast<double>(frames) / format->nSamplesPerSec) + 0.5);
+                if (SUCCEEDED(hr) && client != nullptr) {
+                    hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, aligned, 0, format, nullptr);
+                }
+            }
+        }
+        if (FAILED(hr) || client == nullptr) {
+            note = DescribeCaptureError(hr);
+            retryAt = GetTickCount64() + 2000ULL;
+            Close();
+            return false;
+        }
+        hr = client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&capture));
+        if (FAILED(hr) || capture == nullptr) {
+            note = DescribeCaptureError(hr);
+            retryAt = GetTickCount64() + 2000ULL;
+            Close();
+            return false;
+        }
+        hr = client->Start();
+        if (FAILED(hr)) {
+            note = DescribeCaptureError(hr);
+            retryAt = GetTickCount64() + 2000ULL;
+            Close();
+            return false;
+        }
+        started = true;
+        deviceId = id;
+        note.clear();
+        level = 0.0F;
+        return true;
+    }
+
+    bool consumed = false;
+
+    float Drain() noexcept {
+        consumed = false;
+        if (capture == nullptr || format == nullptr) {
+            return 0.0F;
+        }
+        float peak = 0.0F;
+        for (;;) {
+            UINT32 packet = 0;
+            const HRESULT next = capture->GetNextPacketSize(&packet);
+            if (FAILED(next)) {
+                note = L"Microphone unavailable";
+                retryAt = GetTickCount64() + 500ULL;
+                Close();
+                level = 0.0F;
+                break;
+            }
+            if (packet == 0) {
+                break;
+            }
+            BYTE* data = nullptr;
+            UINT32 frames = 0;
+            DWORD flags = 0;
+            if (FAILED(capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) {
+                break;
+            }
+            consumed = true;
+            if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) == 0) {
+                peak = std::max(peak, PeakOfFrames(data, frames, format));
+            }
+            capture->ReleaseBuffer(frames);
+        }
+        return peak;
+    }
+
+    void Sample(QuickSettingsCache& cache, IMMDevice* device) {
+        const ULONGLONG now = GetTickCount64();
+        const std::wstring id = device != nullptr ? DeviceId(device) : std::wstring();
+        if (device == nullptr) {
+            Close();
+            note = L"No microphone";
+            level = 0.0F;
+            cache.inputPeak = 0.0F;
+            cache.inputNote = note;
+            return;
+        }
+        if (client == nullptr || deviceId != id) {
+            if (now < retryAt && deviceId.empty() && !note.empty()) {
+                cache.inputPeak = 0.0F;
+                cache.inputNote = note;
+                return;
+            }
+            if (!Open(device)) {
+                cache.inputPeak = 0.0F;
+                cache.inputNote = note;
+                return;
+            }
+        }
+        const float instant = Drain();
+        if (client == nullptr) {
+            cache.inputPeak = 0.0F;
+            cache.inputNote = note.empty() ? L"Microphone unavailable" : note;
+            return;
+        }
+        if (consumed) {
+            if (instant >= level) {
+                level = instant;
+            } else {
+                level = std::max(instant, level * 0.55F);
+                if (level < 0.01F) {
+                    level = 0.0F;
+                }
+            }
+        }
+        cache.inputPeak = std::clamp(level, 0.0F, 1.0F);
+        cache.inputNote.clear();
+    }
+};
+
+CaptureMeter g_captureMeter;
+
+using MediaManager = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+using MediaSession = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession;
+using MediaStatus = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus;
+
+struct MediaBridge {
+    std::mutex mutex;
+    MediaManager manager{nullptr};
+    MediaSession session{nullptr};
+    bool requestPending = false;
+    bool propsPending = false;
+    std::wstring title;
+    std::wstring artist;
+    bool have = false;
+    bool playing = false;
+};
+
+MediaBridge g_media;
+
+std::wstring WideFromHstring(const winrt::hstring& value) {
+    return std::wstring(value.c_str());
+}
+
+void EnsureWinRt() {
+    static bool ready = false;
+    if (ready) {
+        return;
+    }
+    try {
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+        ready = true;
+    } catch (const winrt::hresult_error&) {
+        ready = true;
+    }
+}
+
+void EnsureMediaManager() {
+    EnsureWinRt();
+    bool start = false;
+    {
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        start = !g_media.manager && !g_media.requestPending;
+        if (start) {
+            g_media.requestPending = true;
+        }
+    }
+    if (!start) {
+        return;
+    }
+    try {
+        auto operation = MediaManager::RequestAsync();
+        operation.Completed([](auto const& async, winrt::Windows::Foundation::AsyncStatus status) {
+            MediaManager created{nullptr};
+            if (status == winrt::Windows::Foundation::AsyncStatus::Completed) {
+                try {
+                    created = async.GetResults();
+                } catch (const winrt::hresult_error&) {
+                    created = nullptr;
+                }
+            }
+            std::lock_guard<std::mutex> lock(g_media.mutex);
+            g_media.manager = created;
+            g_media.requestPending = false;
+        });
+    } catch (const winrt::hresult_error&) {
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        g_media.requestPending = false;
+    }
+}
+
+MediaSession PickMediaSession(const MediaManager& manager) {
+    MediaSession current{nullptr};
+    MediaSession playing{nullptr};
+    MediaSession paused{nullptr};
+    try {
+        current = manager.GetCurrentSession();
+    } catch (const winrt::hresult_error&) {
+        current = nullptr;
+    }
+    auto playingOf = [](const MediaSession& session) {
+        try {
+            return session.GetPlaybackInfo().PlaybackStatus();
+        } catch (const winrt::hresult_error&) {
+            return MediaStatus::Closed;
+        }
+    };
+    if (current && playingOf(current) == MediaStatus::Playing) {
+        return current;
+    }
+    try {
+        for (const MediaSession& session : manager.GetSessions()) {
+            const MediaStatus status = playingOf(session);
+            if (status == MediaStatus::Playing && !playing) {
+                playing = session;
+            } else if (status == MediaStatus::Paused && !paused) {
+                paused = session;
+            }
+        }
+    } catch (const winrt::hresult_error&) {
+    }
+    if (playing) {
+        return playing;
+    }
+    if (current) {
+        return current;
+    }
+    return paused;
+}
+
+void RequestMediaProperties(const MediaSession& session) {
+    {
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        if (g_media.propsPending) {
+            return;
+        }
+        g_media.propsPending = true;
+    }
+    try {
+        auto operation = session.TryGetMediaPropertiesAsync();
+        operation.Completed([](auto const& async, winrt::Windows::Foundation::AsyncStatus status) {
+            std::wstring title;
+            std::wstring artist;
+            bool have = false;
+            if (status == winrt::Windows::Foundation::AsyncStatus::Completed) {
+                try {
+                    auto props = async.GetResults();
+                    title = WideFromHstring(props.Title());
+                    artist = WideFromHstring(props.Artist());
+                    if (artist.empty()) {
+                        artist = WideFromHstring(props.AlbumArtist());
+                    }
+                    have = !title.empty() || !artist.empty();
+                } catch (const winrt::hresult_error&) {
+                    have = false;
+                }
+            }
+            std::lock_guard<std::mutex> lock(g_media.mutex);
+            if (have) {
+                g_media.title = std::move(title);
+                g_media.artist = std::move(artist);
+            }
+            g_media.propsPending = false;
+        });
+    } catch (const winrt::hresult_error&) {
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        g_media.propsPending = false;
+    }
+}
+
+void PublishMedia(QuickSettingsCache& cache) {
+    std::lock_guard<std::mutex> lock(g_media.mutex);
+    cache.mediaTitle = g_media.title;
+    cache.mediaArtist = g_media.artist;
+    cache.mediaHave = g_media.have;
+    cache.mediaPlaying = g_media.playing;
+}
+
+void QueryMedia(QuickSettingsCache& cache) {
+    EnsureMediaManager();
+    MediaManager manager{nullptr};
+    {
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        manager = g_media.manager;
+    }
+    if (!manager) {
+        PublishMedia(cache);
+        return;
+    }
+    try {
+        MediaSession session = PickMediaSession(manager);
+        if (!session) {
+            std::lock_guard<std::mutex> lock(g_media.mutex);
+            g_media.session = nullptr;
+            g_media.have = false;
+            g_media.playing = false;
+            g_media.title.clear();
+            g_media.artist.clear();
+        } else {
+            const MediaStatus status = session.GetPlaybackInfo().PlaybackStatus();
+            const bool playing = status == MediaStatus::Playing;
+            std::wstring source;
+            try {
+                source = WideFromHstring(session.SourceAppUserModelId());
+            } catch (const winrt::hresult_error&) {
+                source.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_media.mutex);
+                g_media.session = session;
+                g_media.playing = playing;
+                g_media.have = true;
+                if (g_media.title.empty() && !source.empty()) {
+                    g_media.artist = source;
+                }
+            }
+            RequestMediaProperties(session);
+        }
+    } catch (const winrt::hresult_error&) {
+    }
+    PublishMedia(cache);
+}
+
+void ControlMediaSession(int command) {
+    MediaSession session{nullptr};
+    {
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        session = g_media.session;
+    }
+    if (!session) {
+        if (command == 0) {
+            SendMediaKey(VK_MEDIA_PREV_TRACK);
+        } else if (command == 2) {
+            SendMediaKey(VK_MEDIA_NEXT_TRACK);
+        } else {
+            SendMediaKey(VK_MEDIA_PLAY_PAUSE);
+        }
+        return;
+    }
+    try {
+        if (command == 0) {
+            session.TrySkipPreviousAsync();
+        } else if (command == 2) {
+            session.TrySkipNextAsync();
+        } else {
+            session.TryTogglePlayPauseAsync();
+        }
+    } catch (const winrt::hresult_error&) {
+        if (command == 0) {
+            SendMediaKey(VK_MEDIA_PREV_TRACK);
+        } else if (command == 2) {
+            SendMediaKey(VK_MEDIA_NEXT_TRACK);
+        } else {
+            SendMediaKey(VK_MEDIA_PLAY_PAUSE);
+        }
+    }
+}
+
+int MeterBucket(float peak) noexcept {
+    const float shaped = std::pow(std::clamp(peak, 0.0F, 1.0F), 0.45F);
+    return static_cast<int>(std::lround(shaped * 32.0F));
+}
+
 void QueryNightLight(QuickSettingsCache& cache) {
     cache.nightKnown = false;
     cache.nightLight = false;
@@ -918,12 +1476,12 @@ void QueryNightLight(QuickSettingsCache& cache) {
     DWORD size = 0;
     DWORD type = 0;
     if (RegQueryValueExW(key, L"Data", nullptr, &type, nullptr, &size) == ERROR_SUCCESS &&
-        type == REG_BINARY && size > 18) {
+        type == REG_BINARY && size > 22) {
         std::vector<BYTE> data(size);
         if (RegQueryValueExW(key, L"Data", nullptr, &type, data.data(), &size) == ERROR_SUCCESS &&
             size > 18) {
             cache.nightKnown = true;
-            cache.nightLight = data[18] == 0x15 || data[18] == 0x19;
+            cache.nightLight = NightLightEnabled(data.data(), size);
         }
     }
     RegCloseKey(key);
@@ -978,7 +1536,8 @@ void QueryCapture(QuickSettingsCache& cache) {
     cache.inputPeak = 0.0F;
     cache.inputGain = 1.0F;
     cache.inputMuted = false;
-    WithEndpoint(eCapture, [&](IMMDevice* device) {
+    cache.inputNote.clear();
+    const bool opened = WithEndpoint(eCapture, [&](IMMDevice* device) {
         cache.inputName = DeviceName(device);
         IAudioEndpointVolume* volume = nullptr;
         if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
@@ -994,18 +1553,14 @@ void QueryCapture(QuickSettingsCache& cache) {
             }
             volume->Release();
         }
-        IAudioMeterInformation* meter = nullptr;
-        if (SUCCEEDED(device->Activate(__uuidof(IAudioMeterInformation), CLSCTX_ALL, nullptr,
-                reinterpret_cast<void**>(&meter))) &&
-            meter != nullptr) {
-            float peak = 0.0F;
-            if (SUCCEEDED(meter->GetPeakValue(&peak))) {
-                cache.inputPeak = std::clamp(peak, 0.0F, 1.0F);
-            }
-            meter->Release();
-        }
+        g_captureMeter.Sample(cache, device);
         return true;
     });
+    if (!opened) {
+        g_captureMeter.Close();
+        cache.inputPeak = 0.0F;
+        cache.inputNote = L"No microphone";
+    }
 }
 
 bool SetCaptureMuted(bool muted) {
@@ -1100,6 +1655,61 @@ void BlitIcon(uint8_t* pixels, int width, int height, HDC memory, HICON icon, in
 
 }  // namespace
 
+void StopQuickSettingsCapture() noexcept {
+    g_captureMeter.Close();
+    g_captureMeter.note.clear();
+    g_captureMeter.level = 0.0F;
+    g_captureMeter.retryAt = 0;
+}
+
+bool RefreshQuickSettingsLive(QuickSettingsCache& cache) {
+    const int beforeBucket = MeterBucket(cache.inputPeak);
+    const std::wstring beforeTitle = cache.mediaTitle;
+    const std::wstring beforeArtist = cache.mediaArtist;
+    const bool beforeHave = cache.mediaHave;
+    const bool beforePlaying = cache.mediaPlaying;
+    const std::wstring beforeNote = cache.inputNote;
+    if (g_captureMeter.client != nullptr && g_captureMeter.capture != nullptr) {
+        const float instant = g_captureMeter.Drain();
+        if (g_captureMeter.consumed) {
+            if (instant >= g_captureMeter.level) {
+                g_captureMeter.level = instant;
+            } else {
+                g_captureMeter.level = std::max(instant, g_captureMeter.level * 0.55F);
+                if (g_captureMeter.level < 0.01F) {
+                    g_captureMeter.level = 0.0F;
+                }
+            }
+        }
+        cache.inputPeak = std::clamp(g_captureMeter.level, 0.0F, 1.0F);
+        if (g_captureMeter.note.empty()) {
+            cache.inputNote.clear();
+        } else {
+            cache.inputNote = g_captureMeter.note;
+            cache.inputPeak = 0.0F;
+        }
+    } else if (GetTickCount64() >= g_captureMeter.retryAt) {
+        const bool opened = WithEndpoint(eCapture, [&](IMMDevice* device) {
+            if (cache.inputName.empty()) {
+                cache.inputName = DeviceName(device);
+            }
+            g_captureMeter.Sample(cache, device);
+            return true;
+        });
+        if (!opened) {
+            cache.inputPeak = 0.0F;
+            cache.inputNote = L"No microphone";
+        }
+    } else {
+        cache.inputPeak = 0.0F;
+        cache.inputNote = g_captureMeter.note.empty() ? cache.inputNote : g_captureMeter.note;
+    }
+    QueryMedia(cache);
+    return MeterBucket(cache.inputPeak) != beforeBucket || cache.mediaTitle != beforeTitle ||
+        cache.mediaArtist != beforeArtist || cache.mediaHave != beforeHave ||
+        cache.mediaPlaying != beforePlaying || cache.inputNote != beforeNote;
+}
+
 void DockApp::RefreshQuickSettingsCache() {
     const ULONGLONG now = GetTickCount64();
     if (m_qsCache.stamp != 0 && now - m_qsCache.stamp < 800ULL) {
@@ -1126,6 +1736,7 @@ void DockApp::RefreshQuickSettingsCache() {
     }
     QueryHdr(m_qsCache);
     QueryNightLight(m_qsCache);
+    QueryMedia(m_qsCache);
     QueryNearby(m_qsCache);
     m_qsCache.stamp = GetTickCount64();
 }
@@ -1403,8 +2014,15 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         y += gap;
         const LONG inner = panelWidth - padding * 2L;
         const LONG tileGap = gap;
-        const LONG smallW = static_cast<LONG>((static_cast<float>(inner - tileGap * 4L)) / 5.45F);
-        const LONG wifiW = inner - tileGap * 4L - smallW * 4L;
+        // Wi-Fi, Ethernet, Boost, System Tray, and VPN share one tile size.
+        const LONG tileCount = 5L;
+        const LONG tileGaps = tileGap * (tileCount - 1L);
+        const LONG tileBase = (inner - tileGaps) / tileCount;
+        const LONG tileExtra = (inner - tileGaps) - tileBase * tileCount;
+        LONG tileWidths[5] = {};
+        for (LONG tileIndex = 0; tileIndex < tileCount; ++tileIndex) {
+            tileWidths[tileIndex] = tileBase + (tileIndex < tileExtra ? 1L : 0L);
+        }
         const UINT tileIcon = static_cast<UINT>(std::max(16L, std::lround(20.0F * scale)));
         auto tile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
                         bool active, TrayFlyoutHitKind kind, bool chevron = true) {
@@ -1431,23 +2049,23 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         };
         LONG x = padding;
         const bool wifiOn = tray.network == TrayNetworkKind::Wifi;
-        tile({x, y, x + wifiW, y + tileH}, L'\uE701', L"Wi-Fi",
+        tile({x, y, x + tileWidths[0], y + tileH}, L'\uE701', L"Wi-Fi",
             wifiOn ? (tray.networkName.empty() ? L"Connected" : tray.networkName)
                    : (m_qsCache.wifiRadioOn ? L"Not connected" : L"Off"),
             wifiOn, TrayFlyoutHitKind::Wifi);
-        x += wifiW + tileGap;
-        tile({x, y, x + smallW, y + tileH}, L'\uE839', L"Ethernet",
+        x += tileWidths[0] + tileGap;
+        tile({x, y, x + tileWidths[1], y + tileH}, L'\uE839', L"Ethernet",
             m_qsCache.ethernetUp ? L"Connected" : L"Off", false, TrayFlyoutHitKind::Ethernet);
-        x += smallW + tileGap;
-        tile({x, y, x + smallW, y + tileH}, L'\uE945', L"Performance Boost", m_boostStatus,
+        x += tileWidths[1] + tileGap;
+        tile({x, y, x + tileWidths[2], y + tileH}, L'\uE945', L"Performance Boost", m_boostStatus,
             m_boostInFlight.load(), TrayFlyoutHitKind::Boost, false);
-        x += smallW + tileGap;
+        x += tileWidths[2] + tileGap;
         const std::wstring hidden = m_overflowIcons.empty()
             ? L"No icons"
             : (L"Hidden icons \u00B7 " + std::to_wstring(m_overflowIcons.size()));
-        tile({x, y, x + smallW, y + tileH}, L'\uE7F4', L"System Tray", hidden, false,
+        tile({x, y, x + tileWidths[3], y + tileH}, L'\uE7F4', L"System Tray", hidden, false,
             TrayFlyoutHitKind::SystemTrayPage);
-        x += smallW + tileGap;
+        x += tileWidths[3] + tileGap;
         std::wstring vpnLabel = L"Off";
         for (const QsVpnEntry& entry : m_qsCache.vpn) {
             if (entry.connected) {
@@ -1455,7 +2073,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 break;
             }
         }
-        tile({x, y, panelWidth - padding, y + tileH}, L'\uE72E', L"VPN", vpnLabel, false,
+        tile({x, y, x + tileWidths[4], y + tileH}, L'\uE72E', L"VPN", vpnLabel, false,
             TrayFlyoutHitKind::Vpn);
         y += tileH + gap;
 
@@ -1485,8 +2103,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         icon(mic.left + 14, mic.top + 14, L'\uE720', tileIcon, inkR, inkG, inkB);
         text({mic.left + 14 + static_cast<LONG>(tileIcon) + 8, mic.top + 10, mic.right - 24, mic.top + 30},
             labelFont, L"Microphone", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+        const std::wstring micStatus = m_qsCache.inputNote.empty() ? inputName : m_qsCache.inputNote;
         text({mic.left + 14 + static_cast<LONG>(tileIcon) + 8, mic.top + 30, mic.right - 24, mic.top + 50},
-            statusFont, inputName, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
+            statusFont, micStatus, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
         text({mic.right - 24, mic.top + 12, mic.right - 8, mic.top + 36}, statusFont, L"\u203A",
             DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
         const RECT meter{mic.left + 14, mic.bottom - 34, mic.right - 14, mic.bottom - 34 + 8};
@@ -1494,7 +2113,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const int segments = 12;
             const int lit = m_qsCache.inputMuted
                 ? 0
-                : static_cast<int>(std::lround(m_qsCache.inputPeak * static_cast<float>(segments)));
+                : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) * static_cast<float>(segments)));
             const LONG segGap = 3;
             const LONG segW = std::max(3L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
             for (int index = 0; index < segments; ++index) {
@@ -1546,12 +2165,20 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         push(TrayFlyoutHitKind::MediaTransport, next, 2);
         card(media, false);
         icon(media.left + 14, media.top + 16, L'\uE8D6', tileIcon, 30, 215, 96);
-        text({media.left + 44, media.top + 12, prev.left - 8, media.top + 34}, labelFont, L"Nothing playing",
+        const std::wstring mediaTitle = m_qsCache.mediaHave && !m_qsCache.mediaTitle.empty()
+            ? m_qsCache.mediaTitle
+            : (m_qsCache.mediaHave ? L"Now playing" : L"Nothing playing");
+        const std::wstring mediaArtist = !m_qsCache.mediaArtist.empty()
+            ? m_qsCache.mediaArtist
+            : (m_qsCache.mediaPlaying ? L"Playing" : L"Paused");
+        text({media.left + 44, media.top + 12, prev.left - 8, media.top + 34}, labelFont,
+            m_qsCache.mediaHave ? mediaTitle : L"Nothing playing",
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-        text({media.left + 44, media.top + 32, prev.left - 8, media.top + 52}, statusFont, L"Media key",
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 170);
+        text({media.left + 44, media.top + 32, prev.left - 8, media.top + 52}, statusFont,
+            m_qsCache.mediaHave ? mediaArtist : L"System media",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
         icon(prev.left + 8, prev.top + 6, L'\uE892', 18, inkR, inkG, inkB);
-        icon(play.left + 8, play.top + 6, L'\uE768', 18, inkR, inkG, inkB);
+        icon(play.left + 8, play.top + 6, m_qsCache.mediaPlaying ? L'\uE769' : L'\uE768', 18, inkR, inkG, inkB);
         icon(next.left + 8, next.top + 6, L'\uE893', 18, inkR, inkG, inkB);
         const RECT bright{media.left + 14, media.bottom - 30, media.right - 28, media.bottom - 30 + sliderH};
         const RECT brightLink{media.right - 26, media.bottom - 32, media.right - 6, media.bottom - 8};
@@ -1704,11 +2331,14 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         section(L"Input level");
         const RECT level{padding, y, panelWidth - padding, y + 28};
         card(level, false);
-        if (draw) {
+        if (draw && !m_qsCache.inputNote.empty()) {
+            text(level, statusFont, m_qsCache.inputNote, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                220);
+        } else if (draw) {
             const int segments = 16;
             const int lit = m_qsCache.inputMuted
                 ? 0
-                : static_cast<int>(std::lround(m_qsCache.inputPeak * static_cast<float>(segments)));
+                : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) * static_cast<float>(segments)));
             const LONG segGap = 3;
             const LONG segW =
                 std::max(3L, (level.right - level.left - 24 - segGap * (segments - 1)) / segments);
@@ -2190,13 +2820,8 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
         }
         break;
     case TrayFlyoutHitKind::MediaTransport:
-        if (hit.index == 0) {
-            SendMediaKey(VK_MEDIA_PREV_TRACK);
-        } else if (hit.index == 2) {
-            SendMediaKey(VK_MEDIA_NEXT_TRACK);
-        } else {
-            SendMediaKey(VK_MEDIA_PLAY_PAUSE);
-        }
+        ControlMediaSession(hit.index == 0 ? 0 : (hit.index == 2 ? 2 : 1));
+        m_qsCache.stamp = 0;
         break;
     }
 }

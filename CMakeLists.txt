@@ -48,10 +48,22 @@ add_executable(Dock WIN32
     src/RecycleBin.cpp
 )
 
+file(GLOB _dock_media_headers
+    "C:/Program Files (x86)/Windows Kits/10/Include/*/cppwinrt/winrt/Windows.Media.Control.h")
+if(NOT _dock_media_headers)
+    message(FATAL_ERROR "Windows SDK cppwinrt headers for Global System Media Transport Controls were not found.")
+endif()
+list(SORT _dock_media_headers COMPARE NATURAL ORDER DESCENDING)
+list(GET _dock_media_headers 0 _dock_media_header)
+cmake_path(GET _dock_media_header PARENT_PATH _dock_winrt_ns)
+cmake_path(GET _dock_winrt_ns PARENT_PATH DOCK_CPPWINRT_INCLUDE)
+
 target_include_directories(Dock PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    "${DOCK_CPPWINRT_INCLUDE}"
 )
+
 
 if(DOCK_HAS_CXX26)
     target_compile_options(Dock PRIVATE /std:c++26)

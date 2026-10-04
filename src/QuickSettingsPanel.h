@@ -86,4 +86,17 @@ struct QuickSettingsCache {
     bool nightLight = false;
     bool nightKnown = false;
     int nearby = 0;
+    // Set when WASAPI capture cannot be opened (permission, missing device).
+    std::wstring inputNote;
+    std::wstring mediaTitle;
+    std::wstring mediaArtist;
+    bool mediaHave = false;
+    bool mediaPlaying = false;
 };
+
+// Release the Quick Settings capture client so the microphone-in-use indicator
+// drops when the panel closes.
+void StopQuickSettingsCapture() noexcept;
+// Sample the live input meter and the system media session. True when the
+// panel should repaint (meter bucket or now-playing text changed).
+bool RefreshQuickSettingsLive(QuickSettingsCache& cache);

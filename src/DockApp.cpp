@@ -41,6 +41,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -234,26 +235,126 @@ bool EnsureWindowCapturable(HWND window) {
     return window != nullptr && SetWindowDisplayAffinity(window, WDA_NONE) != FALSE;
 }
 
-void ClearPopupLayeredCorners(HWND window) {
+void ApplyPopupDwmPlate(HWND window) noexcept {
     if (window == nullptr) {
         return;
     }
-    // Windows 11 DWM rounds top-level HWNDs and paints the clipped corner
-    // wedges with an opaque black plate. Quick Settings and the other menus
-    // already define a squircle in per-pixel alpha, so that plate shows up as
-    // black squares. Opt out of system rounding and the Mica/acrylic backdrop,
-    // and give DWM an empty blur region so it does not fill a black frame.
     const DWORD corner = DWMWCP_DONOTROUND;
     DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
     const DWORD backdrop = DWMSBT_NONE;
     DwmSetWindowAttribute(window, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
+    // Blur-behind was painting an opaque black plate in the corner wedges.
+    // Leave it off. An empty-but-enabled blur region is what kept the squares.
     DWM_BLURBEHIND blur{};
     blur.dwFlags = DWM_BB_ENABLE | DWM_BB_BLURREGION;
-    blur.fEnable = TRUE;
-    blur.hRgnBlur = CreateRectRgn(0, 0, -1, -1);
+    blur.fEnable = FALSE;
+    blur.hRgnBlur = nullptr;
     DwmEnableBlurBehindWindow(window, &blur);
-    if (blur.hRgnBlur != nullptr) {
-        DeleteObject(blur.hRgnBlur);
+    const DWMNCRENDERINGPOLICY policy = DWMNCRP_DISABLED;
+    DwmSetWindowAttribute(window, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy));
+    const COLORREF border = DWMWA_COLOR_NONE;
+    DwmSetWindowAttribute(window, DWMWA_BORDER_COLOR, &border, sizeof(border));
+}
+
+BOOL CALLBACK ApplyPopupChildPlate(HWND child, LPARAM) {
+    ApplyPopupDwmPlate(child);
+    return TRUE;
+}
+
+void ClearPopupLayeredCorners(HWND window) {
+    if (window == nullptr) {
+        return;
+    }
+    // Windows 11 DWM rounds top-level HWNDs and fills the clipped corner
+    // wedges with an opaque black plate, including on WS_EX_LAYERED popups.
+    // Quick Settings already draws a frosted squircle in per-pixel alpha, so
+    // that plate reads as black squares. Opt out of system rounding, Mica,
+    // acrylic, and the non-client frame, and do the same for any child HWND
+    // (the magnifier host's child is one of these) so it cannot paint an
+    // opaque rectangle outside the radius.
+    ApplyPopupDwmPlate(window);
+    EnumChildWindows(window, ApplyPopupChildPlate, 0);
+}
+
+void ClipLayeredPopupToCoverage(HWND window, const uint8_t* pixels, LONG width, LONG height) noexcept {
+    if (window == nullptr || pixels == nullptr || width <= 0 || height <= 0) {
+        return;
+    }
+    try {
+        std::vector<RECT> spans;
+        spans.reserve(static_cast<size_t>(height));
+        for (LONG y = 0; y < height; ++y) {
+            const uint8_t* row = pixels + static_cast<size_t>(y) * static_cast<size_t>(width) * 4U;
+            LONG x = 0;
+            while (x < width) {
+                while (x < width && row[static_cast<size_t>(x) * 4U + 3U] == 0) {
+                    ++x;
+                }
+                if (x >= width) {
+                    break;
+                }
+                const LONG startX = x;
+                while (x < width && row[static_cast<size_t>(x) * 4U + 3U] != 0) {
+                    ++x;
+                }
+                spans.push_back(RECT{startX, y, x, y + 1});
+            }
+        }
+        if (spans.empty()) {
+            return;
+        }
+        uint32_t hash = 2166136261U;
+        hash ^= static_cast<uint32_t>(width);
+        hash *= 16777619U;
+        hash ^= static_cast<uint32_t>(height);
+        hash *= 16777619U;
+        hash ^= static_cast<uint32_t>(spans.size());
+        hash *= 16777619U;
+        const size_t sample = std::min<size_t>(spans.size(), 8U);
+        for (size_t index = 0; index < sample; ++index) {
+            const RECT& span = spans[(index * (spans.size() - 1)) / std::max<size_t>(sample - 1, 1U)];
+            hash ^= static_cast<uint32_t>(span.left);
+            hash *= 16777619U;
+            hash ^= static_cast<uint32_t>(span.right);
+            hash *= 16777619U;
+        }
+        struct RegionCache {
+            HWND window = nullptr;
+            uint32_t hash = 0;
+        };
+        static RegionCache cache[4]{};
+        for (RegionCache& entry : cache) {
+            if (entry.window == window && entry.hash == hash) {
+                return;
+            }
+        }
+        const DWORD count = static_cast<DWORD>(spans.size());
+        const DWORD bytes = sizeof(RGNDATAHEADER) + count * sizeof(RECT);
+        std::vector<uint8_t> buffer(bytes);
+        auto* data = reinterpret_cast<RGNDATA*>(buffer.data());
+        data->rdh.dwSize = sizeof(RGNDATAHEADER);
+        data->rdh.iType = RDH_RECTANGLES;
+        data->rdh.nCount = count;
+        data->rdh.nRgnSize = count * sizeof(RECT);
+        data->rdh.rcBound = RECT{0, 0, width, height};
+        std::memcpy(data->Buffer, spans.data(), static_cast<size_t>(count) * sizeof(RECT));
+        HRGN region = ExtCreateRegion(nullptr, bytes, data);
+        if (region == nullptr) {
+            return;
+        }
+        if (SetWindowRgn(window, region, FALSE) == 0) {
+            DeleteObject(region);
+            return;
+        }
+        for (RegionCache& entry : cache) {
+            if (entry.window == nullptr || entry.window == window) {
+                entry.window = window;
+                entry.hash = hash;
+                return;
+            }
+        }
+        cache[0] = RegionCache{window, hash};
+    } catch (...) {
     }
 }
 
@@ -2498,6 +2599,16 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
             }
             app->m_qsCache.stamp = 0;
             app->PaintOverflowPopup();
+            return 0;
+        }
+        if (wParam == kQsLiveTimerId && app != nullptr) {
+            if (!app->IsOverflowOpen()) {
+                KillTimer(window, kQsLiveTimerId);
+                return 0;
+            }
+            if (RefreshQuickSettingsLive(app->m_qsCache)) {
+                app->PaintOverflowPopup();
+            }
             return 0;
         }
         break;
@@ -5206,9 +5317,11 @@ void DockApp::FinishOverflowHide() noexcept {
     CloseDockSettings();
     if (m_overflowWindow != nullptr) {
         KillTimer(m_overflowWindow, kEnergySampleTimerId);
+        KillTimer(m_overflowWindow, kQsLiveTimerId);
         ShowWindow(m_overflowWindow, SW_HIDE);
     }
     m_overflowVisibility = VisibilityState::Hidden;
+    StopQuickSettingsCapture();
     m_overflowHover = -1;
     m_qsPage = QuickSettingsPage::Home;
     m_qsReturn = QuickSettingsPage::Home;
@@ -5326,6 +5439,9 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
     } else {
         std::memcpy(slot.bits, pixels, need);
         slot.contentValid = true;
+        // Clip the HWND to the frosted shape so DWM cannot paint black in the
+        // transparent corner wedges outside the squircle (or the caret).
+        ClipLayeredPopupToCoverage(window, pixels, width, height);
     }
     POINT source{0, 0};
     POINT destination{origin.x, origin.y};
@@ -6694,7 +6810,7 @@ void DockApp::PaintSettingsPopup() {
             return;
         }
         constexpr DWORD extendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED |
-            WS_EX_TOPMOST;
+            WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
         m_settingsWindow = CreateWindowExW(extendedStyle, className, L"", WS_POPUP, 0, 0, 1, 1,
             m_window, nullptr, m_instance, this);
         if (m_settingsWindow == nullptr) {
@@ -7610,7 +7726,7 @@ void DockApp::PaintOverflowPopup() {
             return;
         }
         constexpr DWORD extendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED |
-            WS_EX_TOPMOST;
+            WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
         m_overflowWindow = CreateWindowExW(extendedStyle, className, L"", WS_POPUP, 0, 0, 1, 1,
             m_window, nullptr, m_instance, this);
         if (m_overflowWindow == nullptr) {
@@ -7811,6 +7927,9 @@ void DockApp::PaintOverflowPopup() {
         } else {
             KillTimer(m_overflowWindow, kEnergySampleTimerId);
         }
+        const bool fastMeter = m_qsPage == QuickSettingsPage::Home ||
+            m_qsPage == QuickSettingsPage::Microphone;
+        SetTimer(m_overflowWindow, kQsLiveTimerId, fastMeter ? 70U : 500U, nullptr);
     }
 }
 
@@ -8861,7 +8980,7 @@ void DockApp::PaintContextMenu() {
             return;
         }
         constexpr DWORD extendedStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED |
-            WS_EX_TOPMOST;
+            WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
         m_contextWindow = CreateWindowExW(extendedStyle, className, L"", WS_POPUP, 0, 0, 1, 1,
             m_window, nullptr, m_instance, this);
         if (m_contextWindow == nullptr) {
