@@ -32,6 +32,7 @@ set(CMAKE_GENERATOR_PLATFORM x64 CACHE STRING "Build x64 only" FORCE)
 add_executable(Dock WIN32
     src/main.cpp
     src/DockApp.cpp
+    src/QuickSettingsPanel.cpp
     src/DockConfig.cpp
     src/InstalledApps.cpp
     src/Renderer.cpp
@@ -108,6 +109,7 @@ target_link_libraries(Dock PRIVATE
     winhttp
     comctl32
     wlanapi
+    iphlpapi
     Bthprops
     Ws2_32
     Cfgmgr32

@@ -1,0 +1,1921 @@
+#include "DockApp.h"
+
+#include "QuickSettingsPanel.h"
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mmreg.h>
+#include <endpointvolume.h>
+#include <iphlpapi.h>
+#include <mmdeviceapi.h>
+#include <powrprof.h>
+#include <propvarutil.h>
+#include <shellapi.h>
+#include <wlanapi.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <cwctype>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace dock_detail {
+void CompositePremul(uint8_t* dest, int destWidth, int destHeight, int destX, int destY,
+    const uint8_t* source, int sourceWidth, int sourceHeight);
+void DrawFlyoutText(uint8_t* dest, int destWidth, int destHeight, RECT bounds, HFONT font,
+    const std::wstring& text, UINT format, uint8_t gray, int underlineFrom = -1);
+void FillCirclePremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
+    float radius, float alpha, bool useInk = false);
+void FillPillColorPremul(uint8_t* dest, int destWidth, int destHeight, float cxLeft,
+    float cxRight, float cy, float radius, float alpha, uint8_t blue, uint8_t green,
+    uint8_t red);
+void FillSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
+    float radius, float alpha, uint8_t blue, uint8_t green, uint8_t red);
+void FillSquirclePremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, float radius,
+    float alpha);
+float ContentSquircleRadius(const RECT& bounds, float scale) noexcept;
+void RemapPremulInkColor(std::vector<uint8_t>& pixels, uint8_t r, uint8_t g, uint8_t b);
+void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept;
+std::wstring NotifyIconTitle(const TrayNotifyIcon& icon);
+std::wstring NotifyIconStatus(const TrayNotifyIcon& icon);
+}  // namespace dock_detail
+using namespace dock_detail;
+
+namespace {
+
+constexpr uint8_t kBlueB = 255;
+constexpr uint8_t kBlueG = 132;
+constexpr uint8_t kBlueR = 47;
+constexpr uint8_t kInkDarkR = 33;
+constexpr uint8_t kInkDarkG = 34;
+constexpr uint8_t kInkDarkB = 36;
+constexpr uint8_t kInkLightR = 245;
+constexpr uint8_t kInkLightG = 245;
+constexpr uint8_t kInkLightB = 247;
+
+constexpr int kLinkWifi = 0;
+constexpr int kLinkNetwork = 1;
+constexpr int kLinkVpn = 2;
+constexpr int kLinkSound = 3;
+constexpr int kLinkPower = 4;
+constexpr int kLinkTaskbar = 5;
+constexpr int kLinkNearby = 6;
+constexpr int kLinkBluetooth = 7;
+constexpr int kLinkDisplay = 8;
+constexpr int kLinkNight = 9;
+constexpr int kLinkMixer = 10;
+
+constexpr int kToggleWifi = 0;
+constexpr int kToggleMute = 1;
+constexpr int kToggleMic = 2;
+constexpr int kToggleUsb = 3;
+constexpr int kToggleAirplane = 4;
+constexpr int kToggleHdr = 5;
+constexpr int kToggleNearby = 6;
+
+const GUID kUsbSubgroup = {
+    0x2a737441, 0x1930, 0x4402, {0x8d, 0x77, 0xb2, 0xbe, 0xbb, 0xa3, 0x08, 0xa3}};
+const GUID kUsbSuspend = {
+    0x48e6b7a6, 0x50f5, 0x4782, {0xa5, 0xd4, 0x53, 0xbb, 0x8f, 0x07, 0xe2, 0x26}};
+
+struct DeviceShareMode;
+
+MIDL_INTERFACE("f8679f50-850a-41cf-9c72-430f290290c8")
+IPolicyConfig : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetMixFormat(PCWSTR, WAVEFORMATEX**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDeviceFormat(PCWSTR, INT, WAVEFORMATEX**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ResetDeviceFormat(PCWSTR) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDeviceFormat(PCWSTR, WAVEFORMATEX*, WAVEFORMATEX*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetProcessingPeriod(PCWSTR, INT, PINT64, PINT64) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetProcessingPeriod(PCWSTR, PINT64) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetShareMode(PCWSTR, DeviceShareMode*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetShareMode(PCWSTR, DeviceShareMode*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PCWSTR, const PROPERTYKEY&, PROPVARIANT*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetPropertyValue(PCWSTR, const PROPERTYKEY&, PROPVARIANT*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetDefaultEndpoint(PCWSTR deviceId, ERole role) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetEndpointVisibility(PCWSTR, INT) = 0;
+};
+
+const PROPERTYKEY kDeviceFriendlyName = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+
+const CLSID kPolicyConfigClient = {
+    0x870af99c, 0x171d, 0x4f9e, {0xaf, 0x0d, 0xe6, 0x3d, 0xf4, 0x0c, 0x2b, 0xc9}};
+
+std::wstring Lower(std::wstring text) {
+    for (wchar_t& ch : text) {
+        ch = static_cast<wchar_t>(towlower(ch));
+    }
+    return text;
+}
+
+bool Contains(const std::wstring& haystack, const wchar_t* needle) {
+    return haystack.find(needle) != std::wstring::npos;
+}
+
+std::wstring FormatLinkSpeed(ULONG64 bits) {
+    if (bits >= 1000000000ULL) {
+        wchar_t text[32] = {};
+        swprintf_s(text, L"%.1f Gbps", static_cast<double>(bits) / 1000000000.0);
+        return text;
+    }
+    if (bits >= 1000000ULL) {
+        return std::to_wstring(static_cast<unsigned long long>(bits / 1000000ULL)) + L" Mbps";
+    }
+    if (bits == 0) {
+        return L"Unknown";
+    }
+    return std::to_wstring(static_cast<unsigned long long>(bits)) + L" bps";
+}
+
+std::wstring Ipv4Text(const SOCKET_ADDRESS& address) {
+    if (address.lpSockaddr == nullptr || address.lpSockaddr->sa_family != AF_INET) {
+        return {};
+    }
+    const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address.lpSockaddr);
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&ipv4->sin_addr);
+    return std::to_wstring(bytes[0]) + L"." + std::to_wstring(bytes[1]) + L"." +
+        std::to_wstring(bytes[2]) + L"." + std::to_wstring(bytes[3]);
+}
+
+bool LooksVirtual(const std::wstring& description) {
+    const std::wstring text = Lower(description);
+    return Contains(text, L"virtual") || Contains(text, L"hyper-v") || Contains(text, L"vmware") ||
+        Contains(text, L"virtualbox") || Contains(text, L"bluetooth") || Contains(text, L"wan miniport") ||
+        Contains(text, L"loopback");
+}
+
+bool LooksLikeVpn(const std::wstring& description, IFTYPE type) {
+    if (type == IF_TYPE_PPP || type == IF_TYPE_TUNNEL) {
+        return true;
+    }
+    const std::wstring text = Lower(description);
+    return Contains(text, L"vpn") || Contains(text, L"wireguard") || Contains(text, L"wintun") ||
+        Contains(text, L"tap-windows") || Contains(text, L"nordlynx") || Contains(text, L"mullvad") ||
+        Contains(text, L"openvpn");
+}
+
+std::wstring SsidText(const DOT11_SSID& ssid) {
+    if (ssid.uSSIDLength == 0 || ssid.uSSIDLength > DOT11_SSID_MAX_LENGTH) {
+        return {};
+    }
+    const int length = static_cast<int>(ssid.uSSIDLength);
+    const int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        reinterpret_cast<const char*>(ssid.ucSSID), length, nullptr, 0);
+    const UINT codePage = needed > 0 ? CP_UTF8 : CP_ACP;
+    const int wide = needed > 0
+        ? needed
+        : MultiByteToWideChar(CP_ACP, 0, reinterpret_cast<const char*>(ssid.ucSSID), length, nullptr, 0);
+    if (wide <= 0) {
+        return {};
+    }
+    std::wstring text(static_cast<size_t>(wide), L'\0');
+    MultiByteToWideChar(codePage, 0, reinterpret_cast<const char*>(ssid.ucSSID), length, text.data(),
+        wide);
+    return text;
+}
+
+const std::vector<uint8_t>& CachedGlyph(SystemTray& tray, wchar_t symbol, UINT extent, uint8_t red,
+    uint8_t green, uint8_t blue) {
+    struct Entry {
+        wchar_t symbol = 0;
+        UINT extent = 0;
+        uint8_t red = 0;
+        uint8_t green = 0;
+        uint8_t blue = 0;
+        std::vector<uint8_t> pixels;
+    };
+    static std::vector<Entry> cache;
+    for (const Entry& entry : cache) {
+        if (entry.symbol == symbol && entry.extent == extent && entry.red == red &&
+            entry.green == green && entry.blue == blue) {
+            return entry.pixels;
+        }
+    }
+    Entry created;
+    created.symbol = symbol;
+    created.extent = extent;
+    created.red = red;
+    created.green = green;
+    created.blue = blue;
+    created.pixels = tray.RasterizeSymbol(symbol, extent);
+    RemapPremulInkColor(created.pixels, red, green, blue);
+    cache.push_back(std::move(created));
+    return cache.back().pixels;
+}
+
+float TrackLevel(const RECT& track, LONG x) {
+    const LONG inset = std::max(6L, (track.bottom - track.top) / 2L);
+    const LONG left = track.left + inset;
+    const LONG right = std::max(left + 1L, track.right - inset);
+    const float span = static_cast<float>(right - left);
+    return std::clamp(static_cast<float>(x - left) / span, 0.0F, 1.0F);
+}
+
+bool SetDefaultAudioDevice(const std::wstring& id) {
+    if (id.empty()) {
+        return false;
+    }
+    IPolicyConfig* policy = nullptr;
+    if (FAILED(CoCreateInstance(kPolicyConfigClient, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&policy))) ||
+        policy == nullptr) {
+        return false;
+    }
+    const HRESULT console = policy->SetDefaultEndpoint(id.c_str(), eConsole);
+    const HRESULT multimedia = policy->SetDefaultEndpoint(id.c_str(), eMultimedia);
+    const HRESULT communications = policy->SetDefaultEndpoint(id.c_str(), eCommunications);
+    policy->Release();
+    return SUCCEEDED(console) || SUCCEEDED(multimedia) || SUCCEEDED(communications);
+}
+
+bool WithEndpoint(EDataFlow flow, const auto& visitor) {
+    IMMDeviceEnumerator* enumerator = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            IID_PPV_ARGS(&enumerator))) ||
+        enumerator == nullptr) {
+        return false;
+    }
+    IMMDevice* device = nullptr;
+    const bool opened = SUCCEEDED(enumerator->GetDefaultAudioEndpoint(flow, eMultimedia, &device)) &&
+        device != nullptr;
+    enumerator->Release();
+    if (!opened) {
+        return false;
+    }
+    const bool result = visitor(device);
+    device->Release();
+    return result;
+}
+
+std::wstring DeviceName(IMMDevice* device) {
+    if (device == nullptr) {
+        return {};
+    }
+    IPropertyStore* store = nullptr;
+    if (FAILED(device->OpenPropertyStore(STGM_READ, &store)) || store == nullptr) {
+        return {};
+    }
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    std::wstring name;
+    if (SUCCEEDED(store->GetValue(kDeviceFriendlyName, &value)) && value.vt == VT_LPWSTR &&
+        value.pwszVal != nullptr) {
+        name = value.pwszVal;
+    }
+    PropVariantClear(&value);
+    store->Release();
+    return name;
+}
+
+std::wstring DeviceId(IMMDevice* device) {
+    if (device == nullptr) {
+        return {};
+    }
+    LPWSTR id = nullptr;
+    if (FAILED(device->GetId(&id)) || id == nullptr) {
+        return {};
+    }
+    std::wstring text = id;
+    CoTaskMemFree(id);
+    return text;
+}
+
+void CollectEndpoints(EDataFlow flow, std::vector<QsNamedId>& devices, std::wstring& defaultId,
+    std::wstring& defaultName) {
+    devices.clear();
+    defaultId.clear();
+    defaultName.clear();
+    IMMDeviceEnumerator* enumerator = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            IID_PPV_ARGS(&enumerator))) ||
+        enumerator == nullptr) {
+        return;
+    }
+    IMMDevice* current = nullptr;
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(flow, eMultimedia, &current)) &&
+        current != nullptr) {
+        defaultId = DeviceId(current);
+        defaultName = DeviceName(current);
+        current->Release();
+    }
+    IMMDeviceCollection* collection = nullptr;
+    if (SUCCEEDED(enumerator->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &collection)) &&
+        collection != nullptr) {
+        UINT count = 0;
+        collection->GetCount(&count);
+        const UINT limit = std::min<UINT>(count, 6U);
+        for (UINT index = 0; index < limit; ++index) {
+            IMMDevice* device = nullptr;
+            if (FAILED(collection->Item(index, &device)) || device == nullptr) {
+                continue;
+            }
+            QsNamedId entry;
+            entry.id = DeviceId(device);
+            entry.name = DeviceName(device);
+            device->Release();
+            if (!entry.name.empty()) {
+                devices.push_back(std::move(entry));
+            }
+        }
+        collection->Release();
+    }
+    enumerator->Release();
+}
+
+bool SetWifiRadio(bool enabled) {
+    HANDLE client = nullptr;
+    DWORD version = 0;
+    if (WlanOpenHandle(2, nullptr, &version, &client) != ERROR_SUCCESS || client == nullptr) {
+        return false;
+    }
+    PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
+    bool wrote = false;
+    if (WlanEnumInterfaces(client, nullptr, &interfaces) == ERROR_SUCCESS && interfaces != nullptr) {
+        for (DWORD index = 0; index < interfaces->dwNumberOfItems; ++index) {
+            WLAN_PHY_RADIO_STATE state{};
+            state.dwPhyIndex = 0;
+            state.dot11SoftwareRadioState =
+                enabled ? dot11_radio_state_on : dot11_radio_state_off;
+            if (WlanSetInterface(client, &interfaces->InterfaceInfo[index].InterfaceGuid,
+                    wlan_intf_opcode_radio_state, sizeof(state), &state, nullptr) == ERROR_SUCCESS) {
+                wrote = true;
+            }
+        }
+        WlanFreeMemory(interfaces);
+    }
+    WlanCloseHandle(client, nullptr);
+    return wrote;
+}
+
+bool ConnectWifiProfile(const GUID& interfaceId, const std::wstring& profile) {
+    if (profile.empty()) {
+        return false;
+    }
+    HANDLE client = nullptr;
+    DWORD version = 0;
+    if (WlanOpenHandle(2, nullptr, &version, &client) != ERROR_SUCCESS || client == nullptr) {
+        return false;
+    }
+    WLAN_CONNECTION_PARAMETERS parameters{};
+    parameters.wlanConnectionMode = wlan_connection_mode_profile;
+    parameters.strProfile = profile.c_str();
+    parameters.dot11BssType = dot11_BSS_type_any;
+    parameters.pDot11Ssid = nullptr;
+    parameters.dwFlags = 0;
+    const DWORD result = WlanConnect(client, &interfaceId, &parameters, nullptr);
+    WlanCloseHandle(client, nullptr);
+    return result == ERROR_SUCCESS;
+}
+
+void QueryWifiRadio(QuickSettingsCache& cache) {
+    cache.wifiRadioOn = false;
+    cache.haveWifiInterface = false;
+    HANDLE client = nullptr;
+    DWORD version = 0;
+    if (WlanOpenHandle(2, nullptr, &version, &client) != ERROR_SUCCESS || client == nullptr) {
+        return;
+    }
+    PWLAN_INTERFACE_INFO_LIST interfaces = nullptr;
+    if (WlanEnumInterfaces(client, nullptr, &interfaces) == ERROR_SUCCESS && interfaces != nullptr) {
+        for (DWORD index = 0; index < interfaces->dwNumberOfItems; ++index) {
+            const WLAN_INTERFACE_INFO& info = interfaces->InterfaceInfo[index];
+            if (info.isState == wlan_interface_state_not_ready) {
+                continue;
+            }
+            cache.haveWifiInterface = true;
+            cache.wifiInterface = info.InterfaceGuid;
+            DWORD size = 0;
+            PWLAN_RADIO_STATE radio = nullptr;
+            if (WlanQueryInterface(client, &info.InterfaceGuid, wlan_intf_opcode_radio_state, nullptr,
+                    &size, reinterpret_cast<PVOID*>(&radio), nullptr) == ERROR_SUCCESS &&
+                radio != nullptr) {
+                if (radio->dwNumberOfPhys > 0) {
+                    cache.wifiRadioOn =
+                        radio->PhyRadioState[0].dot11SoftwareRadioState == dot11_radio_state_on;
+                }
+                WlanFreeMemory(radio);
+            } else {
+                cache.wifiRadioOn = true;
+            }
+            break;
+        }
+        WlanFreeMemory(interfaces);
+    }
+    WlanCloseHandle(client, nullptr);
+}
+
+void QueryWifiNetworks(QuickSettingsCache& cache) {
+    cache.wifi.clear();
+    if (!cache.haveWifiInterface || !cache.wifiRadioOn) {
+        return;
+    }
+    HANDLE client = nullptr;
+    DWORD version = 0;
+    if (WlanOpenHandle(2, nullptr, &version, &client) != ERROR_SUCCESS || client == nullptr) {
+        return;
+    }
+    PWLAN_AVAILABLE_NETWORK_LIST list = nullptr;
+    if (WlanGetAvailableNetworkList(client, &cache.wifiInterface, 0, nullptr, &list) == ERROR_SUCCESS &&
+        list != nullptr) {
+        for (DWORD index = 0; index < list->dwNumberOfItems && cache.wifi.size() < 6; ++index) {
+            const WLAN_AVAILABLE_NETWORK& network = list->Network[index];
+            QsWifiNetwork entry;
+            entry.name = SsidText(network.dot11Ssid);
+            if (entry.name.empty() && network.strProfileName[0] != 0) {
+                entry.name = network.strProfileName;
+            }
+            if (entry.name.empty()) {
+                continue;
+            }
+            bool duplicate = false;
+            for (const QsWifiNetwork& existing : cache.wifi) {
+                if (existing.name == entry.name) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            const ULONG quality = network.wlanSignalQuality;
+            entry.bars = quality >= 80 ? 3 : quality >= 50 ? 2 : quality >= 20 ? 1 : 0;
+            entry.connected = (network.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) != 0;
+            entry.secure = network.bSecurityEnabled != FALSE;
+            entry.hasProfile = (network.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE) != 0 ||
+                network.strProfileName[0] != 0;
+            cache.wifi.push_back(std::move(entry));
+        }
+        WlanFreeMemory(list);
+    }
+    WlanCloseHandle(client, nullptr);
+    std::stable_sort(cache.wifi.begin(), cache.wifi.end(),
+        [](const QsWifiNetwork& left, const QsWifiNetwork& right) {
+            return left.connected && !right.connected;
+        });
+}
+
+void QueryAdapters(QuickSettingsCache& cache) {
+    cache.ethernetUp = false;
+    cache.ethernetStatus = L"Not connected";
+    cache.ethernetSpeed = L"Unavailable";
+    cache.ethernetIpv4 = L"Unavailable";
+    cache.ethernetAdapter = L"No adapter";
+    cache.vpn.clear();
+    ULONG size = 16U * 1024U;
+    std::vector<unsigned char> buffer(size);
+    auto* addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    ULONG result = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+        nullptr, addresses, &size);
+    if (result == ERROR_BUFFER_OVERFLOW) {
+        buffer.resize(size);
+        addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+        result = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+            nullptr, addresses, &size);
+    }
+    if (result != ERROR_SUCCESS) {
+        return;
+    }
+    const IP_ADAPTER_ADDRESSES* ethernet = nullptr;
+    for (const IP_ADAPTER_ADDRESSES* adapter = addresses; adapter != nullptr; adapter = adapter->Next) {
+        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) {
+            continue;
+        }
+        const std::wstring description = adapter->Description != nullptr ? adapter->Description : L"";
+        const std::wstring friendly = adapter->FriendlyName != nullptr ? adapter->FriendlyName : description;
+        if (LooksLikeVpn(description + L" " + friendly, adapter->IfType)) {
+            if (cache.vpn.size() < 4) {
+                QsVpnEntry entry;
+                entry.name = friendly.empty() ? L"VPN" : friendly;
+                entry.connected = adapter->OperStatus == IfOperStatusUp;
+                cache.vpn.push_back(std::move(entry));
+            }
+            continue;
+        }
+        if (adapter->IfType != IF_TYPE_ETHERNET_CSMACD || LooksVirtual(description)) {
+            continue;
+        }
+        if (ethernet == nullptr ||
+            (adapter->OperStatus == IfOperStatusUp && ethernet->OperStatus != IfOperStatusUp)) {
+            ethernet = adapter;
+        }
+    }
+    if (ethernet == nullptr) {
+        return;
+    }
+    cache.ethernetUp = ethernet->OperStatus == IfOperStatusUp;
+    cache.ethernetStatus = cache.ethernetUp ? L"Connected" : L"Disconnected";
+    cache.ethernetSpeed = FormatLinkSpeed(ethernet->TransmitLinkSpeed);
+    cache.ethernetAdapter =
+        ethernet->Description != nullptr ? ethernet->Description : L"Ethernet";
+    if (ethernet->FirstUnicastAddress != nullptr) {
+        const std::wstring ip = Ipv4Text(ethernet->FirstUnicastAddress->Address);
+        if (!ip.empty()) {
+            cache.ethernetIpv4 = ip;
+        }
+    }
+}
+
+void QueryPower(QuickSettingsCache& cache) {
+    cache.powerName = L"Balanced";
+    cache.powerMode = 1;
+    cache.usbKnown = false;
+    GUID* scheme = nullptr;
+    if (PowerGetActiveScheme(nullptr, &scheme) != ERROR_SUCCESS || scheme == nullptr) {
+        return;
+    }
+    if (IsEqualGUID(*scheme, GUID_MIN_POWER_SAVINGS)) {
+        cache.powerMode = 0;
+    } else if (IsEqualGUID(*scheme, GUID_MAX_POWER_SAVINGS)) {
+        cache.powerMode = 2;
+    } else {
+        cache.powerMode = 1;
+    }
+    DWORD bytes = 0;
+    if (PowerReadFriendlyName(nullptr, scheme, nullptr, nullptr, nullptr, &bytes) == ERROR_SUCCESS &&
+        bytes >= sizeof(wchar_t)) {
+        std::wstring name(bytes / sizeof(wchar_t), L'\0');
+        if (PowerReadFriendlyName(nullptr, scheme, nullptr, nullptr,
+                reinterpret_cast<UCHAR*>(name.data()), &bytes) == ERROR_SUCCESS) {
+            name.resize(wcslen(name.c_str()));
+            if (!name.empty()) {
+                cache.powerName = name;
+            }
+        }
+    }
+    DWORD usb = 0;
+    if (PowerReadACValueIndex(nullptr, scheme, &kUsbSubgroup, &kUsbSuspend, &usb) == ERROR_SUCCESS) {
+        cache.usbKnown = true;
+        cache.usbSuspend = usb != 0;
+    }
+    LocalFree(scheme);
+}
+
+bool SetPowerMode(int mode) {
+    const GUID* scheme = &GUID_TYPICAL_POWER_SAVINGS;
+    if (mode == 0) {
+        scheme = &GUID_MIN_POWER_SAVINGS;
+    } else if (mode == 2) {
+        scheme = &GUID_MAX_POWER_SAVINGS;
+    }
+    return PowerSetActiveScheme(nullptr, scheme) == ERROR_SUCCESS;
+}
+
+bool SetUsbSuspend(bool enabled) {
+    GUID* scheme = nullptr;
+    if (PowerGetActiveScheme(nullptr, &scheme) != ERROR_SUCCESS || scheme == nullptr) {
+        return false;
+    }
+    const DWORD value = enabled ? 1U : 0U;
+    const DWORD ac = PowerWriteACValueIndex(nullptr, scheme, &kUsbSubgroup, &kUsbSuspend, value);
+    const DWORD dc = PowerWriteDCValueIndex(nullptr, scheme, &kUsbSubgroup, &kUsbSuspend, value);
+    const DWORD apply = PowerSetActiveScheme(nullptr, scheme);
+    LocalFree(scheme);
+    return ac == ERROR_SUCCESS || dc == ERROR_SUCCESS || apply == ERROR_SUCCESS;
+}
+
+void QueryHdr(QuickSettingsCache& cache) {
+    cache.hdrSupported = false;
+    cache.hdrOn = false;
+    UINT pathCount = 0;
+    UINT modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS ||
+        pathCount == 0) {
+        return;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(),
+            nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    for (UINT index = 0; index < pathCount; ++index) {
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color{};
+        color.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        color.header.size = sizeof(color);
+        color.header.adapterId = paths[index].targetInfo.adapterId;
+        color.header.id = paths[index].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&color.header) != ERROR_SUCCESS) {
+            continue;
+        }
+        if (color.advancedColorSupported != 0) {
+            cache.hdrSupported = true;
+            cache.hdrOn = color.advancedColorEnabled != 0;
+            return;
+        }
+    }
+}
+
+bool SetHdrEnabled(bool enabled) {
+    UINT pathCount = 0;
+    UINT modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS ||
+        pathCount == 0) {
+        return false;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(),
+            nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    bool wrote = false;
+    for (UINT index = 0; index < pathCount; ++index) {
+        DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE state{};
+        state.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+        state.header.size = sizeof(state);
+        state.header.adapterId = paths[index].targetInfo.adapterId;
+        state.header.id = paths[index].targetInfo.id;
+        state.enableAdvancedColor = enabled ? 1U : 0U;
+        if (DisplayConfigSetDeviceInfo(&state.header) == ERROR_SUCCESS) {
+            wrote = true;
+        }
+    }
+    return wrote;
+}
+
+void QueryNightLight(QuickSettingsCache& cache) {
+    cache.nightKnown = false;
+    cache.nightLight = false;
+    HKEY key = nullptr;
+    const wchar_t* path =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\"
+        L"default$windows.data.bluelightreduction.bluelightreductionstate\\"
+        L"windows.data.bluelightreduction.bluelightreductionstate";
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return;
+    }
+    DWORD size = 0;
+    DWORD type = 0;
+    if (RegQueryValueExW(key, L"Data", nullptr, &type, nullptr, &size) == ERROR_SUCCESS &&
+        type == REG_BINARY && size > 18) {
+        std::vector<BYTE> data(size);
+        if (RegQueryValueExW(key, L"Data", nullptr, &type, data.data(), &size) == ERROR_SUCCESS &&
+            size > 18) {
+            cache.nightKnown = true;
+            cache.nightLight = data[18] == 0x15 || data[18] == 0x19;
+        }
+    }
+    RegCloseKey(key);
+}
+
+int ReadDword(HKEY root, const wchar_t* subkey, const wchar_t* name, int fallback) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return fallback;
+    }
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    DWORD type = 0;
+    const LSTATUS status = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(&value),
+        &size);
+    RegCloseKey(key);
+    if (status != ERROR_SUCCESS || type != REG_DWORD) {
+        return fallback;
+    }
+    return static_cast<int>(value);
+}
+
+void WriteDword(HKEY root, const wchar_t* subkey, const wchar_t* name, DWORD value) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(root, subkey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) !=
+        ERROR_SUCCESS) {
+        return;
+    }
+    RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+}
+
+void QueryNearby(QuickSettingsCache& cache) {
+    cache.nearby = ReadDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\CDP",
+        L"NearShareChannelUserAuthzPolicy", 0);
+    if (cache.nearby < 0 || cache.nearby > 2) {
+        cache.nearby = 0;
+    }
+}
+
+void SetNearbyMode(int mode) {
+    const DWORD value = static_cast<DWORD>(std::clamp(mode, 0, 2));
+    WriteDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\CDP",
+        L"NearShareChannelUserAuthzPolicy", value);
+    WriteDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\CDP",
+        L"CdpSessionUserAuthzPolicy", value == 0 ? 0U : value);
+    WriteDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\CDP\\SettingsPage",
+        L"NearShareChannelUserAuthzPolicy", value == 0 ? 0U : value);
+}
+
+void QueryCapture(QuickSettingsCache& cache) {
+    cache.inputPeak = 0.0F;
+    cache.inputGain = 1.0F;
+    cache.inputMuted = false;
+    WithEndpoint(eCapture, [&](IMMDevice* device) {
+        cache.inputName = DeviceName(device);
+        IAudioEndpointVolume* volume = nullptr;
+        if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(&volume))) &&
+            volume != nullptr) {
+            float level = 1.0F;
+            BOOL muted = FALSE;
+            if (SUCCEEDED(volume->GetMasterVolumeLevelScalar(&level))) {
+                cache.inputGain = std::clamp(level, 0.0F, 1.0F);
+            }
+            if (SUCCEEDED(volume->GetMute(&muted))) {
+                cache.inputMuted = muted != FALSE;
+            }
+            volume->Release();
+        }
+        IAudioMeterInformation* meter = nullptr;
+        if (SUCCEEDED(device->Activate(__uuidof(IAudioMeterInformation), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(&meter))) &&
+            meter != nullptr) {
+            float peak = 0.0F;
+            if (SUCCEEDED(meter->GetPeakValue(&peak))) {
+                cache.inputPeak = std::clamp(peak, 0.0F, 1.0F);
+            }
+            meter->Release();
+        }
+        return true;
+    });
+}
+
+bool SetCaptureMuted(bool muted) {
+    return WithEndpoint(eCapture, [&](IMMDevice* device) {
+        IAudioEndpointVolume* volume = nullptr;
+        if (FAILED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(&volume))) ||
+            volume == nullptr) {
+            return false;
+        }
+        const HRESULT result = volume->SetMute(muted ? TRUE : FALSE, nullptr);
+        volume->Release();
+        return SUCCEEDED(result);
+    });
+}
+
+bool SetCaptureGain(float level) {
+    level = std::clamp(level, 0.0F, 1.0F);
+    return WithEndpoint(eCapture, [&](IMMDevice* device) {
+        IAudioEndpointVolume* volume = nullptr;
+        if (FAILED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(&volume))) ||
+            volume == nullptr) {
+            return false;
+        }
+        const HRESULT result = volume->SetMasterVolumeLevelScalar(level, nullptr);
+        if (SUCCEEDED(result)) {
+            volume->SetMute(FALSE, nullptr);
+        }
+        volume->Release();
+        return SUCCEEDED(result);
+    });
+}
+
+void SendMediaKey(WORD key) {
+    INPUT inputs[2] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = key;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = key;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, inputs, sizeof(INPUT));
+}
+
+}  // namespace
+
+namespace {
+
+void BlitIcon(uint8_t* pixels, int width, int height, HDC memory, HICON icon, int x, int y,
+    int extent) {
+    if (pixels == nullptr || memory == nullptr || icon == nullptr || extent <= 0) {
+        return;
+    }
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = extent;
+    header.bV5Height = -extent;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000U;
+    header.bV5GreenMask = 0x0000ff00U;
+    header.bV5BlueMask = 0x000000ffU;
+    header.bV5AlphaMask = 0xff000000U;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(memory, reinterpret_cast<const BITMAPINFO*>(&header),
+        DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap == nullptr || bits == nullptr) {
+        return;
+    }
+    HDC iconDc = CreateCompatibleDC(memory);
+    if (iconDc == nullptr) {
+        DeleteObject(bitmap);
+        return;
+    }
+    HGDIOBJ previous = SelectObject(iconDc, bitmap);
+    std::memset(bits, 0, static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U);
+    DrawIconEx(iconDc, 0, 0, icon, extent, extent, 0, nullptr, DI_NORMAL);
+    auto* iconPixels = static_cast<uint8_t*>(bits);
+    const size_t count = static_cast<size_t>(extent) * static_cast<size_t>(extent);
+    for (size_t index = 0; index < count; ++index) {
+        uint8_t* sample = iconPixels + index * 4U;
+        if ((sample[0] | sample[1] | sample[2]) != 0 && sample[3] == 0) {
+            sample[3] = 255;
+        }
+    }
+    CompositePremul(pixels, width, height, x, y, iconPixels, extent, extent);
+    SelectObject(iconDc, previous);
+    DeleteDC(iconDc);
+    DeleteObject(bitmap);
+}
+
+}  // namespace
+
+void DockApp::RefreshQuickSettingsCache() {
+    const ULONGLONG now = GetTickCount64();
+    if (m_qsCache.stamp != 0 && now - m_qsCache.stamp < 800ULL) {
+        return;
+    }
+    QueryWifiRadio(m_qsCache);
+    if (m_qsPage == QuickSettingsPage::Wifi) {
+        QueryWifiNetworks(m_qsCache);
+    } else if (m_qsPage != QuickSettingsPage::Wifi) {
+        m_qsCache.wifi.clear();
+    }
+    QueryAdapters(m_qsCache);
+    CollectEndpoints(eRender, m_qsCache.renderDevices, m_qsCache.renderDefaultId, m_qsCache.outputName);
+    CollectEndpoints(eCapture, m_qsCache.captureDevices, m_qsCache.captureDefaultId, m_qsCache.inputName);
+    QueryCapture(m_qsCache);
+    QueryPower(m_qsCache);
+    QueryHdr(m_qsCache);
+    QueryNightLight(m_qsCache);
+    QueryNearby(m_qsCache);
+    m_qsCache.stamp = GetTickCount64();
+}
+
+void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
+    if (page == m_qsPage) {
+        return;
+    }
+    m_qsReturn = m_qsPage;
+    m_qsPage = page;
+    m_overflowHover = -1;
+    m_overflowHoverDirtyValid = false;
+    m_qsDragging = false;
+    m_qsCache.stamp = 0;
+    InvalidateOverflowGlass();
+    PaintOverflowPopup();
+}
+
+void DockApp::CloseQuickSettingsPage() {
+    QuickSettingsPage back = m_qsReturn;
+    if (back == m_qsPage) {
+        back = QuickSettingsPage::Home;
+    }
+    m_qsReturn = QuickSettingsPage::Home;
+    m_qsPage = back;
+    m_overflowHover = -1;
+    m_overflowHoverDirtyValid = false;
+    m_qsDragging = false;
+    InvalidateOverflowGlass();
+    PaintOverflowPopup();
+}
+
+void DockApp::ProjectBrightness(int percent) {
+    percent = std::clamp(percent, 0, 100);
+    m_brightnessTarget.store(percent);
+    if (!m_brightnessAdjustInFlight.exchange(true)) {
+        std::thread([this] { DrainBrightnessWheel(); }).detach();
+    }
+}
+
+void DockApp::OpenSettingsPage(const wchar_t* uri) {
+    CloseOverflowPopup();
+    if (m_window != nullptr) {
+        SetForegroundWindow(m_window);
+    }
+    ShellExecuteW(m_window, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void DockApp::ApplyQuickSettingsSlider(TrayFlyoutHitKind kind, const RECT& track, LONG x) {
+    const float level = TrackLevel(track, x);
+    if (kind == TrayFlyoutHitKind::VolumeSlider) {
+        if (m_tray.SetVolumeLevel(level)) {
+            EnsureTrayIcons();
+            PaintOverflowPopup();
+            QueueRenderFrame();
+        }
+        return;
+    }
+    if (kind == TrayFlyoutHitKind::BrightnessSlider) {
+        if (m_brightnessTarget.load() < 0 && !m_tray.Status().brightnessAvailable) {
+            OpenSettingsPage(L"ms-settings:display");
+            return;
+        }
+        ProjectBrightness(static_cast<int>(std::lround(level * 100.0F)));
+        PaintOverflowPopup();
+        return;
+    }
+    if (kind == TrayFlyoutHitKind::CaptureGain) {
+        if (SetCaptureGain(level)) {
+            m_qsCache.inputGain = level;
+            m_qsCache.inputMuted = false;
+            m_qsCache.stamp = GetTickCount64();
+            PaintOverflowPopup();
+        }
+    }
+}
+
+void DockApp::MeasureQuickSettings(float scale, LONG padding, LONG gearSize, LONG headerHeight,
+    LONG& panelWidth, LONG& contentHeight) {
+    LayoutQuickSettings(false, nullptr, 0, 0, nullptr, scale, padding, gearSize, headerHeight,
+        nullptr, nullptr, nullptr, nullptr, panelWidth, contentHeight);
+}
+
+void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC memory, float scale,
+    LONG padding, LONG panelWidth, LONG gearSize, LONG headerHeight, HFONT titleFont,
+    HFONT sectionFont, HFONT labelFont, HFONT statusFont) {
+    LONG widthOut = panelWidth;
+    LONG heightOut = 0;
+    LayoutQuickSettings(true, pixels, width, height, memory, scale, padding, gearSize, headerHeight,
+        titleFont, sectionFont, labelFont, statusFont, widthOut, heightOut);
+}
+
+void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int height, HDC memory,
+    float scale, LONG padding, LONG gearSize, LONG headerHeight, HFONT titleFont, HFONT sectionFont,
+    HFONT labelFont, HFONT statusFont, LONG& panelWidth, LONG& contentBottom) {
+    const bool home = m_qsPage == QuickSettingsPage::Home;
+    panelWidth = std::max(320L, std::lround((home ? 600.0F : 380.0F) * scale));
+    const LONG gap = std::max(8L, std::lround(10.0F * scale));
+    const LONG tileH = std::max(96L, std::lround(108.0F * scale));
+    const LONG cardH = std::max(112L, std::lround(124.0F * scale));
+    const LONG smallH = std::max(74L, std::lround(84.0F * scale));
+    const LONG mediaH = std::max(86L, std::lround(96.0F * scale));
+    const LONG sliderH = std::max(22L, std::lround(28.0F * scale));
+    const LONG listRow = std::max(52L, std::lround(58.0F * scale));
+    const LONG sectionH = std::max(22L, std::lround(26.0F * scale));
+    const bool light = m_config.LightPanels();
+    const uint8_t inkR = light ? kInkDarkR : kInkLightR;
+    const uint8_t inkG = light ? kInkDarkG : kInkLightG;
+    const uint8_t inkB = light ? kInkDarkB : kInkLightB;
+    LONG y = padding;
+
+    auto push = [&](TrayFlyoutHitKind kind, RECT bounds, int index = -1) {
+        if (!draw) {
+            return;
+        }
+        TrayFlyoutHit hit;
+        hit.kind = kind;
+        hit.index = index;
+        hit.bounds = bounds;
+        m_overflowHits.push_back(hit);
+    };
+    auto restoreInk = [&]() {
+        SetFlyoutChromeInk(inkR, inkG, inkB);
+    };
+    auto text = [&](RECT bounds, HFONT font, const std::wstring& value, UINT format, uint8_t alpha) {
+        if (!draw || value.empty() || font == nullptr) {
+            return;
+        }
+        DrawFlyoutText(pixels, width, height, bounds, font, value, format, alpha);
+    };
+    auto icon = [&](LONG left, LONG top, wchar_t symbol, UINT extent, uint8_t red, uint8_t green,
+                    uint8_t blue) {
+        if (!draw || extent == 0) {
+            return;
+        }
+        const std::vector<uint8_t>& glyph = CachedGlyph(m_tray, symbol, extent, red, green, blue);
+        if (!glyph.empty()) {
+            CompositePremul(pixels, width, height, static_cast<int>(left), static_cast<int>(top),
+                glyph.data(), static_cast<int>(extent), static_cast<int>(extent));
+        }
+    };
+    auto card = [&](RECT bounds, bool active) {
+        if (!draw) {
+            return;
+        }
+        const float radius = ContentSquircleRadius(bounds, scale);
+        if (active) {
+            FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.96F, kBlueB, kBlueG,
+                kBlueR);
+        } else if (light) {
+            FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.72F, 255, 255, 255);
+        } else {
+            FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.42F, 32, 34, 40);
+        }
+    };
+    auto slider = [&](RECT track, float level) {
+        if (!draw) {
+            return;
+        }
+        level = std::clamp(level, 0.0F, 1.0F);
+        const float radius = std::max(3.0F, static_cast<float>(track.bottom - track.top) * 0.5F);
+        const float cy = 0.5F * static_cast<float>(track.top + track.bottom);
+        const float left = static_cast<float>(track.left) + radius;
+        const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
+        FillPillColorPremul(pixels, width, height, left, right, cy, radius, light ? 0.28F : 0.35F,
+            light ? 176 : 70, light ? 182 : 74, light ? 190 : 82);
+        const float fill = left + (right - left) * level;
+        if (level > 0.015F) {
+            FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
+                kBlueB, kBlueG, kBlueR);
+        }
+        FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(2.0F, 3.0F * scale),
+            0.98F, false);
+    };
+    auto radio = [&](float cx, float cy, bool selected) {
+        if (!draw) {
+            return;
+        }
+        const float radius = std::max(7.0F, 8.0F * scale);
+        FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.50F, inkB, inkG, inkR);
+        FillPillColorPremul(pixels, width, height, cx, cx, cy, radius - 1.8F, 0.96F,
+            light ? 255 : 32, light ? 255 : 34, light ? 255 : 40);
+        if (selected) {
+            FillPillColorPremul(pixels, width, height, cx, cx, cy, radius * 0.46F, 1.0F, kBlueB,
+                kBlueG, kBlueR);
+        }
+    };
+    auto toggleRect = [&](LONG centerY, LONG right, bool enabled) {
+        const LONG switchW = std::max(40L, std::lround(44.0F * scale));
+        const LONG switchH = std::max(22L, std::lround(24.0F * scale));
+        const LONG left = right - switchW;
+        const LONG top = centerY - switchH / 2L;
+        if (draw) {
+            const float radius = static_cast<float>(switchH) * 0.5F;
+            const float cxL = static_cast<float>(left) + radius;
+            const float cxR = static_cast<float>(right) - radius;
+            const float cy = static_cast<float>(top) + radius;
+            if (enabled) {
+                FillPillColorPremul(pixels, width, height, cxL, cxR, cy, radius, 0.96F, kBlueB,
+                    kBlueG, kBlueR);
+            } else {
+                FillPillColorPremul(pixels, width, height, cxL, cxR, cy, radius, 0.45F, inkB, inkG,
+                    inkR);
+            }
+            FillCirclePremul(pixels, width, height, enabled ? cxR : cxL, cy,
+                radius - std::max(2.0F, 2.0F * scale), 0.98F, false);
+        }
+        return RECT{left - 8, top - 6, right + 6, top + switchH + 6};
+    };
+    auto beginHeader = [&](const wchar_t* title, bool gear, int toggleIndex, bool toggleOn) {
+        if (m_qsPage != QuickSettingsPage::Home) {
+            const RECT back{padding, y, padding + headerHeight, y + headerHeight};
+            text(back, titleFont, L"\u2190", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
+            push(TrayFlyoutHitKind::Back, back);
+        }
+        LONG rightLimit = panelWidth - padding;
+        if (gear) {
+            const UINT gearExtent = static_cast<UINT>(std::max(1L, gearSize));
+            const RECT gearRect{panelWidth - padding - gearSize, y + (headerHeight - gearSize) / 2L,
+                panelWidth - padding, y + (headerHeight + gearSize) / 2L};
+            if (draw) {
+                EnsureOverflowGlyphs(gearExtent, gearExtent);
+                m_overflowGearX = static_cast<int>(gearRect.left);
+                m_overflowGearY = static_cast<int>(gearRect.top);
+                m_overflowGearExtent = gearExtent;
+                if (!m_overflowGlyphGear.empty()) {
+                    CompositePremul(pixels, width, height, m_overflowGearX, m_overflowGearY,
+                        m_overflowGlyphGear.data(), static_cast<int>(gearExtent),
+                        static_cast<int>(gearExtent));
+                }
+            }
+            push(TrayFlyoutHitKind::Settings, {gearRect.left - 8, y, panelWidth - padding + 4, y + headerHeight});
+            rightLimit = gearRect.left - 8;
+        } else if (draw) {
+            m_overflowGearExtent = 0;
+        }
+        if (toggleIndex >= 0) {
+            const RECT toggle = toggleRect(y + headerHeight / 2L, panelWidth - padding, toggleOn);
+            push(TrayFlyoutHitKind::Toggle, toggle, toggleIndex);
+            rightLimit = toggle.left - 4;
+        }
+        const LONG titleLeft = m_qsPage == QuickSettingsPage::Home ? padding : padding + headerHeight;
+        text({titleLeft, y, rightLimit, y + headerHeight}, titleFont, title,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+        y += headerHeight;
+    };
+    auto section = [&](const wchar_t* label) {
+        text({padding, y, panelWidth - padding, y + sectionH}, sectionFont, label,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 170);
+        y += sectionH;
+    };
+    auto footer = [&](const wchar_t* label, int link) {
+        const RECT row{padding, y, panelWidth - padding, y + listRow};
+        if (draw) {
+            SetFlyoutChromeInk(kBlueR, kBlueG, kBlueB);
+            text(row, labelFont, std::wstring(label) + L"    \u203A",
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+            restoreInk();
+        }
+        push(TrayFlyoutHitKind::MoreSettings, row, link);
+        y += listRow;
+    };
+
+    const TrayStatus& tray = m_tray.Status();
+    const int projected = m_brightnessTarget.load();
+    const float volume = tray.volumeMuted ? 0.0F : tray.volumeLevel;
+    const float brightness = projected >= 0
+        ? static_cast<float>(projected) / 100.0F
+        : (tray.brightnessAvailable ? static_cast<float>(tray.brightnessPercent) / 100.0F : 0.0F);
+    const std::wstring outputName = m_qsCache.outputName.empty() ? L"Speakers" : m_qsCache.outputName;
+    const std::wstring inputName = m_qsCache.inputName.empty() ? L"Microphone" : m_qsCache.inputName;
+
+    if (home) {
+        beginHeader(L"Quick Settings", true, -1, false);
+        y += gap;
+        const LONG inner = panelWidth - padding * 2L;
+        const LONG tileGap = gap;
+        const LONG smallW = static_cast<LONG>((static_cast<float>(inner - tileGap * 4L)) / 5.45F);
+        const LONG wifiW = inner - tileGap * 4L - smallW * 4L;
+        const UINT tileIcon = static_cast<UINT>(std::max(16L, std::lround(20.0F * scale)));
+        auto tile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
+                        bool active, TrayFlyoutHitKind kind) {
+            card(bounds, active);
+            const uint8_t red = active ? 255 : inkR;
+            const uint8_t green = active ? 255 : inkG;
+            const uint8_t blue = active ? 255 : inkB;
+            icon(bounds.left + 12, bounds.top + 12, symbol, tileIcon, red, green, blue);
+            if (draw) {
+                SetFlyoutChromeInk(red, green, blue);
+            }
+            text({bounds.left + 12, bounds.top + 12 + static_cast<LONG>(tileIcon) + 6, bounds.right - 12,
+                     bounds.top + 12 + static_cast<LONG>(tileIcon) + 26},
+                labelFont, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            text({bounds.left + 12, bounds.bottom - 28, bounds.right - 22, bounds.bottom - 8}, statusFont,
+                subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, active ? 230 : 180);
+            text({bounds.right - 22, bounds.bottom - 28, bounds.right - 6, bounds.bottom - 8}, statusFont,
+                L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, active ? 230 : 160);
+            restoreInk();
+            push(kind, bounds);
+        };
+        LONG x = padding;
+        const bool wifiOn = tray.network == TrayNetworkKind::Wifi;
+        tile({x, y, x + wifiW, y + tileH}, L'\uE701', L"Wi-Fi",
+            wifiOn ? (tray.networkName.empty() ? L"Connected" : tray.networkName)
+                   : (m_qsCache.wifiRadioOn ? L"Not connected" : L"Off"),
+            wifiOn, TrayFlyoutHitKind::Wifi);
+        x += wifiW + tileGap;
+        tile({x, y, x + smallW, y + tileH}, L'\uE839', L"Ethernet",
+            m_qsCache.ethernetUp ? L"Connected" : L"Off", false, TrayFlyoutHitKind::Ethernet);
+        x += smallW + tileGap;
+        const bool airplane = !m_qsCache.wifiRadioOn && m_bluetoothSnapshot.ready &&
+            m_bluetoothSnapshot.radioPresent && !m_bluetoothSnapshot.radioOn;
+        tile({x, y, x + smallW, y + tileH}, L'\uE709', L"Airplane mode", airplane ? L"On" : L"Off",
+            false, TrayFlyoutHitKind::Airplane);
+        x += smallW + tileGap;
+        const std::wstring hidden = m_overflowIcons.empty()
+            ? L"No icons"
+            : (L"Hidden icons \u00B7 " + std::to_wstring(m_overflowIcons.size()));
+        tile({x, y, x + smallW, y + tileH}, L'\uE7F4', L"System Tray", hidden, false,
+            TrayFlyoutHitKind::SystemTrayPage);
+        x += smallW + tileGap;
+        std::wstring vpnLabel = L"Off";
+        for (const QsVpnEntry& entry : m_qsCache.vpn) {
+            if (entry.connected) {
+                vpnLabel = entry.name;
+                break;
+            }
+        }
+        tile({x, y, panelWidth - padding, y + tileH}, L'\uE72E', L"VPN", vpnLabel, false,
+            TrayFlyoutHitKind::Vpn);
+        y += tileH + gap;
+
+        const LONG soundW = (inner - gap) * 58L / 100L;
+        const RECT sound{padding, y, padding + soundW, y + cardH};
+        const RECT mic{sound.right + gap, y, panelWidth - padding, y + cardH};
+        const RECT volumeTrack{sound.left + 14, sound.bottom - 36, sound.right - 58, sound.bottom - 36 + sliderH};
+        push(TrayFlyoutHitKind::VolumeSlider, volumeTrack);
+        card(sound, false);
+        icon(sound.left + 14, sound.top + 14, tray.volumeMuted ? L'\uE74F' : L'\uE767', tileIcon, inkR,
+            inkG, inkB);
+        text({sound.left + 14 + static_cast<LONG>(tileIcon) + 8, sound.top + 10, sound.right - 24,
+                 sound.top + 30},
+            labelFont, L"Sound", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+        text({sound.left + 14 + static_cast<LONG>(tileIcon) + 8, sound.top + 30, sound.right - 24,
+                 sound.top + 50},
+            statusFont, outputName, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
+        text({sound.right - 24, sound.top + 12, sound.right - 8, sound.top + 36}, statusFont, L"\u203A",
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
+        slider(volumeTrack, volume);
+        text({volumeTrack.right + 6, volumeTrack.top, sound.right - 10, volumeTrack.bottom}, statusFont,
+            std::to_wstring(static_cast<int>(std::lround(volume * 100.0F))) + L"%",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 200);
+        push(TrayFlyoutHitKind::Sound, sound);
+
+        card(mic, false);
+        icon(mic.left + 14, mic.top + 14, L'\uE720', tileIcon, inkR, inkG, inkB);
+        text({mic.left + 14 + static_cast<LONG>(tileIcon) + 8, mic.top + 10, mic.right - 24, mic.top + 30},
+            labelFont, L"Microphone", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+        text({mic.left + 14 + static_cast<LONG>(tileIcon) + 8, mic.top + 30, mic.right - 24, mic.top + 50},
+            statusFont, inputName, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
+        text({mic.right - 24, mic.top + 12, mic.right - 8, mic.top + 36}, statusFont, L"\u203A",
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
+        const RECT meter{mic.left + 14, mic.bottom - 34, mic.right - 14, mic.bottom - 34 + 8};
+        if (draw) {
+            const int segments = 12;
+            const int lit = m_qsCache.inputMuted
+                ? 0
+                : static_cast<int>(std::lround(m_qsCache.inputPeak * static_cast<float>(segments)));
+            const LONG segGap = 3;
+            const LONG segW = std::max(3L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
+            for (int index = 0; index < segments; ++index) {
+                const LONG left = meter.left + index * (segW + segGap);
+                const RECT seg{left, meter.top, left + segW, meter.bottom};
+                if (index < lit) {
+                    FillSquircleColorPremul(pixels, width, height, seg, 2.0F, 0.95F, kBlueB, kBlueG,
+                        kBlueR);
+                } else {
+                    FillSquircleColorPremul(pixels, width, height, seg, 2.0F, 0.28F, inkB, inkG, inkR);
+                }
+            }
+        }
+        push(TrayFlyoutHitKind::Microphone, mic);
+        y += cardH + gap;
+
+        const LONG hdrW = std::max(72L, std::lround(78.0F * scale));
+        const LONG rest = inner - gap * 3L - hdrW;
+        const LONG cell = rest / 3L;
+        auto drawSmallTile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
+                         TrayFlyoutHitKind kind, bool hdrBadge) {
+            card(bounds, false);
+            if (hdrBadge) {
+                text({bounds.left + 10, bounds.top + 10, bounds.left + 52, bounds.top + 32}, labelFont,
+                    L"HDR", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+            } else {
+                icon(bounds.left + 12, bounds.top + 12, symbol, tileIcon, inkR, inkG, inkB);
+            }
+            const LONG textTop = hdrBadge ? bounds.top + 34 : bounds.top + 12 + static_cast<LONG>(tileIcon) + 4;
+            text({bounds.left + 10, textTop, bounds.right - 8, textTop + 18}, labelFont, title,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            text({bounds.left + 10, bounds.bottom - 26, bounds.right - 18, bounds.bottom - 6}, statusFont,
+                subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
+            text({bounds.right - 18, bounds.bottom - 26, bounds.right - 4, bounds.bottom - 6}, statusFont,
+                L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
+            push(kind, bounds);
+        };
+        const std::wstring night = m_qsCache.nightKnown ? (m_qsCache.nightLight ? L"On" : L"Off") : L"Settings";
+        const std::wstring hdr = !m_qsCache.hdrSupported ? L"Unavailable" : (m_qsCache.hdrOn ? L"On" : L"Off");
+        const std::wstring nearbyLabel = m_qsCache.nearby == 0 ? L"Off" : L"On";
+        x = padding;
+        drawSmallTile({x, y, x + cell, y + smallH}, L'\uE706', L"Display", night, TrayFlyoutHitKind::Display, false);
+        x += cell + gap;
+        drawSmallTile({x, y, x + hdrW, y + smallH}, 0, L"HDR", hdr, TrayFlyoutHitKind::Hdr, true);
+        x += hdrW + gap;
+        drawSmallTile({x, y, x + cell, y + smallH}, L'\uE708', L"Power", m_qsCache.powerName, TrayFlyoutHitKind::Power,
+            false);
+        x += cell + gap;
+        drawSmallTile({x, y, panelWidth - padding, y + smallH}, L'\uE716', L"Nearby sharing", nearbyLabel,
+            TrayFlyoutHitKind::Nearby, false);
+        y += smallH + gap;
+
+        const RECT media{padding, y, panelWidth - padding, y + mediaH};
+        const RECT prev{media.right - 168, media.top + 14, media.right - 128, media.top + 48};
+        const RECT play{prev.right + 4, prev.top, prev.right + 44, prev.bottom};
+        const RECT next{play.right + 4, prev.top, play.right + 44, prev.bottom};
+        push(TrayFlyoutHitKind::MediaTransport, prev, 0);
+        push(TrayFlyoutHitKind::MediaTransport, play, 1);
+        push(TrayFlyoutHitKind::MediaTransport, next, 2);
+        card(media, false);
+        icon(media.left + 14, media.top + 16, L'\uE8D6', tileIcon, 30, 215, 96);
+        text({media.left + 44, media.top + 12, prev.left - 8, media.top + 34}, labelFont, L"Nothing playing",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+        text({media.left + 44, media.top + 32, prev.left - 8, media.top + 52}, statusFont, L"Media key",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 170);
+        icon(prev.left + 8, prev.top + 6, L'\uE892', 18, inkR, inkG, inkB);
+        icon(play.left + 8, play.top + 6, L'\uE768', 18, inkR, inkG, inkB);
+        icon(next.left + 8, next.top + 6, L'\uE893', 18, inkR, inkG, inkB);
+        const RECT bright{media.left + 14, media.bottom - 30, media.right - 28, media.bottom - 30 + sliderH};
+        const RECT brightLink{media.right - 26, media.bottom - 32, media.right - 6, media.bottom - 8};
+        push(TrayFlyoutHitKind::Display, brightLink);
+        icon(media.left + 14, bright.top - 2, L'\uE706', 16, inkR, inkG, inkB);
+        const RECT brightTrack{media.left + 36, bright.top, media.right - 36, bright.bottom};
+        push(TrayFlyoutHitKind::BrightnessSlider, brightTrack);
+        slider(brightTrack, brightness);
+        text(brightLink, statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
+        y += mediaH + padding;
+        contentBottom = y;
+        return;
+    }
+
+    auto infoRow = [&](RECT row, const wchar_t* title, const std::wstring& value) {
+        text({row.left + 14, row.top + 6, row.right - 14, row.top + 26}, labelFont, title,
+            DT_LEFT | DT_BOTTOM | DT_SINGLELINE, 255);
+        text({row.left + 14, row.top + 26, row.right - 14, row.bottom - 4}, statusFont, value,
+            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
+    };
+    auto navRow = [&](RECT row, wchar_t symbol, const std::wstring& title, const std::wstring& subtitle,
+                      TrayFlyoutHitKind kind, int index) {
+        const UINT extent = 18;
+        icon(row.left + 12, row.top + (listRow - 18) / 2L, symbol, extent, inkR, inkG, inkB);
+        text({row.left + 40, row.top + 6, row.right - 28, row.top + 28}, labelFont, title,
+            DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+        text({row.left + 40, row.top + 28, row.right - 28, row.bottom - 4}, statusFont, subtitle,
+            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
+        text({row.right - 24, row.top, row.right - 8, row.bottom}, statusFont, L"\u203A",
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
+        push(kind, row, index);
+    };
+
+    if (m_qsPage == QuickSettingsPage::Wifi) {
+        beginHeader(L"Wi-Fi", false, kToggleWifi, m_qsCache.wifiRadioOn);
+        y += gap;
+        if (!m_qsCache.wifiRadioOn) {
+            card({padding, y, panelWidth - padding, y + listRow}, false);
+            text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"Wi-Fi is off",
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
+            y += listRow + gap;
+        } else if (m_qsCache.wifi.empty()) {
+            card({padding, y, panelWidth - padding, y + listRow}, false);
+            text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"No networks found",
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
+            y += listRow + gap;
+        } else {
+            const LONG rows = static_cast<LONG>(m_qsCache.wifi.size());
+            const RECT group{padding, y, panelWidth - padding, y + rows * listRow};
+            card(group, false);
+            for (LONG index = 0; index < rows; ++index) {
+                const QsWifiNetwork& network = m_qsCache.wifi[static_cast<size_t>(index)];
+                const RECT row{group.left, group.top + index * listRow, group.right,
+                    group.top + (index + 1) * listRow};
+                std::wstring subtitle = network.connected ? L"Connected" : (network.secure ? L"Secured" : L"Open");
+                navRow(row, L'\uE701', network.name, subtitle, TrayFlyoutHitKind::WifiNetwork,
+                    static_cast<int>(index));
+            }
+            y += rows * listRow + gap;
+        }
+        footer(L"More Wi-Fi settings", kLinkWifi);
+    } else if (m_qsPage == QuickSettingsPage::Ethernet) {
+        beginHeader(L"Ethernet", false, -1, false);
+        y += 4;
+        const std::wstring summary = m_qsCache.ethernetUp
+            ? (m_qsCache.ethernetStatus + L"  \u00B7  " + m_qsCache.ethernetSpeed)
+            : m_qsCache.ethernetStatus;
+        text({padding, y, panelWidth - padding, y + sectionH}, statusFont, summary,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
+        y += sectionH + 6;
+        const RECT group{padding, y, panelWidth - padding, y + listRow * 4L};
+        card(group, false);
+        const wchar_t* labels[4] = {L"Status", L"Link speed", L"IPv4", L"Adapter"};
+        const std::wstring values[4] = {m_qsCache.ethernetStatus, m_qsCache.ethernetSpeed,
+            m_qsCache.ethernetIpv4, m_qsCache.ethernetAdapter};
+        for (LONG index = 0; index < 4; ++index) {
+            infoRow({group.left, group.top + index * listRow, group.right, group.top + (index + 1) * listRow},
+                labels[index], values[index]);
+        }
+        y += listRow * 4L + gap;
+        footer(L"More network settings", kLinkNetwork);
+    } else if (m_qsPage == QuickSettingsPage::Vpn) {
+        beginHeader(L"VPN", false, -1, false);
+        y += gap;
+        if (m_qsCache.vpn.empty()) {
+            card({padding, y, panelWidth - padding, y + listRow}, false);
+            text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"No VPN connected",
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
+            y += listRow + gap;
+        } else {
+            const LONG rows = static_cast<LONG>(m_qsCache.vpn.size());
+            const RECT group{padding, y, panelWidth - padding, y + rows * listRow};
+            card(group, false);
+            for (LONG index = 0; index < rows; ++index) {
+                const QsVpnEntry& entry = m_qsCache.vpn[static_cast<size_t>(index)];
+                navRow({group.left, group.top + index * listRow, group.right,
+                           group.top + (index + 1) * listRow},
+                    L'\uE72E', entry.name, entry.connected ? L"Connected" : L"Not connected",
+                    TrayFlyoutHitKind::VpnEntry, static_cast<int>(index));
+            }
+            y += rows * listRow + gap;
+        }
+        footer(L"More VPN settings", kLinkVpn);
+    } else if (m_qsPage == QuickSettingsPage::Sound) {
+        beginHeader(L"Sound", false, -1, false);
+        y += gap;
+        const RECT track{padding + 28, y, panelWidth - padding - 8, y + sliderH};
+        push(TrayFlyoutHitKind::VolumeSlider, track);
+        icon(padding, y - 2, tray.volumeMuted ? L'\uE74F' : L'\uE767', 18, inkR, inkG, inkB);
+        slider(track, volume);
+        y += sliderH + gap;
+        section(L"Output device");
+        const LONG rows = std::max(1L, static_cast<LONG>(m_qsCache.renderDevices.size()));
+        const RECT group{padding, y, panelWidth - padding, y + rows * listRow};
+        card(group, false);
+        if (m_qsCache.renderDevices.empty()) {
+            infoRow(group, outputName.c_str(), L"Default output");
+        } else {
+            for (LONG index = 0; index < rows; ++index) {
+                const QsNamedId& device = m_qsCache.renderDevices[static_cast<size_t>(index)];
+                const RECT row{group.left, group.top + index * listRow, group.right,
+                    group.top + (index + 1) * listRow};
+                const bool selected = device.id == m_qsCache.renderDefaultId;
+                radio(static_cast<float>(row.left + 22), static_cast<float>(row.top + listRow / 2L),
+                    selected);
+                text({row.left + 40, row.top + 8, row.right - 12, row.top + 30}, labelFont, device.name,
+                    DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                text({row.left + 40, row.top + 30, row.right - 12, row.bottom - 6}, statusFont,
+                    selected ? L"Default" : L"Available", DT_LEFT | DT_TOP | DT_SINGLELINE, 170);
+                push(TrayFlyoutHitKind::AudioOutput, row, static_cast<int>(index));
+            }
+        }
+        y += rows * listRow + gap;
+        const RECT mute{padding, y, panelWidth - padding, y + listRow};
+        card(mute, false);
+        text({mute.left + 14, mute.top, mute.right - 70, mute.bottom}, labelFont, L"Mute",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+        const RECT muteToggle = toggleRect(mute.top + listRow / 2L, mute.right - 12, tray.volumeMuted);
+        push(TrayFlyoutHitKind::Toggle, muteToggle, kToggleMute);
+        y += listRow + gap;
+        const RECT apps{padding, y, panelWidth - padding, y + listRow};
+        card(apps, false);
+        navRow(apps, L'\uE767', L"Per-app volume", L"Open the volume mixer", TrayFlyoutHitKind::MoreSettings,
+            kLinkMixer);
+        y += listRow + gap;
+        footer(L"More sound settings", kLinkSound);
+    } else if (m_qsPage == QuickSettingsPage::Microphone) {
+        beginHeader(L"Microphone", false, -1, false);
+        y += gap;
+        section(L"Input level");
+        const RECT level{padding, y, panelWidth - padding, y + 28};
+        card(level, false);
+        if (draw) {
+            const int segments = 16;
+            const int lit = m_qsCache.inputMuted
+                ? 0
+                : static_cast<int>(std::lround(m_qsCache.inputPeak * static_cast<float>(segments)));
+            const LONG segGap = 3;
+            const LONG segW =
+                std::max(3L, (level.right - level.left - 24 - segGap * (segments - 1)) / segments);
+            for (int index = 0; index < segments; ++index) {
+                const LONG left = level.left + 12 + index * (segW + segGap);
+                const RECT seg{left, level.top + 8, left + segW, level.bottom - 8};
+                FillSquircleColorPremul(pixels, width, height, seg, 2.0F, index < lit ? 0.95F : 0.25F,
+                    index < lit ? kBlueB : inkB, index < lit ? kBlueG : inkG, index < lit ? kBlueR : inkR);
+            }
+        }
+        y += 28 + gap;
+        section(L"Gain");
+        const RECT gain{padding, y, panelWidth - padding, y + sliderH};
+        push(TrayFlyoutHitKind::CaptureGain, gain);
+        slider(gain, m_qsCache.inputGain);
+        y += sliderH + gap;
+        section(L"Input device");
+        const LONG rows = std::max(1L, static_cast<LONG>(m_qsCache.captureDevices.size()));
+        const RECT group{padding, y, panelWidth - padding, y + rows * listRow};
+        card(group, false);
+        if (m_qsCache.captureDevices.empty()) {
+            infoRow(group, inputName.c_str(), L"Default input");
+        } else {
+            for (LONG index = 0; index < rows; ++index) {
+                const QsNamedId& device = m_qsCache.captureDevices[static_cast<size_t>(index)];
+                const RECT row{group.left, group.top + index * listRow, group.right,
+                    group.top + (index + 1) * listRow};
+                const bool selected = device.id == m_qsCache.captureDefaultId;
+                radio(static_cast<float>(row.left + 22), static_cast<float>(row.top + listRow / 2L),
+                    selected);
+                text({row.left + 40, row.top + 8, row.right - 12, row.top + 30}, labelFont, device.name,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                push(TrayFlyoutHitKind::AudioInput, row, static_cast<int>(index));
+            }
+        }
+        y += rows * listRow + gap;
+        const RECT mute{padding, y, panelWidth - padding, y + listRow};
+        card(mute, false);
+        text({mute.left + 14, mute.top, mute.right - 70, mute.bottom}, labelFont, L"Mute microphone",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+        push(TrayFlyoutHitKind::Toggle, toggleRect(mute.top + listRow / 2L, mute.right - 12, m_qsCache.inputMuted),
+            kToggleMic);
+        y += listRow + gap;
+        footer(L"More sound settings", kLinkSound);
+    } else if (m_qsPage == QuickSettingsPage::Power) {
+        beginHeader(L"Power", false, -1, false);
+        y += gap;
+        section(L"Power mode");
+        const RECT group{padding, y, panelWidth - padding, y + listRow * 3L};
+        card(group, false);
+        const wchar_t* modes[3] = {L"Best performance", L"Balanced", L"Better battery"};
+        for (int index = 0; index < 3; ++index) {
+            const RECT row{group.left, group.top + index * listRow, group.right,
+                group.top + (index + 1) * listRow};
+            radio(static_cast<float>(row.left + 22), static_cast<float>(row.top + listRow / 2L),
+                m_qsCache.powerMode == index);
+            text({row.left + 40, row.top, row.right - 12, row.bottom}, labelFont, modes[index],
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+            push(TrayFlyoutHitKind::PowerMode, row, index);
+        }
+        y += listRow * 3L + gap;
+        if (m_qsCache.usbKnown) {
+            const RECT usb{padding, y, panelWidth - padding, y + listRow};
+            card(usb, false);
+            text({usb.left + 14, usb.top, usb.right - 70, usb.bottom}, labelFont, L"USB selective suspend",
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+            push(TrayFlyoutHitKind::Toggle,
+                toggleRect(usb.top + listRow / 2L, usb.right - 12, m_qsCache.usbSuspend), kToggleUsb);
+            y += listRow + gap;
+        }
+        const RECT boost{padding, y, panelWidth - padding, y + listRow};
+        card(boost, false);
+        navRow(boost, L'\uE945', L"Performance boost", m_boostStatus, TrayFlyoutHitKind::Boost, -1);
+        y += listRow + gap;
+        footer(L"More power settings", kLinkPower);
+    } else if (m_qsPage == QuickSettingsPage::SystemTray) {
+        beginHeader(L"System Tray", false, -1, false);
+        y += 2;
+        text({padding, y, panelWidth - padding, y + sectionH}, statusFont, L"Icons and right-click actions",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 170);
+        y += sectionH;
+        const size_t shown = std::min(m_overflowIcons.size(), static_cast<size_t>(8));
+        if (shown == 0) {
+            card({padding, y, panelWidth - padding, y + listRow}, false);
+            text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"No tray icons",
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
+            y += listRow + gap;
+        } else {
+            const RECT group{padding, y, panelWidth - padding, y + static_cast<LONG>(shown) * listRow};
+            card(group, false);
+            for (size_t index = 0; index < shown; ++index) {
+                const RECT row{group.left, group.top + static_cast<LONG>(index) * listRow, group.right,
+                    group.top + static_cast<LONG>(index + 1) * listRow};
+                std::wstring title = NotifyIconTitle(m_overflowIcons[index]);
+                const size_t paren = title.find(L" (");
+                if (paren != std::wstring::npos && paren > 0) {
+                    title.resize(paren);
+                }
+                std::wstring subtitle = NotifyIconStatus(m_overflowIcons[index]);
+                if (subtitle.empty()) {
+                    subtitle = L"Click to open";
+                }
+                if (draw) {
+                    BlitIcon(pixels, width, height, memory, m_overflowIcons[index].icon,
+                        static_cast<int>(row.left + 12),
+                        static_cast<int>(row.top + (listRow - 18) / 2L), 18);
+                }
+                text({row.left + 40, row.top + 6, row.right - 16, row.top + 28}, labelFont, title,
+                    DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                text({row.left + 40, row.top + 28, row.right - 16, row.bottom - 4}, statusFont, subtitle,
+                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
+                push(TrayFlyoutHitKind::NotifyIcon, row, static_cast<int>(index));
+            }
+            y += static_cast<LONG>(shown) * listRow + gap;
+        }
+        footer(L"Manage tray icons", kLinkTaskbar);
+    } else if (m_qsPage == QuickSettingsPage::Nearby) {
+        beginHeader(L"Nearby sharing", false, kToggleNearby, m_qsCache.nearby != 0);
+        y += gap;
+        const RECT group{padding, y, panelWidth - padding, y + listRow * 3L};
+        card(group, false);
+        const wchar_t* choices[3] = {L"My devices only", L"Everyone nearby", L"Off"};
+        const int values[3] = {1, 2, 0};
+        for (int index = 0; index < 3; ++index) {
+            const RECT row{group.left, group.top + index * listRow, group.right,
+                group.top + (index + 1) * listRow};
+            radio(static_cast<float>(row.left + 22), static_cast<float>(row.top + listRow / 2L),
+                m_qsCache.nearby == values[index]);
+            text({row.left + 40, row.top, row.right - 12, row.bottom}, labelFont, choices[index],
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+            push(TrayFlyoutHitKind::NearbyMode, row, values[index]);
+        }
+        y += listRow * 3L + gap;
+        section(L"Device discovery");
+        card({padding, y, panelWidth - padding, y + listRow}, false);
+        text({padding + 14, y, panelWidth - padding - 14, y + listRow}, statusFont,
+            L"Phones and PCs appear here while sharing is on",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
+        y += listRow + gap;
+        footer(L"More sharing settings", kLinkNearby);
+    } else if (m_qsPage == QuickSettingsPage::Airplane) {
+        const bool airplane = !m_qsCache.wifiRadioOn &&
+            (!m_bluetoothSnapshot.radioPresent || !m_bluetoothSnapshot.radioOn);
+        beginHeader(L"Airplane mode", false, kToggleAirplane, airplane);
+        y += 4;
+        text({padding, y, panelWidth - padding, y + sectionH}, statusFont, L"Turns off Wi-Fi and Bluetooth.",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180);
+        y += sectionH + 6;
+        const RECT group{padding, y, panelWidth - padding, y + listRow * 2L};
+        card(group, false);
+        navRow({group.left, group.top, group.right, group.top + listRow}, L'\uE701', L"Wi-Fi",
+            m_qsCache.wifiRadioOn ? L"On" : L"Off", TrayFlyoutHitKind::Wifi, -1);
+        navRow({group.left, group.top + listRow, group.right, group.bottom}, L'\uE702', L"Bluetooth",
+            m_bluetoothSnapshot.radioOn ? L"On" : L"Off", TrayFlyoutHitKind::MoreSettings, 11);
+        y += listRow * 2L + gap;
+        footer(L"More network settings", kLinkNetwork);
+    } else if (m_qsPage == QuickSettingsPage::Bluetooth) {
+        beginHeader(L"Bluetooth", false, -1, false);
+        if (m_bluetoothSnapshot.ready && m_bluetoothSnapshot.radioPresent) {
+            const RECT toggle = toggleRect(padding + headerHeight / 2L, panelWidth - padding,
+                m_bluetoothSnapshot.radioOn);
+            push(TrayFlyoutHitKind::BluetoothRadio, toggle);
+        }
+        y += gap;
+        if (!m_bluetoothSnapshot.ready) {
+            text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"Looking for devices...",
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
+            y += listRow;
+        } else if (!m_bluetoothSnapshot.radioPresent || !m_bluetoothSnapshot.radioOn) {
+            card({padding, y, panelWidth - padding, y + listRow}, false);
+            text({padding, y, panelWidth - padding, y + listRow}, labelFont,
+                m_bluetoothSnapshot.radioPresent ? L"Bluetooth is off" : L"Bluetooth is unavailable",
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
+            y += listRow + gap;
+        } else {
+            const size_t paired = std::min(m_bluetoothSnapshot.paired.size(), static_cast<size_t>(4));
+            const size_t found = std::min(m_bluetoothSnapshot.discovered.size(), static_cast<size_t>(3));
+            const LONG rows = static_cast<LONG>(paired + found + 1);
+            const RECT group{padding, y, panelWidth - padding, y + rows * listRow};
+            card(group, false);
+            LONG rowIndex = 0;
+            for (size_t index = 0; index < paired; ++index, ++rowIndex) {
+                const BluetoothDeviceInfo& device = m_bluetoothSnapshot.paired[index];
+                navRow({group.left, group.top + rowIndex * listRow, group.right,
+                           group.top + (rowIndex + 1) * listRow},
+                    L'\uE702', device.name, device.connected ? L"Connected" : device.status,
+                    TrayFlyoutHitKind::BluetoothConnect, static_cast<int>(index));
+            }
+            for (size_t index = 0; index < found; ++index, ++rowIndex) {
+                const BluetoothDeviceInfo& device = m_bluetoothSnapshot.discovered[index];
+                navRow({group.left, group.top + rowIndex * listRow, group.right,
+                           group.top + (rowIndex + 1) * listRow},
+                    L'\uE702', device.name, device.busy ? L"Pairing..." : L"Tap to pair",
+                    TrayFlyoutHitKind::BluetoothPair, static_cast<int>(index));
+            }
+            navRow({group.left, group.top + rowIndex * listRow, group.right, group.bottom}, L'\uE710',
+                m_bluetoothSnapshot.discovering ? L"Stop searching" : L"Pair new device",
+                m_bluetoothSnapshot.discovering ? L"Looking nearby" : L"Headphones, speakers, and more",
+                TrayFlyoutHitKind::BluetoothDiscover, -1);
+            y += rows * listRow + gap;
+        }
+        footer(L"More Bluetooth settings", kLinkBluetooth);
+    } else {
+        beginHeader(L"Display", false, -1, false);
+        y += gap;
+        const RECT night{padding, y, panelWidth - padding, y + listRow};
+        card(night, false);
+        navRow(night, L'\uE706', L"Night light",
+            m_qsCache.nightKnown ? (m_qsCache.nightLight ? L"On" : L"Off") : L"Open settings",
+            TrayFlyoutHitKind::MoreSettings, kLinkNight);
+        y += listRow + gap;
+        const RECT hdr{padding, y, panelWidth - padding, y + listRow};
+        card(hdr, false);
+        text({hdr.left + 14, hdr.top, hdr.right - 70, hdr.bottom}, labelFont, L"HDR",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+        text({hdr.left + 70, hdr.top, hdr.right - 78, hdr.bottom}, statusFont,
+            !m_qsCache.hdrSupported ? L"Unavailable" : (m_qsCache.hdrOn ? L"On" : L"Off"),
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180);
+        if (m_qsCache.hdrSupported) {
+            push(TrayFlyoutHitKind::Toggle,
+                toggleRect(hdr.top + listRow / 2L, hdr.right - 12, m_qsCache.hdrOn), kToggleHdr);
+        }
+        y += listRow + gap;
+        footer(L"More display settings", kLinkDisplay);
+    }
+    y += padding;
+    contentBottom = y;
+}
+
+void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) {
+    const bool alternate = message == WM_RBUTTONUP;
+    auto openUri = [&](const wchar_t* uri) { OpenSettingsPage(uri); };
+    auto navigate = [&](QuickSettingsPage page, const wchar_t* uri) {
+        if (alternate) {
+            openUri(uri);
+        } else {
+            OpenQuickSettingsPage(page);
+        }
+    };
+    switch (hit.kind) {
+    case TrayFlyoutHitKind::None:
+    case TrayFlyoutHitKind::Settings:
+    case TrayFlyoutHitKind::Wifi:
+    case TrayFlyoutHitKind::Sound:
+    case TrayFlyoutHitKind::Brightness:
+    case TrayFlyoutHitKind::Boost:
+    case TrayFlyoutHitKind::BluetoothRadio:
+    case TrayFlyoutHitKind::BluetoothConnect:
+    case TrayFlyoutHitKind::BluetoothPair:
+    case TrayFlyoutHitKind::BluetoothDiscover:
+    case TrayFlyoutHitKind::BluetoothSettings:
+    case TrayFlyoutHitKind::NotifyIcon:
+    case TrayFlyoutHitKind::VolumeSlider:
+    case TrayFlyoutHitKind::BrightnessSlider:
+    case TrayFlyoutHitKind::CaptureGain:
+        break;
+    case TrayFlyoutHitKind::Back:
+        CloseQuickSettingsPage();
+        break;
+    case TrayFlyoutHitKind::Ethernet:
+        navigate(QuickSettingsPage::Ethernet, L"ms-settings:network-ethernet");
+        break;
+    case TrayFlyoutHitKind::Vpn:
+        navigate(QuickSettingsPage::Vpn, L"ms-settings:network-vpn");
+        break;
+    case TrayFlyoutHitKind::Microphone:
+        navigate(QuickSettingsPage::Microphone, L"ms-settings:sound");
+        break;
+    case TrayFlyoutHitKind::Display:
+        navigate(QuickSettingsPage::Display, L"ms-settings:display");
+        break;
+    case TrayFlyoutHitKind::Hdr:
+        navigate(QuickSettingsPage::Display, L"ms-settings:display");
+        break;
+    case TrayFlyoutHitKind::Power:
+        navigate(QuickSettingsPage::Power, L"ms-settings:powersleep");
+        break;
+    case TrayFlyoutHitKind::Nearby:
+        navigate(QuickSettingsPage::Nearby, L"ms-settings:crossdevice");
+        break;
+    case TrayFlyoutHitKind::Airplane:
+        navigate(QuickSettingsPage::Airplane, L"ms-settings:network-airplanemode");
+        break;
+    case TrayFlyoutHitKind::SystemTrayPage:
+        if (alternate) {
+            openUri(L"ms-settings:taskbar");
+        } else {
+            OpenQuickSettingsPage(QuickSettingsPage::SystemTray);
+        }
+        break;
+    case TrayFlyoutHitKind::Toggle:
+        switch (hit.index) {
+        case kToggleWifi:
+            SetWifiRadio(!m_qsCache.wifiRadioOn);
+            static_cast<void>(m_tray.Refresh());
+            m_qsCache.stamp = 0;
+            EnsureTrayIcons();
+            PaintOverflowPopup();
+            QueueRenderFrame();
+            break;
+        case kToggleMute:
+            if (!m_tray.ToggleMute()) {
+                Log(L"Volume mute did not change.");
+                break;
+            }
+            EnsureTrayIcons();
+            PaintOverflowPopup();
+            QueueRenderFrame();
+            break;
+        case kToggleMic:
+            SetCaptureMuted(!m_qsCache.inputMuted);
+            m_qsCache.stamp = 0;
+            PaintOverflowPopup();
+            break;
+        case kToggleUsb:
+            SetUsbSuspend(!m_qsCache.usbSuspend);
+            m_qsCache.stamp = 0;
+            PaintOverflowPopup();
+            break;
+        case kToggleAirplane: {
+            const bool radiosOn = !m_qsCache.wifiRadioOn &&
+                (!m_bluetoothSnapshot.radioPresent || !m_bluetoothSnapshot.radioOn);
+            SetWifiRadio(radiosOn);
+            if (m_bluetoothSnapshot.radioPresent) {
+                m_bluetoothSnapshot.radioOn = radiosOn;
+                m_bluetoothSnapshot.discovering = radiosOn ? m_bluetoothSnapshot.discovering : false;
+                if (!radiosOn) {
+                    m_bluetoothSnapshot.discovered.clear();
+                }
+                m_bluetooth.SetRadioEnabled(radiosOn);
+            }
+            static_cast<void>(m_tray.Refresh());
+            m_qsCache.stamp = 0;
+            EnsureTrayIcons();
+            PaintOverflowPopup();
+            QueueRenderFrame();
+            break;
+        }
+        case kToggleHdr:
+            SetHdrEnabled(!m_qsCache.hdrOn);
+            m_qsCache.stamp = 0;
+            PaintOverflowPopup();
+            break;
+        case kToggleNearby:
+            SetNearbyMode(m_qsCache.nearby == 0 ? 1 : 0);
+            m_qsCache.stamp = 0;
+            PaintOverflowPopup();
+            break;
+        default:
+            break;
+        }
+        break;
+    case TrayFlyoutHitKind::PowerMode:
+        if (SetPowerMode(hit.index)) {
+            m_qsCache.powerMode = hit.index;
+            m_qsCache.stamp = 0;
+            PaintOverflowPopup();
+        }
+        break;
+    case TrayFlyoutHitKind::NearbyMode:
+        SetNearbyMode(hit.index);
+        m_qsCache.nearby = std::clamp(hit.index, 0, 2);
+        m_qsCache.stamp = GetTickCount64();
+        PaintOverflowPopup();
+        break;
+    case TrayFlyoutHitKind::WifiNetwork:
+        if (hit.index >= 0 && static_cast<size_t>(hit.index) < m_qsCache.wifi.size()) {
+            const QsWifiNetwork& network = m_qsCache.wifi[static_cast<size_t>(hit.index)];
+            if (!network.connected && network.hasProfile && m_qsCache.haveWifiInterface &&
+                ConnectWifiProfile(m_qsCache.wifiInterface, network.name)) {
+                static_cast<void>(m_tray.Refresh());
+                m_qsCache.stamp = 0;
+                EnsureTrayIcons();
+                PaintOverflowPopup();
+                QueueRenderFrame();
+            } else if (!network.connected) {
+                openUri(L"ms-settings:network-wifi");
+            }
+        }
+        break;
+    case TrayFlyoutHitKind::AudioOutput:
+        if (hit.index >= 0 && static_cast<size_t>(hit.index) < m_qsCache.renderDevices.size()) {
+            const QsNamedId& device = m_qsCache.renderDevices[static_cast<size_t>(hit.index)];
+            if (!SetDefaultAudioDevice(device.id)) {
+                openUri(L"ms-settings:sound");
+                break;
+            }
+            static_cast<void>(m_tray.Refresh());
+            m_qsCache.stamp = 0;
+            EnsureTrayIcons();
+            PaintOverflowPopup();
+            QueueRenderFrame();
+        }
+        break;
+    case TrayFlyoutHitKind::AudioInput:
+        if (hit.index >= 0 && static_cast<size_t>(hit.index) < m_qsCache.captureDevices.size()) {
+            const QsNamedId& device = m_qsCache.captureDevices[static_cast<size_t>(hit.index)];
+            if (!SetDefaultAudioDevice(device.id)) {
+                openUri(L"ms-settings:sound");
+                break;
+            }
+            m_qsCache.stamp = 0;
+            PaintOverflowPopup();
+        }
+        break;
+    case TrayFlyoutHitKind::VpnEntry:
+        openUri(L"ms-settings:network-vpn");
+        break;
+    case TrayFlyoutHitKind::MoreSettings:
+        switch (hit.index) {
+        case kLinkWifi:
+            openUri(L"ms-settings:network-wifi");
+            break;
+        case kLinkNetwork:
+            openUri(L"ms-settings:network-status");
+            break;
+        case kLinkVpn:
+            openUri(L"ms-settings:network-vpn");
+            break;
+        case kLinkSound:
+            openUri(L"ms-settings:sound");
+            break;
+        case kLinkPower:
+            openUri(L"ms-settings:powersleep");
+            break;
+        case kLinkTaskbar:
+            openUri(L"ms-settings:taskbar");
+            break;
+        case kLinkNearby:
+            openUri(L"ms-settings:crossdevice");
+            break;
+        case kLinkBluetooth:
+            openUri(L"ms-settings:bluetooth");
+            break;
+        case kLinkDisplay:
+            openUri(L"ms-settings:display");
+            break;
+        case kLinkNight:
+            openUri(L"ms-settings:nightlight");
+            break;
+        case kLinkMixer:
+            CloseOverflowPopup();
+            if (!SystemTray::OpenSoundMixer()) {
+                Log(L"Volume mixer did not open.");
+            }
+            break;
+        case 11:
+            OpenQuickSettingsPage(QuickSettingsPage::Bluetooth);
+            break;
+        default:
+            break;
+        }
+        break;
+    case TrayFlyoutHitKind::MediaTransport:
+        if (hit.index == 0) {
+            SendMediaKey(VK_MEDIA_PREV_TRACK);
+        } else if (hit.index == 2) {
+            SendMediaKey(VK_MEDIA_NEXT_TRACK);
+        } else {
+            SendMediaKey(VK_MEDIA_PLAY_PAUSE);
+        }
+        break;
+    }
+}
+
+void DockApp::AdjustCaptureGain(float delta) {
+    const float next = std::clamp(m_qsCache.inputGain + delta, 0.0F, 1.0F);
+    if (!SetCaptureGain(next)) {
+        return;
+    }
+    m_qsCache.inputGain = next;
+    if (delta > 0.0F) {
+        m_qsCache.inputMuted = false;
+    }
+    m_qsCache.stamp = GetTickCount64();
+    PaintOverflowPopup();
+}

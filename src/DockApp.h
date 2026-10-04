@@ -7,6 +7,7 @@
 #include "WindowCatalog.h"
 #include "SystemTray.h"
 #include "Bluetooth.h"
+#include "QuickSettingsPanel.h"
 #include "Weather.h"
 #include "PerfProfiler.h"
 
@@ -191,6 +192,28 @@ private:
         BluetoothDiscover,
         BluetoothSettings,
         NotifyIcon,
+        Back,
+        Ethernet,
+        Vpn,
+        Microphone,
+        Display,
+        Hdr,
+        Power,
+        Nearby,
+        Airplane,
+        SystemTrayPage,
+        VolumeSlider,
+        BrightnessSlider,
+        CaptureGain,
+        Toggle,
+        PowerMode,
+        NearbyMode,
+        WifiNetwork,
+        AudioOutput,
+        AudioInput,
+        VpnEntry,
+        MoreSettings,
+        MediaTransport,
     };
 
     struct TrayFlyoutHit {
@@ -297,6 +320,22 @@ private:
     void CloseOverflowPopup() noexcept;
     void RebuildOverflowPopup();
     void PaintOverflowPopup();
+    void RefreshQuickSettingsCache();
+    void MeasureQuickSettings(float scale, LONG padding, LONG gearSize, LONG headerHeight,
+        LONG& panelWidth, LONG& contentHeight);
+    void PaintQuickSettings(uint8_t* pixels, int width, int height, HDC memory, float scale,
+        LONG padding, LONG panelWidth, LONG gearSize, LONG headerHeight, HFONT titleFont,
+        HFONT sectionFont, HFONT labelFont, HFONT statusFont);
+    void LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int height, HDC memory,
+        float scale, LONG padding, LONG gearSize, LONG headerHeight, HFONT titleFont,
+        HFONT sectionFont, HFONT labelFont, HFONT statusFont, LONG& panelWidth, LONG& contentBottom);
+    void OpenQuickSettingsPage(QuickSettingsPage page);
+    void CloseQuickSettingsPage();
+    void OpenSettingsPage(const wchar_t* uri);
+    void ProjectBrightness(int percent);
+    void ApplyQuickSettingsSlider(TrayFlyoutHitKind kind, const RECT& track, LONG x);
+    void AdjustCaptureGain(float delta);
+    void ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message);
     void DrainBrightnessWheel();
     void ScrollBrightness(int delta);
     void RefreshBrightnessAsync();
@@ -753,6 +792,13 @@ private:
     std::vector<TrayNotifyIcon> m_overflowIcons;
     std::vector<TrayFlyoutHit> m_overflowHits;
     int m_overflowHover = -1;
+    QuickSettingsPage m_qsPage = QuickSettingsPage::Home;
+    QuickSettingsPage m_qsReturn = QuickSettingsPage::Home;
+    QuickSettingsCache m_qsCache{};
+    bool m_qsDragging = false;
+    bool m_qsDragMoved = false;
+    TrayFlyoutHitKind m_qsDragKind = TrayFlyoutHitKind::None;
+    RECT m_qsDragBounds{};
     bool m_overflowPaintQueued = false;
     int m_flyoutWheelAccum = 0;
     // Optimistic brightness UI: the displayed level. -1 follows live status;

@@ -94,7 +94,7 @@ std::vector<uint8_t> BoxDownsamplePremultiplied(const std::vector<uint8_t>& sour
     return dest;
 }
 
-namespace {
+namespace dock_detail {
 
 constexpr double kShowDurationSeconds = 0.050;
 constexpr double kHideDurationSeconds = 0.050;
@@ -1894,7 +1894,8 @@ HBITMAP CreateDragGhostBitmap(const PinnedApp& app, HWND runningWindow, UINT ext
     return CreateDragGhostBitmapFromPixels(pixels, extent);
 }
 
-}  // namespace
+}  // namespace dock_detail
+using namespace dock_detail;
 
 // --- Trash OLE drop target (shell files -> Recycle Bin) ---------------------
 // Registered on the dock input window. Only the Trash icon accepts drops;
@@ -2420,9 +2421,37 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
 
+    case WM_LBUTTONDOWN: {
+        if (app == nullptr) {
+            break;
+        }
+        const POINT downPoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        const int downHit = app->OverflowHitIndex(downPoint);
+        if (downHit >= 0 && static_cast<size_t>(downHit) < app->m_overflowHits.size()) {
+            const TrayFlyoutHit& slider = app->m_overflowHits[static_cast<size_t>(downHit)];
+            if (slider.kind == TrayFlyoutHitKind::VolumeSlider ||
+                slider.kind == TrayFlyoutHitKind::BrightnessSlider ||
+                slider.kind == TrayFlyoutHitKind::CaptureGain) {
+                app->m_qsDragging = true;
+                app->m_qsDragMoved = false;
+                app->m_qsDragKind = slider.kind;
+                app->m_qsDragBounds = slider.bounds;
+                SetCapture(window);
+                app->ApplyQuickSettingsSlider(slider.kind, slider.bounds, downPoint.x);
+            }
+        }
+        return 0;
+    }
+
     case WM_MOUSEMOVE: {
         if (app == nullptr) {
             break;
+        }
+        if (app->m_qsDragging) {
+            app->m_qsDragMoved = true;
+            const POINT dragPoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            app->ApplyQuickSettingsSlider(app->m_qsDragKind, app->m_qsDragBounds, dragPoint.x);
+            return 0;
         }
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const int hover = app->OverflowHitIndex(point);
@@ -2441,6 +2470,18 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
             break;
         }
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (message == WM_LBUTTONUP && app->m_qsDragging) {
+            const bool moved = app->m_qsDragMoved;
+            const TrayFlyoutHitKind dragKind = app->m_qsDragKind;
+            const RECT dragBounds = app->m_qsDragBounds;
+            app->m_qsDragging = false;
+            app->m_qsDragMoved = false;
+            ReleaseCapture();
+            if (!moved) {
+                app->ApplyQuickSettingsSlider(dragKind, dragBounds, point.x);
+            }
+            return 0;
+        }
         const int hit = app->OverflowHitIndex(point);
         if (hit >= 0 && static_cast<size_t>(hit) < app->m_overflowHits.size()) {
             app->HandleOverflowClick(app->m_overflowHits[static_cast<size_t>(hit)], message);
@@ -2594,7 +2635,13 @@ LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
                     (s_instance->m_overflowHits[static_cast<size_t>(hit)].kind ==
                             TrayFlyoutHitKind::Sound ||
                         s_instance->m_overflowHits[static_cast<size_t>(hit)].kind ==
-                            TrayFlyoutHitKind::Brightness)) {
+                            TrayFlyoutHitKind::VolumeSlider ||
+                        s_instance->m_overflowHits[static_cast<size_t>(hit)].kind ==
+                            TrayFlyoutHitKind::Brightness ||
+                        s_instance->m_overflowHits[static_cast<size_t>(hit)].kind ==
+                            TrayFlyoutHitKind::BrightnessSlider ||
+                        s_instance->m_overflowHits[static_cast<size_t>(hit)].kind ==
+                            TrayFlyoutHitKind::CaptureGain)) {
                     PostMessageW(s_instance->m_window, kOverflowWheelMessage,
                         static_cast<WPARAM>(static_cast<INT_PTR>(
                             GET_WHEEL_DELTA_WPARAM(mouse->mouseData))),
@@ -2963,10 +3010,26 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             return 0;
         }
         const TrayFlyoutHitKind kind = m_overflowHits[static_cast<size_t>(hit)].kind;
-        if (kind != TrayFlyoutHitKind::Sound && kind != TrayFlyoutHitKind::Brightness) {
+        if (kind == TrayFlyoutHitKind::CaptureGain) {
+            m_flyoutWheelAccum += static_cast<int>(static_cast<INT_PTR>(wParam));
+            while (m_flyoutWheelAccum >= WHEEL_DELTA) {
+                m_flyoutWheelAccum -= WHEEL_DELTA;
+                AdjustCaptureGain(0.05F);
+            }
+            while (m_flyoutWheelAccum <= -WHEEL_DELTA) {
+                m_flyoutWheelAccum += WHEEL_DELTA;
+                AdjustCaptureGain(-0.05F);
+            }
             return 0;
         }
-        if (kind == TrayFlyoutHitKind::Sound) {
+        const bool volumeHit = kind == TrayFlyoutHitKind::Sound ||
+            kind == TrayFlyoutHitKind::VolumeSlider;
+        const bool brightnessHit = kind == TrayFlyoutHitKind::Brightness ||
+            kind == TrayFlyoutHitKind::BrightnessSlider;
+        if (!volumeHit && !brightnessHit) {
+            return 0;
+        }
+        if (volumeHit) {
             m_flyoutWheelAccum += static_cast<int>(static_cast<INT_PTR>(wParam));
             bool adjusted = false;
             while (m_flyoutWheelAccum >= WHEEL_DELTA) {
@@ -5088,6 +5151,9 @@ void DockApp::FinishOverflowHide() noexcept {
     }
     m_overflowVisibility = VisibilityState::Hidden;
     m_overflowHover = -1;
+    m_qsPage = QuickSettingsPage::Home;
+    m_qsReturn = QuickSettingsPage::Home;
+    m_qsDragging = false;
     std::vector<uint8_t>().swap(m_overflowPresentBits);
     std::vector<uint8_t>().swap(m_overflowBaseBits);
     m_overflowPresentSize = {};
@@ -5266,6 +5332,9 @@ void DockApp::BeginOverflowShow() {
     HideHoverLabel();
     static_cast<void>(m_tray.Refresh());
     RefreshBrightnessAsync();
+    m_qsPage = QuickSettingsPage::Home;
+    m_qsReturn = QuickSettingsPage::Home;
+    m_qsCache.stamp = 0;
     m_overflowVisibility = VisibilityState::Visible;
     RebuildOverflowPopup();
     if (m_overflowWindow == nullptr || m_overflowPresentBits.empty()) {
@@ -7062,10 +7131,14 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         ToggleDockSettings();
         break;
     case TrayFlyoutHitKind::Wifi:
-        CloseOverflowPopup();
-        if (!SystemTray::OpenNetworkPanel()) {
-            Log(L"Network panel did not open.");
+        if (message == WM_RBUTTONUP) {
+            CloseOverflowPopup();
+            if (!SystemTray::OpenNetworkPanel()) {
+                Log(L"Network panel did not open.");
+            }
+            break;
         }
+        OpenQuickSettingsPage(QuickSettingsPage::Wifi);
         break;
     case TrayFlyoutHitKind::Sound:
         if (message == WM_RBUTTONUP) {
@@ -7075,13 +7148,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
             }
             break;
         }
-        if (!m_tray.ToggleMute()) {
-            Log(L"Volume mute did not change.");
-            break;
-        }
-        EnsureTrayIcons();
-        PaintOverflowPopup();
-        QueueRenderFrame();
+        OpenQuickSettingsPage(QuickSettingsPage::Sound);
         break;
     case TrayFlyoutHitKind::Brightness: {
         // Clicks project like wheel input (a click is two notches): instant
@@ -7161,6 +7228,30 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         CloseOverflowPopup();
         SetForegroundWindow(m_window);
         ShellExecuteW(nullptr, L"open", L"ms-settings:bluetooth", nullptr, nullptr, SW_SHOWNORMAL);
+        break;
+    case TrayFlyoutHitKind::Back:
+    case TrayFlyoutHitKind::Ethernet:
+    case TrayFlyoutHitKind::Vpn:
+    case TrayFlyoutHitKind::Microphone:
+    case TrayFlyoutHitKind::Display:
+    case TrayFlyoutHitKind::Hdr:
+    case TrayFlyoutHitKind::Power:
+    case TrayFlyoutHitKind::Nearby:
+    case TrayFlyoutHitKind::Airplane:
+    case TrayFlyoutHitKind::SystemTrayPage:
+    case TrayFlyoutHitKind::VolumeSlider:
+    case TrayFlyoutHitKind::BrightnessSlider:
+    case TrayFlyoutHitKind::CaptureGain:
+    case TrayFlyoutHitKind::Toggle:
+    case TrayFlyoutHitKind::PowerMode:
+    case TrayFlyoutHitKind::NearbyMode:
+    case TrayFlyoutHitKind::WifiNetwork:
+    case TrayFlyoutHitKind::AudioOutput:
+    case TrayFlyoutHitKind::AudioInput:
+    case TrayFlyoutHitKind::VpnEntry:
+    case TrayFlyoutHitKind::MoreSettings:
+    case TrayFlyoutHitKind::MediaTransport:
+        ApplyQuickSettingsCommand(hit, message);
         break;
     case TrayFlyoutHitKind::NotifyIcon:
         if (hit.index >= 0 && static_cast<size_t>(hit.index) < m_overflowIcons.size()) {
@@ -7302,6 +7393,33 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         FillSquirclePremul(pixels, width, height, plate, ContentSquircleRadius(plate, scale), 0.16F);
         break;
     }
+    case TrayFlyoutHitKind::Back:
+    case TrayFlyoutHitKind::Ethernet:
+    case TrayFlyoutHitKind::Vpn:
+    case TrayFlyoutHitKind::Microphone:
+    case TrayFlyoutHitKind::Display:
+    case TrayFlyoutHitKind::Hdr:
+    case TrayFlyoutHitKind::Power:
+    case TrayFlyoutHitKind::Nearby:
+    case TrayFlyoutHitKind::Airplane:
+    case TrayFlyoutHitKind::SystemTrayPage:
+    case TrayFlyoutHitKind::VolumeSlider:
+    case TrayFlyoutHitKind::BrightnessSlider:
+    case TrayFlyoutHitKind::CaptureGain:
+    case TrayFlyoutHitKind::Toggle:
+    case TrayFlyoutHitKind::PowerMode:
+    case TrayFlyoutHitKind::NearbyMode:
+    case TrayFlyoutHitKind::WifiNetwork:
+    case TrayFlyoutHitKind::AudioOutput:
+    case TrayFlyoutHitKind::AudioInput:
+    case TrayFlyoutHitKind::VpnEntry:
+    case TrayFlyoutHitKind::MoreSettings:
+    case TrayFlyoutHitKind::MediaTransport: {
+        const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+        FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
+            0.10F);
+        break;
+    }
     default:
         break;
     }
@@ -7420,53 +7538,12 @@ void DockApp::PaintOverflowPopup() {
         std::max(16L, std::lround(DOCK_CORNER_RADIUS_PT * scale));
     const LONG gearSize = std::max(18L, std::lround(22.0F * scale));
     const LONG headerHeight = std::max(gearSize, std::max(28L, std::lround(32.0F * scale)));
-    const LONG circle = std::max(44L, std::lround(52.0F * scale));
-    const LONG tileGap = std::max(8L, std::lround(10.0F * scale));
-    const LONG labelHeight = std::max(16L, std::lround(18.0F * scale));
-    const LONG statusHeight = std::max(14L, std::lround(16.0F * scale));
-    const LONG tileBlock = circle + std::max(6L, std::lround(8.0F * scale)) + labelHeight + statusHeight;
-    const LONG sectionHeader = std::max(24L, std::lround(28.0F * scale));
-    const LONG deviceRow = std::max(48L, std::lround(52.0F * scale));
-    const LONG bluetoothGap = std::max(6L, std::lround(8.0F * scale));
-    const LONG switchWidth = std::max(40L, std::lround(44.0F * scale));
-    const LONG switchHeight = std::max(22L, std::lround(24.0F * scale));
-    const LONG actionWidth = std::max(88L, std::lround(96.0F * scale));
-    const LONG actionHeight = std::max(26L, std::lround(28.0F * scale));
-    const BluetoothSnapshot& bluetooth = m_bluetoothSnapshot;
-    const LONG bluetoothRows = (!bluetooth.ready || !bluetooth.radioPresent || !bluetooth.radioOn)
-        ? 1L
-        : (bluetooth.paired.empty() ? 1L : static_cast<LONG>(bluetooth.paired.size())) +
-            static_cast<LONG>(bluetooth.discovered.size()) + 1L +
-            (bluetooth.hiddenPaired > 0 ? 1L : 0L);
-    const LONG bluetoothBlock = bluetoothRows * deviceRow +
-        (bluetoothRows > 1 ? (bluetoothRows - 1) * bluetoothGap : 0L);
-    const LONG trayPlate = std::max(28L, std::lround(32.0F * scale));
-    const LONG trayGlyph = std::max(16L, std::lround(18.0F * scale));
-    const LONG trayNameHeight = std::max(14L, std::lround(15.0F * scale));
-    const LONG trayStatusHeight = std::max(13L, std::lround(14.0F * scale));
-    const LONG trayTextGap = std::max(3L, std::lround(4.0F * scale));
-    const LONG otherIconHeight = trayPlate + trayTextGap + trayNameHeight + trayStatusHeight + trayTextGap;
-    const LONG dividerGap = std::max(10L, std::lround(12.0F * scale));
-    LONG panelWidth = std::max(320L, std::lround(348.0F * scale));
-    const size_t otherCount = std::min(m_overflowIcons.size(), static_cast<size_t>(24));
-    const LONG otherColumns = otherCount == 0 ? 1L : std::min(3L, static_cast<LONG>(otherCount));
-    const LONG trayMinCell = std::max(112L, std::lround(124.0F * scale));
-    panelWidth = std::max(panelWidth, padding * 2L + otherColumns * trayMinCell);
-    const LONG otherRows = otherCount == 0 ? 1L :
-        (static_cast<LONG>(otherCount) + otherColumns - 1L) / otherColumns;
-
-    LONG contentY = padding;
-    contentY += headerHeight;
-    contentY += tileBlock;
-    contentY += dividerGap;
-    contentY += sectionHeader;
-    contentY += bluetoothBlock;
-    contentY += dividerGap;
-    contentY += sectionHeader;
-    contentY += otherRows * otherIconHeight;
-    contentY += padding;
+    RefreshQuickSettingsCache();
+    LONG panelWidth = 0;
+    LONG contentHeight = 0;
+    MeasureQuickSettings(scale, padding, gearSize, headerHeight, panelWidth, contentHeight);
     m_overflowSize.cx = panelWidth;
-    m_overflowSize.cy = contentY + caretHeight;
+    m_overflowSize.cy = contentHeight + caretHeight;
 
     if (m_overflowWindow == nullptr) {
         const wchar_t className[] = L"LiquidGlassDockOverflow";
@@ -7657,375 +7734,8 @@ void DockApp::PaintOverflowPopup() {
     const int pendingHover = m_overflowHover;
     m_overflowHits.clear();
 
-    auto pushHit = [this](TrayFlyoutHitKind kind, RECT bounds, int index = -1) {
-        TrayFlyoutHit hit;
-        hit.kind = kind;
-        hit.index = index;
-        hit.bounds = bounds;
-        m_overflowHits.push_back(hit);
-    };
-
-    if (m_config.LightPanels()) {
-        SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
-    } else {
-        SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
-    }
-
-    LONG y = padding;
-    RECT titleBounds{padding, y, panelWidth - padding - gearSize - 8, y + headerHeight};
-    DrawFlyoutText(pixels, width, height, titleBounds, titleFont, L"Quick Settings",
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE, 250);
-    RECT gearBounds{panelWidth - padding - gearSize, y + (headerHeight - gearSize) / 2L,
-        panelWidth - padding, y + (headerHeight - gearSize) / 2L + gearSize};
-    const UINT gearExtent = static_cast<UINT>(std::max(1L, gearSize));
-    const UINT glyphExtent =
-        static_cast<UINT>(std::max(18L, std::lround(static_cast<float>(circle) * 0.38F)));
-    // Glyphs don't depend on hover; rasterize once per status/extent combination so
-    // hover transitions only pay for compositing, not font rasterization.
-    EnsureOverflowGlyphs(gearExtent, glyphExtent);
-    m_overflowGearX = SaturatedInt(gearBounds.left);
-    m_overflowGearY = SaturatedInt(gearBounds.top);
-    m_overflowGearExtent = gearExtent;
-    if (!m_overflowGlyphGear.empty()) {
-        CompositePremul(pixels, width, height, m_overflowGearX, m_overflowGearY,
-            m_overflowGlyphGear.data(), SaturatedInt(gearExtent), SaturatedInt(gearExtent));
-    }
-    pushHit(TrayFlyoutHitKind::Settings, {gearBounds.left - 6, y, panelWidth - padding + 4,
-        y + headerHeight});
-    y += headerHeight;
-
-    struct QuickTile {
-        TrayFlyoutHitKind kind;
-        TraySlot slot;
-        const wchar_t* label;
-        std::wstring status;
-        wchar_t symbol;
-        bool useSlotGlyph;
-    };
-    // Optimistic brightness projection (see ScrollBrightness): while the worker
-    // is persisting scroll input, fill and % show the projected level so the
-    // UI tracks the hand instantly and the monitor follows in its own time.
-    const int projectedBrightness = m_brightnessTarget.load();
-    const QuickTile tiles[] = {
-        {TrayFlyoutHitKind::Wifi, TraySlot::Network, L"Wi-Fi", m_tray.NetworkStatusText(), 0, true},
-        {TrayFlyoutHitKind::Sound, TraySlot::Volume, L"Sound", m_tray.VolumeStatusText(), 0, true},
-        {TrayFlyoutHitKind::Boost, TraySlot::Overflow, L"Boost", m_boostStatus, L'\uE945', false},
-        {TrayFlyoutHitKind::Brightness, TraySlot::Overflow, L"Brightness",
-            projectedBrightness >= 0 ? std::to_wstring(projectedBrightness) + L"%"
-                                     : m_tray.BrightnessStatusText(),
-            L'\uE706', false},
-    };
-    const LONG tileWidth = (panelWidth - padding * 2L - tileGap * 3L) / 4L;
-    for (int index = 0; index < 4; ++index) {
-        const LONG left = padding + index * (tileWidth + tileGap);
-        const RECT tileBounds{left, y, left + tileWidth, y + tileBlock};
-        const RECT disc = QuickControlDisc(tileBounds, scale);
-        const float discRadius = 0.5F * static_cast<float>(disc.right - disc.left);
-        const float cx = 0.5F * static_cast<float>(disc.left + disc.right);
-        const float cy = 0.5F * static_cast<float>(disc.top + disc.bottom);
-        const bool isSlider = tiles[index].kind == TrayFlyoutHitKind::Sound ||
-            tiles[index].kind == TrayFlyoutHitKind::Brightness;
-        // Level meter source of truth (also drives the sage accent state): muted
-        // (sound) or unavailable (brightness) renders empty unless a projected
-        // scroll value is being shown.
-        const TrayStatus& trayStatus = m_tray.Status();
-        float level = 0.0F;
-        if (tiles[index].kind == TrayFlyoutHitKind::Sound) {
-            level = trayStatus.volumeMuted ? 0.0F : trayStatus.volumeLevel;
-        } else if (tiles[index].kind == TrayFlyoutHitKind::Brightness) {
-            if (projectedBrightness >= 0) {
-                level = static_cast<float>(projectedBrightness) / 100.0F;
-            } else if (trayStatus.brightnessAvailable) {
-                level = static_cast<float>(trayStatus.brightnessPercent) / 100.0F;
-            }
-        }
-        const bool isFullAmber = tiles[index].kind == TrayFlyoutHitKind::Boost ||
-            (tiles[index].kind == TrayFlyoutHitKind::Wifi &&
-                trayStatus.network != TrayNetworkKind::Disconnected);
-        if (m_config.LightPanels()) {
-            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.90F, 250, 250, 248);
-        } else {
-            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.92F, 28, 30, 36);
-        }
-        if (isSlider) {
-            // Dark squircle, then a sage wash and a level fill rising with progress.
-            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.55F, kQuickAccentB,
-                kQuickAccentG, kQuickAccentR);
-            FillSquircleLevelColorPremul(pixels, width, height, disc, discRadius, level, 0.94F,
-                kQuickAccentB, kQuickAccentG, kQuickAccentR);
-        } else if (isFullAmber) {
-            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.82F, kQuickAccentB,
-                kQuickAccentG, kQuickAccentR);
-        } else {
-            FillSquircleColorPremul(pixels, width, height, disc, discRadius, 0.42F, kQuickAccentB,
-                kQuickAccentG, kQuickAccentR);
-        }
-        // Glyph bitmaps are cached by EnsureOverflowGlyphs above; hover repaints only composite.
-        const std::vector<uint8_t>* glyph = &m_overflowGlyphBrightness;
-        if (tiles[index].kind == TrayFlyoutHitKind::Boost) {
-            glyph = &m_overflowGlyphBoost;
-        } else if (tiles[index].slot == TraySlot::Network) {
-            glyph = &m_overflowGlyphWifi;
-        } else if (tiles[index].slot == TraySlot::Volume) {
-            glyph = &m_overflowGlyphSound;
-        }
-        if (!glyph->empty()) {
-            CompositePremul(pixels, width, height,
-                static_cast<int>(std::lround(cx - static_cast<float>(glyphExtent) * 0.5F)),
-                static_cast<int>(std::lround(cy - static_cast<float>(glyphExtent) * 0.5F)),
-                glyph->data(), static_cast<int>(glyphExtent), static_cast<int>(glyphExtent));
-        }
-        RECT labelBounds{left, y + circle + 6, left + tileWidth, y + circle + 6 + labelHeight};
-        DrawFlyoutText(pixels, width, height, labelBounds, labelFont, tiles[index].label,
-            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-        RECT statusBounds{left, labelBounds.bottom, left + tileWidth, labelBounds.bottom + statusHeight};
-        DrawFlyoutText(pixels, width, height, statusBounds, statusFont, tiles[index].status,
-            DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
-        pushHit(tiles[index].kind, tileBounds);
-    }
-    y += tileBlock + dividerGap;
-    FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
-        y - dividerGap / 2L + 1}, 0.16F);
-
-    auto drawSwitch = [&](LONG centerY, LONG right, bool enabled) {
-        const LONG trackLeft = right - switchWidth;
-        const LONG trackTop = centerY - switchHeight / 2L;
-        const float trackRadius = static_cast<float>(switchHeight) * 0.5F;
-        const float trackCxL = static_cast<float>(trackLeft) + trackRadius;
-        const float trackCxR = static_cast<float>(right) - trackRadius;
-        const float trackCy = static_cast<float>(trackTop) + trackRadius;
-        if (enabled) {
-            FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
-                0.92F, kQuickAccentB, kQuickAccentG, kQuickAccentR);
-        } else {
-            FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
-                0.62F, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
-        }
-        const float knobRadius = trackRadius - std::max(2.0F, 2.0F * scale);
-        FillCirclePremul(pixels, width, height, enabled ? trackCxR : trackCxL, trackCy, knobRadius,
-            0.95F);
-    };
-    auto advanceBluetoothRow = [&]() {
-        y += deviceRow + bluetoothGap;
-    };
-    auto drawPlainRow = [&](const std::wstring& text) {
-        const RECT row{padding, y, panelWidth - padding, y + deviceRow};
-        FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
-        DrawFlyoutText(pixels, width, height, row, labelFont, text,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
-        advanceBluetoothRow();
-    };
-    auto drawDeviceRow = [&](const BluetoothDeviceInfo& device, const wchar_t* action, bool primary,
-                              TrayFlyoutHitKind kind, int index) {
-        const RECT row{padding, y, panelWidth - padding, y + deviceRow};
-        FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
-        const LONG buttonLeft = row.right - 8 - actionWidth;
-        const LONG buttonTop = y + (deviceRow - actionHeight) / 2L;
-        const RECT button{buttonLeft, buttonTop, buttonLeft + actionWidth, buttonTop + actionHeight};
-        if (primary && !device.busy) {
-            FillSquircleColorPremul(pixels, width, height, button,
-                ContentSquircleRadius(button, scale), 0.90F, kQuickAccentB, kQuickAccentG,
-                kQuickAccentR);
-        } else {
-            FillSquirclePremul(pixels, width, height, button, ContentSquircleRadius(button, scale),
-                0.16F);
-        }
-        DrawFlyoutText(pixels, width, height, button, statusFont, action,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, device.busy ? 170 : 250);
-        const RECT name{row.left + 12, y + 6, buttonLeft - 8, y + 6 + labelHeight};
-        const RECT status{name.left, name.bottom, name.right, y + deviceRow - 4};
-        DrawFlyoutText(pixels, width, height, name, labelFont, device.name,
-            DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-        DrawFlyoutText(pixels, width, height, status, statusFont, device.status,
-            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
-        pushHit(kind, row, index);
-        advanceBluetoothRow();
-    };
-
-    RECT bluetoothHeader{padding, y, panelWidth - padding - switchWidth - 12, y + sectionHeader};
-    DrawFlyoutText(pixels, width, height, bluetoothHeader, sectionFont, L"Bluetooth",
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-    if (bluetooth.ready && bluetooth.radioPresent) {
-        const LONG switchRight = panelWidth - padding;
-        drawSwitch(y + sectionHeader / 2L, switchRight, bluetooth.radioOn);
-        pushHit(TrayFlyoutHitKind::BluetoothRadio,
-            {switchRight - switchWidth - 8, y, switchRight + 4, y + sectionHeader});
-    }
-    y += sectionHeader;
-
-    if (!bluetooth.ready) {
-        drawPlainRow(L"Looking for devices...");
-    } else if (!bluetooth.radioPresent) {
-        drawPlainRow(bluetooth.hint.empty() ? L"Bluetooth is unavailable" : bluetooth.hint);
-    } else if (!bluetooth.radioOn) {
-        drawPlainRow(L"Bluetooth is off");
-    } else {
-        if (bluetooth.paired.empty()) {
-            drawPlainRow(L"No paired devices");
-        } else {
-            for (size_t index = 0; index < bluetooth.paired.size(); ++index) {
-                const BluetoothDeviceInfo& device = bluetooth.paired[index];
-                const wchar_t* action = device.busy ? L"..."
-                    : (device.connected ? L"Disconnect" : L"Connect");
-                drawDeviceRow(device, action, !device.connected, TrayFlyoutHitKind::BluetoothConnect,
-                    static_cast<int>(index));
-            }
-        }
-        for (size_t index = 0; index < bluetooth.discovered.size(); ++index) {
-            const BluetoothDeviceInfo& device = bluetooth.discovered[index];
-            drawDeviceRow(device, device.busy ? L"..." : L"Pair", true, TrayFlyoutHitKind::BluetoothPair,
-                static_cast<int>(index));
-        }
-        if (bluetooth.hiddenPaired > 0) {
-            const RECT row{padding, y, panelWidth - padding, y + deviceRow};
-            FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
-            const std::wstring more = std::to_wstring(bluetooth.hiddenPaired) +
-                (bluetooth.hiddenPaired == 1 ? L" more paired device" : L" more paired devices");
-            DrawFlyoutText(pixels, width, height, row, labelFont, more,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
-            pushHit(TrayFlyoutHitKind::BluetoothSettings, row);
-            advanceBluetoothRow();
-        }
-        {
-            const RECT row{padding, y, panelWidth - padding, y + deviceRow};
-            FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
-            const LONG settingsWidth = std::max(72L, std::lround(78.0F * scale));
-            RECT text{row.left + 12, y + 6, row.right - 12, y + 6 + labelHeight};
-            RECT settings{};
-            if (bluetooth.discovering) {
-                const LONG buttonTop = y + (deviceRow - actionHeight) / 2L;
-                settings = {row.right - 8 - settingsWidth, buttonTop, row.right - 8,
-                    buttonTop + actionHeight};
-                text.right = settings.left - 8;
-                FillSquirclePremul(pixels, width, height, settings,
-                    ContentSquircleRadius(settings, scale), 0.16F);
-                DrawFlyoutText(pixels, width, height, settings, statusFont, L"Settings",
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE, 240);
-                pushHit(TrayFlyoutHitKind::BluetoothSettings, settings);
-            }
-            const wchar_t* discoverLabel =
-                bluetooth.discovering ? L"Stop searching" : L"Pair new device";
-            const std::wstring discoverStatus = bluetooth.discovering
-                ? (bluetooth.hint.empty() ? L"Looking for devices" : bluetooth.hint)
-                : L"Headphones, speakers, and more";
-            const RECT status{text.left, text.bottom, text.right, y + deviceRow - 4};
-            DrawFlyoutText(pixels, width, height, text, labelFont, discoverLabel,
-                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            DrawFlyoutText(pixels, width, height, status, statusFont, discoverStatus,
-                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
-            RECT discoverHit = row;
-            if (bluetooth.discovering) {
-                discoverHit.right = settings.left - 4;
-            }
-            pushHit(TrayFlyoutHitKind::BluetoothDiscover, discoverHit);
-            advanceBluetoothRow();
-        }
-    }
-    if (bluetoothRows > 0) {
-        y -= bluetoothGap;
-    }
-    y += dividerGap;
-    FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
-        y - dividerGap / 2L + 1}, 0.16F);
-
-    RECT otherHeader{padding, y, panelWidth - padding, y + sectionHeader};
-    DrawFlyoutText(pixels, width, height, otherHeader, sectionFont, L"System Tray",
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-    y += sectionHeader;
-    if (otherCount == 0) {
-        RECT empty{padding, y, panelWidth - padding, y + otherIconHeight};
-        DrawFlyoutText(pixels, width, height, empty, statusFont, L"No tray icons",
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE, 240);
-    } else {
-        const LONG innerWidth = panelWidth - padding * 2L;
-        const LONG cellWidth = innerWidth / otherColumns;
-        const LONG gridWidth = cellWidth * otherColumns;
-        const LONG gridLeft = padding + (innerWidth - gridWidth) / 2L;
-        HGDIOBJ previousMeasureFont = SelectObject(memory, statusFont);
-        for (size_t index = 0; index < otherCount; ++index) {
-            const LONG column = static_cast<LONG>(index) % otherColumns;
-            const LONG row = static_cast<LONG>(index) / otherColumns;
-            const LONG rowStart = row * otherColumns;
-            const LONG rowCount = std::min(otherColumns,
-                static_cast<LONG>(otherCount) - rowStart);
-            const LONG rowLeft = gridLeft + (gridWidth - cellWidth * rowCount) / 2L;
-            const LONG left = rowLeft + column * cellWidth;
-            const LONG top = y + row * otherIconHeight;
-            const RECT cell{left, top, left + cellWidth, top + otherIconHeight};
-            const RECT plate = TrayIconPlate(cell, scale);
-            FillSquirclePremul(pixels, width, height, plate, ContentSquircleRadius(plate, scale), 0.10F);
-            if (m_overflowIcons[index].icon != nullptr) {
-                const LONG iconLeft = plate.left + (trayPlate - trayGlyph) / 2L;
-                const LONG iconTop = plate.top + (trayPlate - trayGlyph) / 2L;
-                BITMAPV5HEADER iconHeader = header;
-                iconHeader.bV5Width = SaturatedInt(trayGlyph);
-                iconHeader.bV5Height = -SaturatedInt(trayGlyph);
-                void* iconBits = nullptr;
-                HBITMAP iconBitmap = CreateDIBSection(memory,
-                    reinterpret_cast<const BITMAPINFO*>(&iconHeader), DIB_RGB_COLORS, &iconBits,
-                    nullptr, 0);
-                if (iconBitmap != nullptr && iconBits != nullptr) {
-                    HDC iconDc = CreateCompatibleDC(memory);
-                    if (iconDc != nullptr) {
-                        HGDIOBJ previousIcon = SelectObject(iconDc, iconBitmap);
-                        std::memset(iconBits, 0,
-                            static_cast<size_t>(trayGlyph) * trayGlyph * 4U);
-                        DrawIconEx(iconDc, 0, 0, m_overflowIcons[index].icon,
-                            SaturatedInt(trayGlyph), SaturatedInt(trayGlyph), 0, nullptr,
-                            DI_NORMAL);
-                        auto* iconPixels = static_cast<uint8_t*>(iconBits);
-                        const size_t iconCount = static_cast<size_t>(trayGlyph) * trayGlyph;
-                        for (size_t pixel = 0; pixel < iconCount; ++pixel) {
-                            uint8_t* sample = iconPixels + pixel * 4U;
-                            if ((sample[0] | sample[1] | sample[2]) != 0 && sample[3] == 0) {
-                                sample[3] = 255;
-                            }
-                        }
-                        CompositePremul(pixels, width, height, SaturatedInt(iconLeft),
-                            SaturatedInt(iconTop), iconPixels, SaturatedInt(trayGlyph),
-                            SaturatedInt(trayGlyph));
-                        SelectObject(iconDc, previousIcon);
-                        DeleteDC(iconDc);
-                    }
-                    DeleteObject(iconBitmap);
-                }
-            }
-            std::wstring title = NotifyIconTitle(m_overflowIcons[index]);
-            const size_t paren = title.find(L" (");
-            if (paren != std::wstring::npos && paren > 0) {
-                title.resize(paren);
-            }
-            const size_t andWord = title.find(L" and ");
-            if (andWord != std::wstring::npos && andWord > 0) {
-                title.resize(andWord);
-            }
-            SIZE titleSize{};
-            if (!title.empty()) {
-                GetTextExtentPoint32W(memory, title.c_str(), static_cast<int>(title.size()),
-                    &titleSize);
-            }
-            const RECT nameBounds{left, plate.bottom + trayTextGap, left + cellWidth,
-                plate.bottom + trayTextGap + trayNameHeight};
-            const RECT statusBounds{left, nameBounds.bottom, left + cellWidth,
-                nameBounds.bottom + trayStatusHeight};
-            const bool titleFits = titleSize.cx <= cellWidth;
-            if (titleFits) {
-                DrawFlyoutText(pixels, width, height, nameBounds, statusFont, title,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
-                const std::wstring status = NotifyIconStatus(m_overflowIcons[index]);
-                if (!status.empty()) {
-                    DrawFlyoutText(pixels, width, height, statusBounds, statusFont, status,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 230);
-                }
-            } else {
-                const RECT wrapBounds{left, nameBounds.top, left + cellWidth, statusBounds.bottom};
-                DrawFlyoutText(pixels, width, height, wrapBounds, statusFont, title,
-                    DT_CENTER | DT_TOP | DT_WORDBREAK, 255);
-            }
-            pushHit(TrayFlyoutHitKind::NotifyIcon, cell, static_cast<int>(index));
-        }
-        SelectObject(memory, previousMeasureFont);
-    }
+    PaintQuickSettings(pixels, width, height, memory, scale, padding, panelWidth, gearSize,
+        headerHeight, titleFont, sectionFont, labelFont, statusFont);
 
     const size_t bytes = pixelCount * 4U;
     m_overflowBaseBits.resize(bytes);

@@ -89,6 +89,7 @@ public:
     [[nodiscard]] std::vector<TrayNotifyIcon> EnumerateNotifyIcons() const;
     bool ToggleMute();
     bool AdjustVolume(float delta);
+    bool SetVolumeLevel(float level);
     bool AdjustBrightness(int deltaPercent);
     // Absolute set without re-reading first (worker threads only). The caller
     // owns freshness; used for debounced writes of an already-projected value.

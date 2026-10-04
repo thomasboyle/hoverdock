@@ -1934,6 +1934,22 @@ bool SystemTray::AdjustVolume(float delta) {
     return SUCCEEDED(result);
 }
 
+bool SystemTray::SetVolumeLevel(float level) {
+    IAudioEndpointVolume* volume = OpenEndpointVolume();
+    if (volume == nullptr) {
+        return false;
+    }
+    level = std::clamp(level, 0.0F, 1.0F);
+    const HRESULT result = volume->SetMasterVolumeLevelScalar(level, nullptr);
+    if (SUCCEEDED(result)) {
+        volume->SetMute(FALSE, nullptr);
+        m_status.volumeLevel = level;
+        m_status.volumeMuted = false;
+    }
+    volume->Release();
+    return SUCCEEDED(result);
+}
+
 bool SystemTray::AdjustBrightness(int deltaPercent) {
     if (!m_status.brightnessAvailable) {
         return OpenDisplaySettings();
