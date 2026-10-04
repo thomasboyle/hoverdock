@@ -2004,10 +2004,28 @@ void DockApp::MeasureQuickSettings(float scale, LONG padding, LONG gearSize, LON
 void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC memory, float scale,
     LONG padding, LONG panelWidth, LONG gearSize, LONG headerHeight, HFONT titleFont,
     HFONT sectionFont, HFONT labelFont, HFONT statusFont) {
+    // The window is deliberately larger than the content plate. Keeping this
+    // transparent margin outside the squircle lets the layered window carry a
+    // soft shadow/rim while the wallpaper remains visible in every corner.
+    const LONG shadowMargin = std::max(1L, std::lround(DOCK_SHADOW_MARGIN_PT * scale));
+    const int contentWidth = width - static_cast<int>(shadowMargin * 2L);
+    const int contentHeight = height - static_cast<int>(shadowMargin * 2L);
+    if (pixels == nullptr || contentWidth <= 0 || contentHeight <= 0) {
+        return;
+    }
+    const size_t bytes = static_cast<size_t>(contentWidth) * static_cast<size_t>(contentHeight) * 4U;
+    std::vector<uint8_t> content(bytes, 0);
     LONG widthOut = panelWidth;
     LONG heightOut = 0;
-    LayoutQuickSettings(true, pixels, width, height, memory, scale, padding, gearSize, headerHeight,
-        titleFont, sectionFont, labelFont, statusFont, widthOut, heightOut);
+    LayoutQuickSettings(true, content.data(), contentWidth, contentHeight, memory, scale, padding,
+        gearSize, headerHeight, titleFont, sectionFont, labelFont, statusFont, widthOut, heightOut);
+    CompositePremul(pixels, width, height, static_cast<int>(shadowMargin), static_cast<int>(shadowMargin),
+        content.data(), contentWidth, contentHeight);
+    for (TrayFlyoutHit& hit : m_overflowHits) {
+        OffsetRect(&hit.bounds, shadowMargin, shadowMargin);
+    }
+    m_overflowGearX += static_cast<int>(shadowMargin);
+    m_overflowGearY += static_cast<int>(shadowMargin);
 }
 
 void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int height, HDC memory,

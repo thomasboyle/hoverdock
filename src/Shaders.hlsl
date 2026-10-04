@@ -289,12 +289,13 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // drop shade into the margin outside the mask.
     // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
+    const float popupShadowOn = FxEnabled(scene1.x, (float)DOCK_FX_POPUP_SHADOW);
     const bool isPanel = panelOn > 0.5;
     // Charcoal plate only for panels that did not opt into the dock face.
     // Text panels are Quick Settings and Dock Settings (DOCK_FX_DOCK_FACE).
     const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE);
     const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE));
-    const float marginDev = (1.0 - panelOn) * DOCK_SHADOW_MARGIN_PT * dpi;
+    const float marginDev = max(1.0 - panelOn, popupShadowOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli). Squircle n=4 gives
     // Apple-like continuous curvature (slightly fuller corners than the true
@@ -324,11 +325,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float thickOn = FxEnabled(fxBits, 128.0);
     if (mask <= 0.0)
     {
-        // Panels have no shadow margin: a drop shade here is clipped by the
-        // square HWND and reads as a black/gray rectangle in the corner wedges.
-        // The dock keeps its shade; it is drawn into the layout margin, not
-        // into a square corner of the glass plate.
-        if (isPanel || shadowOn < 0.5)
+        // Only Quick Settings opts into a transparent popup margin. Other
+        // panels retain their old no-shadow contract.
+        if ((isPanel && popupShadowOn < 0.5) || shadowOn < 0.5)
         {
             return float4(0.0, 0.0, 0.0, 0.0);
         }
@@ -621,8 +620,9 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
 {
     // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
+    const float popupShadowOn = FxEnabled(scene1.x, (float)DOCK_FX_POPUP_SHADOW);
     const bool isPanel = panelOn > 0.5;
-    const float marginDev = (1.0 - panelOn) * DOCK_SHADOW_MARGIN_PT * dpi;
+    const float marginDev = max(1.0 - panelOn, popupShadowOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
     const float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);

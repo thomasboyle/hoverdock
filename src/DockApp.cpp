@@ -292,8 +292,9 @@ float PopupSquircleDistance(float x, float y, float width, float height, float r
 // squircle (panels have no shadow margin, so the shade is clipped by the HWND
 // into a dark rectangle). Force those pixels to exact transparent black so
 // UpdateLayeredWindow and the window region both let the wallpaper through.
-void PunchPopupSquircleWedges(HWND window, uint8_t* pixels, LONG width, LONG height) noexcept {
-    if (pixels == nullptr || width <= 1 || height <= 1) {
+void PunchPopupSquircleWedges(HWND window, uint8_t* pixels, LONG width, LONG height,
+    bool preservePopupShadow) noexcept {
+    if (preservePopupShadow || pixels == nullptr || width <= 1 || height <= 1) {
         return;
     }
     UINT dpi = 96;
@@ -676,6 +677,50 @@ void ApplyLiquidGlassFace(uint8_t* pixels, int width, int height,
         }
     }
 }
+
+void ApplyPopupOuterShadow(uint8_t* pixels, int width, int height, int margin, float radius,
+    float scale) noexcept
+{
+    if (pixels == nullptr || width <= 0 || height <= 0 || margin <= 0) {
+        return;
+    }
+    const int innerWidth = width - margin * 2;
+    const int innerHeight = height - margin * 2;
+    if (innerWidth <= 2 || innerHeight <= 2) {
+        return;
+    }
+    const float shadowWidth = std::max(1.0F, 16.0F * scale);
+    const float shadowOffset = 4.0F * scale;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const float localX = static_cast<float>(x - margin) + 0.5F;
+            const float localY = static_cast<float>(y - margin) + 0.5F;
+            const float edge = PopupSquircleDistance(localX, localY,
+                static_cast<float>(innerWidth), static_cast<float>(innerHeight), radius);
+            if (edge <= 0.0F) {
+                continue;
+            }
+            // Offset the virtual plate down, matching GlassPS's contact shade.
+            const float shadowDistance = PopupSquircleDistance(localX, localY - shadowOffset,
+                static_cast<float>(innerWidth), static_cast<float>(innerHeight), radius);
+            if (shadowDistance >= shadowWidth) {
+                continue;
+            }
+            const float t = 1.0F - std::clamp(std::max(shadowDistance, 0.0F) / shadowWidth,
+                0.0F, 1.0F);
+            const float smooth = t * t * (3.0F - 2.0F * t);
+            uint8_t* pixel = pixels +
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 4U;
+            if (pixel[3] == 0) {
+                pixel[0] = 0;
+                pixel[1] = 0;
+                pixel[2] = 0;
+                pixel[3] = static_cast<uint8_t>(std::lround(255.0F * 0.20F * smooth));
+            }
+        }
+    }
+}
+
 HFONT CreateFlyoutFont(int pixelHeight, int weight) {
     // LOGFONT metrics only - DrawFlyoutText rasterizes via DirectWrite grayscale
     // (NATURAL_SYMMETRIC + FLAT) so GDI lfQuality is unused for flyout ink.
@@ -5465,7 +5510,7 @@ void DockApp::ReleaseLayerPresentDib(LayerPresentDib& slot) noexcept
 
 bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, LONG height,
     const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
-    const RECT* dirty) noexcept
+    const RECT* dirty, bool preservePopupShadow) noexcept
 {
     if (window == nullptr || pixels == nullptr || width <= 0 || height <= 0) {
         return false;
@@ -5481,7 +5526,8 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
     // Last gate before ULW: the panel shadow (and any stale bake) leaves
     // non-zero alpha in the square wedges. Zero them on the source so a later
     // dirty present cannot copy the dark rectangle back in.
-    PunchPopupSquircleWedges(window, const_cast<uint8_t*>(pixels), width, height);
+    PunchPopupSquircleWedges(window, const_cast<uint8_t*>(pixels), width, height,
+        preservePopupShadow);
     // A dirty rect is only valid when the DIB already matches the screen except
     // for that rect. Live glass clears contentValid; clipping the composite to
     // the hover highlight would leave the rest of the plate frozen.
@@ -5542,7 +5588,7 @@ void DockApp::PresentOverflowLayer() noexcept {
     const LONG width = m_overflowPresentSize.cx;
     const LONG height = m_overflowPresentSize.cy;
     if (!PresentLayeredBits(m_overflowWindow, origin, width, height, m_overflowPresentBits.data(),
-            m_overflowPresentBits.size(), m_overflowLayerDib)) {
+            m_overflowPresentBits.size(), m_overflowLayerDib, nullptr, true)) {
         return;
     }
     // Do not call PositionDockSettings here: UpdateLayeredWindow already placed
@@ -6306,7 +6352,7 @@ void DockApp::RebuildSettingsPopup() {
 }
 
 
-UINT DockApp::PackPopupGlassFxFlags(bool dockFace) const noexcept
+UINT DockApp::PackPopupGlassFxFlags(bool dockFace, bool popupShadow) const noexcept
 {
     // Same packing as the dock frame (frost<<16 | halo<<8 | fx), plus PANEL so
     // GlassPS fills the plate without the dock shadow margin. Halo slots stay 0
@@ -6336,6 +6382,9 @@ UINT DockApp::PackPopupGlassFxFlags(bool dockFace) const noexcept
     }
     if (m_config.DepthShade()) {
         glassFx |= DOCK_FX_THICKNESS;
+    }
+    if (popupShadow) {
+        glassFx |= DOCK_FX_POPUP_SHADOW;
     }
     constexpr UINT haloSlots = 0u;
     const UINT frostByte =
@@ -6460,7 +6509,8 @@ bool DockApp::TickLivePopupGlass()
     const UINT contextFlags = PackPopupGlassFxFlags(false);
 
     for (int target = 0; target < 3; ++target) {
-        const UINT fxFlags = target == 2 ? contextFlags : dockFaceFlags;
+        const UINT fxFlags = target == 1 ? PackPopupGlassFxFlags(true, true)
+            : (target == 2 ? contextFlags : dockFaceFlags);
         const float glassAlpha = target == 2 ? contextAlpha : settingsAlpha;
         POINT origin{};
         LONG width = 0;
@@ -6517,7 +6567,7 @@ bool DockApp::TickLivePopupGlass()
 }
 
 bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* pixels,
-    size_t byteCount, bool dockFace)
+    size_t byteCount, bool dockFace, bool popupShadow)
 {
     if (!m_rendererInitialized || pixels == nullptr || width <= 0 || height <= 0) {
         return false;
@@ -6533,7 +6583,7 @@ bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* 
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
     std::vector<uint8_t> glass;
     if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(width), static_cast<UINT>(height),
-            PackPopupGlassFxFlags(dockFace), glassAlpha, dpiScale, m_settingsWindow,
+            PackPopupGlassFxFlags(dockFace, popupShadow), glassAlpha, dpiScale, m_settingsWindow,
             m_overflowWindow, m_contextWindow, dockFace && m_config.LightPanels(), glass)) {
         return false;
     }
@@ -7346,8 +7396,10 @@ bool DockApp::OverflowScreenOrigin(POINT& origin, LONG& caretX) const noexcept {
     const LONG margin = std::max(8L, std::lround(8.0F * scale));
     const LONG shadowMargin = DockShadowMarginPx(scale);
     const LONG chevronCenter = chevronTopLeft.x + (chevronBottomRight.x - chevronTopLeft.x) / 2L;
+    const LONG popupMargin = std::max(1L, std::lround(DOCK_SHADOW_MARGIN_PT * scale));
     LONG x = chevronCenter - m_overflowSize.cx / 2L;
-    LONG y = m_currentY + shadowMargin - gap - m_overflowSize.cy;
+    // Keep the inner plate anchored where the pre-margin panel lived.
+    LONG y = m_currentY + shadowMargin - gap - m_overflowSize.cy + popupMargin;
     const LONG minX = m_hostBounds.left + margin;
     const LONG maxX = m_hostBounds.right - m_overflowSize.cx - margin;
     if (maxX >= minX) {
@@ -7357,7 +7409,8 @@ bool DockApp::OverflowScreenOrigin(POINT& origin, LONG& caretX) const noexcept {
     }
     y = std::max(m_hostBounds.top + margin, y);
     const LONG radius = std::max(18L, std::lround(22.0F * scale));
-    caretX = std::clamp(chevronCenter - x, radius, m_overflowSize.cx - radius);
+    caretX = std::clamp(chevronCenter - x, popupMargin + radius,
+        m_overflowSize.cx - popupMargin - radius);
     origin = {x, y};
     return true;
 }
@@ -7772,14 +7825,17 @@ void DockApp::PaintOverflowPopup() {
     const LONG caretWidth = std::max(16L, std::lround(18.0F * scale));
     const LONG radius =
         std::max(16L, std::lround(DOCK_CORNER_RADIUS_PT * scale));
+    const LONG shadowMargin = std::max(1L, std::lround(DOCK_SHADOW_MARGIN_PT * scale));
     const LONG gearSize = std::max(18L, std::lround(22.0F * scale));
     const LONG headerHeight = std::max(gearSize, std::max(28L, std::lround(32.0F * scale)));
     RefreshQuickSettingsCache();
     LONG panelWidth = 0;
     LONG contentHeight = 0;
     MeasureQuickSettings(scale, padding, gearSize, headerHeight, panelWidth, contentHeight);
-    m_overflowSize.cx = panelWidth;
-    m_overflowSize.cy = contentHeight + caretHeight;
+    // Reserve a transparent device-pixel ring outside the actual panel. The
+    // panel layout remains the same size; only its layered HWND grows.
+    m_overflowSize.cx = panelWidth + shadowMargin * 2L;
+    m_overflowSize.cy = contentHeight + caretHeight + shadowMargin * 2L;
 
     if (m_overflowWindow == nullptr) {
         const wchar_t className[] = L"LiquidGlassDockOverflow";
@@ -7848,7 +7904,7 @@ void DockApp::PaintOverflowPopup() {
     } else {
         std::memset(pixels, 0, pixelCount * 4U);
         const bool gpuGlass = TryBakePopupGlass(origin, m_overflowSize.cx, m_overflowSize.cy, pixels,
-            pixelCount * 4U, true);
+            pixelCount * 4U, true, true);
         if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {
@@ -7895,8 +7951,13 @@ void DockApp::PaintOverflowPopup() {
             HPEN whitePen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
             HGDIOBJ previousBrush = SelectObject(maskDc, whiteBrush);
             HGDIOBJ previousPen = SelectObject(maskDc, whitePen);
-            const LONG bodyBottom = m_overflowSize.cy - caretHeight;
-            RoundRect(maskDc, 0, 0, maskW, SaturatedInt(bodyBottom * kMaskSupersample),
+            const LONG bodyBottom = m_overflowSize.cy - shadowMargin - caretHeight;
+            const LONG bodyLeft = shadowMargin;
+            const LONG bodyRight = m_overflowSize.cx - shadowMargin;
+            RoundRect(maskDc, SaturatedInt(bodyLeft * kMaskSupersample),
+                SaturatedInt(shadowMargin * kMaskSupersample),
+                SaturatedInt(bodyRight * kMaskSupersample),
+                SaturatedInt(bodyBottom * kMaskSupersample),
                 SaturatedInt(radius * 2L * kMaskSupersample),
                 SaturatedInt(radius * 2L * kMaskSupersample));
             POINT triangle[3] = {
@@ -7905,7 +7966,7 @@ void DockApp::PaintOverflowPopup() {
                 {(m_overflowCaretX + caretWidth / 2L) * kMaskSupersample,
                     bodyBottom * kMaskSupersample - kMaskSupersample},
                 {m_overflowCaretX * kMaskSupersample,
-                    m_overflowSize.cy * kMaskSupersample - kMaskSupersample},
+                    (m_overflowSize.cy - shadowMargin) * kMaskSupersample - kMaskSupersample},
             };
             Polygon(maskDc, triangle, 3);
             SelectObject(maskDc, previousPen);
@@ -7947,6 +8008,8 @@ void DockApp::PaintOverflowPopup() {
             // Same liquid-glass face as the dock (calibrated tone map + rim).
             ApplyLiquidGlassFace(pixels, SaturatedInt(glassW), SaturatedInt(glassH), coverage,
                 blurredCoverage, m_config.FrostAmount(), true, m_config.LightPanels());
+            ApplyPopupOuterShadow(pixels, SaturatedInt(glassW), SaturatedInt(glassH),
+                static_cast<int>(shadowMargin), static_cast<float>(radius), scale);
             SelectObject(maskDc, previousMask);
             DeleteObject(maskBitmap);
             DeleteDC(maskDc);

@@ -369,11 +369,11 @@ private:
     void ReleaseLayerPresentDib(LayerPresentDib& slot) noexcept;
     bool PresentLayeredBits(HWND window, const POINT& origin, LONG width, LONG height,
         const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
-        const RECT* dirty = nullptr) noexcept;
+        const RECT* dirty = nullptr, bool preservePopupShadow = false) noexcept;
     void QueueSettingsPaint(bool hoverOnly = false);
-    [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace) const noexcept;
+    [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false) const noexcept;
     [[nodiscard]] bool TryBakePopupGlass(POINT origin, LONG width, LONG height,
-        uint8_t* pixels, size_t byteCount, bool dockFace);
+        uint8_t* pixels, size_t byteCount, bool dockFace, bool popupShadow = false);
     void RebuildSettingsPopup();
     void HandleSettingsClick(const SettingsHit& hit, UINT message);
     void ApplyFrostSliderAt(LONG clientX);
