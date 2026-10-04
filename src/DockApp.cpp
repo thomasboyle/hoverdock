@@ -276,6 +276,65 @@ void ClearPopupLayeredCorners(HWND window) {
     EnumChildWindows(window, ApplyPopupChildPlate, 0);
 }
 
+float PopupSquircleDistance(float x, float y, float width, float height, float radius) noexcept {
+    const float halfW = width * 0.5F;
+    const float halfH = height * 0.5F;
+    const float corner = std::min(radius, std::min(halfW, halfH));
+    const float qx = std::fabs(x - halfW) - (halfW - corner);
+    const float qy = std::fabs(y - halfH) - (halfH - corner);
+    const float outside = std::sqrt(std::max(qx, 0.0F) * std::max(qx, 0.0F) +
+        std::max(qy, 0.0F) * std::max(qy, 0.0F));
+    const float inside = std::min(std::max(qx, qy), 0.0F);
+    return outside + inside - corner;
+}
+
+// GlassPS draws the panel drop shadow into the square wedges outside the
+// squircle (panels have no shadow margin, so the shade is clipped by the HWND
+// into a dark rectangle). Force those pixels to exact transparent black so
+// UpdateLayeredWindow and the window region both let the wallpaper through.
+void PunchPopupSquircleWedges(HWND window, uint8_t* pixels, LONG width, LONG height) noexcept {
+    if (pixels == nullptr || width <= 1 || height <= 1) {
+        return;
+    }
+    UINT dpi = 96;
+    if (window != nullptr) {
+        const UINT windowDpi = GetDpiForWindow(window);
+        if (windowDpi > 0) {
+            dpi = windowDpi;
+        }
+    }
+    const float dpiScale = std::max(static_cast<float>(dpi) / 96.0F, 1.0F);
+    const float radius = DOCK_CORNER_RADIUS_PT * dpiScale;
+    const float aa = 1.35F * dpiScale;
+    const int reach = std::max(2, static_cast<int>(std::ceil(radius + aa + 1.0F)));
+    const int origins[4][2] = {{0, 0}, {std::max(0, static_cast<int>(width) - reach), 0},
+        {0, std::max(0, static_cast<int>(height) - reach)},
+        {std::max(0, static_cast<int>(width) - reach), std::max(0, static_cast<int>(height) - reach)}};
+    const float fw = static_cast<float>(width);
+    const float fh = static_cast<float>(height);
+    for (const auto& origin : origins) {
+        const int x0 = origin[0];
+        const int y0 = origin[1];
+        const int x1 = std::min(static_cast<int>(width), x0 + reach);
+        const int y1 = std::min(static_cast<int>(height), y0 + reach);
+        for (int y = y0; y < y1; ++y) {
+            uint8_t* row = pixels + (static_cast<size_t>(y) * static_cast<size_t>(width)) * 4U;
+            for (int x = x0; x < x1; ++x) {
+                const float distance = PopupSquircleDistance(static_cast<float>(x) + 0.5F,
+                    static_cast<float>(y) + 0.5F, fw, fh, radius);
+                if (distance < aa) {
+                    continue;
+                }
+                uint8_t* pixel = row + static_cast<size_t>(x) * 4U;
+                pixel[0] = 0;
+                pixel[1] = 0;
+                pixel[2] = 0;
+                pixel[3] = 0;
+            }
+        }
+    }
+}
+
 void ClipLayeredPopupToCoverage(HWND window, const uint8_t* pixels, LONG width, LONG height) noexcept {
     if (window == nullptr || pixels == nullptr || width <= 0 || height <= 0) {
         return;
@@ -5418,6 +5477,10 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
     if (!EnsureLayerPresentDib(slot, width, height) || slot.bits == nullptr || slot.dc == nullptr) {
         return false;
     }
+    // Last gate before ULW: the panel shadow (and any stale bake) leaves
+    // non-zero alpha in the square wedges. Zero them on the source so a later
+    // dirty present cannot copy the dark rectangle back in.
+    PunchPopupSquircleWedges(window, const_cast<uint8_t*>(pixels), width, height);
     // A dirty rect is only valid when the DIB already matches the screen except
     // for that rect. Live glass clears contentValid; clipping the composite to
     // the hover highlight would leave the rest of the plate frozen.

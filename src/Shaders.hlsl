@@ -324,23 +324,26 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float thickOn = FxEnabled(fxBits, 128.0);
     if (mask <= 0.0)
     {
-        if (shadowOn < 0.5)
+        // Panels have no shadow margin: a drop shade here is clipped by the
+        // square HWND and reads as a black/gray rectangle in the corner wedges.
+        // The dock keeps its shade; it is drawn into the layout margin, not
+        // into a square corner of the glass plate.
+        if (isPanel || shadowOn < 0.5)
         {
             return float4(0.0, 0.0, 0.0, 0.0);
         }
         // Soft outer contact shadow: the pill SDF re-evaluated with a small
         // downward offset, falloff over a 16px band. Premultiplied black over
         // the desktop = drop shade via the DComp blend. Fits inside the layout
-        // margin (18px). Panels: down-right key-light shade. Dock: lighter,
-        // centered ambient float with a smooth tail (Apple glass).
-        const float2 shadowOffset = isPanel ? float2(2.0, 6.0) : float2(0.0, 4.0);
+        // margin (18px). Dock: lighter, centered ambient float (Apple glass).
+        const float2 shadowOffset = float2(0.0, 4.0);
         const float2 shadowCenter = outputSize * 0.5 + shadowOffset * dpi;
         const float shadowSdf = SdSquircleBox(pixel - shadowCenter, halfSize, cornerRadius);
         const float shadowWidth = 16.0 * dpi;
         if (shadowSdf < shadowWidth)
         {
             float s = 1.0 - max(shadowSdf, 0.0) / shadowWidth;
-            const float shadowAlpha = isPanel ? s * s * 0.42 : s * s * (3.0 - 2.0 * s) * 0.20;
+            const float shadowAlpha = s * s * (3.0 - 2.0 * s) * 0.20;
             return float4(0.0, 0.0, 0.0, shadowAlpha);
         }
         return float4(0.0, 0.0, 0.0, 0.0);
