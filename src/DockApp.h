@@ -178,6 +178,7 @@ private:
     static constexpr UINT kTrashNotifyMessage = WM_APP + 19;
     static constexpr UINT kTrashRefreshMessage = WM_APP + 20;
     static constexpr UINT kTrashDropMessage = WM_APP + 21;
+    static constexpr UINT kOverflowDismissMessage = WM_APP + 24;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -276,6 +277,7 @@ private:
     static LRESULT CALLBACK DockSettingsProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
     static LRESULT CALLBACK MouseHook(int code, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK OverflowDismissHook(int code, WPARAM wParam, LPARAM lParam);
     static BOOL CALLBACK FindTaskbarWindow(HWND window, LPARAM data);
 
     LRESULT HandleRendererMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
@@ -541,6 +543,9 @@ private:
     void StartCursorWatch() noexcept;
     void StopCursorWatch() noexcept;
     void EnsureMouseHook() noexcept;
+    void InstallOverflowDismissHook() noexcept;
+    void RemoveOverflowDismissHook() noexcept;
+    void DismissQuickSettings();
     void PumpCursorWatch();
     [[nodiscard]] UINT DesiredCursorWatchIntervalMs() const noexcept;
     void SyncCursorWatchInterval() noexcept;
@@ -608,6 +613,7 @@ private:
     HWND m_launchEdit = nullptr;
     HWND m_launchStatus = nullptr;
     HHOOK m_mouseHook = nullptr;
+    HHOOK m_overflowDismissHook = nullptr;
     HFONT m_hoverLabelFont = nullptr;
     UINT m_hoverLabelFontDpi = 0;
     int m_hoverLabelFontPx = 0;

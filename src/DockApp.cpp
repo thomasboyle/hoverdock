@@ -1044,12 +1044,6 @@ constexpr uint8_t kAmberB = DOCK_PANEL_TOGGLE_B;
 constexpr uint8_t kAmberG = DOCK_PANEL_TOGGLE_G;
 constexpr uint8_t kAmberR = DOCK_PANEL_TOGGLE_R;
 
-// Quick Settings control squircles (#98A869 olive sage — same as Dock Settings).
-// DIB order: B, G, R.
-constexpr uint8_t kQuickAccentB = DOCK_PANEL_TOGGLE_B;
-constexpr uint8_t kQuickAccentG = DOCK_PANEL_TOGGLE_G;
-constexpr uint8_t kQuickAccentR = DOCK_PANEL_TOGGLE_R;
-
 void FillPillColorPremul(uint8_t* dest, int destWidth, int destHeight, float cxLeft,
     float cxRight, float cy, float radius, float alpha, uint8_t blue, uint8_t green,
     uint8_t red) {
@@ -1149,14 +1143,6 @@ RECT InsetContentRect(RECT bounds, LONG inset) noexcept {
     return bounds;
 }
 
-// Square control that used to be a circle, now a full superellipse in that box.
-RECT QuickControlDisc(const RECT& tile, float scale) noexcept {
-    const LONG side = std::max(44L, std::lround(52.0F * scale));
-    const LONG cx = (tile.left + tile.right) / 2L;
-    const LONG left = cx - side / 2L;
-    return RECT{left, tile.top, left + side, tile.top + side};
-}
-
 void FillSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
     float radius, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
     if (alpha <= 0.0F || bounds.right <= bounds.left || bounds.bottom <= bounds.top) {
@@ -1214,41 +1200,6 @@ void FillSquircleLevelColorPremul(uint8_t* dest, int destWidth, int destHeight, 
                 blue, green, red);
         }
     }
-}
-
-void StrokeSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
-    float radius, float halfWidth, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
-    if (halfWidth <= 0.0F || alpha <= 0.0F || bounds.right <= bounds.left ||
-        bounds.bottom <= bounds.top) {
-        return;
-    }
-    const float halfW = 0.5F * static_cast<float>(bounds.right - bounds.left);
-    const float halfH = 0.5F * static_cast<float>(bounds.bottom - bounds.top);
-    const float cx = 0.5F * static_cast<float>(bounds.left + bounds.right);
-    const float cy = 0.5F * static_cast<float>(bounds.top + bounds.bottom);
-    const int pad = static_cast<int>(std::ceil(halfWidth + 2.0F));
-    const int left = std::max(0, static_cast<int>(bounds.left) - pad);
-    const int top = std::max(0, static_cast<int>(bounds.top) - pad);
-    const int right = std::min(destWidth, static_cast<int>(bounds.right) + pad);
-    const int bottom = std::min(destHeight, static_cast<int>(bounds.bottom) + pad);
-    constexpr float aa = 1.15F;
-    for (int y = top; y < bottom; ++y) {
-        for (int x = left; x < right; ++x) {
-            const float dist = SdSquircleBox(static_cast<float>(x) + 0.5F,
-                static_cast<float>(y) + 0.5F, cx, cy, halfW, halfH, radius);
-            const float coverage =
-                1.0F - std::clamp((std::abs(dist) - halfWidth) / aa + 0.5F, 0.0F, 1.0F);
-            CompositeCoverage(dest, destWidth, destHeight, x, y, coverage, alpha, blue, green, red);
-        }
-    }
-}
-
-void GlowSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
-    float radius, uint8_t blue, uint8_t green, uint8_t red) {
-    StrokeSquircleColorPremul(dest, destWidth, destHeight, bounds, radius, 3.2F, 0.28F, blue,
-        green, red);
-    StrokeSquircleColorPremul(dest, destWidth, destHeight, bounds, radius, 1.35F, 0.92F, blue,
-        green, red);
 }
 
 std::wstring NotifyIconTitle(const TrayNotifyIcon& icon) {
@@ -2489,7 +2440,18 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         return 0;
     }
 
+    case WM_KEYDOWN:
+        // NOACTIVATE, so this only fires if the popup actually has focus.
+        // The low-level hook covers Escape while another app is foreground.
+        if (wParam == VK_ESCAPE && app != nullptr) {
+            app->DismissQuickSettings();
+            return 0;
+        }
+        break;
+
     case WM_MOUSELEAVE:
+        // Leaving the popup only clears hover. Drill-ins resize away from the
+        // cursor; closing here would hide the new page before the pointer enters.
         if (app != nullptr && app->m_overflowHover >= 0) {
             app->m_overflowHover = -1;
             app->QueueOverflowPaint(true);
@@ -2658,6 +2620,51 @@ LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
+
+LRESULT CALLBACK DockApp::OverflowDismissHook(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && s_instance != nullptr &&
+        (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (key != nullptr && key->vkCode == VK_ESCAPE &&
+            (s_instance->IsContextMenuOpen() || s_instance->IsDockSettingsOpen() ||
+                s_instance->IsOverflowOpen())) {
+            PostMessageW(s_instance->m_window, kOverflowDismissMessage, 0, 0);
+            return 1;
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+void DockApp::InstallOverflowDismissHook() noexcept {
+    if (m_overflowDismissHook != nullptr || m_instance == nullptr) {
+        return;
+    }
+    m_overflowDismissHook = SetWindowsHookExW(WH_KEYBOARD_LL, &DockApp::OverflowDismissHook,
+        m_instance, 0);
+}
+
+void DockApp::RemoveOverflowDismissHook() noexcept {
+    if (m_overflowDismissHook == nullptr) {
+        return;
+    }
+    UnhookWindowsHookEx(m_overflowDismissHook);
+    m_overflowDismissHook = nullptr;
+}
+
+void DockApp::DismissQuickSettings() {
+    if (IsContextMenuOpen()) {
+        CloseContextMenu();
+        return;
+    }
+    if (IsDockSettingsOpen()) {
+        CloseDockSettings();
+        return;
+    }
+    if (IsOverflowOpen()) {
+        CloseOverflowPopup();
+    }
+}
+
 BOOL CALLBACK DockApp::FindTaskbarWindow(HWND window, LPARAM data) {
     wchar_t className[64]{};
     if (GetClassNameW(window, className, static_cast<int>(std::size(className))) == 0) {
@@ -2775,6 +2782,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 CloseContextMenu();
             } else if (IsDockSettingsOpen()) {
                 CloseDockSettings();
+            } else if (IsOverflowOpen()) {
+                CloseOverflowPopup();
             } else {
                 BeginHide();
             }
@@ -2988,6 +2997,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 PaintContextMenu();
             }
         }
+        return 0;
+
+    case kOverflowDismissMessage:
+        DismissQuickSettings();
         return 0;
 
     case kOverflowWheelMessage: {
@@ -5141,6 +5154,7 @@ void DockApp::EnsureOverflowGlyphs(UINT gearExtent, UINT tileExtent) {
 }
 
 void DockApp::FinishOverflowHide() noexcept {
+    RemoveOverflowDismissHook();
     if (m_window != nullptr) {
         KillTimer(m_window, kBluetoothTimerId);
     }
@@ -5342,6 +5356,7 @@ void DockApp::BeginOverflowShow() {
         return;
     }
     PresentOverflowLayer();
+    InstallOverflowDismissHook();
     m_bluetooth.RequestRefresh();
     if (m_window != nullptr) {
         SetTimer(m_window, kBluetoothTimerId, 4000, nullptr);
@@ -7359,19 +7374,6 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         // The cog stays its idle size. A hover plate or scale-up covered the
         // tile underneath.
         break;
-    case TrayFlyoutHitKind::Wifi:
-    case TrayFlyoutHitKind::Sound:
-    case TrayFlyoutHitKind::Boost:
-    case TrayFlyoutHitKind::Brightness: {
-        // Squircle edge glow. A solid hover fill paints over the cached glyph;
-        // the stroke leaves the interior clear so the icon stays crisp.
-        const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
-        const RECT disc = QuickControlDisc(hit.bounds, scale);
-        const float radius = 0.5F * static_cast<float>(disc.right - disc.left);
-        GlowSquircleColorPremul(pixels, width, height, disc, radius, kQuickAccentB, kQuickAccentG,
-            kQuickAccentR);
-        break;
-    }
     case TrayFlyoutHitKind::BluetoothRadio:
     case TrayFlyoutHitKind::BluetoothSettings: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
@@ -7393,6 +7395,10 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         FillSquirclePremul(pixels, width, height, plate, ContentSquircleRadius(plate, scale), 0.16F);
         break;
     }
+    case TrayFlyoutHitKind::Wifi:
+    case TrayFlyoutHitKind::Sound:
+    case TrayFlyoutHitKind::Boost:
+    case TrayFlyoutHitKind::Brightness:
     case TrayFlyoutHitKind::Back:
     case TrayFlyoutHitKind::Ethernet:
     case TrayFlyoutHitKind::Vpn:
@@ -8228,9 +8234,11 @@ void DockApp::HandlePointer(POINT cursor) {
 
     if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
         !inHotZone && !IsLaunchPromptOpen() && !IsCursorOverDock(cursor) &&
-        !IsCursorWithinFlyoutZone(cursor) &&
+        !IsCursorWithinFlyoutZone(cursor) && !IsOverflowOpen() &&
         (cursor.y < m_visibleY + DockShadowMarginPx(static_cast<float>(HostDpi()) / 96.0F) ||
             MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) != m_hostMonitor)) {
+        // Quick Settings stays up when a drill-in resizes out from under the
+        // cursor. Dismiss is an outside click, Escape, or Back — not mouse-leave.
         BeginHide();
         return;
     }
