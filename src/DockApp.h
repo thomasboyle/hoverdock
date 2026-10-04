@@ -217,6 +217,7 @@ private:
         VpnEntry,
         MoreSettings,
         MediaTransport,
+        MediaSeek,
     };
 
     struct TrayFlyoutHit {

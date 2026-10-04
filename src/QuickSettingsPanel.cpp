@@ -1235,6 +1235,7 @@ struct MediaBridge {
     std::wstring artist;
     bool have = false;
     bool playing = false;
+    float progress = 0.0F;
 };
 
 MediaBridge g_media;
@@ -1369,12 +1370,29 @@ void RequestMediaProperties(const MediaSession& session) {
     }
 }
 
+float ReadMediaProgress(const MediaSession& session) noexcept {
+    try {
+        const auto timeline = session.GetTimelineProperties();
+        const auto start = timeline.StartTime().count();
+        const auto end = timeline.EndTime().count();
+        const auto position = timeline.Position().count();
+        const auto span = end - start;
+        if (span <= 0) {
+            return 0.0F;
+        }
+        return std::clamp(static_cast<float>(position - start) / static_cast<float>(span), 0.0F, 1.0F);
+    } catch (const winrt::hresult_error&) {
+        return 0.0F;
+    }
+}
+
 void PublishMedia(QuickSettingsCache& cache) {
     std::lock_guard<std::mutex> lock(g_media.mutex);
     cache.mediaTitle = g_media.title;
     cache.mediaArtist = g_media.artist;
     cache.mediaHave = g_media.have;
     cache.mediaPlaying = g_media.playing;
+    cache.mediaProgress = g_media.progress;
 }
 
 void QueryMedia(QuickSettingsCache& cache) {
@@ -1395,6 +1413,7 @@ void QueryMedia(QuickSettingsCache& cache) {
             g_media.session = nullptr;
             g_media.have = false;
             g_media.playing = false;
+            g_media.progress = 0.0F;
             g_media.title.clear();
             g_media.artist.clear();
         } else {
@@ -1406,11 +1425,13 @@ void QueryMedia(QuickSettingsCache& cache) {
             } catch (const winrt::hresult_error&) {
                 source.clear();
             }
+            const float progress = ReadMediaProgress(session);
             {
                 std::lock_guard<std::mutex> lock(g_media.mutex);
                 g_media.session = session;
                 g_media.playing = playing;
                 g_media.have = true;
+                g_media.progress = progress;
                 if (g_media.title.empty() && !source.empty()) {
                     g_media.artist = source;
                 }
@@ -1605,6 +1626,132 @@ void SendMediaKey(WORD key) {
     SendInput(2, inputs, sizeof(INPUT));
 }
 
+
+void FillHGradientPill(uint8_t* dest, int destWidth, int destHeight, float x0, float x1, float cy,
+    float radius, float alpha, uint8_t b0, uint8_t g0, uint8_t r0, uint8_t b1, uint8_t g1,
+    uint8_t r1) {
+    if (dest == nullptr || alpha <= 0.0F || x1 <= x0 + 0.5F || radius <= 0.5F) {
+        return;
+    }
+    const int left = std::max(0, static_cast<int>(std::floor(x0 - 1.0F)));
+    const int right = std::min(destWidth, static_cast<int>(std::ceil(x1 + 1.0F)));
+    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 2.0F)));
+    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 2.0F)));
+    const float span = std::max(1.0F, x1 - x0);
+    constexpr float aa = 1.2F;
+    for (int y = top; y < bottom; ++y) {
+        const float dy = std::fabs(static_cast<float>(y) + 0.5F - cy);
+        for (int x = left; x < right; ++x) {
+            const float px = static_cast<float>(x) + 0.5F;
+            float dx = 0.0F;
+            if (px < x0) {
+                dx = x0 - px;
+            } else if (px > x1) {
+                dx = px - x1;
+            }
+            const float sd = (dx > 0.0F ? std::sqrt(dx * dx + dy * dy) : dy) - radius;
+            const float coverage = 1.0F - std::clamp(sd / aa + 0.5F, 0.0F, 1.0F);
+            if (coverage <= 0.0F) {
+                continue;
+            }
+            const float t = std::clamp((px - x0) / span, 0.0F, 1.0F);
+            const float srcA = coverage * alpha;
+            const auto channel = [&](uint8_t from, uint8_t to) {
+                return static_cast<uint8_t>(std::lround(
+                    ((1.0F - t) * static_cast<float>(from) + t * static_cast<float>(to)) * srcA));
+            };
+            uint8_t pixel[4] = {channel(b0, b1), channel(g0, g1), channel(r0, r1),
+                static_cast<uint8_t>(std::lround(255.0F * srcA))};
+            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+        }
+    }
+}
+
+void FillSoftDisc(uint8_t* dest, int destWidth, int destHeight, float cx, float cy, float radius,
+    float alpha, uint8_t blue, uint8_t green, uint8_t red) {
+    if (dest == nullptr || alpha <= 0.0F || radius <= 0.5F) {
+        return;
+    }
+    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - 2.0F)));
+    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 2.0F)));
+    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 2.0F)));
+    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 2.0F)));
+    constexpr float aa = 1.25F;
+    for (int y = top; y < bottom; ++y) {
+        for (int x = left; x < right; ++x) {
+            const float dx = static_cast<float>(x) + 0.5F - cx;
+            const float dy = static_cast<float>(y) + 0.5F - cy;
+            const float sd = std::sqrt(dx * dx + dy * dy) - radius;
+            const float coverage = 1.0F - std::clamp(sd / aa + 0.5F, 0.0F, 1.0F);
+            if (coverage <= 0.0F) {
+                continue;
+            }
+            const float srcA = coverage * alpha;
+            uint8_t pixel[4] = {
+                static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
+                static_cast<uint8_t>(std::lround(255.0F * srcA)),
+            };
+            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+        }
+    }
+}
+
+void FillAlbumDisc(uint8_t* dest, int destWidth, int destHeight, float cx, float cy, float radius) {
+    if (dest == nullptr || radius <= 1.0F) {
+        return;
+    }
+    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - 2.0F)));
+    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 2.0F)));
+    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 2.0F)));
+    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 2.0F)));
+    constexpr float aa = 1.2F;
+    for (int y = top; y < bottom; ++y) {
+        const float v = std::clamp((static_cast<float>(y) + 0.5F - (cy - radius)) / (radius * 2.0F),
+            0.0F, 1.0F);
+        // Sunset stand-in: purple sky, warm horizon, dark foreground.
+        float red = 0.0F;
+        float green = 0.0F;
+        float blue = 0.0F;
+        if (v < 0.42F) {
+            const float t = v / 0.42F;
+            red = 88.0F + t * 150.0F;
+            green = 48.0F + t * 70.0F;
+            blue = 140.0F - t * 40.0F;
+        } else if (v < 0.68F) {
+            const float t = (v - 0.42F) / 0.26F;
+            red = 238.0F - t * 40.0F;
+            green = 118.0F - t * 30.0F;
+            blue = 100.0F - t * 40.0F;
+        } else {
+            const float t = (v - 0.68F) / 0.32F;
+            red = 198.0F - t * 170.0F;
+            green = 88.0F - t * 70.0F;
+            blue = 60.0F - t * 40.0F;
+        }
+        for (int x = left; x < right; ++x) {
+            const float dx = static_cast<float>(x) + 0.5F - cx;
+            const float dy = static_cast<float>(y) + 0.5F - cy;
+            const float dist = std::sqrt(dx * dx + dy * dy);
+            const float coverage = 1.0F - std::clamp((dist - radius) / aa + 0.5F, 0.0F, 1.0F);
+            if (coverage <= 0.0F) {
+                continue;
+            }
+            const float edge = std::clamp(dist / radius, 0.0F, 1.0F);
+            const float shade = 1.0F - 0.22F * edge * edge;
+            const float srcA = coverage;
+            uint8_t pixel[4] = {
+                static_cast<uint8_t>(std::lround(std::clamp(blue * shade, 0.0F, 255.0F) * srcA)),
+                static_cast<uint8_t>(std::lround(std::clamp(green * shade, 0.0F, 255.0F) * srcA)),
+                static_cast<uint8_t>(std::lround(std::clamp(red * shade, 0.0F, 255.0F) * srcA)),
+                static_cast<uint8_t>(std::lround(255.0F * srcA)),
+            };
+            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+        }
+    }
+}
+
 }  // namespace
 
 namespace {
@@ -1655,6 +1802,31 @@ void BlitIcon(uint8_t* pixels, int width, int height, HDC memory, HICON icon, in
 
 }  // namespace
 
+void SeekQuickSettingsMedia(float level) noexcept {
+    level = std::clamp(level, 0.0F, 1.0F);
+    MediaSession session{nullptr};
+    {
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        session = g_media.session;
+        g_media.progress = level;
+    }
+    if (!session) {
+        return;
+    }
+    try {
+        const auto timeline = session.GetTimelineProperties();
+        const auto start = timeline.StartTime().count();
+        const auto end = timeline.EndTime().count();
+        const auto span = end - start;
+        if (span <= 0) {
+            return;
+        }
+        const auto target = start + static_cast<int64_t>(std::llround(static_cast<double>(span) * level));
+        session.TryChangePlaybackPositionAsync(target);
+    } catch (const winrt::hresult_error&) {
+    }
+}
+
 void StopQuickSettingsCapture() noexcept {
     g_captureMeter.Close();
     g_captureMeter.note.clear();
@@ -1668,6 +1840,7 @@ bool RefreshQuickSettingsLive(QuickSettingsCache& cache) {
     const std::wstring beforeArtist = cache.mediaArtist;
     const bool beforeHave = cache.mediaHave;
     const bool beforePlaying = cache.mediaPlaying;
+    const int beforeProgress = static_cast<int>(std::lround(cache.mediaProgress * 48.0F));
     const std::wstring beforeNote = cache.inputNote;
     if (g_captureMeter.client != nullptr && g_captureMeter.capture != nullptr) {
         const float instant = g_captureMeter.Drain();
@@ -1707,7 +1880,9 @@ bool RefreshQuickSettingsLive(QuickSettingsCache& cache) {
     QueryMedia(cache);
     return MeterBucket(cache.inputPeak) != beforeBucket || cache.mediaTitle != beforeTitle ||
         cache.mediaArtist != beforeArtist || cache.mediaHave != beforeHave ||
-        cache.mediaPlaying != beforePlaying || cache.inputNote != beforeNote;
+        cache.mediaPlaying != beforePlaying ||
+        static_cast<int>(std::lround(cache.mediaProgress * 48.0F)) != beforeProgress ||
+        cache.inputNote != beforeNote;
 }
 
 void DockApp::RefreshQuickSettingsCache() {
@@ -1811,6 +1986,12 @@ void DockApp::ApplyQuickSettingsSlider(TrayFlyoutHitKind kind, const RECT& track
             m_qsCache.stamp = GetTickCount64();
             PaintOverflowPopup();
         }
+        return;
+    }
+    if (kind == TrayFlyoutHitKind::MediaSeek) {
+        SeekQuickSettingsMedia(level);
+        m_qsCache.mediaProgress = level;
+        PaintOverflowPopup();
     }
 }
 
@@ -1835,10 +2016,6 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     const bool home = m_qsPage == QuickSettingsPage::Home;
     panelWidth = std::max(320L, std::lround((home ? 600.0F : 380.0F) * scale));
     const LONG gap = std::max(8L, std::lround(10.0F * scale));
-    const LONG tileH = std::max(96L, std::lround(108.0F * scale));
-    const LONG cardH = std::max(112L, std::lround(124.0F * scale));
-    const LONG smallH = std::max(74L, std::lround(84.0F * scale));
-    const LONG mediaH = std::max(86L, std::lround(96.0F * scale));
     const LONG sliderH = std::max(22L, std::lround(28.0F * scale));
     const LONG listRow = std::max(52L, std::lround(58.0F * scale));
     const LONG sectionH = std::max(22L, std::lround(26.0F * scale));
@@ -2011,10 +2188,14 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
 
     if (home) {
         beginHeader(L"Quick Settings", true, -1, false);
-        y += gap;
+        const LONG homeGap = std::max(8L, std::lround(12.0F * scale));
+        y += homeGap;
         const LONG inner = panelWidth - padding * 2L;
-        const LONG tileGap = gap;
-        // Wi-Fi, Ethernet, Boost, System Tray, and VPN share one tile size.
+        const LONG tileGap = homeGap;
+        const LONG homeTileH = std::max(100L, std::lround(112.0F * scale));
+        const LONG homeCardH = std::max(118L, std::lround(128.0F * scale));
+        const LONG homeSmallH = std::max(78L, std::lround(88.0F * scale));
+        const LONG homeMediaH = std::max(80L, std::lround(92.0F * scale));
         const LONG tileCount = 5L;
         const LONG tileGaps = tileGap * (tileCount - 1L);
         const LONG tileBase = (inner - tileGaps) / tileCount;
@@ -2023,172 +2204,275 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         for (LONG tileIndex = 0; tileIndex < tileCount; ++tileIndex) {
             tileWidths[tileIndex] = tileBase + (tileIndex < tileExtra ? 1L : 0L);
         }
-        const UINT tileIcon = static_cast<UINT>(std::max(16L, std::lround(20.0F * scale)));
+        const UINT tileIcon = static_cast<UINT>(std::max(16L, std::lround(18.0F * scale)));
+        const LONG inset = std::max(10L, std::lround(14.0F * scale));
+        auto homeCard = [&](RECT bounds) {
+            if (!draw) {
+                return;
+            }
+            const float radius = std::min(ContentSquircleRadius(bounds, scale),
+                std::max(10.0F, 16.0F * scale));
+            RECT shadow = bounds;
+            const LONG drop = std::max(2L, std::lround(3.0F * scale));
+            shadow.top += drop;
+            shadow.bottom += drop + std::max(1L, std::lround(2.0F * scale));
+            FillSquircleColorPremul(pixels, width, height, shadow, radius, light ? 0.14F : 0.30F,
+                light ? 160 : 0, light ? 164 : 0, light ? 172 : 0);
+            FillSquircleColorPremul(pixels, width, height, bounds, radius, light ? 0.90F : 0.50F,
+                light ? 214 : 52, light ? 216 : 54, light ? 220 : 60);
+            RECT face = bounds;
+            const LONG border = std::max(1L, std::lround(1.25F * scale));
+            InflateRect(&face, -border, -border);
+            if (face.right > face.left + 4 && face.bottom > face.top + 4) {
+                FillSquircleColorPremul(pixels, width, height, face,
+                    std::max(6.0F, radius - static_cast<float>(border)), light ? 0.96F : 0.94F,
+                    light ? 252 : 30, light ? 252 : 32, light ? 253 : 36);
+            }
+        };
         auto tile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
-                        bool active, TrayFlyoutHitKind kind, bool chevron = true) {
-            card(bounds, active);
-            const uint8_t red = active ? 255 : inkR;
-            const uint8_t green = active ? 255 : inkG;
-            const uint8_t blue = active ? 255 : inkB;
-            icon(bounds.left + 12, bounds.top + 12, symbol, tileIcon, red, green, blue);
-            if (draw) {
-                SetFlyoutChromeInk(red, green, blue);
-            }
-            text({bounds.left + 12, bounds.top + 12 + static_cast<LONG>(tileIcon) + 4, bounds.right - 10,
-                     bounds.bottom - 30},
+                        TrayFlyoutHitKind kind, bool chevron = true) {
+            homeCard(bounds);
+            icon(bounds.left + inset, bounds.top + inset, symbol, tileIcon, inkR, inkG, inkB);
+            const LONG titleTop = bounds.top + inset + static_cast<LONG>(tileIcon) +
+                std::max(2L, std::lround(3.0F * scale));
+            const LONG statusBand = std::max(18L, std::lround(22.0F * scale));
+            text({bounds.left + inset, titleTop, bounds.right - std::max(8L, inset - 2),
+                     bounds.bottom - statusBand},
                 labelFont, title, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 255);
-            text({bounds.left + 12, bounds.bottom - 28, bounds.right - (chevron ? 22 : 10), bounds.bottom - 8},
-                statusFont, subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                active ? 230 : 180);
+            const LONG chevW = chevron ? std::max(12L, std::lround(14.0F * scale)) : 0L;
+            const LONG statusBottom = bounds.bottom - std::max(8L, std::lround(10.0F * scale));
+            const LONG statusTop = statusBottom - std::max(16L, std::lround(18.0F * scale));
+            text({bounds.left + inset, statusTop, bounds.right - inset - chevW, statusBottom},
+                statusFont, subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 158);
             if (chevron) {
-                text({bounds.right - 22, bounds.bottom - 28, bounds.right - 6, bounds.bottom - 8}, statusFont,
-                    L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, active ? 230 : 160);
+                text({bounds.right - inset - chevW, statusTop, bounds.right - std::max(6L, std::lround(8.0F * scale)),
+                         statusBottom},
+                    statusFont, L"\u203A", DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 145);
             }
-            restoreInk();
             push(kind, bounds);
         };
+        auto gradientSlider = [&](RECT track, float level, bool media) {
+            if (!draw) {
+                return;
+            }
+            level = std::clamp(level, 0.0F, 1.0F);
+            const float radius = std::max(4.0F, static_cast<float>(track.bottom - track.top) * 0.5F);
+            const float cy = 0.5F * static_cast<float>(track.top + track.bottom);
+            const float left = static_cast<float>(track.left) + radius;
+            const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
+            const float fill = left + (right - left) * level;
+            if (media) {
+                FillHGradientPill(pixels, width, height, left, right, cy, radius, light ? 0.22F : 0.28F,
+                    230, 226, 236, 214, 210, 224);
+            } else {
+                FillHGradientPill(pixels, width, height, left, right, cy, radius, 1.0F, 232, 232, 234,
+                    226, 226, 230);
+            }
+            if (level > 0.01F) {
+                if (media) {
+                    FillHGradientPill(pixels, width, height, left, std::max(left + radius, fill), cy, radius,
+                        1.0F, 250, 150, 70, 245, 96, 168);
+                } else {
+                    FillHGradientPill(pixels, width, height, left, std::max(left + radius, fill), cy, radius,
+                        1.0F, 255, 176, 96, 255, 124, 40);
+                }
+            }
+            const float thumb = radius + (media ? std::max(1.5F, 2.0F * scale) : std::max(3.0F, 4.0F * scale));
+            if (media) {
+                FillSoftDisc(pixels, width, height, fill, cy, thumb + std::max(3.0F, 4.0F * scale), 0.45F,
+                    255, 170, 210);
+                FillSoftDisc(pixels, width, height, fill, cy, thumb, 1.0F, 250, 196, 232);
+                FillSoftDisc(pixels, width, height, fill, cy, thumb * 0.55F, 1.0F, 255, 236, 250);
+            } else {
+                FillSoftDisc(pixels, width, height, fill, cy, thumb + std::max(2.0F, 3.0F * scale), 0.28F,
+                    210, 220, 235);
+                FillCirclePremul(pixels, width, height, fill, cy, thumb, 0.98F, false);
+            }
+        };
+
         LONG x = padding;
         const bool wifiOn = tray.network == TrayNetworkKind::Wifi;
-        tile({x, y, x + tileWidths[0], y + tileH}, L'\uE701', L"Wi-Fi",
-            wifiOn ? (tray.networkName.empty() ? L"Connected" : tray.networkName)
-                   : (m_qsCache.wifiRadioOn ? L"Not connected" : L"Off"),
-            wifiOn, TrayFlyoutHitKind::Wifi);
+        std::wstring wifiLabel = L"Off";
+        if (wifiOn) {
+            wifiLabel = tray.networkName.empty() ? L"Connected" : tray.networkName;
+        } else if (m_qsCache.wifiRadioOn) {
+            wifiLabel = L"Not connected";
+        }
+        tile({x, y, x + tileWidths[0], y + homeTileH}, L'\uE701', L"Wi-Fi", wifiLabel,
+            TrayFlyoutHitKind::Wifi);
         x += tileWidths[0] + tileGap;
-        tile({x, y, x + tileWidths[1], y + tileH}, L'\uE839', L"Ethernet",
-            m_qsCache.ethernetUp ? L"Connected" : L"Off", false, TrayFlyoutHitKind::Ethernet);
+        tile({x, y, x + tileWidths[1], y + homeTileH}, L'\uE839', L"Ethernet",
+            m_qsCache.ethernetUp ? L"Connected" : L"Off", TrayFlyoutHitKind::Ethernet);
         x += tileWidths[1] + tileGap;
-        tile({x, y, x + tileWidths[2], y + tileH}, L'\uE945', L"Performance Boost", m_boostStatus,
-            m_boostInFlight.load(), TrayFlyoutHitKind::Boost, false);
+        tile({x, y, x + tileWidths[2], y + homeTileH}, L'\uE945', L"Performance Boost", m_boostStatus,
+            TrayFlyoutHitKind::Boost, false);
         x += tileWidths[2] + tileGap;
-        const std::wstring hidden = m_overflowIcons.empty()
-            ? L"No icons"
-            : (L"Hidden icons \u00B7 " + std::to_wstring(m_overflowIcons.size()));
-        tile({x, y, x + tileWidths[3], y + tileH}, L'\uE7F4', L"System Tray", hidden, false,
-            TrayFlyoutHitKind::SystemTrayPage);
+        tile({x, y, x + tileWidths[3], y + homeTileH}, L'\uE7F4', L"System Tray",
+            m_overflowIcons.empty() ? L"No icons" : L"Hidden", TrayFlyoutHitKind::SystemTrayPage);
         x += tileWidths[3] + tileGap;
         std::wstring vpnLabel = L"Off";
         for (const QsVpnEntry& entry : m_qsCache.vpn) {
             if (entry.connected) {
-                vpnLabel = entry.name;
+                vpnLabel = entry.name.empty() ? L"Connected" : entry.name;
                 break;
             }
         }
-        tile({x, y, x + tileWidths[4], y + tileH}, L'\uE72E', L"VPN", vpnLabel, false,
-            TrayFlyoutHitKind::Vpn);
-        y += tileH + gap;
+        tile({x, y, x + tileWidths[4], y + homeTileH}, L'\uE72E', L"VPN", vpnLabel, TrayFlyoutHitKind::Vpn);
+        y += homeTileH + homeGap;
 
-        const LONG soundW = (inner - gap) * 58L / 100L;
-        const RECT sound{padding, y, padding + soundW, y + cardH};
-        const RECT mic{sound.right + gap, y, panelWidth - padding, y + cardH};
-        const RECT volumeTrack{sound.left + 14, sound.bottom - 36, sound.right - 58, sound.bottom - 36 + sliderH};
+        // Mock measures about 58/42, not a literal 2:1. Sound is the wide card.
+        const LONG soundW = (inner - homeGap) * 58L / 100L;
+        const RECT sound{padding, y, padding + soundW, y + homeCardH};
+        const RECT mic{sound.right + homeGap, y, panelWidth - padding, y + homeCardH};
+        const LONG percentW = std::max(36L, std::lround(44.0F * scale));
+        const LONG sliderTrackH = std::max(16L, std::lround(22.0F * scale));
+        const RECT volumeTrack{sound.left + inset, sound.bottom - inset - sliderTrackH,
+            sound.right - inset - percentW, sound.bottom - inset};
         push(TrayFlyoutHitKind::VolumeSlider, volumeTrack);
-        card(sound, false);
-        icon(sound.left + 14, sound.top + 14, tray.volumeMuted ? L'\uE74F' : L'\uE767', tileIcon, inkR,
-            inkG, inkB);
-        text({sound.left + 14 + static_cast<LONG>(tileIcon) + 8, sound.top + 10, sound.right - 24,
-                 sound.top + 30},
+        homeCard(sound);
+        icon(sound.left + inset, sound.top + inset, tray.volumeMuted ? L'\uE74F' : L'\uE767', tileIcon,
+            inkR, inkG, inkB);
+        const LONG titleLeft = sound.left + inset + static_cast<LONG>(tileIcon) + std::max(6L, std::lround(8.0F * scale));
+        text({titleLeft, sound.top + inset - 2, sound.right - 28, sound.top + inset + static_cast<LONG>(tileIcon)},
             labelFont, L"Sound", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-        text({sound.left + 14 + static_cast<LONG>(tileIcon) + 8, sound.top + 30, sound.right - 24,
-                 sound.top + 50},
-            statusFont, outputName, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
-        text({sound.right - 24, sound.top + 12, sound.right - 8, sound.top + 36}, statusFont, L"\u203A",
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
-        slider(volumeTrack, volume);
-        text({volumeTrack.right + 6, volumeTrack.top, sound.right - 10, volumeTrack.bottom}, statusFont,
+        text({titleLeft, sound.top + inset + static_cast<LONG>(tileIcon) - 2, sound.right - inset,
+                 volumeTrack.top - 4},
+            statusFont, outputName, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+        text({sound.right - 26, sound.top + inset - 2, sound.right - 8, sound.top + inset + static_cast<LONG>(tileIcon)},
+            statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 145);
+        gradientSlider(volumeTrack, volume, false);
+        text({volumeTrack.right + 4, volumeTrack.top, sound.right - 8, volumeTrack.bottom}, statusFont,
             std::to_wstring(static_cast<int>(std::lround(volume * 100.0F))) + L"%",
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 200);
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 170);
         push(TrayFlyoutHitKind::Sound, sound);
 
-        card(mic, false);
-        icon(mic.left + 14, mic.top + 14, L'\uE720', tileIcon, inkR, inkG, inkB);
-        text({mic.left + 14 + static_cast<LONG>(tileIcon) + 8, mic.top + 10, mic.right - 24, mic.top + 30},
-            labelFont, L"Microphone", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+        homeCard(mic);
+        icon(mic.left + inset, mic.top + inset, L'\uE720', tileIcon, inkR, inkG, inkB);
+        const LONG micTitleLeft = mic.left + inset + static_cast<LONG>(tileIcon) + std::max(6L, std::lround(8.0F * scale));
+        text({micTitleLeft, mic.top + inset - 2, mic.right - 28, mic.top + inset + static_cast<LONG>(tileIcon)},
+            labelFont, L"Microphone", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
         const std::wstring micStatus = m_qsCache.inputNote.empty() ? inputName : m_qsCache.inputNote;
-        text({mic.left + 14 + static_cast<LONG>(tileIcon) + 8, mic.top + 30, mic.right - 24, mic.top + 50},
-            statusFont, micStatus, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
-        text({mic.right - 24, mic.top + 12, mic.right - 8, mic.top + 36}, statusFont, L"\u203A",
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
-        const RECT meter{mic.left + 14, mic.bottom - 34, mic.right - 14, mic.bottom - 34 + 8};
+        text({micTitleLeft, mic.top + inset + static_cast<LONG>(tileIcon) - 2, mic.right - inset, mic.bottom - 36},
+            statusFont, micStatus, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+        text({mic.right - 26, mic.top + inset - 2, mic.right - 8, mic.top + inset + static_cast<LONG>(tileIcon)},
+            statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 145);
+        const LONG barH = std::max(8L, std::lround(10.0F * scale));
+        const RECT meter{mic.left + inset, mic.bottom - inset - barH, mic.right - inset, mic.bottom - inset};
         if (draw) {
-            const int segments = 12;
+            constexpr int segments = 12;
             const int lit = m_qsCache.inputMuted
                 ? 0
-                : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) * static_cast<float>(segments)));
-            const LONG segGap = 3;
-            const LONG segW = std::max(3L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
+                : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) *
+                      static_cast<float>(segments)));
+            const LONG segGap = std::max(3L, std::lround(4.0F * scale));
+            const LONG segW = std::max(4L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
+            const float segRadius = static_cast<float>(barH) * 0.5F;
             for (int index = 0; index < segments; ++index) {
                 const LONG left = meter.left + index * (segW + segGap);
-                const RECT seg{left, meter.top, left + segW, meter.bottom};
+                const float cxL = static_cast<float>(left) + segRadius;
+                const float cxR = static_cast<float>(left + segW) - segRadius;
+                const float cy = 0.5F * static_cast<float>(meter.top + meter.bottom);
                 if (index < lit) {
-                    FillSquircleColorPremul(pixels, width, height, seg, 2.0F, 0.95F, kBlueB, kBlueG,
-                        kBlueR);
+                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
+                        1.0F, kBlueB, kBlueG, kBlueR, kBlueB, kBlueG, kBlueR);
                 } else {
-                    FillSquircleColorPremul(pixels, width, height, seg, 2.0F, 0.28F, inkB, inkG, inkR);
+                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
+                        1.0F, 186, 186, 190, 176, 176, 180);
                 }
             }
         }
         push(TrayFlyoutHitKind::Microphone, mic);
-        y += cardH + gap;
+        y += homeCardH + homeGap;
 
-        const LONG cell = (inner - gap * 2L) / 3L;
-        auto drawSmallTile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
-                         TrayFlyoutHitKind kind) {
-            card(bounds, false);
-            icon(bounds.left + 12, bounds.top + 12, symbol, tileIcon, inkR, inkG, inkB);
-            const LONG textTop = bounds.top + 12 + static_cast<LONG>(tileIcon) + 4;
-            text({bounds.left + 10, textTop, bounds.right - 8, textTop + 18}, labelFont, title,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            text({bounds.left + 10, bounds.bottom - 26, bounds.right - 18, bounds.bottom - 6}, statusFont,
-                subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
-            text({bounds.right - 18, bounds.bottom - 26, bounds.right - 4, bounds.bottom - 6}, statusFont,
-                L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
+        const LONG cell = (inner - homeGap * 2L) / 3L;
+        auto smallTile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
+                             TrayFlyoutHitKind kind) {
+            homeCard(bounds);
+            icon(bounds.left + inset, bounds.top + std::max(8L, std::lround(10.0F * scale)), symbol, tileIcon,
+                inkR, inkG, inkB);
+            const LONG titleTop = bounds.top + std::max(8L, std::lround(10.0F * scale)) +
+                static_cast<LONG>(tileIcon) + 2;
+            text({bounds.left + inset, titleTop, bounds.right - 8, titleTop + std::max(16L, std::lround(20.0F * scale))},
+                labelFont, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            const LONG statusBottom = bounds.bottom - std::max(8L, std::lround(10.0F * scale));
+            const LONG statusTop = statusBottom - std::max(16L, std::lround(18.0F * scale));
+            const LONG chevW = std::max(12L, std::lround(14.0F * scale));
+            text({bounds.left + inset, statusTop, bounds.right - inset - chevW, statusBottom}, statusFont,
+                subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 158);
+            text({bounds.right - inset - chevW, statusTop, bounds.right - std::max(6L, std::lround(8.0F * scale)),
+                     statusBottom},
+                statusFont, L"\u203A", DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 145);
             push(kind, bounds);
         };
-        const std::wstring night = m_qsCache.nightKnown ? (m_qsCache.nightLight ? L"On" : L"Off") : L"Settings";
+        std::wstring displayStatus = L"On";
+        if (m_qsCache.nightKnown && m_qsCache.nightLight) {
+            displayStatus = L"Night light";
+        }
         const std::wstring nearbyLabel = m_qsCache.nearby == 0 ? L"Off" : L"On";
         x = padding;
-        drawSmallTile({x, y, x + cell, y + smallH}, L'\uE706', L"Display", night, TrayFlyoutHitKind::Display);
-        x += cell + gap;
-        drawSmallTile({x, y, x + cell, y + smallH}, L'\uE708', L"Power", EnergyModeLabel(m_qsCache.powerMode),
+        smallTile({x, y, x + cell, y + homeSmallH}, L'\uE706', L"Display", displayStatus,
+            TrayFlyoutHitKind::Display);
+        x += cell + homeGap;
+        smallTile({x, y, x + cell, y + homeSmallH}, L'\uE708', L"Power", EnergyModeLabel(m_qsCache.powerMode),
             TrayFlyoutHitKind::Power);
-        x += cell + gap;
-        drawSmallTile({x, y, panelWidth - padding, y + smallH}, L'\uE716', L"Nearby sharing", nearbyLabel,
+        x += cell + homeGap;
+        smallTile({x, y, panelWidth - padding, y + homeSmallH}, L'\uE716', L"Nearby sharing", nearbyLabel,
             TrayFlyoutHitKind::Nearby);
-        y += smallH + gap;
+        y += homeSmallH + homeGap;
 
-        const RECT media{padding, y, panelWidth - padding, y + mediaH};
-        const RECT prev{media.right - 168, media.top + 14, media.right - 128, media.top + 48};
-        const RECT play{prev.right + 4, prev.top, prev.right + 44, prev.bottom};
-        const RECT next{play.right + 4, prev.top, play.right + 44, prev.bottom};
+        const RECT media{padding, y, panelWidth - padding, y + homeMediaH};
+        homeCard(media);
+        const LONG art = std::max(44L, std::min(homeMediaH - std::max(16L, std::lround(20.0F * scale)),
+                          std::lround(56.0F * scale)));
+        const LONG artLeft = media.left + std::max(12L, std::lround(14.0F * scale));
+        const LONG artTop = media.top + (homeMediaH - art) / 2L;
+        if (draw) {
+            FillAlbumDisc(pixels, width, height, static_cast<float>(artLeft) + static_cast<float>(art) * 0.5F,
+                static_cast<float>(artTop) + static_cast<float>(art) * 0.5F,
+                static_cast<float>(art) * 0.5F);
+        }
+        const LONG scrubW = std::max(108L, std::lround(132.0F * scale));
+        const LONG scrubH = std::max(6L, std::lround(8.0F * scale));
+        const LONG scrubRight = media.right - std::max(16L, std::lround(18.0F * scale));
+        const LONG scrubLeft = scrubRight - scrubW;
+        const LONG midY = media.top + homeMediaH / 2L;
+        const RECT scrub{scrubLeft, midY - scrubH / 2L, scrubRight, midY + (scrubH - scrubH / 2L)};
+        const LONG transport = std::max(28L, std::lround(32.0F * scale));
+        const LONG transportGap = std::max(2L, std::lround(4.0F * scale));
+        const LONG nextRight = scrubLeft - std::max(12L, std::lround(16.0F * scale));
+        const RECT next{nextRight - transport, midY - transport / 2L, nextRight, midY + transport / 2L};
+        const RECT play{next.left - transportGap - transport, next.top, next.left - transportGap, next.bottom};
+        const RECT prev{play.left - transportGap - transport, next.top, play.left - transportGap, next.bottom};
+        push(TrayFlyoutHitKind::MediaSeek, scrub);
         push(TrayFlyoutHitKind::MediaTransport, prev, 0);
         push(TrayFlyoutHitKind::MediaTransport, play, 1);
         push(TrayFlyoutHitKind::MediaTransport, next, 2);
-        card(media, false);
-        icon(media.left + 14, media.top + 16, L'\uE8D6', tileIcon, 30, 215, 96);
+        const LONG textLeft = artLeft + art + std::max(10L, std::lround(12.0F * scale));
         const std::wstring mediaTitle = m_qsCache.mediaHave && !m_qsCache.mediaTitle.empty()
             ? m_qsCache.mediaTitle
             : (m_qsCache.mediaHave ? L"Now playing" : L"Nothing playing");
-        const std::wstring mediaArtist = !m_qsCache.mediaArtist.empty()
-            ? m_qsCache.mediaArtist
-            : (m_qsCache.mediaPlaying ? L"Playing" : L"Paused");
-        text({media.left + 44, media.top + 12, prev.left - 8, media.top + 34}, labelFont,
-            m_qsCache.mediaHave ? mediaTitle : L"Nothing playing",
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-        text({media.left + 44, media.top + 32, prev.left - 8, media.top + 52}, statusFont,
-            m_qsCache.mediaHave ? mediaArtist : L"System media",
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
-        icon(prev.left + 8, prev.top + 6, L'\uE892', 18, inkR, inkG, inkB);
-        icon(play.left + 8, play.top + 6, m_qsCache.mediaPlaying ? L'\uE769' : L'\uE768', 18, inkR, inkG, inkB);
-        icon(next.left + 8, next.top + 6, L'\uE893', 18, inkR, inkG, inkB);
-        const RECT bright{media.left + 14, media.bottom - 30, media.right - 28, media.bottom - 30 + sliderH};
-        const RECT brightLink{media.right - 26, media.bottom - 32, media.right - 6, media.bottom - 8};
-        push(TrayFlyoutHitKind::Display, brightLink);
-        icon(media.left + 14, bright.top - 2, L'\uE706', 16, inkR, inkG, inkB);
-        const RECT brightTrack{media.left + 36, bright.top, media.right - 36, bright.bottom};
-        push(TrayFlyoutHitKind::BrightnessSlider, brightTrack);
-        slider(brightTrack, brightness);
-        text(brightLink, statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 160);
-        y += mediaH + padding;
+        const std::wstring mediaArtist = m_qsCache.mediaHave
+            ? (m_qsCache.mediaArtist.empty() ? (m_qsCache.mediaPlaying ? L"Playing" : L"Paused")
+                                             : m_qsCache.mediaArtist)
+            : L"System media";
+        text({textLeft, media.top + homeMediaH / 2L - std::max(20L, std::lround(22.0F * scale)), prev.left - 8,
+                 media.top + homeMediaH / 2L},
+            titleFont, mediaTitle, DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+        text({textLeft, media.top + homeMediaH / 2L, prev.left - 8,
+                 media.top + homeMediaH / 2L + std::max(18L, std::lround(20.0F * scale))},
+            statusFont, mediaArtist, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+        const UINT transportIcon = static_cast<UINT>(std::max(14L, std::lround(16.0F * scale)));
+        icon(prev.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
+            prev.top + (transport - static_cast<LONG>(transportIcon)) / 2L, L'\uE892', transportIcon, inkR, inkG,
+            inkB);
+        icon(play.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
+            play.top + (transport - static_cast<LONG>(transportIcon)) / 2L,
+            m_qsCache.mediaPlaying ? L'\uE769' : L'\uE768', transportIcon, inkR, inkG, inkB);
+        icon(next.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
+            next.top + (transport - static_cast<LONG>(transportIcon)) / 2L, L'\uE893', transportIcon, inkR, inkG,
+            inkB);
+        gradientSlider(scrub, m_qsCache.mediaHave ? m_qsCache.mediaProgress : 0.0F, true);
+        y += homeMediaH + padding;
         contentBottom = y;
         return;
     }
@@ -2571,6 +2855,16 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     } else {
         beginHeader(L"Display", false, -1, false);
         y += gap;
+        const RECT brightRow{padding, y, panelWidth - padding, y + listRow};
+        card(brightRow, false);
+        icon(brightRow.left + 14, brightRow.top + (listRow - 18) / 2L, L'\uE706', 18, inkR, inkG, inkB);
+        text({brightRow.left + 42, brightRow.top + 4, brightRow.right - 14, brightRow.top + 24}, labelFont,
+            L"Brightness", DT_LEFT | DT_BOTTOM | DT_SINGLELINE, 255);
+        const RECT brightTrack{brightRow.left + 42, brightRow.bottom - 8 - sliderH, brightRow.right - 16,
+            brightRow.bottom - 8};
+        push(TrayFlyoutHitKind::BrightnessSlider, brightTrack);
+        slider(brightTrack, brightness);
+        y += listRow + gap;
         const RECT night{padding, y, panelWidth - padding, y + listRow};
         card(night, false);
         navRow(night, L'\uE706', L"Night light",
@@ -2621,6 +2915,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
     case TrayFlyoutHitKind::VolumeSlider:
     case TrayFlyoutHitKind::BrightnessSlider:
     case TrayFlyoutHitKind::CaptureGain:
+    case TrayFlyoutHitKind::MediaSeek:
         break;
     case TrayFlyoutHitKind::Back:
         CloseQuickSettingsPage();

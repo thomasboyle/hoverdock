@@ -92,6 +92,8 @@ struct QuickSettingsCache {
     std::wstring mediaArtist;
     bool mediaHave = false;
     bool mediaPlaying = false;
+    // 0..1 along the GSMTC timeline. 0 when the session has no duration.
+    float mediaProgress = 0.0F;
 };
 
 // Release the Quick Settings capture client so the microphone-in-use indicator
@@ -100,3 +102,5 @@ void StopQuickSettingsCapture() noexcept;
 // Sample the live input meter and the system media session. True when the
 // panel should repaint (meter bucket or now-playing text changed).
 bool RefreshQuickSettingsLive(QuickSettingsCache& cache);
+// Seek the current GSMTC session. level is 0..1 across its timeline.
+void SeekQuickSettingsMedia(float level) noexcept;

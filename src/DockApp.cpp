@@ -2574,7 +2574,8 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
             const TrayFlyoutHit& slider = app->m_overflowHits[static_cast<size_t>(downHit)];
             if (slider.kind == TrayFlyoutHitKind::VolumeSlider ||
                 slider.kind == TrayFlyoutHitKind::BrightnessSlider ||
-                slider.kind == TrayFlyoutHitKind::CaptureGain) {
+                slider.kind == TrayFlyoutHitKind::CaptureGain ||
+                slider.kind == TrayFlyoutHitKind::MediaSeek) {
                 app->m_qsDragging = true;
                 app->m_qsDragMoved = false;
                 app->m_qsDragKind = slider.kind;
@@ -7492,6 +7493,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::VpnEntry:
     case TrayFlyoutHitKind::MoreSettings:
     case TrayFlyoutHitKind::MediaTransport:
+    case TrayFlyoutHitKind::MediaSeek:
         ApplyQuickSettingsCommand(hit, message);
         break;
     case TrayFlyoutHitKind::NotifyIcon:
@@ -7646,6 +7648,8 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::AudioInput:
     case TrayFlyoutHitKind::VpnEntry:
     case TrayFlyoutHitKind::MoreSettings:
+    case TrayFlyoutHitKind::MediaSeek:
+        break;
     case TrayFlyoutHitKind::MediaTransport: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
