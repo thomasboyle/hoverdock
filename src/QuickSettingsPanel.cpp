@@ -83,6 +83,11 @@ const GUID kUsbSubgroup = {
 const GUID kUsbSuspend = {
     0x48e6b7a6, 0x50f5, 0x4782, {0xa5, 0xd4, 0x53, 0xbb, 0x8f, 0x07, 0xe2, 0x26}};
 
+// Windows keeps the Ultimate Performance source scheme hidden until it is
+// duplicated. The duplicate receives a normal, enumerable scheme GUID.
+const GUID kUltimatePowerSchemeSource = {
+    0xe9a42b02, 0xd5df, 0x448d, {0xaa, 0x00, 0x03, 0xf1, 0x47, 0x49, 0xeb, 0x61}};
+
 struct DeviceShareMode;
 
 MIDL_INTERFACE("f8679f50-850a-41cf-9c72-430f290290c8")
@@ -721,6 +726,69 @@ void QueryEnergyApps(QuickSettingsCache& cache) {
     }
 }
 
+std::wstring PowerSchemeFriendlyName(const GUID& scheme) {
+    DWORD bytes = 0;
+    if (PowerReadFriendlyName(nullptr, &scheme, nullptr, nullptr, nullptr, &bytes) != ERROR_SUCCESS ||
+        bytes < sizeof(wchar_t)) {
+        return {};
+    }
+    std::wstring name(bytes / sizeof(wchar_t), L'\0');
+    if (PowerReadFriendlyName(nullptr, &scheme, nullptr, nullptr,
+            reinterpret_cast<UCHAR*>(name.data()), &bytes) != ERROR_SUCCESS) {
+        return {};
+    }
+    name.resize(wcslen(name.c_str()));
+    return name;
+}
+
+bool EnumeratePowerScheme(DWORD index, GUID& scheme) {
+    DWORD bytes = sizeof(scheme);
+    return PowerEnumerate(nullptr, nullptr, nullptr, ACCESS_SCHEME, static_cast<UCHAR>(index),
+        reinterpret_cast<UCHAR*>(&scheme), &bytes) == ERROR_SUCCESS;
+}
+
+bool FindUltimatePowerScheme(GUID& scheme) {
+    for (DWORD index = 0; index <= 255; ++index) {
+        GUID candidate{};
+        if (!EnumeratePowerScheme(index, candidate)) {
+            break;
+        }
+        if (IsEqualGUID(candidate, kUltimatePowerSchemeSource) ||
+            Lower(PowerSchemeFriendlyName(candidate)) == L"ultimate performance") {
+            scheme = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DuplicateUltimatePowerScheme() {
+    wchar_t commandLine[] =
+        L"powercfg.exe /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(nullptr, commandLine, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+            nullptr, &startup, &process)) {
+        return false;
+    }
+    const DWORD wait = WaitForSingleObject(process.hProcess, 10000);
+    DWORD exitCode = ERROR_PROCESS_ABORTED;
+    if (wait == WAIT_OBJECT_0) {
+        GetExitCodeProcess(process.hProcess, &exitCode);
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return wait == WAIT_OBJECT_0 && exitCode == ERROR_SUCCESS;
+}
+
+bool EnsureUltimatePowerScheme(GUID& scheme) {
+    if (FindUltimatePowerScheme(scheme)) {
+        return true;
+    }
+    return DuplicateUltimatePowerScheme() && FindUltimatePowerScheme(scheme);
+}
+
 void QueryPower(QuickSettingsCache& cache) {
     cache.powerName = L"Balanced";
     cache.powerMode = 1;
@@ -729,24 +797,17 @@ void QueryPower(QuickSettingsCache& cache) {
     if (PowerGetActiveScheme(nullptr, &scheme) != ERROR_SUCCESS || scheme == nullptr) {
         return;
     }
-    if (IsEqualGUID(*scheme, GUID_MIN_POWER_SAVINGS)) {
-        cache.powerMode = 0;
-    } else if (IsEqualGUID(*scheme, GUID_MAX_POWER_SAVINGS)) {
+    const std::wstring name = PowerSchemeFriendlyName(*scheme);
+    if (IsEqualGUID(*scheme, GUID_MAX_POWER_SAVINGS)) {
         cache.powerMode = 2;
+    } else if (IsEqualGUID(*scheme, GUID_MIN_POWER_SAVINGS) ||
+        Lower(name) == L"ultimate performance") {
+        cache.powerMode = 0;
     } else {
         cache.powerMode = 1;
     }
-    DWORD bytes = 0;
-    if (PowerReadFriendlyName(nullptr, scheme, nullptr, nullptr, nullptr, &bytes) == ERROR_SUCCESS &&
-        bytes >= sizeof(wchar_t)) {
-        std::wstring name(bytes / sizeof(wchar_t), L'\0');
-        if (PowerReadFriendlyName(nullptr, scheme, nullptr, nullptr,
-                reinterpret_cast<UCHAR*>(name.data()), &bytes) == ERROR_SUCCESS) {
-            name.resize(wcslen(name.c_str()));
-            if (!name.empty()) {
-                cache.powerName = name;
-            }
-        }
+    if (!name.empty()) {
+        cache.powerName = name;
     }
     DWORD usb = 0;
     if (PowerReadACValueIndex(nullptr, scheme, &kUsbSubgroup, &kUsbSuspend, &usb) == ERROR_SUCCESS) {
@@ -757,9 +818,13 @@ void QueryPower(QuickSettingsCache& cache) {
 }
 
 bool SetPowerMode(int mode) {
+    GUID ultimate{};
     const GUID* scheme = &GUID_TYPICAL_POWER_SAVINGS;
     if (mode == 0) {
-        scheme = &GUID_MIN_POWER_SAVINGS;
+        if (!EnsureUltimatePowerScheme(ultimate)) {
+            return false;
+        }
+        scheme = &ultimate;
     } else if (mode == 2) {
         scheme = &GUID_MAX_POWER_SAVINGS;
     }
