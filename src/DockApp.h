@@ -136,6 +136,7 @@ private:
     static constexpr UINT_PTR kCursorWatchTimerId = 9;
     static constexpr UINT_PTR kGlintTimerId = 15;
     static constexpr UINT_PTR kBluetoothTimerId = 16;
+    static constexpr UINT_PTR kEnergySampleTimerId = 17;
     // Pointer glint easing cadence (~60 Hz); the timer only runs while the
     // glint is still converging on the cursor, so an idle dock costs nothing.
     static constexpr UINT kGlintIntervalMs = 16;

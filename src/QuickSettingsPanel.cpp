@@ -11,6 +11,7 @@
 #include <powrprof.h>
 #include <propvarutil.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <wlanapi.h>
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <cwctype>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace dock_detail {
@@ -518,6 +520,207 @@ void QueryAdapters(QuickSettingsCache& cache) {
     }
 }
 
+const wchar_t* EnergyModeLabel(int mode) noexcept {
+    if (mode == 0) {
+        return L"High power";
+    }
+    if (mode == 2) {
+        return L"Low power";
+    }
+    return L"Automatic";
+}
+
+bool IsEnergyNoiseProcess(const std::wstring& exeLower) {
+    // Hosts and session infrastructure, not apps a person would recognize
+    // in an "using energy" list. User processes (browsers, games, Dock) stay.
+    static const wchar_t* kNoise[] = {
+        L"system",
+        L"idle",
+        L"registry",
+        L"secure system",
+        L"memory compression",
+        L"smss.exe",
+        L"csrss.exe",
+        L"wininit.exe",
+        L"winlogon.exe",
+        L"services.exe",
+        L"lsass.exe",
+        L"svchost.exe",
+        L"fontdrvhost.exe",
+        L"dwm.exe",
+        L"sihost.exe",
+        L"taskhostw.exe",
+        L"runtimebroker.exe",
+        L"searchhost.exe",
+        L"startmenuexperiencehost.exe",
+        L"shellexperiencehost.exe",
+        L"textinputhost.exe",
+        L"widgetservice.exe",
+        L"widgets.exe",
+        L"securityhealthservice.exe",
+        L"securityhealthsystray.exe",
+        L"msmpeng.exe",
+        L"nissrv.exe",
+        L"conhost.exe",
+        L"dllhost.exe",
+        L"ctfmon.exe",
+        L"applicationframehost.exe",
+        L"backgroundtaskhost.exe",
+        L"wlanext.exe",
+        L"spoolsv.exe",
+        L"searchindexer.exe",
+        L"audiodg.exe",
+    };
+    for (const wchar_t* name : kNoise) {
+        if (exeLower == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::wstring PrettyProcessName(std::wstring name) {
+    if (name.size() > 4 && Lower(name.substr(name.size() - 4)) == L".exe") {
+        name.resize(name.size() - 4);
+    }
+    if (!name.empty()) {
+        name[0] = static_cast<wchar_t>(towupper(name[0]));
+    }
+    return name;
+}
+
+struct EnergyCpuSample {
+    DWORD pid = 0;
+    unsigned long long cpu = 0;
+    std::wstring name;
+};
+
+struct EnergyBaseline {
+    ULONGLONG tick = 0;
+    std::vector<EnergyCpuSample> samples;
+};
+
+EnergyBaseline g_energyBaseline;
+
+// Two toolhelp snapshots. The first open of Energy has no delta yet and is
+// labeled pending; the follow-up paint (about a second later) reports real
+// CPU share. Snapshot failure is an explicit stub, not a fake app list.
+void QueryEnergyApps(QuickSettingsCache& cache) {
+    cache.energyApps.clear();
+    cache.energyLive = false;
+    cache.energyPending = false;
+    cache.energyNote.clear();
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        cache.energyNote = L"Energy usage unavailable";
+        return;
+    }
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    std::vector<EnergyCpuSample> current;
+    const DWORD self = GetCurrentProcessId();
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == 0 || entry.th32ProcessID == self) {
+                continue;
+            }
+            const std::wstring exeLower = Lower(entry.szExeFile);
+            if (IsEnergyNoiseProcess(exeLower)) {
+                continue;
+            }
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+            if (process == nullptr) {
+                continue;
+            }
+            FILETIME created{}, exited{}, kernel{}, user{};
+            if (GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+                ULARGE_INTEGER kernelTime{};
+                ULARGE_INTEGER userTime{};
+                kernelTime.LowPart = kernel.dwLowDateTime;
+                kernelTime.HighPart = kernel.dwHighDateTime;
+                userTime.LowPart = user.dwLowDateTime;
+                userTime.HighPart = user.dwHighDateTime;
+                EnergyCpuSample sample;
+                sample.pid = entry.th32ProcessID;
+                sample.cpu = kernelTime.QuadPart + userTime.QuadPart;
+                sample.name = PrettyProcessName(entry.szExeFile);
+                current.push_back(std::move(sample));
+            }
+            CloseHandle(process);
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    if (current.empty() && g_energyBaseline.samples.empty()) {
+        cache.energyNote = L"Energy usage unavailable";
+        return;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG elapsed = g_energyBaseline.tick == 0 ? 0 : now - g_energyBaseline.tick;
+    const bool usable = elapsed >= 250ULL && elapsed <= 8000ULL && !g_energyBaseline.samples.empty();
+    if (!usable) {
+        g_energyBaseline.tick = now;
+        g_energyBaseline.samples = std::move(current);
+        cache.energyPending = true;
+        cache.energyNote = L"Measuring energy use\u2026";
+        return;
+    }
+
+    std::unordered_map<DWORD, unsigned long long> previous;
+    previous.reserve(g_energyBaseline.samples.size());
+    for (const EnergyCpuSample& sample : g_energyBaseline.samples) {
+        previous[sample.pid] = sample.cpu;
+    }
+    const DWORD cores = (std::max)(static_cast<DWORD>(1), GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    const double wall = static_cast<double>(elapsed) * 10000.0 * static_cast<double>(cores);
+    struct Ranked {
+        std::wstring name;
+        double percent = 0.0;
+    };
+    std::vector<Ranked> ranked;
+    for (const EnergyCpuSample& sample : current) {
+        const auto found = previous.find(sample.pid);
+        if (found == previous.end() || sample.cpu < found->second || wall <= 0.0) {
+            continue;
+        }
+        const double percent =
+            (static_cast<double>(sample.cpu - found->second) / wall) * 100.0;
+        if (percent >= 1.0) {
+            ranked.push_back(Ranked{sample.name, percent});
+        }
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const Ranked& left, const Ranked& right) {
+        return left.percent > right.percent;
+    });
+    // Prefer clearly busy apps. If nothing clears 2%, keep the >=1% tail so a
+    // mildly busy machine still lists something real.
+    std::vector<Ranked> significant;
+    for (const Ranked& row : ranked) {
+        if (row.percent >= 2.0) {
+            significant.push_back(row);
+        }
+    }
+    if (significant.empty()) {
+        significant = ranked;
+    }
+    if (significant.size() > 3) {
+        significant.resize(3);
+    }
+    for (const Ranked& row : significant) {
+        QsEnergyApp app;
+        app.name = row.name;
+        app.cpuPercent = std::clamp(static_cast<int>(std::lround(row.percent)), 1, 100);
+        cache.energyApps.push_back(std::move(app));
+    }
+    g_energyBaseline.tick = now;
+    g_energyBaseline.samples = std::move(current);
+    cache.energyLive = true;
+    if (cache.energyApps.empty()) {
+        cache.energyNote = L"No apps using significant energy";
+    }
+}
+
 void QueryPower(QuickSettingsCache& cache) {
     cache.powerName = L"Balanced";
     cache.powerMode = 1;
@@ -848,6 +1051,14 @@ void DockApp::RefreshQuickSettingsCache() {
     CollectEndpoints(eCapture, m_qsCache.captureDevices, m_qsCache.captureDefaultId, m_qsCache.inputName);
     QueryCapture(m_qsCache);
     QueryPower(m_qsCache);
+    if (m_qsPage == QuickSettingsPage::Power) {
+        QueryEnergyApps(m_qsCache);
+    } else {
+        m_qsCache.energyApps.clear();
+        m_qsCache.energyLive = false;
+        m_qsCache.energyPending = false;
+        m_qsCache.energyNote.clear();
+    }
     QueryHdr(m_qsCache);
     QueryNightLight(m_qsCache);
     QueryNearby(m_qsCache);
@@ -1131,7 +1342,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         const LONG wifiW = inner - tileGap * 4L - smallW * 4L;
         const UINT tileIcon = static_cast<UINT>(std::max(16L, std::lround(20.0F * scale)));
         auto tile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
-                        bool active, TrayFlyoutHitKind kind) {
+                        bool active, TrayFlyoutHitKind kind, bool chevron = true) {
             card(bounds, active);
             const uint8_t red = active ? 255 : inkR;
             const uint8_t green = active ? 255 : inkG;
@@ -1140,13 +1351,16 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             if (draw) {
                 SetFlyoutChromeInk(red, green, blue);
             }
-            text({bounds.left + 12, bounds.top + 12 + static_cast<LONG>(tileIcon) + 6, bounds.right - 12,
-                     bounds.top + 12 + static_cast<LONG>(tileIcon) + 26},
-                labelFont, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            text({bounds.left + 12, bounds.bottom - 28, bounds.right - 22, bounds.bottom - 8}, statusFont,
-                subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, active ? 230 : 180);
-            text({bounds.right - 22, bounds.bottom - 28, bounds.right - 6, bounds.bottom - 8}, statusFont,
-                L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, active ? 230 : 160);
+            text({bounds.left + 12, bounds.top + 12 + static_cast<LONG>(tileIcon) + 4, bounds.right - 10,
+                     bounds.bottom - 30},
+                labelFont, title, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 255);
+            text({bounds.left + 12, bounds.bottom - 28, bounds.right - (chevron ? 22 : 10), bounds.bottom - 8},
+                statusFont, subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                active ? 230 : 180);
+            if (chevron) {
+                text({bounds.right - 22, bounds.bottom - 28, bounds.right - 6, bounds.bottom - 8}, statusFont,
+                    L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, active ? 230 : 160);
+            }
             restoreInk();
             push(kind, bounds);
         };
@@ -1160,10 +1374,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         tile({x, y, x + smallW, y + tileH}, L'\uE839', L"Ethernet",
             m_qsCache.ethernetUp ? L"Connected" : L"Off", false, TrayFlyoutHitKind::Ethernet);
         x += smallW + tileGap;
-        const bool airplane = !m_qsCache.wifiRadioOn && m_bluetoothSnapshot.ready &&
-            m_bluetoothSnapshot.radioPresent && !m_bluetoothSnapshot.radioOn;
-        tile({x, y, x + smallW, y + tileH}, L'\uE709', L"Airplane mode", airplane ? L"On" : L"Off",
-            false, TrayFlyoutHitKind::Airplane);
+        tile({x, y, x + smallW, y + tileH}, L'\uE945', L"Performance Boost", m_boostStatus,
+            m_boostInFlight.load(), TrayFlyoutHitKind::Boost, false);
         x += smallW + tileGap;
         const std::wstring hidden = m_overflowIcons.empty()
             ? L"No icons"
@@ -1234,19 +1446,12 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         push(TrayFlyoutHitKind::Microphone, mic);
         y += cardH + gap;
 
-        const LONG hdrW = std::max(72L, std::lround(78.0F * scale));
-        const LONG rest = inner - gap * 3L - hdrW;
-        const LONG cell = rest / 3L;
+        const LONG cell = (inner - gap * 2L) / 3L;
         auto drawSmallTile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
-                         TrayFlyoutHitKind kind, bool hdrBadge) {
+                         TrayFlyoutHitKind kind) {
             card(bounds, false);
-            if (hdrBadge) {
-                text({bounds.left + 10, bounds.top + 10, bounds.left + 52, bounds.top + 32}, labelFont,
-                    L"HDR", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-            } else {
-                icon(bounds.left + 12, bounds.top + 12, symbol, tileIcon, inkR, inkG, inkB);
-            }
-            const LONG textTop = hdrBadge ? bounds.top + 34 : bounds.top + 12 + static_cast<LONG>(tileIcon) + 4;
+            icon(bounds.left + 12, bounds.top + 12, symbol, tileIcon, inkR, inkG, inkB);
+            const LONG textTop = bounds.top + 12 + static_cast<LONG>(tileIcon) + 4;
             text({bounds.left + 10, textTop, bounds.right - 8, textTop + 18}, labelFont, title,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             text({bounds.left + 10, bounds.bottom - 26, bounds.right - 18, bounds.bottom - 6}, statusFont,
@@ -1256,18 +1461,15 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             push(kind, bounds);
         };
         const std::wstring night = m_qsCache.nightKnown ? (m_qsCache.nightLight ? L"On" : L"Off") : L"Settings";
-        const std::wstring hdr = !m_qsCache.hdrSupported ? L"Unavailable" : (m_qsCache.hdrOn ? L"On" : L"Off");
         const std::wstring nearbyLabel = m_qsCache.nearby == 0 ? L"Off" : L"On";
         x = padding;
-        drawSmallTile({x, y, x + cell, y + smallH}, L'\uE706', L"Display", night, TrayFlyoutHitKind::Display, false);
+        drawSmallTile({x, y, x + cell, y + smallH}, L'\uE706', L"Display", night, TrayFlyoutHitKind::Display);
         x += cell + gap;
-        drawSmallTile({x, y, x + hdrW, y + smallH}, 0, L"HDR", hdr, TrayFlyoutHitKind::Hdr, true);
-        x += hdrW + gap;
-        drawSmallTile({x, y, x + cell, y + smallH}, L'\uE708', L"Power", m_qsCache.powerName, TrayFlyoutHitKind::Power,
-            false);
+        drawSmallTile({x, y, x + cell, y + smallH}, L'\uE708', L"Power", EnergyModeLabel(m_qsCache.powerMode),
+            TrayFlyoutHitKind::Power);
         x += cell + gap;
         drawSmallTile({x, y, panelWidth - padding, y + smallH}, L'\uE716', L"Nearby sharing", nearbyLabel,
-            TrayFlyoutHitKind::Nearby, false);
+            TrayFlyoutHitKind::Nearby);
         y += smallH + gap;
 
         const RECT media{padding, y, panelWidth - padding, y + mediaH};
@@ -1489,10 +1691,10 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     } else if (m_qsPage == QuickSettingsPage::Power) {
         beginHeader(L"Power", false, -1, false);
         y += gap;
-        section(L"Power mode");
+        section(L"Energy mode");
         const RECT group{padding, y, panelWidth - padding, y + listRow * 3L};
         card(group, false);
-        const wchar_t* modes[3] = {L"Best performance", L"Balanced", L"Better battery"};
+        const wchar_t* modes[3] = {L"High power", L"Automatic", L"Low power"};
         for (int index = 0; index < 3; ++index) {
             const RECT row{group.left, group.top + index * listRow, group.right,
                 group.top + (index + 1) * listRow};
@@ -1512,11 +1714,38 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 toggleRect(usb.top + listRow / 2L, usb.right - 12, m_qsCache.usbSuspend), kToggleUsb);
             y += listRow + gap;
         }
-        const RECT boost{padding, y, panelWidth - padding, y + listRow};
-        card(boost, false);
-        navRow(boost, L'\uE945', L"Performance boost", m_boostStatus, TrayFlyoutHitKind::Boost, -1);
-        y += listRow + gap;
+        section(L"Using significant energy");
+        const size_t energyCount = m_qsCache.energyLive
+            ? std::min(m_qsCache.energyApps.size(), static_cast<size_t>(3))
+            : 0;
+        if (energyCount == 0) {
+            const std::wstring note = m_qsCache.energyNote.empty()
+                ? (m_qsCache.energyPending ? L"Measuring energy use\u2026" : L"Energy usage unavailable")
+                : m_qsCache.energyNote;
+            const RECT row{padding, y, panelWidth - padding, y + listRow};
+            card(row, false);
+            text({row.left + 14, row.top, row.right - 14, row.bottom}, labelFont, note,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 200);
+            y += listRow + gap;
+        } else {
+            const RECT energyGroup{padding, y, panelWidth - padding,
+                y + static_cast<LONG>(energyCount) * listRow};
+            card(energyGroup, false);
+            for (size_t index = 0; index < energyCount; ++index) {
+                const QsEnergyApp& energyApp = m_qsCache.energyApps[index];
+                const RECT row{energyGroup.left,
+                    energyGroup.top + static_cast<LONG>(index) * listRow, energyGroup.right,
+                    energyGroup.top + static_cast<LONG>(index + 1) * listRow};
+                const std::wstring usage = std::to_wstring(energyApp.cpuPercent) + L"% CPU";
+                text({row.left + 14, row.top, row.right - 92, row.bottom}, labelFont, energyApp.name,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                text({row.right - 88, row.top, row.right - 12, row.bottom}, statusFont, usage,
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
+            }
+            y += static_cast<LONG>(energyCount) * listRow + gap;
+        }
         footer(L"More power settings", kLinkPower);
+
     } else if (m_qsPage == QuickSettingsPage::SystemTray) {
         beginHeader(L"System Tray", false, -1, false);
         y += 2;

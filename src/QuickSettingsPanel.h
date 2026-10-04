@@ -41,6 +41,13 @@ struct QsVpnEntry {
     bool connected = false;
 };
 
+// One app row on the Energy page. cpuPercent is this process's share of
+// machine CPU between two samples (a stand-in for significant energy use).
+struct QsEnergyApp {
+    std::wstring name;
+    int cpuPercent = 0;
+};
+
 // Snapshot filled on the UI thread while Quick Settings is open. Queries are
 // cached for a short interval so slider drags do not redo WLAN/COM work.
 struct QuickSettingsCache {
@@ -66,6 +73,12 @@ struct QuickSettingsCache {
     bool inputMuted = false;
     std::wstring powerName;
     int powerMode = 1;
+    std::vector<QsEnergyApp> energyApps;
+    bool energyLive = false;
+    // True while the first CPU sample has no baseline yet. The popup timer
+    // paints again so the list can fill without blocking the UI thread.
+    bool energyPending = false;
+    std::wstring energyNote;
     bool usbSuspend = false;
     bool usbKnown = false;
     bool hdrOn = false;

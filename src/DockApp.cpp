@@ -120,6 +120,15 @@ constexpr BYTE kInputWindowAlpha = 1;
 #ifndef DWMWCP_ROUND
 #define DWMWCP_ROUND 2
 #endif
+#ifndef DWMWCP_DONOTROUND
+#define DWMWCP_DONOTROUND 1
+#endif
+#ifndef DWMWA_SYSTEMBACKDROP_TYPE
+#define DWMWA_SYSTEMBACKDROP_TYPE 38
+#endif
+#ifndef DWMSBT_NONE
+#define DWMSBT_NONE 1
+#endif
 constexpr wchar_t kStartTarget[] = L"dock:start";
 constexpr wchar_t kSearchTarget[] = L"dock:search";
 constexpr wchar_t kDividerTarget[] = L"dock:divider";
@@ -223,6 +232,29 @@ bool EnsureWindowCapturable(HWND window) {
     // filter list instead of toggling WDA_EXCLUDEFROMCAPTURE (that toggle
     // blanked the dock in recordings).
     return window != nullptr && SetWindowDisplayAffinity(window, WDA_NONE) != FALSE;
+}
+
+void ClearPopupLayeredCorners(HWND window) {
+    if (window == nullptr) {
+        return;
+    }
+    // Windows 11 DWM rounds top-level HWNDs and paints the clipped corner
+    // wedges with an opaque black plate. Quick Settings and the other menus
+    // already define a squircle in per-pixel alpha, so that plate shows up as
+    // black squares. Opt out of system rounding and the Mica/acrylic backdrop,
+    // and give DWM an empty blur region so it does not fill a black frame.
+    const DWORD corner = DWMWCP_DONOTROUND;
+    DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+    const DWORD backdrop = DWMSBT_NONE;
+    DwmSetWindowAttribute(window, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
+    DWM_BLURBEHIND blur{};
+    blur.dwFlags = DWM_BB_ENABLE | DWM_BB_BLURREGION;
+    blur.fEnable = TRUE;
+    blur.hRgnBlur = CreateRectRgn(0, 0, -1, -1);
+    DwmEnableBlurBehindWindow(window, &blur);
+    if (blur.hRgnBlur != nullptr) {
+        DeleteObject(blur.hRgnBlur);
+    }
 }
 
 HRGN CreateDockInputRegion(int width, int height, int cornerDiameter) {
@@ -2457,6 +2489,18 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
             app->QueueOverflowPaint(true);
         }
         return 0;
+
+    case WM_TIMER:
+        if (wParam == kEnergySampleTimerId && app != nullptr) {
+            if (app->m_qsPage != QuickSettingsPage::Power || !app->IsOverflowOpen()) {
+                KillTimer(window, kEnergySampleTimerId);
+                return 0;
+            }
+            app->m_qsCache.stamp = 0;
+            app->PaintOverflowPopup();
+            return 0;
+        }
+        break;
 
     case WM_MOUSEWHEEL: {
         if (app == nullptr) {
@@ -5161,6 +5205,7 @@ void DockApp::FinishOverflowHide() noexcept {
     m_bluetooth.StopDiscovery();
     CloseDockSettings();
     if (m_overflowWindow != nullptr) {
+        KillTimer(m_overflowWindow, kEnergySampleTimerId);
         ShowWindow(m_overflowWindow, SW_HIDE);
     }
     m_overflowVisibility = VisibilityState::Hidden;
@@ -5252,6 +5297,7 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
     if (window == nullptr || pixels == nullptr || width <= 0 || height <= 0) {
         return false;
     }
+    ClearPopupLayeredCorners(window);
     const size_t need = static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
     if (byteCount < need) {
         return false;
@@ -6656,6 +6702,7 @@ void DockApp::PaintSettingsPopup() {
             return;
         }
         EnsureWindowCapturable(m_settingsWindow);
+        ClearPopupLayeredCorners(m_settingsWindow);
     }
 
     POINT origin{};
@@ -7571,6 +7618,7 @@ void DockApp::PaintOverflowPopup() {
             return;
         }
         EnsureWindowCapturable(m_overflowWindow);
+        ClearPopupLayeredCorners(m_overflowWindow);
     }
 
     POINT origin{};
@@ -7757,6 +7805,13 @@ void DockApp::PaintOverflowPopup() {
     DeleteObject(bitmap);
     DeleteDC(memory);
     PresentOverflowLayer();
+    if (m_overflowWindow != nullptr) {
+        if (m_qsPage == QuickSettingsPage::Power && m_qsCache.energyPending) {
+            SetTimer(m_overflowWindow, kEnergySampleTimerId, 900, nullptr);
+        } else {
+            KillTimer(m_overflowWindow, kEnergySampleTimerId);
+        }
+    }
 }
 
 UINT DockApp::DesiredTrayIntervalMs() const noexcept {
@@ -8814,6 +8869,7 @@ void DockApp::PaintContextMenu() {
             return;
         }
         EnsureWindowCapturable(m_contextWindow);
+        ClearPopupLayeredCorners(m_contextWindow);
     }
 
     POINT origin{};
