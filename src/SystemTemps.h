@@ -1,12 +1,12 @@
-#pragma once
+﻿#pragma once
 
 #include <Windows.h>
 
 #include <string>
 
 // CPU / GPU temperatures and package/board watts for the Quick Settings home
-// tile. All sensor I/O (WMI, PDH, NVML, nvidia-smi, shared memory) runs on one
-// background worker; the UI thread only takes a mutex to read the latest
+// tile. All sensor I/O (WMI, PDH, NVML, nvidia-smi, PawnIO, shared memory) runs
+// on one background worker; the UI thread only takes a mutex to read the latest
 // published values.
 //
 // Task Manager (Windows 11 Performance) shows GPU temperature via the WDDM /
@@ -20,10 +20,13 @@
 // CPU temperature (prefer real package/die sensors; skip the fixed ACPI
 // 27.85 C / 301.0 K placeholder many Z390 boards report):
 //   1. LibreHardwareMonitor / OpenHardwareMonitor WMI (needs LHM/OHM GUI running).
-//   2. Bundled DockCpuTemp helper (LibreHardwareMonitorLib NuGet) writing
-//      %LOCALAPPDATA%\LiquidGlassDock\cpu-temp.bin. Auto-started by Dock.
-//      Reads Intel "CPU Package" via PawnIO; one-time elevation installs the
-//      HoverDockCpuTemp scheduled task so later launches need no UAC.
+//   2. Native PawnIO Intel MSR path (LibreHardwareMonitor algorithm): open
+//      \\?\GLOBALROOT\Device\PawnIO, load the signed IntelMSR module, read
+//      IA32_PACKAGE_THERM_STATUS + IA32_TEMPERATURE_TARGET for "CPU Package".
+//      CreateFile requires elevation on Windows; when Dock is not elevated a
+//      one-time UAC installs scheduled task HoverDockCpuSensor (ONLOGON /
+//      RL HIGHEST) that runs Dock.exe --cpu-sensor (same binary, no .NET) and
+//      publishes %LOCALAPPDATA%\LiquidGlassDock\cpu-temp.bin.
 //   3. Core Temp shared memory ("CoreTempMappingObject") when Core Temp is
 //      running -- max core reading, converted from F / delta-to-TjMax.
 //   4. HWiNFO shared memory ("Global\HWiNFO_SENS_SM2") when Shared Memory
@@ -32,7 +35,7 @@
 //      the ACPI placeholder).
 //   6. PDH Thermal Zone Information (same ACPI data, no admin).
 //
-// Without the helper (or LHM/Core Temp/HWiNFO), Intel package °C is unavailable
+// Without PawnIO (or LHM/Core Temp/HWiNFO), Intel package C is unavailable
 // on this class of hardware -- Dock will show watts-only (RAPL) rather than a
 // fake 27.85 C.
 //
@@ -70,3 +73,12 @@ void RequestSystemTemps(HWND notifyHwnd, UINT notifyMsg) noexcept;
 // Copy the latest published reading. Returns false when nothing has been
 // published yet.
 bool LatestSystemTemps(SystemTempsReading& out);
+
+// Headless elevated sibling: Dock.exe --cpu-sensor
+// Opens PawnIO + IntelMSR, publishes cpu-temp.bin every ~1.5 s. Returns process exit code.
+int RunCpuSensorWorker() noexcept;
+
+// One-shot elevated installer: Dock.exe --install-cpu-sensor
+// Creates scheduled task HoverDockCpuSensor (ONLOGON /RL HIGHEST /IT) and runs it.
+// Removes the legacy HoverDockCpuTemp / DockCpuTemp.exe task if present.
+int InstallCpuSensorTask() noexcept;

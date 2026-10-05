@@ -23,6 +23,9 @@
 #include <Shellapi.h>
 #include <ShlObj.h>
 #include <fstream>
+#include <cstring>
+
+#include "IntelMsrBin.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -568,17 +571,26 @@ struct SmiSource {
 };
 
 
-// --- Bundled DockCpuTemp helper (LibreHardwareMonitorLib) --------------------
-// Dock.exe is native C++ and cannot reference the LHM NuGet package. A small
-// .NET helper (tools/DockCpuTemp) opens LHM against PawnIO and writes
-// %LOCALAPPDATA%\LiquidGlassDock\cpu-temp.bin every ~1.5 s. PawnIO device
-// open requires elevation on this machine; a one-time elevated scheduled task
-// (HoverDockCpuTemp, ONLOGON /RL HIGHEST) keeps the helper running without
-// UAC on later launches. Dock only reads the file + starts/restarts the task.
+// --- Native Intel package temp via PawnIO (LibreHardwareMonitor approach) ----
+// Opens \\?\GLOBALROOT\Device\PawnIO, loads the signed IntelMSR AMX blob, and
+// reads IA32_PACKAGE_THERM_STATUS / IA32_TEMPERATURE_TARGET the same way
+// LibreHardwareMonitor's IntelCpu does. Package C = TjMax - digital readout.
+// CreateFile requires elevation on Windows; when the dock UI is medium-IL we
+// publish via an elevated sibling (Dock.exe --cpu-sensor) writing cpu-temp.bin.
 constexpr uint32_t kCpuTempMagic = 0x54434448u;  // 'HDCT'
 constexpr uint32_t kCpuTempVersion = 1;
 constexpr ULONGLONG kCpuTempFreshMs = 5000;
 constexpr ULONGLONG kHelperEnsureIntervalMs = 8000;
+constexpr wchar_t kCpuSensorTaskName[] = L"HoverDockCpuSensor";
+constexpr wchar_t kLegacyCpuTempTaskName[] = L"HoverDockCpuTemp";
+constexpr wchar_t kCpuSensorSingleton[] = L"Global\\HoverDockCpuSensor.Singleton";
+
+constexpr DWORD kPawnDeviceType = 41394u << 16;
+constexpr DWORD kIoctlLoadBinary = kPawnDeviceType | (0x821u << 2);
+constexpr DWORD kIoctlExecuteFn = kPawnDeviceType | (0x841u << 2);
+constexpr int kPawnFnNameLength = 32;
+constexpr uint32_t kMsrPackageThermStatus = 0x1B1;
+constexpr uint32_t kMsrTemperatureTarget = 0x1A2;
 
 #pragma pack(push, 1)
 struct HoverDockCpuTempFile {
@@ -599,35 +611,38 @@ std::wstring CpuTempPayloadPath() {
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &local)) &&
         local != nullptr) {
         path = local;
-        path += L"\\LiquidGlassDock\\cpu-temp.bin";
+        path += L"\\LiquidGlassDock";
+        CreateDirectoryW(path.c_str(), nullptr);
+        path += L"\\cpu-temp.bin";
         CoTaskMemFree(local);
     }
     return path;
 }
 
-std::wstring HelperExePath() {
-    wchar_t module[MAX_PATH]{};
-    const DWORD n = GetModuleFileNameW(nullptr, module, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) {
-        return {};
+bool WriteCpuTempFile(const HoverDockCpuTempFile& file) {
+    const std::wstring path = CpuTempPayloadPath();
+    if (path.empty()) {
+        return false;
     }
-    std::wstring dir(module, module + n);
-    const size_t slash = dir.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) {
-        return {};
-    }
-    dir.resize(slash);
-    const std::wstring candidates[] = {
-        dir + L"\\cpu-temp\\DockCpuTemp.exe",
-        dir + L"\\DockCpuTemp.exe",
-    };
-    for (const std::wstring& path : candidates) {
-        const DWORD attr = GetFileAttributesW(path.c_str());
-        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-            return path;
+    const std::wstring tmp = path + L".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return false;
+        }
+        out.write(reinterpret_cast<const char*>(&file), sizeof(file));
+        if (!out) {
+            return false;
         }
     }
-    return {};
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(path.c_str());
+        if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ReadCpuTempFile(HoverDockCpuTempFile& out) {
@@ -655,6 +670,27 @@ bool CpuTempFileFresh(const HoverDockCpuTempFile& file, ULONGLONG now) {
     return (now - file.stampMs) <= kCpuTempFreshMs;
 }
 
+bool IsCurrentProcessElevated() noexcept {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return false;
+    }
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size);
+    CloseHandle(token);
+    return ok && elevation.TokenIsElevated != 0;
+}
+
+std::wstring DockExePath() {
+    wchar_t module[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, module, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        return {};
+    }
+    return std::wstring(module, module + n);
+}
+
 void RunSchtasks(const wchar_t* args) {
     wchar_t systemDir[MAX_PATH]{};
     GetSystemDirectoryW(systemDir, MAX_PATH);
@@ -668,8 +704,8 @@ void RunSchtasks(const wchar_t* args) {
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
     mutableCmd.push_back(L'\0');
-    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+            nullptr, &si, &pi)) {
         return;
     }
     WaitForSingleObject(pi.hProcess, 8000);
@@ -677,20 +713,22 @@ void RunSchtasks(const wchar_t* args) {
     CloseHandle(pi.hProcess);
 }
 
-bool TaskExists() {
+bool TaskExists(const wchar_t* name) {
     wchar_t systemDir[MAX_PATH]{};
     GetSystemDirectoryW(systemDir, MAX_PATH);
     std::wstring cmd = L"\"";
     cmd += systemDir;
-    cmd += L"\\schtasks.exe\" /Query /TN \"HoverDockCpuTemp\"";
+    cmd += L"\\schtasks.exe\" /Query /TN \"";
+    cmd += name;
+    cmd += L"\"";
     STARTUPINFOW si{sizeof(si)};
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
     mutableCmd.push_back(L'\0');
-    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+            nullptr, &si, &pi)) {
         return false;
     }
     WaitForSingleObject(pi.hProcess, 8000);
@@ -701,11 +739,101 @@ bool TaskExists() {
     return code == 0;
 }
 
-struct DockCpuTempSource {
+struct PawnIoIntelPackage {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    bool loaded = false;
+    bool tried = false;
+    bool needAdmin = false;
+    bool unavailable = false;
+    float tjMaxC = 100.0f;
+
+    ~PawnIoIntelPackage() { Close(); }
+
+    void Close() noexcept {
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
+        }
+        loaded = false;
+    }
+
+    bool ReadMsr(uint32_t index, uint64_t& value) const {
+        alignas(8) unsigned char inBuf[kPawnFnNameLength + sizeof(uint64_t)]{};
+        strncpy_s(reinterpret_cast<char*>(inBuf), kPawnFnNameLength, "ioctl_read_msr", _TRUNCATE);
+        const uint64_t msr = index;
+        memcpy(inBuf + kPawnFnNameLength, &msr, sizeof(msr));
+        uint64_t out = 0;
+        DWORD returned = 0;
+        if (!DeviceIoControl(handle, kIoctlExecuteFn, inBuf, sizeof(inBuf), &out, sizeof(out), &returned,
+                nullptr)) {
+            return false;
+        }
+        value = out;
+        return true;
+    }
+
+    bool Open() {
+        tried = true;
+        needAdmin = false;
+        unavailable = false;
+        Close();
+        handle = CreateFileW(L"\\\\?\\GLOBALROOT\\Device\\PawnIO", GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_ACCESS_DENIED || err == ERROR_PRIVILEGE_NOT_HELD) {
+                needAdmin = true;
+            } else {
+                unavailable = true;
+            }
+            return false;
+        }
+        DWORD returned = 0;
+        if (!DeviceIoControl(handle, kIoctlLoadBinary,
+                const_cast<unsigned char*>(HoverDockPawnIo::kIntelMsrBin),
+                static_cast<DWORD>(HoverDockPawnIo::kIntelMsrBinSize), nullptr, 0, &returned, nullptr)) {
+            Close();
+            unavailable = true;
+            return false;
+        }
+        loaded = true;
+        uint64_t tj = 0;
+        if (ReadMsr(kMsrTemperatureTarget, tj)) {
+            const uint32_t raw = (static_cast<uint32_t>(tj) >> 16) & 0xFFu;
+            if (raw >= 60 && raw <= 125) {
+                tjMaxC = static_cast<float>(raw);
+            }
+        }
+        return true;
+    }
+
+    // Returns package Celsius, or NaN.
+    double ReadPackageC() {
+        if (!tried) {
+            Open();
+        }
+        if (!loaded) {
+            return kNaN;
+        }
+        uint64_t pkg = 0;
+        if (!ReadMsr(kMsrPackageThermStatus, pkg)) {
+            return kNaN;
+        }
+        if ((pkg & 0x80000000ull) == 0) {
+            return kNaN;
+        }
+        const uint32_t delta = (static_cast<uint32_t>(pkg) & 0x007F0000u) >> 16;
+        const double celsius = static_cast<double>(tjMaxC) - static_cast<double>(delta);
+        return PlausibleTemp(celsius) ? celsius : kNaN;
+    }
+};
+
+struct NativeCpuPackageSource {
+    PawnIoIntelPackage pawn;
     ULONGLONG nextEnsureAt = 0;
     bool promptedInstall = false;
 
-    void EnsureHelper(ULONGLONG now) {
+    void EnsureElevatedSibling(ULONGLONG now) {
         if (now < nextEnsureAt) {
             return;
         }
@@ -717,57 +845,65 @@ struct DockCpuTempSource {
             return;
         }
 
-        if (TaskExists()) {
-            RunSchtasks(L"/Run /TN \"HoverDockCpuTemp\"");
+        if (TaskExists(kCpuSensorTaskName)) {
+            std::wstring args = L"/Run /TN \"";
+            args += kCpuSensorTaskName;
+            args += L"\"";
+            RunSchtasks(args.c_str());
             return;
         }
 
-        const std::wstring exe = HelperExePath();
-        if (exe.empty()) {
+        // Legacy .NET helper task from v1.1.62 — still publishes the same file.
+        if (TaskExists(kLegacyCpuTempTaskName)) {
+            std::wstring args = L"/Run /TN \"";
+            args += kLegacyCpuTempTaskName;
+            args += L"\"";
+            RunSchtasks(args.c_str());
             return;
         }
 
-        // Prefer starting the already-bundled helper. Unelevated it publishes
-        // status=needAdmin; we then prompt once per dock process for the
-        // one-shot elevated task install (PawnIO).
-        if (!promptedInstall) {
-            HoverDockCpuTempFile latest{};
-            const bool sawNeedAdmin =
-                ReadCpuTempFile(latest) && latest.status == 1;
-            if (sawNeedAdmin || !ReadCpuTempFile(latest)) {
-                promptedInstall = true;
-                ShellExecuteW(nullptr, L"open", exe.c_str(), L"--install-task", nullptr,
-                              SW_SHOWNORMAL);
-                return;
-            }
+        const std::wstring exe = DockExePath();
+        if (exe.empty() || promptedInstall) {
+            return;
         }
-
-        ShellExecuteW(nullptr, L"open", exe.c_str(), L"--run", nullptr, SW_HIDE);
+        promptedInstall = true;
+        ShellExecuteW(nullptr, L"open", exe.c_str(), L"--install-cpu-sensor", nullptr, SW_SHOWNORMAL);
     }
 
-    bool Read(ULONGLONG now, double& tempC, double& watts, std::wstring& sensorName) {
-        EnsureHelper(now);
-        HoverDockCpuTempFile file{};
-        if (!ReadCpuTempFile(file) || !CpuTempFileFresh(file, now)) {
-            return false;
+    bool Read(ULONGLONG now, double& tempC, std::wstring& sensorName) {
+        tempC = kNaN;
+        sensorName.clear();
+
+        // Prefer in-process PawnIO when Dock is already elevated (or ACL allows).
+        if (!pawn.tried || (pawn.needAdmin && IsCurrentProcessElevated())) {
+            if (pawn.needAdmin) {
+                pawn.tried = false;
+            }
+            pawn.Open();
         }
-        bool any = false;
-        if (file.cpuPackageC > 0 && PlausibleTemp(static_cast<double>(file.cpuPackageC))) {
-            tempC = static_cast<double>(file.cpuPackageC);
-            any = true;
-        }
-        if (file.cpuPackageW > 0 && PlausibleWatts(static_cast<double>(file.cpuPackageW))) {
-            watts = static_cast<double>(file.cpuPackageW);
-            any = true;
-        }
-        if (any) {
-            file.name[63] = L'\0';
-            sensorName = file.name;
-            if (sensorName.empty()) {
+        if (pawn.loaded) {
+            const double value = pawn.ReadPackageC();
+            if (PlausibleTemp(value)) {
+                tempC = value;
                 sensorName = L"CPU Package";
+                return true;
             }
         }
-        return any;
+
+        if (pawn.needAdmin) {
+            EnsureElevatedSibling(now);
+            HoverDockCpuTempFile file{};
+            if (!ReadCpuTempFile(file) || !CpuTempFileFresh(file, now)) {
+                return false;
+            }
+            if (file.cpuPackageC > 0 && PlausibleTemp(static_cast<double>(file.cpuPackageC))) {
+                tempC = static_cast<double>(file.cpuPackageC);
+                file.name[63] = L'\0';
+                sensorName = file.name[0] != L'\0' ? file.name : L"CPU Package";
+                return true;
+            }
+        }
+        return false;
     }
 };
 
@@ -1257,7 +1393,7 @@ struct RaplPdhSource {
 
 struct Sensors {
     HwmonSource hwmon;
-    DockCpuTempSource dockCpuTemp;
+    NativeCpuPackageSource nativeCpuPackage;
     CoreTempSource coreTemp;
     HwinfoSource hwinfo;
     NvmlSource nvml;
@@ -1276,18 +1412,16 @@ struct Sensors {
         hwmon.Poll(now, hwCpuTemp, hwGpuTemp, hwCpuPower, hwGpuPower);
 
         double cpuTemp = kNaN;
-        double dockCpuPower = kNaN;
         std::wstring dockSensor;
         if (PlausibleTemp(hwCpuTemp)) {
             cpuTemp = hwCpuTemp;
             reading.cpuSource = hwmon.name;
         }
         if (!PlausibleTemp(cpuTemp)) {
-            double dockTemp = kNaN;
-            if (dockCpuTemp.Read(now, dockTemp, dockCpuPower, dockSensor) &&
-                PlausibleTemp(dockTemp)) {
-                cpuTemp = dockTemp;
-                reading.cpuSource = L"LibreHardwareMonitorLib (" + dockSensor + L")";
+            double nativeTemp = kNaN;
+            if (nativeCpuPackage.Read(now, nativeTemp, dockSensor) && PlausibleTemp(nativeTemp)) {
+                cpuTemp = nativeTemp;
+                reading.cpuSource = L"PawnIO Intel MSR (" + dockSensor + L")";
             }
         }
         if (!PlausibleTemp(cpuTemp)) {
@@ -1324,11 +1458,6 @@ struct Sensors {
         if (PlausibleWatts(hwCpuPower)) {
             cpuPower = hwCpuPower;
             reading.cpuPowerSource = hwmon.name;
-        }
-        if (!PlausibleWatts(cpuPower) && PlausibleWatts(dockCpuPower)) {
-            cpuPower = dockCpuPower;
-            reading.cpuPowerSource = L"LibreHardwareMonitorLib (" +
-                (dockSensor.empty() ? std::wstring(L"CPU Package") : dockSensor) + L")";
         }
         if (!PlausibleWatts(cpuPower)) {
             const double ctPower = coreTemp.ReadPower(now);
@@ -1456,7 +1585,146 @@ void WorkerMain() {
     }
 }
 
+int RunCpuSensorWorkerImpl() {
+    HANDLE singleton = CreateMutexW(nullptr, FALSE, kCpuSensorSingleton);
+    if (singleton == nullptr) {
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(singleton);
+        return 0;
+    }
+
+    if (!IsCurrentProcessElevated()) {
+        HoverDockCpuTempFile denied{};
+        denied.magic = kCpuTempMagic;
+        denied.version = kCpuTempVersion;
+        denied.sequence = 1;
+        denied.cpuPackageC = -1;
+        denied.cpuPackageW = -1;
+        denied.stampMs = GetTickCount64();
+        denied.status = 1;
+        wcsncpy_s(denied.name, L"need-admin", _TRUNCATE);
+        WriteCpuTempFile(denied);
+        Sleep(2500);
+        CloseHandle(singleton);
+        return 1;
+    }
+
+    PawnIoIntelPackage pawn;
+    if (!pawn.Open()) {
+        HoverDockCpuTempFile fail{};
+        fail.magic = kCpuTempMagic;
+        fail.version = kCpuTempVersion;
+        fail.sequence = 1;
+        fail.cpuPackageC = -1;
+        fail.cpuPackageW = -1;
+        fail.stampMs = GetTickCount64();
+        fail.status = 2;
+        wcsncpy_s(fail.name, L"no-sensor", _TRUNCATE);
+        WriteCpuTempFile(fail);
+        CloseHandle(singleton);
+        return 2;
+    }
+
+    uint32_t seq = 0;
+    for (;;) {
+        const double celsius = pawn.ReadPackageC();
+        HoverDockCpuTempFile file{};
+        file.magic = kCpuTempMagic;
+        file.version = kCpuTempVersion;
+        file.sequence = ++seq;
+        file.cpuPackageC = PlausibleTemp(celsius) ? static_cast<int>(std::lround(celsius)) : -1;
+        file.cpuPackageW = -1;  // RAPL watts stay on the unelevated PDH path in Dock
+        file.stampMs = GetTickCount64();
+        file.status = file.cpuPackageC > 0 ? 0 : 2;
+        wcsncpy_s(file.name, L"CPU Package", _TRUNCATE);
+        WriteCpuTempFile(file);
+        Sleep(1500);
+    }
+}
+
+int InstallCpuSensorTaskImpl() {
+    if (!IsCurrentProcessElevated()) {
+        const std::wstring exe = DockExePath();
+        if (exe.empty()) {
+            return 5;
+        }
+        SHELLEXECUTEINFOW info{sizeof(info)};
+        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        info.lpVerb = L"runas";
+        info.lpFile = exe.c_str();
+        info.lpParameters = L"--install-cpu-sensor";
+        info.nShow = SW_HIDE;
+        if (!ShellExecuteExW(&info)) {
+            return 5;
+        }
+        if (info.hProcess != nullptr) {
+            WaitForSingleObject(info.hProcess, 60000);
+            DWORD code = 5;
+            GetExitCodeProcess(info.hProcess, &code);
+            CloseHandle(info.hProcess);
+            return static_cast<int>(code);
+        }
+        return 5;
+    }
+
+    const std::wstring exe = DockExePath();
+    if (exe.empty()) {
+        return 4;
+    }
+
+    // Drop legacy .NET helper task / process.
+    RunSchtasks(L"/End /TN \"HoverDockCpuTemp\"");
+    RunSchtasks(L"/Delete /F /TN \"HoverDockCpuTemp\"");
+    {
+        wchar_t systemDir[MAX_PATH]{};
+        GetSystemDirectoryW(systemDir, MAX_PATH);
+        std::wstring kill = L"\"";
+        kill += systemDir;
+        kill += L"\\taskkill.exe\" /F /IM DockCpuTemp.exe";
+        STARTUPINFOW si{sizeof(si)};
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi{};
+        std::vector<wchar_t> mutableCmd(kill.begin(), kill.end());
+        mutableCmd.push_back(L'\0');
+        if (CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                nullptr, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 5000);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
+
+    std::wstring del = L"/Delete /F /TN \"";
+    del += kCpuSensorTaskName;
+    del += L"\"";
+    RunSchtasks(del.c_str());
+
+    std::wstring create = L"/Create /F /TN \"";
+    create += kCpuSensorTaskName;
+    create += L"\" /SC ONLOGON /RL HIGHEST /IT /TR \"";
+    create += exe;
+    create += L" --cpu-sensor\"";
+    RunSchtasks(create.c_str());
+
+    std::wstring run = L"/Run /TN \"";
+    run += kCpuSensorTaskName;
+    run += L"\"";
+    RunSchtasks(run.c_str());
+    return TaskExists(kCpuSensorTaskName) ? 0 : 3;
+}
+
 }  // namespace
+
+int RunCpuSensorWorker() noexcept {
+    return RunCpuSensorWorkerImpl();
+}
+
+int InstallCpuSensorTask() noexcept {
+    return InstallCpuSensorTaskImpl();
+}
 
 void RequestSystemTemps(HWND notifyHwnd, UINT notifyMsg) noexcept {
     try {

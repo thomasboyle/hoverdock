@@ -1,0 +1,26 @@
+﻿Third-party notices for Hoverdock
+=================================
+
+LibreHardwareMonitor (Intel CPU package temperature algorithm)
+--------------------------------------------------------------
+Portions of the native Intel package-temperature path in src/SystemTemps.cpp
+follow the MSR usage in LibreHardwareMonitor's IntelCpu (IA32_TEMPERATURE_TARGET,
+IA32_PACKAGE_THERM_STATUS, TjMax - digital readout).
+
+  https://github.com/LibreHardwareMonitor/LibreHardwareMonitor
+  License: Mozilla Public License 2.0 / Apache License 2.0
+
+PawnIO IntelMSR module (third_party/pawnio/IntelMSR.bin)
+--------------------------------------------------------
+Signed PawnIO AMX blob used to read whitelisted Intel MSRs via the PawnIO
+kernel driver (\\?\GLOBALROOT\Device\PawnIO). Redistributed from the
+LibreHardwareMonitorLib resources / namazso PawnIO.Modules releases.
+
+  https://github.com/namazso/PawnIO.Modules
+  https://pawnio.eu/
+  License: GNU LGPL 2.1 (see third_party/pawnio/COPYING)
+
+The PawnIO driver itself is a separate system install (not bundled with
+Hoverdock). Opening the device typically requires an elevated process on
+Windows; Hoverdock uses a one-time elevated scheduled task that runs
+Dock.exe --cpu-sensor (same binary, no .NET helper).

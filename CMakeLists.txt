@@ -1,10 +1,10 @@
-cmake_minimum_required(VERSION 3.25)
+﻿cmake_minimum_required(VERSION 3.25)
 
 if(NOT WIN32)
     message(FATAL_ERROR "Liquid Glass Dock is a native Windows/MSVC project.")
 endif()
 
-project(LiquidGlassDock VERSION 1.1.62 LANGUAGES CXX)
+project(LiquidGlassDock VERSION 1.1.63 LANGUAGES CXX)
 
 # Tag builds override the version: -DDOCK_VERSION=1.2.3 (release.yml passes the
 # git tag through). Defaults to the project version above.
@@ -186,26 +186,8 @@ add_dependencies(Dock DockShaders)
 set_property(TARGET Dock PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:Dock>")
 
 
-# --- DockCpuTemp helper (LibreHardwareMonitorLib) -----------------------------
-# Native Dock cannot reference the LHM NuGet package. Build a small .NET 8
-# helper and stage it next to Dock.exe under cpu-temp/.
-set(DOCK_CPUTEMP_PROJ "${CMAKE_CURRENT_SOURCE_DIR}/tools/DockCpuTemp/DockCpuTemp.csproj")
-set(DOCK_CPUTEMP_OUT "$<TARGET_FILE_DIR:Dock>/cpu-temp")
-find_program(DOTNET_EXECUTABLE NAMES dotnet)
-if(DOTNET_EXECUTABLE)
-    add_custom_target(DockCpuTempHelper ALL
-        COMMAND "${DOTNET_EXECUTABLE}" publish "${DOCK_CPUTEMP_PROJ}"
-            -c $<IF:$<CONFIG:Debug>,Debug,Release>
-            -o "${DOCK_CPUTEMP_OUT}"
-            --self-contained false
-            -v q
-        COMMENT "Publishing DockCpuTemp helper next to Dock.exe"
-        VERBATIM
-    )
-    add_dependencies(Dock DockCpuTempHelper)
-else()
-    message(WARNING "dotnet not found; DockCpuTemp helper will not be built (CPU package temp needs it).")
-endif()
+# Signed PawnIO IntelMSR blob header (third_party/pawnio/IntelMsrBin.h).
+target_include_directories(Dock PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pawnio")
 
 # --- NSIS installer -------------------------------------------------------
 # Per-user install (no elevation) so silent auto-updates work without UAC:
@@ -225,10 +207,6 @@ if(MAKENSIS_EXECUTABLE)
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/staging"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:Dock>"
             "${CMAKE_BINARY_DIR}/staging/Dock.exe"
-        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CMAKE_BINARY_DIR}/staging/cpu-temp"
-        COMMAND "${CMAKE_COMMAND}" -E copy_directory
-            "$<TARGET_FILE_DIR:Dock>/cpu-temp"
-            "${CMAKE_BINARY_DIR}/staging/cpu-temp"
         COMMAND "${MAKENSIS_EXECUTABLE}"
             /DVERSION=${DOCK_EFFECTIVE_VERSION}
             "/DSRCBIN=${DOCK_STAGED_EXE_NATIVE}"
@@ -245,3 +223,5 @@ else()
         COMMAND_EXPAND_LISTS
     )
 endif()
+
+

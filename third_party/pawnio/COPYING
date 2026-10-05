@@ -1,0 +1,9 @@
+﻿The IntelMSR.bin PawnIO module redistributed under third_party/pawnio/ is licensed
+under the GNU Lesser General Public License, version 2.1 (or later).
+
+Full license text:
+  https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+  https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/blob/master/LibreHardwareMonitorLib/Resources/PawnIo/COPYING
+
+Corresponding source for the module scripts:
+  https://github.com/namazso/PawnIO.Modules
