@@ -10,3 +10,7 @@ out/
 
 tools/_meteocons_build/
 
+# DockCpuTemp helper build
+tools/DockCpuTemp/bin/
+tools/DockCpuTemp/obj/
+tools/DockCpuTemp/publish/

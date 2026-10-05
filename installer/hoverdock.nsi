@@ -100,6 +100,10 @@ Section "Install"
   Call CloseRunningDock
   ClearErrors
   File "${SRCBIN}"
+  ; Bundled LibreHardwareMonitorLib helper for CPU package temperature.
+  SetOutPath "$INSTDIR\cpu-temp"
+  File /r /x *.pdb "${SRCBIN}\..\cpu-temp\*.*"
+  SetOutPath "$INSTDIR"
   IfErrors 0 +3
     DetailPrint "Failed to replace ${APPEXE} (file in use?). Aborting without changing Version."
     Abort
@@ -162,6 +166,11 @@ Section "Uninstall"
   Call un.CloseRunningDock
   ExecWait '"$SYSDIR\schtasks.exe" /Delete /TN "${RUNVALUE}" /F' $0
   Delete "$INSTDIR\${APPEXE}"
+  RMDir /r "$INSTDIR\cpu-temp"
+  ; Stop elevated helper if the scheduled task left it running.
+  ExecWait '"$SYSDIR\schtasks.exe" /End /TN "HoverDockCpuTemp"' $0
+  ExecWait '"$SYSDIR\taskkill.exe" /F /IM DockCpuTemp.exe' $0
+  ExecWait '"$SYSDIR\schtasks.exe" /Delete /F /TN "HoverDockCpuTemp"' $0
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
   Delete "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk"

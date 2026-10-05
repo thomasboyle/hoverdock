@@ -19,18 +19,20 @@
 //
 // CPU temperature (prefer real package/die sensors; skip the fixed ACPI
 // 27.85 C / 301.0 K placeholder many Z390 boards report):
-//   1. LibreHardwareMonitor / OpenHardwareMonitor WMI (needs LHM/OHM running;
-//      their WinRing0/kernel driver is installed once by those apps -- Dock does
-//      not ship or load WinRing0, which would force admin elevation).
-//   2. Core Temp shared memory ("CoreTempMappingObject") when Core Temp is
+//   1. LibreHardwareMonitor / OpenHardwareMonitor WMI (needs LHM/OHM GUI running).
+//   2. Bundled DockCpuTemp helper (LibreHardwareMonitorLib NuGet) writing
+//      %LOCALAPPDATA%\LiquidGlassDock\cpu-temp.bin. Auto-started by Dock.
+//      Reads Intel "CPU Package" via PawnIO; one-time elevation installs the
+//      HoverDockCpuTemp scheduled task so later launches need no UAC.
+//   3. Core Temp shared memory ("CoreTempMappingObject") when Core Temp is
 //      running -- max core reading, converted from F / delta-to-TjMax.
-//   3. HWiNFO shared memory ("Global\\HWiNFO_SENS_SM2") when Shared Memory
+//   4. HWiNFO shared memory ("Global\HWiNFO_SENS_SM2") when Shared Memory
 //      Support is enabled -- prefers "CPU Package" / Tctl/Tdie labels.
-//   4. MSAcpi_ThermalZoneTemperature (often admin-only; rejected if stuck at
+//   5. MSAcpi_ThermalZoneTemperature (often admin-only; rejected if stuck at
 //      the ACPI placeholder).
-//   5. PDH Thermal Zone Information (same ACPI data, no admin).
+//   6. PDH Thermal Zone Information (same ACPI data, no admin).
 //
-// Without LHM/OHM, Core Temp, or HWiNFO running, Intel package °C is unavailable
+// Without the helper (or LHM/Core Temp/HWiNFO), Intel package °C is unavailable
 // on this class of hardware -- Dock will show watts-only (RAPL) rather than a
 // fake 27.85 C.
 //
