@@ -33,8 +33,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr ULONGLONG kPollIntervalMs = 2000;
-// The UI re-arms this every ~2 s while the home page is up; the worker idles
+constexpr ULONGLONG kPollIntervalMs = 500;
+// The UI re-arms this every ~500 ms while the home page is up; the worker idles
 // (no WMI/PDH/NVML calls) once it lapses.
 constexpr ULONGLONG kKeepAliveMs = 5000;
 // LibreHardwareMonitor / OpenHardwareMonitor may be started after the dock.
@@ -2267,7 +2267,7 @@ int RunCpuSensorWorkerImpl() {
             wcsncpy_s(file.name, L"CPU Package", _TRUNCATE);
         }
         WriteCpuTempFile(file);
-        Sleep(1500);
+        Sleep(500);
     }
 }
 

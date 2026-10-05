@@ -2205,7 +2205,7 @@ void DockApp::RefreshQuickSettingsCache() {
             m_qsCache.energyPending = true;
             m_qsCache.energyNote = L"Measuring energy use…";
         }
-        // ToolHelp runs on the energy worker (~2 s), never on this thread.
+        // ToolHelp runs on the energy worker (~500 ms), never on this thread.
         if (m_overflowWindow != nullptr) {
             RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
         }
@@ -2217,7 +2217,7 @@ void DockApp::RefreshQuickSettingsCache() {
     }
     if (m_qsPage == QuickSettingsPage::Home) {
         // Sensors are read on the temperature worker; this only copies the
-        // last published values and re-arms its ~2 s poll.
+        // last published values and re-arms its ~500 ms poll.
         ApplyQuickSettingsTemps(m_qsCache);
         if (m_overflowWindow != nullptr) {
             RequestQuickSettingsTemps(m_overflowWindow, kQsTempsResultMessage);

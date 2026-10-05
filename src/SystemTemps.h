@@ -64,7 +64,7 @@ struct SystemTempsReading {
     ULONGLONG stamp = 0;  // GetTickCount64 of the poll that produced this reading
 };
 
-// Keep the worker polling (~2 s cadence) for a few seconds after the last call.
+// Keep the worker polling (~500 ms cadence) for a few seconds after the last call.
 // notifyMsg is posted to notifyHwnd whenever a poll changes a displayed value.
 // Cheap: never blocks on sensor I/O.
 void RequestSystemTemps(HWND notifyHwnd, UINT notifyMsg) noexcept;

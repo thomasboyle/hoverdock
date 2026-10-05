@@ -8209,14 +8209,14 @@ void DockApp::PaintOverflowPopup() {
     PresentOverflowLayer();
     if (m_overflowWindow != nullptr) {
         if (m_qsPage == QuickSettingsPage::Power) {
-            SetTimer(m_overflowWindow, kEnergySampleTimerId, 2000, nullptr);
+            SetTimer(m_overflowWindow, kEnergySampleTimerId, 500, nullptr);
             RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
         } else {
             KillTimer(m_overflowWindow, kEnergySampleTimerId);
         }
         if (m_qsPage == QuickSettingsPage::Home) {
             // Temperature worker keep-alive; the worker itself polls every ~2 s.
-            SetTimer(m_overflowWindow, kQsTempsTimerId, 2000, nullptr);
+            SetTimer(m_overflowWindow, kQsTempsTimerId, 500, nullptr);
             RequestQuickSettingsTemps(m_overflowWindow, kQsTempsResultMessage);
         } else {
             KillTimer(m_overflowWindow, kQsTempsTimerId);

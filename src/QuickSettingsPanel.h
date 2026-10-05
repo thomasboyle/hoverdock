@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <Windows.h>
 
@@ -116,12 +116,12 @@ enum class QsLiveChange : uint8_t {
 QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache);
 // Seek the current GSMTC session. level is 0..1 across its timeline.
 void SeekQuickSettingsMedia(float level) noexcept;
-// Kick a ToolHelp energy sample on a worker (~2 s cadence). Posts notifyMsg to
+// Kick a ToolHelp energy sample on a worker (~500 ms cadence). Posts notifyMsg to
 // notifyHwnd when a fresh result is ready; never blocks the UI thread.
 void RequestEnergyAppsAsync(HWND notifyHwnd, UINT notifyMsg);
 // Copy the latest worker energy snapshot into cache. True when values changed.
 bool ApplyEnergyAppsResult(QuickSettingsCache& cache);
-// Keep the background CPU/GPU temperature worker polling (~2 s). Posts
+// Keep the background CPU/GPU temperature worker polling (~500 ms). Posts
 // notifyMsg to notifyHwnd when a displayed value changes; never blocks.
 void RequestQuickSettingsTemps(HWND notifyHwnd, UINT notifyMsg) noexcept;
 // Copy the latest worker temperatures into cache. True when a value changed.
