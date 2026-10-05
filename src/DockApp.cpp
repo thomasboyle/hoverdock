@@ -2698,14 +2698,21 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         }
         return 0;
 
+    case kQsEnergyResultMessage:
+        if (app != nullptr && app->IsOverflowOpen()) {
+            if (ApplyEnergyAppsResult(app->m_qsCache)) {
+                app->PaintOverflowPopup();
+            }
+        }
+        return 0;
+
     case WM_TIMER:
         if (wParam == kEnergySampleTimerId && app != nullptr) {
             if (app->m_qsPage != QuickSettingsPage::Power || !app->IsOverflowOpen()) {
                 KillTimer(window, kEnergySampleTimerId);
                 return 0;
             }
-            app->m_qsCache.stamp = 0;
-            app->PaintOverflowPopup();
+            RequestEnergyAppsAsync(window, DockApp::kQsEnergyResultMessage);
             return 0;
         }
         if (wParam == kQsLiveTimerId && app != nullptr) {
@@ -2713,8 +2720,11 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
                 KillTimer(window, kQsLiveTimerId);
                 return 0;
             }
-            if (RefreshQuickSettingsLive(app->m_qsCache)) {
+            const QsLiveChange change = RefreshQuickSettingsLive(app->m_qsCache);
+            if (change == QsLiveChange::Labels) {
                 app->PaintOverflowPopup();
+            } else if (change == QsLiveChange::MetersOnly) {
+                app->PaintOverflowLiveFast();
             }
             return 0;
         }
@@ -5435,6 +5445,9 @@ void DockApp::FinishOverflowHide() noexcept {
     m_qsDragging = false;
     std::vector<uint8_t>().swap(m_overflowPresentBits);
     std::vector<uint8_t>().swap(m_overflowBaseBits);
+    std::vector<uint8_t>().swap(m_overflowUnderlayBits);
+    m_qsMeterValid = false;
+    m_qsScrubValid = false;
     m_overflowPresentSize = {};
     m_overflowHoverPaintOnly = false;
     InvalidateOverflowGlass();
@@ -5623,6 +5636,8 @@ void DockApp::BeginOverflowShow() {
     m_qsPage = QuickSettingsPage::Home;
     m_qsReturn = QuickSettingsPage::Home;
     m_qsCache.stamp = 0;
+    m_qsCache.stampNetwork = 0;
+    m_qsCache.stampNight = 0;
     m_overflowVisibility = VisibilityState::Visible;
     RebuildOverflowPopup();
     if (m_overflowWindow == nullptr || m_overflowPresentBits.empty()) {
@@ -7819,6 +7834,109 @@ void DockApp::PaintOverflowHoverFast() {
     }
 }
 
+void DockApp::PaintOverflowLiveFast() {
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (m_overflowUnderlayBits.empty() || m_overflowWindow == nullptr ||
+        m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0 ||
+        m_overflowPresentSize.cx != m_overflowSize.cx ||
+        m_overflowPresentSize.cy != m_overflowSize.cy ||
+        (!m_qsMeterValid && !m_qsScrubValid) ||
+        m_overflowUnderlayBits.size() != m_overflowPresentBits.size() ||
+        !OverflowScreenOrigin(origin, caret)) {
+        PaintOverflowPopup();
+        return;
+    }
+    m_overflowCaretX = caret;
+    const int width = SaturatedInt(m_overflowPresentSize.cx);
+    const int height = SaturatedInt(m_overflowPresentSize.cy);
+    const float scale = static_cast<float>(HostDpi()) / 96.0F;
+
+    auto restoreRect = [&](const RECT& rect) {
+        const LONG left = (std::max)(0L, rect.left);
+        const LONG top = (std::max)(0L, rect.top);
+        const LONG right = (std::min)(static_cast<LONG>(width), rect.right);
+        const LONG bottom = (std::min)(static_cast<LONG>(height), rect.bottom);
+        if (right <= left || bottom <= top) {
+            return;
+        }
+        const size_t rowBytes = static_cast<size_t>(right - left) * 4U;
+        for (LONG y = top; y < bottom; ++y) {
+            const size_t offset =
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) * 4U;
+            std::memcpy(m_overflowPresentBits.data() + offset, m_overflowUnderlayBits.data() + offset,
+                rowBytes);
+            if (m_overflowBaseBits.size() == m_overflowPresentBits.size()) {
+                std::memcpy(m_overflowBaseBits.data() + offset, m_overflowUnderlayBits.data() + offset,
+                    rowBytes);
+            }
+        }
+    };
+
+    auto expandDirty = [&](RECT rect) -> RECT {
+        rect.left = (std::max)(0L, rect.left - 10);
+        rect.top = (std::max)(0L, rect.top - 10);
+        rect.right = (std::min)(static_cast<LONG>(width), rect.right + 10);
+        rect.bottom = (std::min)(static_cast<LONG>(height), rect.bottom + 10);
+        return rect;
+    };
+
+    RECT dirty{};
+    bool haveDirty = false;
+    auto addDirty = [&](RECT rect) {
+        rect = expandDirty(rect);
+        restoreRect(rect);
+        if (!haveDirty) {
+            dirty = rect;
+            haveDirty = true;
+        } else {
+            dirty.left = (std::min)(dirty.left, rect.left);
+            dirty.top = (std::min)(dirty.top, rect.top);
+            dirty.right = (std::max)(dirty.right, rect.right);
+            dirty.bottom = (std::max)(dirty.bottom, rect.bottom);
+        }
+    };
+
+    if (m_qsMeterValid) {
+        addDirty(m_qsMeterRect);
+    }
+    if (m_qsScrubValid) {
+        addDirty(m_qsScrubRect);
+    }
+    if (!haveDirty) {
+        return;
+    }
+
+    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale);
+    if (m_overflowBaseBits.size() == m_overflowPresentBits.size()) {
+        // Keep base in sync so hover-fast restores still show live meters.
+        const LONG left = dirty.left;
+        const LONG top = dirty.top;
+        const LONG right = dirty.right;
+        const LONG bottom = dirty.bottom;
+        const size_t rowBytes = static_cast<size_t>(right - left) * 4U;
+        for (LONG y = top; y < bottom; ++y) {
+            const size_t offset =
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) * 4U;
+            std::memcpy(m_overflowBaseBits.data() + offset, m_overflowPresentBits.data() + offset, rowBytes);
+        }
+    }
+    if (m_overflowHover >= 0 && static_cast<size_t>(m_overflowHover) < m_overflowHits.size()) {
+        ApplyOverflowHoverHighlight(m_overflowPresentBits.data(), width, height,
+            m_overflowHits[static_cast<size_t>(m_overflowHover)]);
+        m_overflowHoverDirtyValid = false;
+    }
+
+    if (!PresentLayeredBits(m_overflowWindow, origin, m_overflowPresentSize.cx,
+            m_overflowPresentSize.cy, m_overflowPresentBits.data(), m_overflowPresentBits.size(),
+            m_overflowLayerDib, &dirty)) {
+        return;
+    }
+    if (!IsWindowVisible(m_overflowWindow)) {
+        ShowWindow(m_overflowWindow, SW_SHOWNA);
+    }
+}
+
 void DockApp::PaintOverflowPopup() {
     const UINT dpi = HostDpi();
     const float scale = static_cast<float>(dpi) / 96.0F;
@@ -8036,10 +8154,18 @@ void DockApp::PaintOverflowPopup() {
     const int pendingHover = m_overflowHover;
     m_overflowHits.clear();
 
+    // Underlay pass: meter/scrub tracks at empty levels. Live overlays then paint
+    // real peaks/progress so meters can update via UpdateLayeredWindowIndirect.
+    m_qsPaintUnderlayPass = true;
     PaintQuickSettings(pixels, width, height, memory, scale, padding, panelWidth, gearSize,
         headerHeight, titleFont, sectionFont, labelFont, statusFont);
+    m_qsPaintUnderlayPass = false;
 
     const size_t bytes = pixelCount * 4U;
+    m_overflowUnderlayBits.resize(bytes);
+    std::memcpy(m_overflowUnderlayBits.data(), pixels, bytes);
+    PaintQsLiveOverlays(pixels, width, height, scale);
+
     m_overflowBaseBits.resize(bytes);
     std::memcpy(m_overflowBaseBits.data(), pixels, bytes);
     if (pendingHover >= 0 && static_cast<size_t>(pendingHover) < m_overflowHits.size()) {
@@ -8054,14 +8180,17 @@ void DockApp::PaintOverflowPopup() {
     DeleteDC(memory);
     PresentOverflowLayer();
     if (m_overflowWindow != nullptr) {
-        if (m_qsPage == QuickSettingsPage::Power && m_qsCache.energyPending) {
-            SetTimer(m_overflowWindow, kEnergySampleTimerId, 900, nullptr);
+        if (m_qsPage == QuickSettingsPage::Power) {
+            SetTimer(m_overflowWindow, kEnergySampleTimerId, 2000, nullptr);
+            RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
         } else {
             KillTimer(m_overflowWindow, kEnergySampleTimerId);
         }
+        // UI live timer only publishes background peak / rate-limited media; keep
+        // ~40 ms on meter pages so the underlay present stays smooth.
         const bool fastMeter = m_qsPage == QuickSettingsPage::Home ||
             m_qsPage == QuickSettingsPage::Microphone;
-        SetTimer(m_overflowWindow, kQsLiveTimerId, fastMeter ? 70U : 500U, nullptr);
+        SetTimer(m_overflowWindow, kQsLiveTimerId, fastMeter ? 40U : 500U, nullptr);
     }
 }
 

@@ -24,6 +24,7 @@
 #pragma warning(pop)
 
 
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -617,6 +618,17 @@ struct EnergyBaseline {
 
 EnergyBaseline g_energyBaseline;
 
+struct EnergyBridge {
+    std::mutex mutex;
+    bool inFlight = false;
+    bool haveResult = false;
+    QuickSettingsCache result{};
+    HWND notifyHwnd = nullptr;
+    UINT notifyMsg = 0;
+};
+
+EnergyBridge g_energy;
+
 // Two toolhelp snapshots. The first open of Energy has no delta yet and is
 // labeled pending; the follow-up paint (about a second later) reports real
 // CPU share. Snapshot failure is an explicit stub, not a fake app list.
@@ -1023,8 +1035,26 @@ struct CaptureMeter {
     float level = 0.0F;
     ULONGLONG retryAt = 0;
     bool started = false;
+    // WASAPI drain runs on a ~25 Hz background pump so the UI thread never
+    // touches GetBuffer while meters twitch.
+    std::mutex mutex;
+    std::atomic<bool> pumpRun{false};
+    std::thread pumpThread;
+    std::atomic<float> publishedLevel{0.0F};
+    std::wstring publishedNote;
 
-    void Close() noexcept {
+    void StopPump() noexcept {
+        pumpRun.store(false, std::memory_order_release);
+        if (pumpThread.joinable()) {
+            if (pumpThread.get_id() == std::this_thread::get_id()) {
+                pumpThread.detach();
+            } else {
+                pumpThread.join();
+            }
+        }
+    }
+
+    void ReleaseResources() noexcept {
         if (client != nullptr && started) {
             client->Stop();
         }
@@ -1044,8 +1074,54 @@ struct CaptureMeter {
         deviceId.clear();
     }
 
+    void Close() noexcept {
+        StopPump();
+        std::lock_guard<std::mutex> lock(mutex);
+        ReleaseResources();
+        level = 0.0F;
+        publishedLevel.store(0.0F, std::memory_order_relaxed);
+        publishedNote.clear();
+    }
+
+    void StartPump() {
+        if (pumpRun.load(std::memory_order_acquire)) {
+            return;
+        }
+        StopPump();
+        pumpRun.store(true, std::memory_order_release);
+        pumpThread = std::thread([this] {
+            while (pumpRun.load(std::memory_order_acquire)) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (client != nullptr && capture != nullptr) {
+                        const float instant = DrainUnlocked();
+                        if (consumed) {
+                            if (instant >= level) {
+                                level = instant;
+                            } else {
+                                level = std::max(instant, level * 0.55F);
+                                if (level < 0.01F) {
+                                    level = 0.0F;
+                                }
+                            }
+                        }
+                        if (note.empty()) {
+                            publishedLevel.store(std::clamp(level, 0.0F, 1.0F), std::memory_order_relaxed);
+                            publishedNote.clear();
+                        } else {
+                            publishedLevel.store(0.0F, std::memory_order_relaxed);
+                            publishedNote = note;
+                        }
+                    }
+                }
+                Sleep(40);  // ~25 Hz
+            }
+        });
+    }
+
     bool Open(IMMDevice* device) {
-        Close();
+        // Caller holds mutex (pump stopped). Tear down without StopPump.
+        ReleaseResources();
         note.clear();
         if (device == nullptr) {
             note = L"No microphone";
@@ -1058,7 +1134,7 @@ struct CaptureMeter {
         if (FAILED(hr) || client == nullptr) {
             note = DescribeCaptureError(hr);
             retryAt = GetTickCount64() + 2000ULL;
-            Close();
+            ReleaseResources();
             return false;
         }
         WAVEFORMATEX desired{};
@@ -1076,7 +1152,7 @@ struct CaptureMeter {
             format = static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
             if (format == nullptr) {
                 note = L"Microphone unavailable";
-                Close();
+                ReleaseResources();
                 return false;
             }
             *format = desired;
@@ -1094,7 +1170,7 @@ struct CaptureMeter {
             if (FAILED(hr) || format == nullptr) {
                 note = L"Unsupported microphone";
                 retryAt = GetTickCount64() + 2000ULL;
-                Close();
+                ReleaseResources();
                 return false;
             }
             hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 2000000, 0, format, nullptr);
@@ -1115,21 +1191,21 @@ struct CaptureMeter {
         if (FAILED(hr) || client == nullptr) {
             note = DescribeCaptureError(hr);
             retryAt = GetTickCount64() + 2000ULL;
-            Close();
+            ReleaseResources();
             return false;
         }
         hr = client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&capture));
         if (FAILED(hr) || capture == nullptr) {
             note = DescribeCaptureError(hr);
             retryAt = GetTickCount64() + 2000ULL;
-            Close();
+            ReleaseResources();
             return false;
         }
         hr = client->Start();
         if (FAILED(hr)) {
             note = DescribeCaptureError(hr);
             retryAt = GetTickCount64() + 2000ULL;
-            Close();
+            ReleaseResources();
             return false;
         }
         started = true;
@@ -1141,7 +1217,7 @@ struct CaptureMeter {
 
     bool consumed = false;
 
-    float Drain() noexcept {
+    float DrainUnlocked() noexcept {
         consumed = false;
         if (capture == nullptr || format == nullptr) {
             return 0.0F;
@@ -1153,8 +1229,10 @@ struct CaptureMeter {
             if (FAILED(next)) {
                 note = L"Microphone unavailable";
                 retryAt = GetTickCount64() + 500ULL;
-                Close();
+                ReleaseResources();
                 level = 0.0F;
+                publishedLevel.store(0.0F, std::memory_order_relaxed);
+                publishedNote = note;
                 break;
             }
             if (packet == 0) {
@@ -1175,47 +1253,59 @@ struct CaptureMeter {
         return peak;
     }
 
+    float Drain() noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        return DrainUnlocked();
+    }
+
+    void ReadPublished(QuickSettingsCache& cache) {
+        cache.inputPeak = publishedLevel.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(mutex);
+        cache.inputNote = publishedNote;
+        if (!publishedNote.empty()) {
+            cache.inputPeak = 0.0F;
+        }
+    }
+
     void Sample(QuickSettingsCache& cache, IMMDevice* device) {
         const ULONGLONG now = GetTickCount64();
         const std::wstring id = device != nullptr ? DeviceId(device) : std::wstring();
         if (device == nullptr) {
             Close();
-            note = L"No microphone";
-            level = 0.0F;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                note = L"No microphone";
+                publishedNote = note;
+            }
+            publishedLevel.store(0.0F, std::memory_order_relaxed);
             cache.inputPeak = 0.0F;
-            cache.inputNote = note;
+            cache.inputNote = L"No microphone";
             return;
         }
-        if (client == nullptr || deviceId != id) {
-            if (now < retryAt && deviceId.empty() && !note.empty()) {
+        bool needOpen = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            needOpen = client == nullptr || deviceId != id;
+            if (needOpen && now < retryAt && deviceId.empty() && !note.empty()) {
                 cache.inputPeak = 0.0F;
                 cache.inputNote = note;
                 return;
             }
+        }
+        if (needOpen) {
+            StopPump();
+            std::lock_guard<std::mutex> lock(mutex);
             if (!Open(device)) {
+                publishedNote = note;
+                publishedLevel.store(0.0F, std::memory_order_relaxed);
                 cache.inputPeak = 0.0F;
                 cache.inputNote = note;
                 return;
             }
+            publishedNote.clear();
         }
-        const float instant = Drain();
-        if (client == nullptr) {
-            cache.inputPeak = 0.0F;
-            cache.inputNote = note.empty() ? L"Microphone unavailable" : note;
-            return;
-        }
-        if (consumed) {
-            if (instant >= level) {
-                level = instant;
-            } else {
-                level = std::max(instant, level * 0.55F);
-                if (level < 0.01F) {
-                    level = 0.0F;
-                }
-            }
-        }
-        cache.inputPeak = std::clamp(level, 0.0F, 1.0F);
-        cache.inputNote.clear();
+        StartPump();
+        ReadPublished(cache);
     }
 };
 
@@ -1236,6 +1326,8 @@ struct MediaBridge {
     bool have = false;
     bool playing = false;
     float progress = 0.0F;
+    ULONGLONG lastSessionQuery = 0;
+    ULONGLONG lastProgressQuery = 0;
 };
 
 MediaBridge g_media;
@@ -1395,7 +1487,7 @@ void PublishMedia(QuickSettingsCache& cache) {
     cache.mediaProgress = g_media.progress;
 }
 
-void QueryMedia(QuickSettingsCache& cache) {
+void QueryMediaSession() {
     EnsureMediaManager();
     MediaManager manager{nullptr};
     {
@@ -1403,7 +1495,6 @@ void QueryMedia(QuickSettingsCache& cache) {
         manager = g_media.manager;
     }
     if (!manager) {
-        PublishMedia(cache);
         return;
     }
     try {
@@ -1425,13 +1516,11 @@ void QueryMedia(QuickSettingsCache& cache) {
             } catch (const winrt::hresult_error&) {
                 source.clear();
             }
-            const float progress = ReadMediaProgress(session);
             {
                 std::lock_guard<std::mutex> lock(g_media.mutex);
                 g_media.session = session;
                 g_media.playing = playing;
                 g_media.have = true;
-                g_media.progress = progress;
                 if (g_media.title.empty() && !source.empty()) {
                     g_media.artist = source;
                 }
@@ -1439,6 +1528,45 @@ void QueryMedia(QuickSettingsCache& cache) {
             RequestMediaProperties(session);
         }
     } catch (const winrt::hresult_error&) {
+    }
+}
+
+void QueryMediaProgress() {
+    MediaSession session{nullptr};
+    {
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        session = g_media.session;
+    }
+    if (!session) {
+        return;
+    }
+    const float progress = ReadMediaProgress(session);
+    std::lock_guard<std::mutex> lock(g_media.mutex);
+    g_media.progress = progress;
+}
+
+void QueryMedia(QuickSettingsCache& cache, bool forceSession = false, bool forceProgress = false) {
+    const ULONGLONG now = GetTickCount64();
+    bool doSession = forceSession;
+    bool doProgress = forceProgress;
+    {
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        if (!doSession && (g_media.lastSessionQuery == 0 || now - g_media.lastSessionQuery >= 1000ULL)) {
+            doSession = true;
+        }
+        if (!doProgress && (g_media.lastProgressQuery == 0 || now - g_media.lastProgressQuery >= 200ULL)) {
+            doProgress = true;
+        }
+    }
+    if (doSession) {
+        QueryMediaSession();
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        g_media.lastSessionQuery = now;
+    }
+    if (doProgress) {
+        QueryMediaProgress();
+        std::lock_guard<std::mutex> lock(g_media.mutex);
+        g_media.lastProgressQuery = now;
     }
     PublishMedia(cache);
 }
@@ -1875,12 +2003,72 @@ void SeekQuickSettingsMedia(float level) noexcept {
 
 void StopQuickSettingsCapture() noexcept {
     g_captureMeter.Close();
-    g_captureMeter.note.clear();
-    g_captureMeter.level = 0.0F;
     g_captureMeter.retryAt = 0;
 }
 
-bool RefreshQuickSettingsLive(QuickSettingsCache& cache) {
+void RequestEnergyAppsAsync(HWND notifyHwnd, UINT notifyMsg) {
+    if (notifyHwnd == nullptr || notifyMsg == 0) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_energy.mutex);
+        g_energy.notifyHwnd = notifyHwnd;
+        g_energy.notifyMsg = notifyMsg;
+        if (g_energy.inFlight) {
+            return;
+        }
+        g_energy.inFlight = true;
+    }
+    std::thread([] {
+        QuickSettingsCache local{};
+        QueryEnergyApps(local);
+        HWND hwnd = nullptr;
+        UINT msg = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_energy.mutex);
+            g_energy.result.energyApps = std::move(local.energyApps);
+            g_energy.result.energyLive = local.energyLive;
+            g_energy.result.energyPending = local.energyPending;
+            g_energy.result.energyNote = std::move(local.energyNote);
+            g_energy.haveResult = true;
+            g_energy.inFlight = false;
+            hwnd = g_energy.notifyHwnd;
+            msg = g_energy.notifyMsg;
+        }
+        if (hwnd != nullptr && msg != 0) {
+            PostMessageW(hwnd, msg, 0, 0);
+        }
+    }).detach();
+}
+
+bool ApplyEnergyAppsResult(QuickSettingsCache& cache) {
+    std::lock_guard<std::mutex> lock(g_energy.mutex);
+    if (!g_energy.haveResult) {
+        return false;
+    }
+    g_energy.haveResult = false;
+    bool changed = cache.energyLive != g_energy.result.energyLive ||
+        cache.energyPending != g_energy.result.energyPending ||
+        cache.energyNote != g_energy.result.energyNote ||
+        cache.energyApps.size() != g_energy.result.energyApps.size();
+    if (!changed) {
+        for (size_t i = 0; i < cache.energyApps.size(); ++i) {
+            if (cache.energyApps[i].name != g_energy.result.energyApps[i].name ||
+                cache.energyApps[i].cpuPercent != g_energy.result.energyApps[i].cpuPercent) {
+                changed = true;
+                break;
+            }
+        }
+    }
+    cache.energyApps = g_energy.result.energyApps;
+    cache.energyLive = g_energy.result.energyLive;
+    cache.energyPending = g_energy.result.energyPending;
+    cache.energyNote = g_energy.result.energyNote;
+    return changed;
+}
+
+
+QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
     const int beforeBucket = MeterBucket(cache.inputPeak);
     const std::wstring beforeTitle = cache.mediaTitle;
     const std::wstring beforeArtist = cache.mediaArtist;
@@ -1888,25 +2076,15 @@ bool RefreshQuickSettingsLive(QuickSettingsCache& cache) {
     const bool beforePlaying = cache.mediaPlaying;
     const int beforeProgress = static_cast<int>(std::lround(cache.mediaProgress * 48.0F));
     const std::wstring beforeNote = cache.inputNote;
-    if (g_captureMeter.client != nullptr && g_captureMeter.capture != nullptr) {
-        const float instant = g_captureMeter.Drain();
-        if (g_captureMeter.consumed) {
-            if (instant >= g_captureMeter.level) {
-                g_captureMeter.level = instant;
-            } else {
-                g_captureMeter.level = std::max(instant, g_captureMeter.level * 0.55F);
-                if (g_captureMeter.level < 0.01F) {
-                    g_captureMeter.level = 0.0F;
-                }
-            }
-        }
-        cache.inputPeak = std::clamp(g_captureMeter.level, 0.0F, 1.0F);
-        if (g_captureMeter.note.empty()) {
-            cache.inputNote.clear();
-        } else {
-            cache.inputNote = g_captureMeter.note;
-            cache.inputPeak = 0.0F;
-        }
+
+    // Mic peak comes from the ~25 Hz background pump; UI only publishes it.
+    bool pumpAlive = false;
+    {
+        std::lock_guard<std::mutex> lock(g_captureMeter.mutex);
+        pumpAlive = g_captureMeter.client != nullptr && g_captureMeter.capture != nullptr;
+    }
+    if (pumpAlive) {
+        g_captureMeter.ReadPublished(cache);
     } else if (GetTickCount64() >= g_captureMeter.retryAt) {
         const bool opened = WithEndpoint(eCapture, [&](IMMDevice* device) {
             if (cache.inputName.empty()) {
@@ -1920,46 +2098,71 @@ bool RefreshQuickSettingsLive(QuickSettingsCache& cache) {
             cache.inputNote = L"No microphone";
         }
     } else {
-        cache.inputPeak = 0.0F;
-        cache.inputNote = g_captureMeter.note.empty() ? cache.inputNote : g_captureMeter.note;
+        g_captureMeter.ReadPublished(cache);
+        if (cache.inputNote.empty() && !pumpAlive) {
+            cache.inputPeak = 0.0F;
+        }
     }
-    QueryMedia(cache);
-    return MeterBucket(cache.inputPeak) != beforeBucket || cache.mediaTitle != beforeTitle ||
-        cache.mediaArtist != beforeArtist || cache.mediaHave != beforeHave ||
-        cache.mediaPlaying != beforePlaying ||
-        static_cast<int>(std::lround(cache.mediaProgress * 48.0F)) != beforeProgress ||
+
+    // GSMTC: session ~1 Hz, scrub/progress ~5 Hz.
+    QueryMedia(cache, false, false);
+
+    const bool labels = cache.mediaTitle != beforeTitle || cache.mediaArtist != beforeArtist ||
+        cache.mediaHave != beforeHave || cache.mediaPlaying != beforePlaying ||
         cache.inputNote != beforeNote;
+    const bool meters = MeterBucket(cache.inputPeak) != beforeBucket ||
+        static_cast<int>(std::lround(cache.mediaProgress * 48.0F)) != beforeProgress;
+    if (labels) {
+        return QsLiveChange::Labels;
+    }
+    if (meters) {
+        return QsLiveChange::MetersOnly;
+    }
+    return QsLiveChange::None;
 }
 
 void DockApp::RefreshQuickSettingsCache() {
     const ULONGLONG now = GetTickCount64();
-    if (m_qsCache.stamp != 0 && now - m_qsCache.stamp < 800ULL) {
-        return;
+    // Network / adapters / endpoints / power / HDR / nearby: ~2.5 s.
+    if (m_qsCache.stampNetwork == 0 || now - m_qsCache.stampNetwork >= 2500ULL) {
+        QueryWifiRadio(m_qsCache);
+        if (m_qsPage == QuickSettingsPage::Wifi) {
+            QueryWifiNetworks(m_qsCache);
+        } else if (m_qsPage != QuickSettingsPage::Wifi) {
+            m_qsCache.wifi.clear();
+        }
+        QueryAdapters(m_qsCache);
+        CollectEndpoints(eRender, m_qsCache.renderDevices, m_qsCache.renderDefaultId, m_qsCache.outputName);
+        CollectEndpoints(eCapture, m_qsCache.captureDevices, m_qsCache.captureDefaultId, m_qsCache.inputName);
+        QueryCapture(m_qsCache);
+        QueryPower(m_qsCache);
+        QueryHdr(m_qsCache);
+        QueryNearby(m_qsCache);
+        m_qsCache.stampNetwork = now;
     }
-    QueryWifiRadio(m_qsCache);
-    if (m_qsPage == QuickSettingsPage::Wifi) {
-        QueryWifiNetworks(m_qsCache);
-    } else if (m_qsPage != QuickSettingsPage::Wifi) {
-        m_qsCache.wifi.clear();
+    // Night Light CloudStore: ~8 s.
+    if (m_qsCache.stampNight == 0 || now - m_qsCache.stampNight >= 8000ULL) {
+        QueryNightLight(m_qsCache);
+        m_qsCache.stampNight = now;
     }
-    QueryAdapters(m_qsCache);
-    CollectEndpoints(eRender, m_qsCache.renderDevices, m_qsCache.renderDefaultId, m_qsCache.outputName);
-    CollectEndpoints(eCapture, m_qsCache.captureDevices, m_qsCache.captureDefaultId, m_qsCache.inputName);
-    QueryCapture(m_qsCache);
-    QueryPower(m_qsCache);
     if (m_qsPage == QuickSettingsPage::Power) {
-        QueryEnergyApps(m_qsCache);
+        if (!m_qsCache.energyLive && !m_qsCache.energyPending) {
+            m_qsCache.energyPending = true;
+            m_qsCache.energyNote = L"Measuring energy use…";
+        }
+        // ToolHelp runs on the energy worker (~2 s), never on this thread.
+        if (m_overflowWindow != nullptr) {
+            RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
+        }
     } else {
         m_qsCache.energyApps.clear();
         m_qsCache.energyLive = false;
         m_qsCache.energyPending = false;
         m_qsCache.energyNote.clear();
     }
-    QueryHdr(m_qsCache);
-    QueryNightLight(m_qsCache);
-    QueryMedia(m_qsCache);
-    QueryNearby(m_qsCache);
-    m_qsCache.stamp = GetTickCount64();
+    // Keep media labels fresh without forcing a session pick every paint.
+    QueryMedia(m_qsCache, false, false);
+    m_qsCache.stamp = now;
 }
 
 void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
@@ -1972,6 +2175,8 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
     m_qsCache.stamp = 0;
+    m_qsCache.stampNetwork = 0;
+    m_qsCache.stampNight = 0;
     InvalidateOverflowGlass();
     PaintOverflowPopup();
 }
@@ -2070,13 +2275,100 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
     for (TrayFlyoutHit& hit : m_overflowHits) {
         OffsetRect(&hit.bounds, shadowMargin, shadowMargin);
     }
+    if (m_qsMeterValid) {
+        OffsetRect(&m_qsMeterRect, shadowMargin, shadowMargin);
+    }
+    if (m_qsScrubValid) {
+        OffsetRect(&m_qsScrubRect, shadowMargin, shadowMargin);
+    }
     m_overflowGearX += static_cast<int>(shadowMargin);
     m_overflowGearY += static_cast<int>(shadowMargin);
+}
+
+void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale) const {
+    if (pixels == nullptr || width <= 0 || height <= 0) {
+        return;
+    }
+    const bool light = m_config.LightPanels();
+    const uint8_t inkR = light ? kInkDarkR : kInkLightR;
+    const uint8_t inkG = light ? kInkDarkG : kInkLightG;
+    const uint8_t inkB = light ? kInkDarkB : kInkLightB;
+    if (m_qsMeterValid) {
+        const RECT& meter = m_qsMeterRect;
+        if (m_qsPage == QuickSettingsPage::Microphone) {
+            const int segments = 16;
+            const int lit = m_qsCache.inputMuted
+                ? 0
+                : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) *
+                      static_cast<float>(segments)));
+            const LONG segGap = 3;
+            const LONG segW =
+                std::max(3L, (meter.right - meter.left - 24 - segGap * (segments - 1)) / segments);
+            for (int index = 0; index < segments; ++index) {
+                const LONG left = meter.left + 12 + index * (segW + segGap);
+                const RECT seg{left, meter.top + 8, left + segW, meter.bottom - 8};
+                FillSquircleColorPremul(pixels, width, height, seg, 2.0F, index < lit ? 0.95F : 0.25F,
+                    index < lit ? kBlueB : inkB, index < lit ? kBlueG : inkG, index < lit ? kBlueR : inkR);
+            }
+        } else {
+            constexpr int segments = 12;
+            const int lit = m_qsCache.inputMuted
+                ? 0
+                : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) *
+                      static_cast<float>(segments)));
+            const LONG barH = std::max(1L, meter.bottom - meter.top);
+            const LONG segGap = std::max(2L, std::lround(3.0F * scale));
+            const LONG segW = std::max(4L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
+            const float segRadius = static_cast<float>(barH) * 0.5F;
+            for (int index = 0; index < segments; ++index) {
+                const LONG left = meter.left + index * (segW + segGap);
+                const float cxL = static_cast<float>(left) + segRadius;
+                const float cxR = static_cast<float>(left + segW) - segRadius;
+                const float cy = 0.5F * static_cast<float>(meter.top + meter.bottom);
+                if (index < lit) {
+                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
+                        1.0F, kBlueB, kBlueG, kBlueR, kBlueB, kBlueG, kBlueR);
+                } else {
+                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
+                        1.0F, 198, 198, 202, 188, 188, 192);
+                }
+            }
+        }
+    }
+    if (m_qsScrubValid && m_qsPage == QuickSettingsPage::Home) {
+        const RECT& track = m_qsScrubRect;
+        const float level = m_qsCache.mediaHave ? std::clamp(m_qsCache.mediaProgress, 0.0F, 1.0F) : 0.0F;
+        const float radius = std::max(4.0F, static_cast<float>(track.bottom - track.top) * 0.5F);
+        const float cy = 0.5F * static_cast<float>(track.top + track.bottom);
+        const float left = static_cast<float>(track.left) + radius;
+        const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
+        const float fill = left + (right - left) * level;
+        const float shadeY = cy + std::max(1.5F, 2.0F * scale);
+        FillHGradientPill(pixels, width, height, left, right, shadeY, radius, light ? 0.16F : 0.22F,
+            180, 170, 190, 170, 160, 184);
+        FillHGradientPill(pixels, width, height, left, right, cy, radius, light ? 0.40F : 0.34F,
+            228, 220, 236, 210, 204, 226);
+        if (level > 0.01F) {
+            FillHGradientPill(pixels, width, height, left, std::max(left + radius, fill), cy, radius,
+                1.0F, 250, 140, 64, 245, 90, 176);
+        }
+        const float thumb = radius + std::max(3.5F, 5.0F * scale);
+        FillSoftDisc(pixels, width, height, fill, cy, thumb + std::max(4.0F, 5.5F * scale), 0.55F,
+            255, 150, 210);
+        FillSoftDisc(pixels, width, height, fill, cy, thumb, 1.0F, 245, 120, 210);
+        FillSoftDisc(pixels, width, height, fill, cy, thumb * 0.62F, 1.0F, 255, 236, 252);
+    }
 }
 
 void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int height, HDC memory,
     float scale, LONG padding, LONG gearSize, LONG headerHeight, HFONT titleFont, HFONT sectionFont,
     HFONT labelFont, HFONT statusFont, LONG& panelWidth, LONG& contentBottom) {
+    if (draw) {
+        m_qsMeterValid = false;
+        m_qsScrubValid = false;
+        m_qsMeterRect = {};
+        m_qsScrubRect = {};
+    }
     const bool home = m_qsPage == QuickSettingsPage::Home;
     panelWidth = std::max(320L, std::lround((home ? 600.0F : 380.0F) * scale));
     const LONG gap = std::max(8L, std::lround(10.0F * scale));
@@ -2451,10 +2743,13 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         const LONG barH = std::max(6L, std::lround(8.0F * scale));
         const RECT meter{mic.left + inset, mic.bottom - inset - barH, mic.right - inset, mic.bottom - inset};
         if (draw) {
+            m_qsMeterRect = meter;
+            m_qsMeterValid = true;
             constexpr int segments = 12;
-            const int lit = m_qsCache.inputMuted
+            const float peak = m_qsPaintUnderlayPass ? 0.0F : m_qsCache.inputPeak;
+            const int lit = m_qsCache.inputMuted || m_qsPaintUnderlayPass
                 ? 0
-                : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) *
+                : static_cast<int>(std::lround(std::pow(std::clamp(peak, 0.0F, 1.0F), 0.45F) *
                       static_cast<float>(segments)));
             const LONG segGap = std::max(2L, std::lround(3.0F * scale));
             const LONG segW = std::max(4L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
@@ -2563,7 +2858,12 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         icon(next.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
             next.top + (transport - static_cast<LONG>(transportIcon)) / 2L, L'\uE893', transportIcon, inkR, inkG,
             inkB);
-        gradientSlider(scrub, m_qsCache.mediaHave ? m_qsCache.mediaProgress : 0.0F, true);
+        if (draw) {
+            m_qsScrubRect = scrub;
+            m_qsScrubValid = true;
+        }
+        const float scrubLevel = (!m_qsPaintUnderlayPass && m_qsCache.mediaHave) ? m_qsCache.mediaProgress : 0.0F;
+        gradientSlider(scrub, scrubLevel, true);
         y += homeMediaH + padding;
         contentBottom = y;
         return;
@@ -2711,10 +3011,13 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             text(level, statusFont, m_qsCache.inputNote, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                 220);
         } else if (draw) {
+            m_qsMeterRect = level;
+            m_qsMeterValid = true;
             const int segments = 16;
-            const int lit = m_qsCache.inputMuted
+            const float peak = m_qsPaintUnderlayPass ? 0.0F : m_qsCache.inputPeak;
+            const int lit = m_qsCache.inputMuted || m_qsPaintUnderlayPass
                 ? 0
-                : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) * static_cast<float>(segments)));
+                : static_cast<int>(std::lround(std::pow(std::clamp(peak, 0.0F, 1.0F), 0.45F) * static_cast<float>(segments)));
             const LONG segGap = 3;
             const LONG segW =
                 std::max(3L, (level.right - level.left - 24 - segGap * (segments - 1)) / segments);

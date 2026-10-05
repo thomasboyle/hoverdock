@@ -52,6 +52,9 @@ struct QsEnergyApp {
 // cached for a short interval so slider drags do not redo WLAN/COM work.
 struct QuickSettingsCache {
     ULONGLONG stamp = 0;
+    // Independent TTLs so heavy queries are not all tied to the 800 ms stamp.
+    ULONGLONG stampNetwork = 0;  // wifi / adapters / endpoints / power / HDR / nearby
+    ULONGLONG stampNight = 0;    // Night Light CloudStore
     bool wifiRadioOn = true;
     bool haveWifiInterface = false;
     GUID wifiInterface{};
@@ -97,10 +100,21 @@ struct QuickSettingsCache {
 };
 
 // Release the Quick Settings capture client so the microphone-in-use indicator
-// drops when the panel closes.
+// drops when the panel closes. Also stops the background peak pump.
 void StopQuickSettingsCapture() noexcept;
-// Sample the live input meter and the system media session. True when the
-// panel should repaint (meter bucket or now-playing text changed).
-bool RefreshQuickSettingsLive(QuickSettingsCache& cache);
+// Live-meter / media poll result. MetersOnly = peak or scrub moved (partial
+// present). Labels = title/artist/note/playing changed (full rebuild).
+enum class QsLiveChange : uint8_t {
+    None = 0,
+    MetersOnly = 1,
+    Labels = 2,
+};
+// Read the background mic peak and rate-limited GSMTC state into cache.
+QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache);
 // Seek the current GSMTC session. level is 0..1 across its timeline.
 void SeekQuickSettingsMedia(float level) noexcept;
+// Kick a ToolHelp energy sample on a worker (~2 s cadence). Posts notifyMsg to
+// notifyHwnd when a fresh result is ready; never blocks the UI thread.
+void RequestEnergyAppsAsync(HWND notifyHwnd, UINT notifyMsg);
+// Copy the latest worker energy snapshot into cache. True when values changed.
+bool ApplyEnergyAppsResult(QuickSettingsCache& cache);

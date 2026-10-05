@@ -181,6 +181,7 @@ private:
     static constexpr UINT kTrashRefreshMessage = WM_APP + 20;
     static constexpr UINT kTrashDropMessage = WM_APP + 21;
     static constexpr UINT kOverflowDismissMessage = WM_APP + 24;
+    static constexpr UINT kQsEnergyResultMessage = WM_APP + 25;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -410,6 +411,9 @@ private:
     void PresentOverflowLayer() noexcept;
     void QueueOverflowPaint(bool hoverOnly = false);
     void PaintOverflowHoverFast();
+    // Meter/scrub-only present from underlay via UpdateLayeredWindowIndirect.
+    void PaintOverflowLiveFast();
+    void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale) const;
     void ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
         const TrayFlyoutHit& hit) const;
     void DestroyOverflowPopup() noexcept;
@@ -880,7 +884,16 @@ private:
     SIZE m_overflowSize{};
     LONG m_overflowCaretX = 0;
     std::vector<uint8_t> m_overflowBaseBits;
+    // Static plate without live meter/scrub values; live present restores from here.
+    std::vector<uint8_t> m_overflowUnderlayBits;
     std::vector<uint8_t> m_overflowPresentBits;
+    RECT m_qsMeterRect{};
+    RECT m_qsScrubRect{};
+    bool m_qsMeterValid = false;
+    bool m_qsScrubValid = false;
+    // When true, LayoutQuickSettings paints meter/scrub tracks at empty levels and
+    // records their rects for PaintOverflowLiveFast.
+    bool m_qsPaintUnderlayPass = false;
     LayerPresentDib m_overflowLayerDib{};
     ULONGLONG m_lastOverflowHoverPresentMs = 0;
     RECT m_overflowHoverDirty{};
