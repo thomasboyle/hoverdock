@@ -3463,9 +3463,15 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                     subtitle = L"Click to open";
                 }
                 if (draw) {
-                    BlitIcon(pixels, width, height, memory, m_overflowIcons[index].icon,
-                        static_cast<int>(row.left + 12),
-                        static_cast<int>(row.top + (listRow - 18) / 2L), 18);
+                    const LONG iconLeft = row.left + 12;
+                    const LONG iconTop = row.top + (listRow - 18) / 2L;
+                    if (m_overflowIcons[index].icon != nullptr) {
+                        BlitIcon(pixels, width, height, memory, m_overflowIcons[index].icon,
+                            static_cast<int>(iconLeft), static_cast<int>(iconTop), 18);
+                    } else {
+                        // No grey placeholder plate — use a Fluent app glyph instead.
+                        icon(iconLeft, iconTop, static_cast<wchar_t>(0xE8A5), 18, inkR, inkG, inkB);
+                    }
                 }
                 text({row.left + 40, row.top + 6, row.right - 16, row.top + 28}, labelFont, title,
                     DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);

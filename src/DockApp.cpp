@@ -1496,12 +1496,6 @@ std::wstring NotifyIconStatus(const TrayNotifyIcon& icon) {
     return status;
 }
 
-RECT TrayIconPlate(RECT cell, float scale) {
-    const LONG plate = std::max(28L, std::lround(32.0F * scale));
-    const LONG left = cell.left + ((cell.right - cell.left) - plate) / 2L;
-    return {left, cell.top, left + plate, cell.top + plate};
-}
-
 HWND FindNamedCoreWindow(const wchar_t* title) {
     HWND window = FindWindowW(L"Windows.UI.Core.CoreWindow", title);
     if (window != nullptr) {
@@ -7738,7 +7732,11 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::NotifyIcon:
         if (hit.index >= 0 && static_cast<size_t>(hit.index) < m_overflowIcons.size()) {
             SystemTray::InvokeNotifyIcon(m_overflowIcons[static_cast<size_t>(hit.index)], message);
-            CloseOverflowPopup();
+            // Right-click opens the tray icon's context menu; keep Quick Settings
+            // open so the menu is usable. Left-click still dismisses after invoke.
+            if (message != WM_RBUTTONUP) {
+                CloseOverflowPopup();
+            }
         }
         break;
     }
@@ -7859,9 +7857,11 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         break;
     }
     case TrayFlyoutHitKind::NotifyIcon: {
+        // Full-row highlight like other list pages. A centered icon plate on a
+        // wide row looked like a grey placeholder square over the app name.
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
-        const RECT plate = TrayIconPlate(hit.bounds, scale);
-        FillSquirclePremul(pixels, width, height, plate, ContentSquircleRadius(plate, scale), 0.16F);
+        FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
+            0.10F);
         break;
     }
     case TrayFlyoutHitKind::Wifi:

@@ -12,6 +12,7 @@
 #include <UIAutomation.h>
 #include <oleauto.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <tlhelp32.h>
 #include <wlanapi.h>
 
@@ -1410,6 +1411,71 @@ HICON ExtractExeIcon(const std::wstring& exePath, int size) {
     if (ExtractIconExW(exePath.c_str(), 0, &largeIcon, nullptr, 1) > 0 && largeIcon != nullptr) {
         return largeIcon;
     }
+    SHFILEINFOW info{};
+    const UINT flags = size >= 48 ? (SHGFI_ICON | SHGFI_LARGEICON) : (SHGFI_ICON | SHGFI_SMALLICON);
+    if (SHGetFileInfoW(exePath.c_str(), 0, &info, sizeof(info), flags) != 0 &&
+        info.hIcon != nullptr) {
+        return info.hIcon;
+    }
+    return nullptr;
+}
+
+std::wstring SystemDirectoryFile(const wchar_t* fileName) {
+    wchar_t directory[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(directory, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH || fileName == nullptr || fileName[0] == 0) {
+        return {};
+    }
+    std::wstring path(directory, length);
+    if (!path.empty() && path.back() != L'\\') {
+        path.push_back(L'\\');
+    }
+    path += fileName;
+    return path;
+}
+
+// Shell button tips for icons hosted by explorer/system DLLs (explorer itself is
+// ignored by AssignShellIcons). Map common tip fragments to a file that carries
+// the real glyph so the System Tray list never shows an empty slot.
+HICON IconForKnownTrayTip(const std::wstring& tipLower, int size) {
+    struct KnownTip {
+        const wchar_t* needle;
+        const wchar_t* file;
+    };
+    static constexpr KnownTip kKnown[] = {
+        {L"bluetooth", L"bthprops.cpl"},
+        {L"safely remove", L"hotplug.dll"},
+        {L"hardware and eject", L"hotplug.dll"},
+        {L"windows security", L"SecurityHealthSystray.exe"},
+        {L"virus & threat", L"SecurityHealthSystray.exe"},
+        {L"network", L"ncpa.cpl"},
+        {L"volume", L"mmsys.cpl"},
+        {L"sound", L"mmsys.cpl"},
+        {L"action center", L"ActionCenter.dll"},
+        {L"location", L"locctrl.dll"},
+        {L"touch keyboard", L"tabtip.exe"},
+        {L"ink workspace", L"ShellExperienceHost.exe"},
+    };
+    for (const KnownTip& known : kKnown) {
+        if (tipLower.find(known.needle) == std::wstring::npos) {
+            continue;
+        }
+        if (HICON icon = ExtractExeIcon(SystemDirectoryFile(known.file), size)) {
+            return icon;
+        }
+    }
+    // Security Health usually lives under Program Files, not System32.
+    if (tipLower.find(L"windows security") != std::wstring::npos ||
+        tipLower.find(L"virus") != std::wstring::npos) {
+        wchar_t programFiles[MAX_PATH]{};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, 0, programFiles))) {
+            std::wstring path = programFiles;
+            path += L"\\Windows Defender\\SecurityHealthSystray.exe";
+            if (HICON icon = ExtractExeIcon(path, size)) {
+                return icon;
+            }
+        }
+    }
     return nullptr;
 }
 
@@ -1755,13 +1821,15 @@ void AssignShellIcons(std::vector<TrayNotifyIcon>& icons) {
                 best = &candidate;
             }
         }
-        if (best == nullptr || bestScore < 5) {
-            continue;
+        if (best != nullptr && bestScore >= 5) {
+            icon.executablePath = best->path;
+            icon.exeName = FileStem(best->path);
+            icon.window = best->window;
+            icon.icon = ExtractExeIcon(best->path, 64);
         }
-        icon.executablePath = best->path;
-        icon.exeName = FileStem(best->path);
-        icon.window = best->window;
-        icon.icon = ExtractExeIcon(best->path, 64);
+        if (icon.icon == nullptr) {
+            icon.icon = IconForKnownTrayTip(display, 64);
+        }
     }
 }
 
@@ -2234,8 +2302,10 @@ bool SystemTray::InvokeNotifyIcon(const TrayNotifyIcon& icon, UINT mouseMessage)
         PostMessageW(icon.window, kQtTrayMessage, iconId, up);
     }
     if (rightClick) {
+        POINT cursor{};
+        GetCursorPos(&cursor);
         PostMessageW(icon.window, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(icon.window),
-            MAKELPARAM(-1, -1));
+            MAKELPARAM(cursor.x, cursor.y));
     }
     return true;
 }
