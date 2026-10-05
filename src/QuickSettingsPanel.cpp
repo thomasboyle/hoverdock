@@ -1934,8 +1934,23 @@ void FillThermometerPremul(uint8_t* dest, int destWidth, int destHeight, float c
     CompositePremul(dest, destWidth, destHeight, left, y0, glyph.data(), boxW, boxH);
 }
 
-std::wstring TempText(int celsius) {
-    return celsius < 0 ? std::wstring(L"\u2014") : std::to_wstring(celsius) + L"\u00B0C";
+std::wstring TempPowerText(int celsius, int watts) {
+    if (celsius < 0 && watts < 0) {
+        return std::wstring(L"\u2014");
+    }
+    std::wstring out;
+    if (celsius >= 0) {
+        out += std::to_wstring(celsius);
+        out += L"\u00B0C";
+    }
+    if (watts >= 0) {
+        if (!out.empty()) {
+            out += L" \u00B7 ";
+        }
+        out += std::to_wstring(watts);
+        out += L"W";
+    }
+    return out;
 }
 
 }  // namespace
@@ -2090,13 +2105,20 @@ bool ApplyQuickSettingsTemps(QuickSettingsCache& cache) {
     SystemTempsReading reading;
     int cpu = -1;
     int gpu = -1;
+    int cpuW = -1;
+    int gpuW = -1;
     if (LatestSystemTemps(reading) && GetTickCount64() - reading.stamp <= kStaleMs) {
         cpu = reading.cpuC;
         gpu = reading.gpuC;
+        cpuW = reading.cpuW;
+        gpuW = reading.gpuW;
     }
-    const bool changed = cpu != cache.cpuTempC || gpu != cache.gpuTempC;
+    const bool changed = cpu != cache.cpuTempC || gpu != cache.gpuTempC ||
+        cpuW != cache.cpuWatts || gpuW != cache.gpuWatts;
     cache.cpuTempC = cpu;
     cache.gpuTempC = gpu;
+    cache.cpuWatts = cpuW;
+    cache.gpuWatts = gpuW;
     return changed;
 }
 
@@ -2412,9 +2434,9 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
         SetFlyoutChromeInk(m_qsTempsInkR, m_qsTempsInkG, m_qsTempsInkB);
         constexpr UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE;
         DrawFlyoutText(pixels, width, height, m_qsTempCpuRect, m_overflowLabelFont,
-            TempText(m_qsCache.cpuTempC), format, 255);
+            TempPowerText(m_qsCache.cpuTempC, m_qsCache.cpuWatts), format, 255);
         DrawFlyoutText(pixels, width, height, m_qsTempGpuRect, m_overflowLabelFont,
-            TempText(m_qsCache.gpuTempC), format, 255);
+            TempPowerText(m_qsCache.gpuTempC, m_qsCache.gpuWatts), format, 255);
         SetFlyoutChromeInk(savedR, savedG, savedB);
     }
 }
@@ -2865,8 +2887,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             TrayFlyoutHitKind::Power);
         x += cell + homeGap;
         {
-            // Temperatures: thermometer, then CPU / GPU label-over-value
-            // columns. Read-only, so no hit target, hover, or chevron.
+            // Temperatures + watts: thermometer, then CPU / GPU label-over-value
+            // columns (e.g. 48C + W). Read-only, no hit/hover/chevron.
             const RECT temps{x, y, panelWidth - padding, y + homeSmallH};
             homeCard(temps);
             const float glyphH = static_cast<float>(tileIcon) * 1.3F;
@@ -2900,8 +2922,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             // Values are a live overlay (see PaintQsLiveOverlays); only an
             // overlay-less paint draws them into the plate.
             if (!m_qsPaintUnderlayPass) {
-                text(cpuValue, labelFont, TempText(m_qsCache.cpuTempC), format, 255);
-                text(gpuValue, labelFont, TempText(m_qsCache.gpuTempC), format, 255);
+                text(cpuValue, labelFont, TempPowerText(m_qsCache.cpuTempC, m_qsCache.cpuWatts), format, 255);
+                text(gpuValue, labelFont, TempPowerText(m_qsCache.gpuTempC, m_qsCache.gpuWatts), format, 255);
             }
         }
         y += homeSmallH + homeGap;

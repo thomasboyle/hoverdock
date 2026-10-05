@@ -38,8 +38,12 @@ constexpr int kAcpiPlaceholderDeciKelvin = 3010;
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 
-bool Plausible(double celsius) noexcept {
+bool PlausibleTemp(double celsius) noexcept {
     return std::isfinite(celsius) && celsius >= 5.0 && celsius <= 125.0;
+}
+
+bool PlausibleWatts(double watts) noexcept {
+    return std::isfinite(watts) && watts >= 0.5 && watts <= 600.0;
 }
 
 std::wstring Lower(std::wstring text) {
@@ -141,16 +145,18 @@ double NumberProp(IWbemClassObject* row, const wchar_t* name) {
 }
 
 // --- LibreHardwareMonitor / OpenHardwareMonitor WMI ------------------------
-// Both publish a Sensor class while running (LHM needs admin for CPU MSRs).
-// These read the real package/die sensors, so they win for the CPU.
+// Both publish Sensor while running. LHM needs its kernel driver (WinRing0 /
+// similar) for Intel package/die MSR and RAPL; that driver is installed once
+// by LHM itself (often with a single admin elevation). Dock only reads the
+// WMI namespace — it never loads WinRing0 or asks for admin at dock launch.
 struct HwmonSource {
     ComPtr<IWbemServices> services;
     std::wstring name;
     ULONGLONG retryAt = 0;
 
-    static int CpuScore(const std::wstring& label) {
+    static int CpuTempScore(const std::wstring& label) {
         if (Has(label, L"distance")) {
-            return 0;  // "Distance to TjMax" is a Temperature-typed delta, not a reading
+            return 0;  // "Distance to TjMax" is a Temperature-typed delta
         }
         if (label == L"cpu package" || label == L"core (tctl/tdie)" || label == L"core (tdie)") {
             return 4;
@@ -164,7 +170,7 @@ struct HwmonSource {
         return Has(label, L"core") || Has(label, L"ccd") ? 1 : 0;
     }
 
-    static int GpuScore(const std::wstring& label) {
+    static int GpuTempScore(const std::wstring& label) {
         if (label == L"gpu core") {
             return 3;
         }
@@ -174,9 +180,37 @@ struct HwmonSource {
         return 1;
     }
 
-    void Poll(ULONGLONG now, double& cpu, double& gpu) {
-        cpu = kNaN;
-        gpu = kNaN;
+    static int CpuPowerScore(const std::wstring& label) {
+        if (label == L"cpu package" || label == L"package") {
+            return 4;
+        }
+        if (Has(label, L"package")) {
+            return 3;
+        }
+        if (label == L"cpu cores" || Has(label, L"cores power")) {
+            return 1;
+        }
+        return 0;
+    }
+
+    static int GpuPowerScore(const std::wstring& label) {
+        if (label == L"gpu package" || label == L"gpu power" || label == L"power") {
+            return 3;
+        }
+        if (Has(label, L"board") || Has(label, L"total")) {
+            return 4;
+        }
+        if (Has(label, L"gpu")) {
+            return 2;
+        }
+        return 0;
+    }
+
+    void Poll(ULONGLONG now, double& cpuTemp, double& gpuTemp, double& cpuPower, double& gpuPower) {
+        cpuTemp = kNaN;
+        gpuTemp = kNaN;
+        cpuPower = kNaN;
+        gpuPower = kNaN;
         if (!services) {
             if (now < retryAt) {
                 return;
@@ -193,40 +227,68 @@ struct HwmonSource {
                 return;
             }
         }
-        int cpuBest = 0;
-        int gpuBest = 0;
+        int cpuTempBest = 0;
+        int gpuTempBest = 0;
+        int cpuPowerBest = 0;
+        int gpuPowerBest = 0;
         const HRESULT hr = ForEachRow(services.Get(),
-            L"SELECT Identifier, Name, Value FROM Sensor WHERE SensorType = 'Temperature'",
+            L"SELECT Identifier, Name, Value, SensorType FROM Sensor "
+            L"WHERE SensorType = 'Temperature' OR SensorType = 'Power'",
             [&](IWbemClassObject* row) {
                 const double value = NumberProp(row, L"Value");
-                if (!Plausible(value)) {
-                    return;
-                }
+                const std::wstring type = Lower(StringProp(row, L"SensorType"));
                 const std::wstring id = Lower(StringProp(row, L"Identifier"));
                 const std::wstring label = Lower(StringProp(row, L"Name"));
-                // LHM: /intelcpu/0/..., /amdcpu/0/..., /gpu-nvidia/0/...
-                // OHM: /intelcpu/0/..., /nvidiagpu/0/..., /atigpu/0/...
-                if (Has(id, L"cpu/")) {
-                    const int score = CpuScore(label);
-                    if (score > cpuBest || (score == cpuBest && score > 0 && value > cpu)) {
-                        cpuBest = score;
-                        cpu = value;
+                if (type == L"temperature") {
+                    if (!PlausibleTemp(value)) {
+                        return;
                     }
-                } else if (Has(id, L"gpu")) {
-                    const int score = GpuScore(label);
-                    if (score > gpuBest || (score == gpuBest && score > 0 && value > gpu)) {
-                        gpuBest = score;
-                        gpu = value;
+                    if (Has(id, L"cpu/")) {
+                        const int score = CpuTempScore(label);
+                        if (score > cpuTempBest ||
+                            (score == cpuTempBest && score > 0 && value > cpuTemp)) {
+                            cpuTempBest = score;
+                            cpuTemp = value;
+                        }
+                    } else if (Has(id, L"gpu")) {
+                        const int score = GpuTempScore(label);
+                        if (score > gpuTempBest ||
+                            (score == gpuTempBest && score > 0 && value > gpuTemp)) {
+                            gpuTempBest = score;
+                            gpuTemp = value;
+                        }
+                    }
+                } else if (type == L"power") {
+                    if (!PlausibleWatts(value)) {
+                        return;
+                    }
+                    if (Has(id, L"cpu/")) {
+                        const int score = CpuPowerScore(label);
+                        if (score > cpuPowerBest ||
+                            (score == cpuPowerBest && score > 0 &&
+                                (!std::isfinite(cpuPower) || value > cpuPower))) {
+                            cpuPowerBest = score;
+                            cpuPower = value;
+                        }
+                    } else if (Has(id, L"gpu")) {
+                        const int score = GpuPowerScore(label);
+                        if (score > gpuPowerBest ||
+                            (score == gpuPowerBest && score > 0 &&
+                                (!std::isfinite(gpuPower) || value > gpuPower))) {
+                            gpuPowerBest = score;
+                            gpuPower = value;
+                        }
                     }
                 }
             });
         if (FAILED(hr)) {
-            // Monitor exited (namespace or provider gone). Reconnect later.
             services.Reset();
             name.clear();
             retryAt = now + kHwmonRetryMs;
-            cpu = kNaN;
-            gpu = kNaN;
+            cpuTemp = kNaN;
+            gpuTemp = kNaN;
+            cpuPower = kNaN;
+            gpuPower = kNaN;
         }
     }
 };
@@ -238,9 +300,11 @@ struct NvmlSource {
     using CountFn = int (*)(unsigned int*);
     using HandleFn = int (*)(unsigned int, Device*);
     using TempFn = int (*)(Device, int, unsigned int*);
+    using PowerFn = int (*)(Device, unsigned int*);
 
     HMODULE module = nullptr;
     TempFn temperature = nullptr;
+    PowerFn powerUsage = nullptr;
     std::vector<Device> devices;
     bool tried = false;
     int failures = 0;
@@ -263,10 +327,13 @@ struct NvmlSource {
         const auto handle =
             reinterpret_cast<HandleFn>(GetProcAddress(module, "nvmlDeviceGetHandleByIndex_v2"));
         temperature = reinterpret_cast<TempFn>(GetProcAddress(module, "nvmlDeviceGetTemperature"));
+        powerUsage = reinterpret_cast<PowerFn>(GetProcAddress(module, "nvmlDeviceGetPowerUsage"));
         unsigned int deviceCount = 0;
+        // Temperature is required; power is best-effort (unsupported on some GPUs).
         if (init == nullptr || count == nullptr || handle == nullptr || temperature == nullptr ||
             init() != 0 || count(&deviceCount) != 0) {
             temperature = nullptr;
+            powerUsage = nullptr;
             FreeLibrary(module);
             module = nullptr;
             return;
@@ -279,7 +346,7 @@ struct NvmlSource {
         }
     }
 
-    double Read() {
+    double ReadTemp() {
         if (!tried) {
             Load();
         }
@@ -290,21 +357,45 @@ struct NvmlSource {
         for (Device device : devices) {
             unsigned int value = 0;
             // NVML_TEMPERATURE_GPU = 0 (core die sensor).
-            if (temperature(device, 0, &value) == 0 && Plausible(static_cast<double>(value))) {
+            if (temperature(device, 0, &value) == 0 && PlausibleTemp(static_cast<double>(value))) {
                 best = std::isfinite(best) ? std::max(best, static_cast<double>(value))
                                            : static_cast<double>(value);
             }
         }
         if (!std::isfinite(best) && ++failures >= 5) {
-            devices.clear();  // driver reset / GPU gone: hand over to nvidia-smi
+            devices.clear();
         } else if (std::isfinite(best)) {
             failures = 0;
         }
         return best;
     }
+
+    // Watts for the entire board on pre-Turing GPUs (GTX 1070 Ti / Pascal):
+    // nvmlDeviceGetPowerUsage matches nvidia-smi power.draw ("entire board").
+    // Turing+ may report GPU-only here; MODULE-scope APIs are not in this
+    // driver build, so board total via GetPowerUsage is what we ship.
+    double ReadPower() {
+        if (!tried) {
+            Load();
+        }
+        if (powerUsage == nullptr || devices.empty()) {
+            return kNaN;
+        }
+        double best = kNaN;
+        for (Device device : devices) {
+            unsigned int milliwatts = 0;
+            if (powerUsage(device, &milliwatts) == 0) {
+                const double watts = static_cast<double>(milliwatts) / 1000.0;
+                if (PlausibleWatts(watts)) {
+                    best = std::isfinite(best) ? std::max(best, watts) : watts;
+                }
+            }
+        }
+        return best;
+    }
 };
 
-// --- nvidia-smi fallback (only when NVML cannot be loaded) ------------------
+// --- nvidia-smi fallback (temp and/or power when NVML cannot supply them) ---
 struct SmiSource {
     std::wstring exe;
     bool resolved = false;
@@ -330,16 +421,15 @@ struct SmiSource {
         }
     }
 
-    double Run() const {
+    std::string RunQuery(const wchar_t* query) const {
         SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
         HANDLE readPipe = nullptr;
         HANDLE writePipe = nullptr;
         if (!CreatePipe(&readPipe, &writePipe, &security, 0)) {
-            return kNaN;
+            return {};
         }
         SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
 
-        // Inherit only the pipe's write end, not every inheritable dock handle.
         SIZE_T attributeSize = 0;
         InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
         std::vector<unsigned char> attributeBuffer(attributeSize);
@@ -352,11 +442,6 @@ struct SmiSource {
             DeleteProcThreadAttributeList(attributes);
             haveAttributes = false;
         }
-        if (!haveAttributes) {
-            CloseHandle(readPipe);
-            CloseHandle(writePipe);
-            return kNaN;
-        }
 
         STARTUPINFOEXW startup{};
         startup.StartupInfo.cb = sizeof(startup);
@@ -364,39 +449,64 @@ struct SmiSource {
         startup.StartupInfo.wShowWindow = SW_HIDE;
         startup.StartupInfo.hStdOutput = writePipe;
         startup.StartupInfo.hStdError = writePipe;
-        startup.lpAttributeList = attributes;
-        std::wstring command =
-            L"\"" + exe + L"\" --query-gpu=temperature.gpu --format=csv,noheader,nounits";
+        if (haveAttributes) {
+            startup.lpAttributeList = attributes;
+        }
+
+        std::wstring command = L"\"" + exe + L"\" --query-gpu=" + query +
+            L" --format=csv,noheader,nounits";
         PROCESS_INFORMATION process{};
-        const BOOL started = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
-            &startup.StartupInfo, &process);
+        const DWORD flags = CREATE_NO_WINDOW |
+            (haveAttributes ? EXTENDED_STARTUPINFO_PRESENT : 0);
+        std::vector<wchar_t> cmdline(command.begin(), command.end());
+        cmdline.push_back(L'\0');
+        const BOOL created = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE, flags,
+            nullptr, nullptr, &startup.StartupInfo, &process);
         CloseHandle(writePipe);
-        DeleteProcThreadAttributeList(attributes);
-        if (!started) {
+        if (haveAttributes) {
+            DeleteProcThreadAttributeList(attributes);
+        }
+        if (!created) {
             CloseHandle(readPipe);
-            return kNaN;
+            return {};
         }
-        if (WaitForSingleObject(process.hProcess, kSmiTimeoutMs) != WAIT_OBJECT_0) {
-            TerminateProcess(process.hProcess, 1);
-            WaitForSingleObject(process.hProcess, 1000);
-        }
+
         std::string output;
         char buffer[256];
-        DWORD available = 0;
-        while (output.size() < 4096 &&
-            PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
-            DWORD got = 0;
-            if (!ReadFile(readPipe, buffer, std::min<DWORD>(available, static_cast<DWORD>(sizeof(buffer))), &got, nullptr) ||
-                got == 0) {
+        const ULONGLONG deadline = GetTickCount64() + kSmiTimeoutMs;
+        for (;;) {
+            DWORD available = 0;
+            if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr)) {
                 break;
             }
-            output.append(buffer, got);
+            if (available > 0) {
+                DWORD read = 0;
+                if (!ReadFile(readPipe, buffer, sizeof(buffer), &read, nullptr) || read == 0) {
+                    break;
+                }
+                output.append(buffer, buffer + read);
+                continue;
+            }
+            const DWORD wait = WaitForSingleObject(process.hProcess, 50);
+            if (wait == WAIT_OBJECT_0) {
+                DWORD read = 0;
+                while (ReadFile(readPipe, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
+                    output.append(buffer, buffer + read);
+                }
+                break;
+            }
+            if (GetTickCount64() >= deadline) {
+                TerminateProcess(process.hProcess, 1);
+                break;
+            }
         }
-        CloseHandle(readPipe);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
+        CloseHandle(readPipe);
+        return output;
+    }
 
+    static double ParseFirstNumber(const std::string& output) {
         double best = kNaN;
         const char* cursor = output.c_str();
         while (*cursor != '\0') {
@@ -406,23 +516,41 @@ struct SmiSource {
                 ++cursor;
                 continue;
             }
-            if (Plausible(value)) {
-                best = std::isfinite(best) ? std::max(best, value) : value;
-            }
-            cursor = end;
+            best = value;
+            break;
         }
         return best;
     }
 
-    double Read(ULONGLONG now) {
+    double ReadTemp(ULONGLONG now) {
         if (!resolved) {
             Resolve();
         }
         if (exe.empty() || now < retryAt) {
             return kNaN;
         }
-        const double value = Run();
-        if (!Plausible(value)) {
+        const double value = ParseFirstNumber(RunQuery(L"temperature.gpu"));
+        if (!PlausibleTemp(value)) {
+            if (++failures >= 3) {
+                failures = 0;
+                retryAt = now + kSmiRetryMs;
+            }
+            return kNaN;
+        }
+        failures = 0;
+        return value;
+    }
+
+    double ReadPower(ULONGLONG now) {
+        if (!resolved) {
+            Resolve();
+        }
+        if (exe.empty() || now < retryAt) {
+            return kNaN;
+        }
+        // power.draw = entire board (nvidia-smi docs); nounits → watts.
+        const double value = ParseFirstNumber(RunQuery(L"power.draw"));
+        if (!PlausibleWatts(value)) {
             if (++failures >= 3) {
                 failures = 0;
                 retryAt = now + kSmiRetryMs;
@@ -450,7 +578,7 @@ struct AcpiTrust {
 
 double DeciKelvinToCelsius(int deciKelvin) noexcept {
     const double celsius = static_cast<double>(deciKelvin) / 10.0 - 273.15;
-    return Plausible(celsius) ? celsius : kNaN;
+    return PlausibleTemp(celsius) ? celsius : kNaN;
 }
 
 // root\WMI MSAcpi_ThermalZoneTemperature: tenths of a Kelvin. Usually
@@ -499,7 +627,7 @@ struct AcpiWmiSource {
 };
 
 // PDH "Thermal Zone Information" — same ACPI zones, readable without admin.
-struct PdhSource {
+struct PdhThermalSource {
     PDH_HQUERY query = nullptr;
     PDH_HCOUNTER counter = nullptr;
     bool highPrecision = true;  // tenths of K; plain "Temperature" is whole K
@@ -568,53 +696,178 @@ struct PdhSource {
     }
 };
 
+// PDH Energy Meter RAPL package power — undelevated on modern Windows when
+// the kernel exposes RAPL_Package*_PKG. Values are milliwatts.
+struct RaplPdhSource {
+    PDH_HQUERY query = nullptr;
+    PDH_HCOUNTER counter = nullptr;
+    bool disabled = false;
+    bool primed = false;
+
+    bool Open() {
+        if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
+            query = nullptr;
+            return false;
+        }
+        if (PdhAddEnglishCounterW(query, L"\\Energy Meter(*)\\Power", 0, &counter) != ERROR_SUCCESS) {
+            PdhCloseQuery(query);
+            query = nullptr;
+            counter = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    static int InstanceScore(const wchar_t* name) {
+        if (name == nullptr) {
+            return 0;
+        }
+        const std::wstring lower = Lower(name);
+        if (Has(lower, L"_total") || Has(lower, L"dram") || Has(lower, L"pp1")) {
+            return 0;
+        }
+        if (Has(lower, L"pkg")) {
+            return 4;
+        }
+        if (Has(lower, L"pp0") || Has(lower, L"core")) {
+            return 1;
+        }
+        if (Has(lower, L"rapl") || Has(lower, L"package")) {
+            return 2;
+        }
+        return 0;
+    }
+
+    double Read() {
+        if (disabled) {
+            return kNaN;
+        }
+        if (query == nullptr && !Open()) {
+            disabled = true;
+            return kNaN;
+        }
+        if (PdhCollectQueryData(query) != ERROR_SUCCESS) {
+            return kNaN;
+        }
+        // First collect after Open often has no valid data yet.
+        if (!primed) {
+            primed = true;
+            PdhCollectQueryData(query);
+        }
+        DWORD size = 0;
+        DWORD count = 0;
+        if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE | PDH_FMT_NOSCALE, &size, &count, nullptr) !=
+                static_cast<PDH_STATUS>(PDH_MORE_DATA) ||
+            size == 0) {
+            return kNaN;
+        }
+        std::vector<unsigned char> buffer(size);
+        auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+        if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE | PDH_FMT_NOSCALE, &size, &count, items) !=
+            ERROR_SUCCESS) {
+            return kNaN;
+        }
+        int bestScore = 0;
+        double bestMw = kNaN;
+        for (DWORD index = 0; index < count; ++index) {
+            const PDH_FMT_COUNTERVALUE& value = items[index].FmtValue;
+            if (value.CStatus != PDH_CSTATUS_VALID_DATA && value.CStatus != PDH_CSTATUS_NEW_DATA) {
+                continue;
+            }
+            const int score = InstanceScore(items[index].szName);
+            if (score <= 0 || !std::isfinite(value.doubleValue) || value.doubleValue <= 0.0) {
+                continue;
+            }
+            if (score > bestScore || (score == bestScore && value.doubleValue > bestMw)) {
+                bestScore = score;
+                bestMw = value.doubleValue;
+            }
+        }
+        if (bestScore <= 0 || !std::isfinite(bestMw)) {
+            return kNaN;
+        }
+        const double watts = bestMw / 1000.0;
+        return PlausibleWatts(watts) ? watts : kNaN;
+    }
+};
+
 struct Sensors {
     HwmonSource hwmon;
     NvmlSource nvml;
     SmiSource smi;
     AcpiWmiSource acpi;
-    PdhSource pdh;
+    PdhThermalSource pdhThermal;
+    RaplPdhSource rapl;
 
     SystemTempsReading Poll() {
         const ULONGLONG now = GetTickCount64();
         SystemTempsReading reading;
-        double hwCpu = kNaN;
-        double hwGpu = kNaN;
-        hwmon.Poll(now, hwCpu, hwGpu);
+        double hwCpuTemp = kNaN;
+        double hwGpuTemp = kNaN;
+        double hwCpuPower = kNaN;
+        double hwGpuPower = kNaN;
+        hwmon.Poll(now, hwCpuTemp, hwGpuTemp, hwCpuPower, hwGpuPower);
 
-        double cpu = kNaN;
-        if (Plausible(hwCpu)) {
-            cpu = hwCpu;
+        double cpuTemp = kNaN;
+        if (PlausibleTemp(hwCpuTemp)) {
+            cpuTemp = hwCpuTemp;
             reading.cpuSource = hwmon.name;
         }
-        if (!Plausible(cpu)) {
-            cpu = acpi.Read();
-            if (Plausible(cpu)) {
+        if (!PlausibleTemp(cpuTemp)) {
+            cpuTemp = acpi.Read();
+            if (PlausibleTemp(cpuTemp)) {
                 reading.cpuSource = L"ACPI thermal zone (WMI)";
             }
         }
-        if (!Plausible(cpu)) {
-            cpu = pdh.Read();
-            if (Plausible(cpu)) {
+        if (!PlausibleTemp(cpuTemp)) {
+            cpuTemp = pdhThermal.Read();
+            if (PlausibleTemp(cpuTemp)) {
                 reading.cpuSource = L"ACPI thermal zone (PDH)";
             }
         }
 
-        double gpu = nvml.Read();
-        if (Plausible(gpu)) {
+        double cpuPower = kNaN;
+        if (PlausibleWatts(hwCpuPower)) {
+            cpuPower = hwCpuPower;
+            reading.cpuPowerSource = hwmon.name;
+        }
+        if (!PlausibleWatts(cpuPower)) {
+            cpuPower = rapl.Read();
+            if (PlausibleWatts(cpuPower)) {
+                reading.cpuPowerSource = L"RAPL Energy Meter (PDH)";
+            }
+        }
+
+        double gpuTemp = nvml.ReadTemp();
+        if (PlausibleTemp(gpuTemp)) {
             reading.gpuSource = L"NVML";
-        } else if (Plausible(hwGpu)) {
-            gpu = hwGpu;
+        } else if (PlausibleTemp(hwGpuTemp)) {
+            gpuTemp = hwGpuTemp;
             reading.gpuSource = hwmon.name;
         } else {
-            gpu = smi.Read(now);
-            if (Plausible(gpu)) {
+            gpuTemp = smi.ReadTemp(now);
+            if (PlausibleTemp(gpuTemp)) {
                 reading.gpuSource = L"nvidia-smi";
             }
         }
 
-        reading.cpuC = Plausible(cpu) ? static_cast<int>(std::lround(cpu)) : -1;
-        reading.gpuC = Plausible(gpu) ? static_cast<int>(std::lround(gpu)) : -1;
+        double gpuPower = nvml.ReadPower();
+        if (PlausibleWatts(gpuPower)) {
+            reading.gpuPowerSource = L"NVML (board power.draw)";
+        } else if (PlausibleWatts(hwGpuPower)) {
+            gpuPower = hwGpuPower;
+            reading.gpuPowerSource = hwmon.name;
+        } else {
+            gpuPower = smi.ReadPower(now);
+            if (PlausibleWatts(gpuPower)) {
+                reading.gpuPowerSource = L"nvidia-smi power.draw";
+            }
+        }
+
+        reading.cpuC = PlausibleTemp(cpuTemp) ? static_cast<int>(std::lround(cpuTemp)) : -1;
+        reading.gpuC = PlausibleTemp(gpuTemp) ? static_cast<int>(std::lround(gpuTemp)) : -1;
+        reading.cpuW = PlausibleWatts(cpuPower) ? static_cast<int>(std::lround(cpuPower)) : -1;
+        reading.gpuW = PlausibleWatts(gpuPower) ? static_cast<int>(std::lround(gpuPower)) : -1;
         reading.stamp = GetTickCount64();
         return reading;
     }
@@ -650,18 +903,25 @@ void WorkerMain() {
     TempsBridge& bridge = Bridge();
     std::wstring loggedCpu = L"?";
     std::wstring loggedGpu = L"?";
+    std::wstring loggedCpuW = L"?";
+    std::wstring loggedGpuW = L"?";
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(bridge.mutex);
             bridge.wake.wait(lock, [&] { return GetTickCount64() < bridge.activeUntil; });
         }
         SystemTempsReading reading = sensors.Poll();
-        if (reading.cpuSource != loggedCpu || reading.gpuSource != loggedGpu) {
+        if (reading.cpuSource != loggedCpu || reading.gpuSource != loggedGpu ||
+            reading.cpuPowerSource != loggedCpuW || reading.gpuPowerSource != loggedGpuW) {
             loggedCpu = reading.cpuSource;
             loggedGpu = reading.gpuSource;
+            loggedCpuW = reading.cpuPowerSource;
+            loggedGpuW = reading.gpuPowerSource;
             const std::wstring line = L"[Dock] temps: CPU via " +
                 (loggedCpu.empty() ? std::wstring(L"(none)") : loggedCpu) + L", GPU via " +
-                (loggedGpu.empty() ? std::wstring(L"(none)") : loggedGpu) + L"\n";
+                (loggedGpu.empty() ? std::wstring(L"(none)") : loggedGpu) + L"; power CPU via " +
+                (loggedCpuW.empty() ? std::wstring(L"(none)") : loggedCpuW) + L", GPU via " +
+                (loggedGpuW.empty() ? std::wstring(L"(none)") : loggedGpuW) + L"\n";
             OutputDebugStringW(line.c_str());
         }
         HWND hwnd = nullptr;
@@ -669,7 +929,8 @@ void WorkerMain() {
         {
             std::lock_guard<std::mutex> lock(bridge.mutex);
             const bool changed = !bridge.published || bridge.latest.cpuC != reading.cpuC ||
-                bridge.latest.gpuC != reading.gpuC;
+                bridge.latest.gpuC != reading.gpuC || bridge.latest.cpuW != reading.cpuW ||
+                bridge.latest.gpuW != reading.gpuW;
             bridge.latest = std::move(reading);
             bridge.published = true;
             if (changed) {

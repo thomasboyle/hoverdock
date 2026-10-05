@@ -87,9 +87,11 @@ struct QuickSettingsCache {
     bool hdrSupported = false;
     bool nightLight = false;
     bool nightKnown = false;
-    // Home temperature tile. Whole degrees C; -1 shows an em dash.
+    // Home temperature tile. Whole degrees C / watts; -1 shows an em dash.
     int cpuTempC = -1;
     int gpuTempC = -1;
+    int cpuWatts = -1;
+    int gpuWatts = -1;
     // Set when WASAPI capture cannot be opened (permission, missing device).
     std::wstring inputNote;
     std::wstring mediaTitle;
