@@ -85,6 +85,15 @@ private:
         UINT generation = 0;
         LaunchJudgment judgment;
         std::vector<LaunchTarget> targets;
+        // Agent-in-search: when set, `agent` carries the validated actions and
+        // reply instead of `judgment`.
+        bool agentMode = false;
+        SearchAgentResult agent;
+    };
+
+    struct AgentStatusReply {
+        UINT generation = 0;
+        std::wstring text;
     };
 
     struct BoostReply {
@@ -124,6 +133,7 @@ private:
     static constexpr UINT kDeferredClickMessage = WM_APP + 17;
     static constexpr UINT kWeatherMessage = WM_APP + 22;
     static constexpr UINT kBluetoothMessage = WM_APP + 23;
+    static constexpr UINT kAgentStatusMessage = WM_APP + 28;
     static constexpr UINT_PTR kWeatherTimerId = 10;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
@@ -484,6 +494,7 @@ private:
     void SetLaunchPromptStatus(const std::wstring& text);
     void SubmitLaunchPrompt();
     void ApplyLaunchJudgment(UINT generation, const LaunchJudgment& judgment);
+    void ApplyAgentResult(UINT generation, const SearchAgentResult& result);
     [[nodiscard]] std::vector<LaunchTarget> CollectLaunchTargets(
         const std::vector<DisplayApp>& displayApps,
         const std::vector<RunningWindow>& runningWindows) const;

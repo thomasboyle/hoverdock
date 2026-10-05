@@ -31,8 +31,49 @@ Expand-Archive llama-b11405-bin-win-cpu-x64.zip -DestinationPath . -Force
 `-ngl 0` keeps weights in **system RAM**. Default model path is the LM Studio
 catalog download for `Qwen3.8-27B-Q4_K_M.gguf`.
 
+Check it is up: `curl.exe http://127.0.0.1:8080/health` -> `{"status":"ok"}`.
+
 ## Qwen3.8 notes
 
 Qwen3.8 uses hybrid Gated DeltaNet; recent llama.cpp builds (including b11405)
 support it. Dock Search sends `chat_template_kwargs.enable_thinking=false` and
 `/no_think` so reasoning stays off for latency.
+
+## Agent-in-search (1.1.72+)
+
+Typing a *goal* into dock Search (instead of an app name) runs a small local
+agent loop against llama-server. Order of resolution for every query:
+
+1. **Exact app name** ("steam", "open steam" when an app is literally named Steam) - instant.
+2. **Direct action, no model** - instant, works with the server down:
+   - URL / domain: `go to github.com`, `https://news.ycombinator.com`
+   - Known user folder: `open downloads folder`, `open documents`, `desktop folder`
+     (Downloads, Documents, Desktop, Pictures, Music, Videos, Home)
+   - Existing absolute path: `C:\Users\thoma\Downloads`
+3. **Goal?** The query is treated as a goal when it starts with a verb
+   (open, launch, run, play, find, search, go, visit, show, watch, listen, ...)
+   and has 2+ words, has 4+ words, contains a URL/domain, or mentions
+   folder/website. Otherwise it is a **plain search** (model ranking, fuzzy fallback).
+4. For goals, a **confident lexical hit** on the remainder skips the model
+   (`open chrome`, `launch steam` when only one app clearly matches).
+5. Otherwise **agent mode**: up to 3 model rounds, max 3 actions, ~96 output
+   tokens per round. Tools (all validated before anything runs):
+   - `search_apps {q}` - catalog lookup, result fed back to the model
+   - `launch_app {id}` - catalog id only (same launch/focus path as clicking)
+   - `open_url {url}` - http/https only
+   - `open_path {path}` - existing local folder or document; UNC paths and
+     executables/scripts/shortcuts (.exe .bat .ps1 .lnk .msi ...) are refused
+   - `done {say}` - short reply shown on the Search status line
+   No shell commands, deletes, elevation or file reads. Status lines show the
+   current step; a successful action closes Search like a normal launch.
+6. **Server down** (or first round fails): falls back to fuzzy search on the
+   remainder; no agent replies are shown.
+
+Example goals: `open chrome`, `launch steam`, `open downloads folder`,
+`go to github.com`, `play lofi on youtube`, `search google for rtx 5090 price`,
+`find something to edit photos`.
+
+Speed: on CPU (`-ngl 0`) the 27B model does ~6 tok/s prompt and ~1-2 tok/s
+generation, so a model round takes roughly 30-60 s. Fast paths 1, 2 and 4 never
+touch the model. The system prompt is kept static so llama-server's prompt cache
+reuses it between queries.

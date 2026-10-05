@@ -1,6 +1,8 @@
 #include "LlamaServerClient.h"
 
 #include <Windows.h>
+#include <ShlObj.h>
+#include <KnownFolders.h>
 #include <shellapi.h>
 #include <winhttp.h>
 
@@ -202,7 +204,8 @@ LaunchJudgment MakeError(std::wstring message) {
 }
 
 bool HttpExchange(const ParsedUrl& url, const wchar_t* method, const wchar_t* path,
-    const std::string* body, DWORD& status, std::string& response, std::wstring& error) {
+    const std::string* body, DWORD& status, std::string& response, std::wstring& error,
+    DWORD receiveTimeoutMs = kReceiveTimeoutMs) {
     status = 0;
     response.clear();
     WinHttpHandle session(WinHttpOpen(L"HoverdockLlama/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
@@ -212,7 +215,7 @@ bool HttpExchange(const ParsedUrl& url, const wchar_t* method, const wchar_t* pa
         return false;
     }
     WinHttpSetTimeouts(session.Get(), kConnectTimeoutMs, kConnectTimeoutMs, kSendTimeoutMs,
-        kReceiveTimeoutMs);
+        static_cast<int>(receiveTimeoutMs));
     WinHttpHandle connection(WinHttpConnect(session.Get(), url.host.c_str(), url.port, 0));
     if (connection.Get() == nullptr) {
         error = L"Could not connect to llama-server.";
@@ -593,6 +596,445 @@ LaunchJudgment ParseModelJudgment(const std::string& response,
     return judgment;
 }
 
+// ---------------------------------------------------------------------------
+// Agent-in-search helpers
+// ---------------------------------------------------------------------------
+
+// CPU-only 27B runs ~1-2 tok/s generation and ~6 tok/s prompt eval, so keep
+// every agent prompt tiny and the loop short. The static system prompt (which
+// also carries the user's known folders) stays byte-identical across requests
+// so llama-server's prompt cache can skip re-evaluating it.
+constexpr int kAgentMaxSteps = 3;
+constexpr size_t kAgentMaxActions = 3;
+constexpr size_t kAgentContextApps = 6;
+constexpr size_t kAgentSearchResults = 6;
+constexpr int kAgentMaxTokens = 96;
+constexpr DWORD kAgentReceiveTimeoutMs = 240000;
+constexpr size_t kAgentMaxReplyChars = 120;
+constexpr size_t kAgentMaxUrlChars = 2048;
+constexpr double kConfidentMinScore = 80.0;
+constexpr double kConfidentMargin = 30.0;
+
+bool IsWordChar(wchar_t c) {
+    return std::iswalnum(c) != 0 || c == L'_' || c == L'-';
+}
+
+std::wstring StripLeadingPhrases(std::wstring text) {
+    // Longest phrases first so "show me " wins over "show ".
+    static constexpr std::wstring_view prefixes[] = {
+        L"please ", L"can you ", L"could you ", L"would you ", L"i want to ", L"i'd like to ",
+        L"take me to ", L"navigate to ", L"bring up ", L"switch to ", L"browse to ", L"show me ",
+        L"go to ", L"goto ", L"open up ", L"open ", L"launch ", L"start ", L"run ", L"visit ",
+        L"browse ", L"show ", L"focus ",
+    };
+    text = TrimWide(std::move(text));
+    bool stripped = true;
+    while (stripped && !text.empty()) {
+        stripped = false;
+        const std::wstring lower = ToLowerWide(text);
+        for (const std::wstring_view prefix : prefixes) {
+            if (lower.starts_with(prefix)) {
+                text = TrimWide(text.substr(prefix.size()));
+                stripped = true;
+                break;
+            }
+        }
+    }
+    const std::wstring lower = ToLowerWide(text);
+    for (const std::wstring_view article : {std::wstring_view(L"the "), std::wstring_view(L"my ")}) {
+        if (lower.starts_with(article)) {
+            text = TrimWide(text.substr(article.size()));
+            break;
+        }
+    }
+    while (!text.empty() && (text.back() == L'.' || text.back() == L'!' || text.back() == L'?')) {
+        text.pop_back();
+    }
+    return TrimWide(std::move(text));
+}
+
+bool LooksLikeDomain(const std::wstring& token) {
+    std::wstring lower = ToLowerWide(token);
+    if (lower.starts_with(L"http://") || lower.starts_with(L"https://")) {
+        return lower.size() > 8 && lower.find_first_of(L" \t\r\n") == std::wstring::npos;
+    }
+    if (lower.empty() || lower.find_first_of(L" \t\r\n\\\"<>") != std::wstring::npos) {
+        return false;
+    }
+    if (lower.starts_with(L"www.")) {
+        return lower.size() > 5;
+    }
+    const size_t slash = lower.find(L'/');
+    const std::wstring host = slash == std::wstring::npos ? lower : lower.substr(0, slash);
+    const size_t dot = host.rfind(L'.');
+    if (dot == std::wstring::npos || dot == 0 || dot + 1 >= host.size()) {
+        return false;
+    }
+    const std::wstring tld = host.substr(dot + 1);
+    static constexpr std::wstring_view tlds[] = {
+        L"com", L"org", L"net", L"io", L"dev", L"co", L"uk", L"ai", L"app", L"gg", L"tv",
+        L"me", L"edu", L"gov", L"info", L"xyz", L"so", L"de", L"fr", L"eu", L"us", L"ca",
+        L"au", L"ly", L"to", L"fm", L"sh", L"page", L"site", L"wiki",
+    };
+    return std::ranges::any_of(tlds, [&](std::wstring_view t) { return tld == t; });
+}
+
+std::optional<std::wstring> NormalizeUrl(std::wstring raw) {
+    raw = TrimWide(std::move(raw));
+    if (raw.empty() || raw.size() > kAgentMaxUrlChars) {
+        return std::nullopt;
+    }
+    for (const wchar_t c : raw) {
+        if (c < 0x20 || c == L'"' || c == L'<' || c == L'>' || c == L'\\') {
+            return std::nullopt;
+        }
+    }
+    std::wstring lower = ToLowerWide(raw);
+    if (!lower.starts_with(L"http://") && !lower.starts_with(L"https://")) {
+        if (lower.find(L"://") != std::wstring::npos || lower.find(L':') == 1) {
+            return std::nullopt;  // other schemes (file:, ms-settings:, javascript:) or drive paths
+        }
+        if (!LooksLikeDomain(raw)) {
+            return std::nullopt;
+        }
+        raw = L"https://" + raw;
+    }
+    std::wstring encoded;
+    encoded.reserve(raw.size());
+    for (const wchar_t c : raw) {
+        if (c == L' ') {
+            encoded += L"%20";
+        } else {
+            encoded.push_back(c);
+        }
+    }
+    return encoded;
+}
+
+std::wstring KnownFolder(REFKNOWNFOLDERID id) {
+    PWSTR path = nullptr;
+    std::wstring result;
+    if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &path)) && path != nullptr) {
+        result = path;
+    }
+    if (path != nullptr) {
+        CoTaskMemFree(path);
+    }
+    return result;
+}
+
+struct NamedFolder {
+    const wchar_t* label;
+    std::wstring path;
+};
+
+const std::vector<NamedFolder>& UserFolders() {
+    static const std::vector<NamedFolder> folders = [] {
+        std::vector<NamedFolder> list;
+        const auto add = [&list](const wchar_t* label, REFKNOWNFOLDERID id) {
+            std::wstring path = KnownFolder(id);
+            if (!path.empty()) {
+                list.push_back({label, std::move(path)});
+            }
+        };
+        add(L"Downloads", FOLDERID_Downloads);
+        add(L"Documents", FOLDERID_Documents);
+        add(L"Desktop", FOLDERID_Desktop);
+        add(L"Pictures", FOLDERID_Pictures);
+        add(L"Music", FOLDERID_Music);
+        add(L"Videos", FOLDERID_Videos);
+        add(L"Home", FOLDERID_Profile);
+        return list;
+    }();
+    return folders;
+}
+
+std::optional<std::wstring> FolderByName(std::wstring name) {
+    name = ToLowerWide(TrimWide(std::move(name)));
+    for (const std::wstring_view suffix : {std::wstring_view(L" folder"), std::wstring_view(L" directory"),
+             std::wstring_view(L" dir")}) {
+        if (name.size() > suffix.size() && name.ends_with(suffix)) {
+            name = TrimWide(name.substr(0, name.size() - suffix.size()));
+            break;
+        }
+    }
+    struct Alias {
+        std::wstring_view alias;
+        std::wstring_view label;
+    };
+    constexpr Alias aliases[] = {
+        {L"downloads", L"Downloads"}, {L"download", L"Downloads"},
+        {L"documents", L"Documents"}, {L"document", L"Documents"}, {L"docs", L"Documents"},
+        {L"desktop", L"Desktop"},
+        {L"pictures", L"Pictures"}, {L"picture", L"Pictures"}, {L"photos", L"Pictures"},
+        {L"music", L"Music"},
+        {L"videos", L"Videos"}, {L"video", L"Videos"},
+        {L"home", L"Home"}, {L"user", L"Home"}, {L"profile", L"Home"},
+    };
+    for (const Alias& alias : aliases) {
+        if (name != alias.alias) {
+            continue;
+        }
+        for (const NamedFolder& folder : UserFolders()) {
+            if (alias.label == folder.label) {
+                return folder.path;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool IsBlockedOpenExtension(const std::wstring& path) {
+    const size_t dot = path.rfind(L'.');
+    const size_t sep = path.find_last_of(L"\\/");
+    if (dot == std::wstring::npos || (sep != std::wstring::npos && dot < sep)) {
+        return false;
+    }
+    const std::wstring ext = ToLowerWide(path.substr(dot));
+    // Anything that would execute code via ShellExecute "open". Apps must go
+    // through launch_app (the curated catalog), never open_path.
+    static constexpr std::wstring_view blocked[] = {
+        L".exe", L".com", L".bat", L".cmd", L".ps1", L".psm1", L".psd1", L".vbs", L".vbe",
+        L".js", L".jse", L".wsf", L".wsh", L".msi", L".msp", L".msc", L".scr", L".pif",
+        L".lnk", L".url", L".reg", L".hta", L".cpl", L".jar", L".appref-ms", L".application",
+        L".gadget", L".inf", L".sys", L".dll", L".scf", L".settingcontent-ms", L".library-ms",
+    };
+    return std::ranges::any_of(blocked, [&](std::wstring_view b) { return ext == b; });
+}
+
+// Returns a canonical existing path that is safe to ShellExecute("open").
+std::optional<std::wstring> ValidateOpenPath(std::wstring raw, std::wstring& why) {
+    raw = TrimWide(std::move(raw));
+    while (raw.size() >= 2 && (raw.front() == L'"' || raw.front() == L'\'') && raw.back() == raw.front()) {
+        raw = TrimWide(raw.substr(1, raw.size() - 2));
+    }
+    if (raw.empty()) {
+        why = L"empty path";
+        return std::nullopt;
+    }
+    if (const auto folder = FolderByName(raw); folder.has_value()) {
+        return folder;
+    }
+    wchar_t expanded[MAX_PATH * 2] = {};
+    const DWORD expandedLen = ExpandEnvironmentStringsW(raw.c_str(), expanded,
+        static_cast<DWORD>(std::size(expanded)));
+    if (expandedLen > 0 && expandedLen <= std::size(expanded)) {
+        raw = expanded;
+    }
+    if (raw.starts_with(L"\\\\") || raw.starts_with(L"//") || raw.find(L"://") != std::wstring::npos) {
+        why = L"network/URL paths not allowed";
+        return std::nullopt;
+    }
+    if (raw.size() < 3 || raw[1] != L':' || (raw[2] != L'\\' && raw[2] != L'/')) {
+        why = L"need an absolute path";
+        return std::nullopt;
+    }
+    wchar_t full[MAX_PATH * 2] = {};
+    const DWORD fullLen = GetFullPathNameW(raw.c_str(), static_cast<DWORD>(std::size(full)), full, nullptr);
+    if (fullLen == 0 || fullLen >= std::size(full)) {
+        why = L"bad path";
+        return std::nullopt;
+    }
+    std::wstring path(full, fullLen);
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        why = L"path does not exist";
+        return std::nullopt;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 && IsBlockedOpenExtension(path)) {
+        why = L"executables/scripts are not opened; use launch_app";
+        return std::nullopt;
+    }
+    return path;
+}
+
+std::vector<std::wstring> GoalKeywords(const std::wstring& request) {
+    static constexpr std::wstring_view stop[] = {
+        L"open", L"launch", L"start", L"run", L"play", L"find", L"search", L"for", L"go",
+        L"to", L"the", L"a", L"an", L"my", L"me", L"on", L"in", L"and", L"then", L"please",
+        L"show", L"app", L"application", L"some", L"up", L"with", L"of", L"it", L"i", L"want",
+    };
+    std::vector<std::wstring> words;
+    std::wstring cleaned = ToLowerWide(request);
+    for (wchar_t& c : cleaned) {
+        if (!IsWordChar(c) && c != L'.') {
+            c = L' ';
+        }
+    }
+    for (std::wstring& token : Tokenize(cleaned)) {
+        if (!std::ranges::any_of(stop, [&](std::wstring_view s) { return token == s; })) {
+            words.push_back(std::move(token));
+        }
+    }
+    return words;
+}
+
+std::vector<const LaunchCandidate*> RankForAgent(const std::vector<LaunchCandidate>& candidates,
+    const std::wstring& query, size_t limit) {
+    std::wstring joined;
+    for (const std::wstring& word : GoalKeywords(query)) {
+        if (!joined.empty()) {
+            joined.push_back(L' ');
+        }
+        joined += word;
+    }
+    const std::vector<std::wstring> tokens = Tokenize(joined);
+    std::vector<std::pair<double, const LaunchCandidate*>> ranked;
+    ranked.reserve(candidates.size());
+    for (const LaunchCandidate& candidate : candidates) {
+        const double score = CandidateRelevance(candidate, joined, tokens);
+        if (score >= 12.0) {
+            ranked.emplace_back(score, &candidate);
+        }
+    }
+    std::stable_sort(ranked.begin(), ranked.end(),
+        [](const auto& left, const auto& right) { return left.first > right.first; });
+    std::vector<const LaunchCandidate*> top;
+    for (size_t index = 0; index < ranked.size() && top.size() < limit; ++index) {
+        top.push_back(ranked[index].second);
+    }
+    return top;
+}
+
+void AppendCompactCandidate(std::string& out, const LaunchCandidate& candidate) {
+    out += '{';
+    AppendUtf8Field(out, "id", Utf8ToWide(candidate.id));
+    out += ',';
+    AppendUtf8Field(out, "name", TruncateWide(candidate.name, 40));
+    if (!candidate.executable.empty() &&
+        ToLowerWide(candidate.executable).find(ToLowerWide(candidate.name)) == std::wstring::npos) {
+        out += ',';
+        AppendUtf8Field(out, "exe", TruncateWide(candidate.executable, 32));
+    }
+    if (candidate.running) {
+        out += ",\"running\":true";
+    }
+    out += '}';
+}
+
+std::string CandidateListJson(const std::vector<const LaunchCandidate*>& list) {
+    std::string out = "[";
+    for (size_t index = 0; index < list.size(); ++index) {
+        if (index > 0) {
+            out += ',';
+        }
+        AppendCompactCandidate(out, *list[index]);
+    }
+    out += ']';
+    return out;
+}
+
+const std::string& AgentSystemPrompt() {
+    static const std::string prompt = [] {
+        std::string text =
+            "You are Hoverdock Search, a local Windows agent. Do the user's goal with tools.\n"
+            "Reply ONLY with JSON objects, one per line, no other text:\n"
+            "{\"tool\":\"launch_app\",\"id\":\"c3\"} launch an app by id from apps/results\n"
+            "{\"tool\":\"open_url\",\"url\":\"https://...\"} open a website in the default browser\n"
+            "{\"tool\":\"open_path\",\"path\":\"C:\\\\...\"} open an existing folder or document\n"
+            "{\"tool\":\"search_apps\",\"q\":\"words\"} find installed apps, then wait for results\n"
+            "{\"tool\":\"done\",\"say\":\"short reply\"} finish (max 10 words)\n"
+            "Rules: use ids exactly as given, never invent ids. open_url already opens the browser; "
+            "do not also launch one. Web goals: build a URL, e.g. "
+            "https://www.youtube.com/results?search_query=lofi or https://www.google.com/search?q=x. "
+            "If nothing fits, reply only done with a short reason. End with done unless you used "
+            "search_apps.\nfolders:";
+        for (const NamedFolder& folder : UserFolders()) {
+            text += ' ';
+            text += WideToUtf8(folder.label);
+            text += '=';
+            text += WideToUtf8(folder.path);
+            text += ';';
+        }
+        return text;
+    }();
+    return prompt;
+}
+
+struct ChatMessage {
+    const char* role;
+    std::string content;
+};
+
+std::string BuildAgentBody(const std::vector<ChatMessage>& messages) {
+    std::string body = "{\"model\":\"local\",\"temperature\":0,\"max_tokens\":";
+    body += std::to_string(kAgentMaxTokens);
+    body += ",\"cache_prompt\":true,\"chat_template_kwargs\":{\"enable_thinking\":false},"
+            "\"reasoning_format\":\"none\",\"messages\":[{\"role\":\"system\",\"content\":";
+    AppendEscaped(body, AgentSystemPrompt());
+    body += '}';
+    for (const ChatMessage& message : messages) {
+        body += ",{\"role\":\"";
+        body += message.role;
+        body += "\",\"content\":";
+        AppendEscaped(body, message.content);
+        body += '}';
+    }
+    body += "]}";
+    return body;
+}
+
+std::vector<std::string> ExtractJsonObjects(const std::string& text) {
+    std::vector<std::string> objects;
+    size_t cursor = 0;
+    while (cursor < text.size()) {
+        const auto object = ExtractJsonObject(text.substr(cursor));
+        if (!object.has_value()) {
+            break;
+        }
+        const size_t at = text.find(*object, cursor);
+        objects.push_back(*object);
+        cursor = (at == std::string::npos ? cursor : at) + object->size();
+    }
+    return objects;
+}
+
+std::string ToolNameOf(const std::string& json) {
+    static constexpr std::string_view tools[] = {
+        "launch_app", "open_url", "open_path", "search_apps", "done", "say", "reply",
+    };
+    for (const std::string_view key : {std::string_view("tool"), std::string_view("name"),
+             std::string_view("action"), std::string_view("function")}) {
+        if (const auto value = ExtractStringField(json, key); value.has_value()) {
+            for (const std::string_view tool : tools) {
+                if (*value == tool) {
+                    return *value;
+                }
+            }
+        }
+    }
+    // {"launch_app":{"id":"c3"}} style.
+    for (const std::string_view tool : tools) {
+        if (json.find("\"" + std::string(tool) + "\"") != std::string::npos) {
+            return std::string(tool);
+        }
+    }
+    return {};
+}
+
+std::wstring FirstField(const std::string& json, std::initializer_list<std::string_view> keys) {
+    for (const std::string_view key : keys) {
+        if (const auto value = ExtractStringField(json, key); value.has_value() && !value->empty()) {
+            return TrimWide(Utf8ToWide(*value));
+        }
+    }
+    return {};
+}
+
+const LaunchCandidate* FindCandidate(const std::vector<LaunchCandidate>& candidates, const std::string& id) {
+    for (const LaunchCandidate& candidate : candidates) {
+        if (candidate.id == id) {
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
+std::wstring Sentence(std::wstring text) {
+    text = TruncateWide(TrimWide(std::move(text)), kAgentMaxReplyChars);
+    return text;
+}
+
 }  // namespace
 
 bool LlamaServerClient::IsServerReachable(const std::wstring& baseUrl) {
@@ -683,4 +1125,293 @@ LaunchJudgment LlamaServerClient::ResolveApp(const std::wstring& baseUrl,
         }
     }
     return judgment;
+}
+
+// ---------------------------------------------------------------------------
+// Agent-in-search
+// ---------------------------------------------------------------------------
+
+std::wstring LlamaServerClient::StripGoalVerbs(const std::wstring& request) {
+    return StripLeadingPhrases(request);
+}
+
+bool LlamaServerClient::LooksLikeAgentGoal(const std::wstring& request) {
+    const std::wstring lower = ToLowerWide(TrimWide(request));
+    const std::vector<std::wstring> tokens = Tokenize(lower);
+    if (tokens.empty()) {
+        return false;
+    }
+    if (lower.find(L"://") != std::wstring::npos ||
+        std::ranges::any_of(tokens, [](const std::wstring& token) { return LooksLikeDomain(token); })) {
+        return true;
+    }
+    if (tokens.size() >= 4) {
+        return true;
+    }
+    static constexpr std::wstring_view verbs[] = {
+        L"open", L"launch", L"run", L"start", L"play", L"find", L"search", L"go", L"goto",
+        L"visit", L"browse", L"navigate", L"show", L"take", L"look", L"google", L"watch",
+        L"listen", L"switch", L"bring", L"focus", L"please", L"can", L"could",
+    };
+    if (tokens.size() >= 2 &&
+        std::ranges::any_of(verbs, [&](std::wstring_view verb) { return tokens.front() == verb; })) {
+        return true;
+    }
+    static constexpr std::wstring_view nouns[] = {L"folder", L"directory", L"website", L"site", L"url"};
+    return std::ranges::any_of(tokens, [&](const std::wstring& token) {
+        return std::ranges::any_of(nouns, [&](std::wstring_view noun) { return token == noun; });
+    });
+}
+
+std::optional<SearchAgentAction> LlamaServerClient::DirectAction(const std::wstring& request) {
+    const std::wstring trimmed = TrimWide(request);
+    const std::wstring rest = StripLeadingPhrases(trimmed);
+    if (rest.empty()) {
+        return std::nullopt;
+    }
+    if (rest.find(L' ') == std::wstring::npos && LooksLikeDomain(rest)) {
+        if (const auto url = NormalizeUrl(rest); url.has_value()) {
+            SearchAgentAction action;
+            action.kind = SearchAgentAction::Kind::OpenUrl;
+            action.target = *url;
+            action.label = rest;
+            return action;
+        }
+    }
+    const std::wstring restLower = ToLowerWide(rest);
+    const bool commanded = ToLowerWide(trimmed) != restLower;
+    const bool saysFolder = restLower.ends_with(L" folder") || restLower.ends_with(L" directory");
+    if (commanded || saysFolder) {
+        if (const auto folder = FolderByName(rest); folder.has_value()) {
+            SearchAgentAction action;
+            action.kind = SearchAgentAction::Kind::OpenPath;
+            action.target = *folder;
+            action.label = rest;
+            return action;
+        }
+    }
+    if (rest.size() >= 3 && rest[1] == L':' && (rest[2] == L'\\' || rest[2] == L'/')) {
+        std::wstring why;
+        if (const auto path = ValidateOpenPath(rest, why); path.has_value()) {
+            SearchAgentAction action;
+            action.kind = SearchAgentAction::Kind::OpenPath;
+            action.target = *path;
+            action.label = *path;
+            return action;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string LlamaServerClient::ConfidentAppId(const std::wstring& appText,
+    const std::vector<LaunchCandidate>& candidates) {
+    const std::wstring queryLower = ToLowerWide(TrimWide(appText));
+    const std::vector<std::wstring> tokens = Tokenize(queryLower);
+    if (tokens.empty() || tokens.size() > 3) {
+        return {};
+    }
+    double best = -1.0;
+    double second = -1.0;
+    const LaunchCandidate* winner = nullptr;
+    for (const LaunchCandidate& candidate : candidates) {
+        const double score = CandidateRelevance(candidate, queryLower, tokens);
+        if (score > best) {
+            second = best;
+            best = score;
+            winner = &candidate;
+        } else if (score > second) {
+            second = score;
+        }
+    }
+    if (winner == nullptr || best < kConfidentMinScore || best - second < kConfidentMargin) {
+        return {};
+    }
+    return winner->id;
+}
+
+SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
+    const std::wstring& request, const std::vector<LaunchCandidate>& candidates,
+    const StatusCallback& status, const CancelCallback& cancelled) {
+    SearchAgentResult result;
+    const std::wstring goal = TruncateWide(TrimWide(request), kMaxRequestChars);
+    if (goal.empty()) {
+        result.reply = L"Type an app or a goal.";
+        return result;
+    }
+    const auto notify = [&status](const std::wstring& text) {
+        if (status) {
+            status(text);
+        }
+    };
+    const auto isCancelled = [&cancelled]() { return cancelled && cancelled(); };
+
+    if (!IsServerReachable(baseUrl)) {
+        result.serverUnavailable = true;
+        return result;
+    }
+
+    const ParsedUrl url = ParseBaseUrl(baseUrl);
+    std::vector<ChatMessage> messages;
+    {
+        std::string user = "/no_think\ngoal=";
+        user += WideToUtf8(goal);
+        user += "\napps=";
+        user += CandidateListJson(RankForAgent(candidates, goal, kAgentContextApps));
+        messages.push_back({"user", std::move(user)});
+    }
+
+    for (int step = 1; step <= kAgentMaxSteps; ++step) {
+        if (isCancelled()) {
+            return result;
+        }
+        result.steps = step;
+        notify(L"Agent working (step " + std::to_wstring(step) + L"/" +
+            std::to_wstring(kAgentMaxSteps) + L", local CPU model, may take ~1 min)...");
+
+        const std::string body = BuildAgentBody(messages);
+        DWORD httpStatus = 0;
+        std::string response;
+        std::wstring error;
+        const bool exchanged = HttpExchange(url, L"POST", L"/v1/chat/completions", &body, httpStatus,
+            response, error, kAgentReceiveTimeoutMs);
+        std::optional<std::string> content;
+        if (exchanged && httpStatus >= 200 && httpStatus < 300) {
+            content = ExtractAssistantContent(response);
+        }
+        if (!content.has_value()) {
+            if (result.actions.empty() && step == 1) {
+                // No agent claims: let the caller run classic fuzzy search.
+                result.serverUnavailable = true;
+                return result;
+            }
+            result.reply = L"Agent stopped: " +
+                (error.empty() ? L"no usable reply (HTTP " + std::to_wstring(httpStatus) + L")" : error);
+            return result;
+        }
+        if (isCancelled()) {
+            return result;
+        }
+
+        const std::vector<std::string> calls = ExtractJsonObjects(*content);
+        if (calls.empty()) {
+            std::string prose = *content;
+            if (const size_t endThink = prose.find("</think>"); endThink != std::string::npos) {
+                prose = prose.substr(endThink + 8);
+            }
+            result.reply = Sentence(Utf8ToWide(prose));
+            if (result.reply.empty()) {
+                result.reply = L"The agent had nothing to do for that.";
+            }
+            return result;
+        }
+
+        std::string toolResults;
+        std::string assistantEcho;
+        bool needsAnotherStep = false;
+        for (const std::string& call : calls) {
+            const std::string tool = ToolNameOf(call);
+            if (tool.empty()) {
+                continue;
+            }
+            assistantEcho += call;
+            assistantEcho += '\n';
+            if (tool == "search_apps") {
+                std::wstring query = FirstField(call, {"q", "query", "text", "name"});
+                if (query.empty() || query == L"search_apps") {
+                    query = goal;
+                }
+                notify(L"Searching apps: " + TruncateWide(query, 60));
+                toolResults += "search_apps \"" + WideToUtf8(TruncateWide(query, 60)) + "\" -> " +
+                    CandidateListJson(RankForAgent(candidates, query, kAgentSearchResults)) + "\n";
+                needsAnotherStep = true;
+            } else if (tool == "launch_app") {
+                if (result.actions.size() >= kAgentMaxActions) {
+                    toolResults += "launch_app: action limit reached\n";
+                    continue;
+                }
+                const std::wstring idText = FirstField(call, {"id", "app_id", "app", "target"});
+                const LaunchCandidate* candidate = FindCandidate(candidates, WideToUtf8(idText));
+                if (candidate == nullptr && !idText.empty()) {
+                    // Tolerate {"id":"Steam"}: map a name to a confident catalog hit.
+                    candidate = FindCandidate(candidates, ConfidentAppId(idText, candidates));
+                }
+                if (candidate == nullptr) {
+                    toolResults += "launch_app \"" + WideToUtf8(TruncateWide(idText, 40)) +
+                        "\": unknown id; use an id from apps or search_apps\n";
+                    needsAnotherStep = true;
+                    continue;
+                }
+                const bool duplicate = std::ranges::any_of(result.actions, [&](const SearchAgentAction& a) {
+                    return a.kind == SearchAgentAction::Kind::LaunchApp && a.appId == candidate->id;
+                });
+                if (!duplicate) {
+                    SearchAgentAction action;
+                    action.kind = SearchAgentAction::Kind::LaunchApp;
+                    action.appId = candidate->id;
+                    action.label = candidate->name;
+                    result.actions.push_back(std::move(action));
+                }
+                notify(L"Launching " + candidate->name + L"...");
+                toolResults += "launch_app " + candidate->id + ": ok (" +
+                    WideToUtf8(TruncateWide(candidate->name, 40)) + ")\n";
+            } else if (tool == "open_url") {
+                if (result.actions.size() >= kAgentMaxActions) {
+                    toolResults += "open_url: action limit reached\n";
+                    continue;
+                }
+                const auto target = NormalizeUrl(FirstField(call, {"url", "href", "link", "target"}));
+                if (!target.has_value()) {
+                    toolResults += "open_url: rejected (only http/https URLs)\n";
+                    needsAnotherStep = true;
+                    continue;
+                }
+                SearchAgentAction action;
+                action.kind = SearchAgentAction::Kind::OpenUrl;
+                action.target = *target;
+                action.label = TruncateWide(*target, 60);
+                result.actions.push_back(std::move(action));
+                notify(L"Opening " + TruncateWide(*target, 60));
+                toolResults += "open_url: ok\n";
+            } else if (tool == "open_path") {
+                if (result.actions.size() >= kAgentMaxActions) {
+                    toolResults += "open_path: action limit reached\n";
+                    continue;
+                }
+                std::wstring why;
+                const auto target = ValidateOpenPath(FirstField(call, {"path", "folder", "file", "target"}), why);
+                if (!target.has_value()) {
+                    toolResults += "open_path: rejected (" + WideToUtf8(why) + ")\n";
+                    needsAnotherStep = true;
+                    continue;
+                }
+                SearchAgentAction action;
+                action.kind = SearchAgentAction::Kind::OpenPath;
+                action.target = *target;
+                action.label = *target;
+                result.actions.push_back(std::move(action));
+                notify(L"Opening " + TruncateWide(*target, 60));
+                toolResults += "open_path: ok\n";
+            } else {  // done / say / reply
+                const std::wstring say = FirstField(call, {"say", "text", "reply", "message"});
+                if (!say.empty()) {
+                    result.reply = Sentence(say);
+                    notify(result.reply);
+                }
+            }
+        }
+
+        if (!needsAnotherStep) {
+            // done, or actions/say without an explicit done: nothing left to learn.
+            return result;
+        }
+        if (step == kAgentMaxSteps || isCancelled()) {
+            break;
+        }
+        messages.push_back({"assistant", assistantEcho});
+        messages.push_back({"user", "/no_think\nresults:\n" + toolResults + "Continue. End with done."});
+    }
+    if (result.actions.empty() && result.reply.empty()) {
+        result.reply = L"The agent could not finish that. Try naming the app.";
+    }
+    return result;
 }

@@ -3381,7 +3381,19 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             if (!reply->targets.empty()) {
                 m_launchTargets = std::move(reply->targets);
             }
-            ApplyLaunchJudgment(reply->generation, reply->judgment);
+            if (reply->agentMode) {
+                ApplyAgentResult(reply->generation, reply->agent);
+            } else {
+                ApplyLaunchJudgment(reply->generation, reply->judgment);
+            }
+        }
+        return 0;
+    }
+
+    case kAgentStatusMessage: {
+        std::unique_ptr<AgentStatusReply> reply(reinterpret_cast<AgentStatusReply*>(lParam));
+        if (reply != nullptr && reply->generation == m_launchGeneration.load() && m_launchInFlight) {
+            SetLaunchPromptStatus(reply->text);
         }
         return 0;
     }
@@ -9945,7 +9957,7 @@ bool DockApp::OpenLaunchPrompt() {
     m_launchEdit = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT, 0, 0, 1, 1, m_launchPromptWindow,
         reinterpret_cast<HMENU>(1), m_instance, nullptr);
-    m_launchStatus = CreateWindowExW(0, L"STATIC", L"Describe the app to open",
+    m_launchStatus = CreateWindowExW(0, L"STATIC", L"Type an app, or a goal for the local agent",
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 0, 0, 1, 1, m_launchPromptWindow,
         reinterpret_cast<HMENU>(2), m_instance, nullptr);
     if (m_launchEdit == nullptr || m_launchStatus == nullptr) {
@@ -9957,7 +9969,7 @@ bool DockApp::OpenLaunchPrompt() {
     SendMessageW(m_launchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     SendMessageW(m_launchStatus, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     SendMessageW(m_launchEdit, EM_SETCUEBANNER, TRUE,
-        reinterpret_cast<LPARAM>(L"chrome, notepad, documents folder..."));
+        reinterpret_cast<LPARAM>(L"chrome, open downloads folder, play lofi on youtube..."));
 
     m_launchEditPrevious = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(m_launchEdit, GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(&DockApp::LaunchEditProcedure)));
@@ -10049,7 +10061,7 @@ void DockApp::SubmitLaunchPrompt() {
 
     const std::wstring request = TrimWide(WindowText(m_launchEdit));
     if (request.empty()) {
-        SetLaunchPromptStatus(L"Describe the app to open");
+        SetLaunchPromptStatus(L"Type an app, or a goal for the local agent");
         return;
     }
 
@@ -10066,34 +10078,84 @@ void DockApp::SubmitLaunchPrompt() {
         // thread calls std::terminate and the dock vanishes with no log.
         std::vector<LaunchTarget> targets;
         LaunchJudgment judgment;
+        bool agentMode = false;
+        SearchAgentResult agent;
+        const auto postStatus = [replyWindow, generation](const std::wstring& text) {
+            if (replyWindow == nullptr) {
+                return;
+            }
+            AgentStatusReply* status = nullptr;
+            try {
+                status = new AgentStatusReply{generation, text};
+            } catch (...) {
+                return;
+            }
+            if (PostMessageW(replyWindow, kAgentStatusMessage, 0, reinterpret_cast<LPARAM>(status)) ==
+                FALSE) {
+                delete status;
+            }
+        };
+        const auto superseded = [this, generation]() { return m_launchGeneration.load() != generation; };
+        const auto launchJudgment = [](const std::string& id, double confidence) {
+            LaunchJudgment picked;
+            picked.action = LaunchJudgment::Action::Launch;
+            picked.chosenId = id;
+            picked.exists = 1.0;
+            picked.confidence = confidence;
+            return picked;
+        };
         try {
             m_installedApps.EnsureLoaded();
             targets = CollectLaunchTargets(displayApps, runningWindows);
             const std::string exactId = ExactLaunchId(request, targets);
             if (!exactId.empty()) {
-                judgment.action = LaunchJudgment::Action::Launch;
-                judgment.chosenId = exactId;
-                judgment.exists = 1.0;
-                judgment.confidence = 1.0;
+                // Fast path 1: exact app name.
+                judgment = launchJudgment(exactId, 1.0);
             } else {
                 std::vector<LaunchCandidate> candidates;
                 candidates.reserve(targets.size());
                 for (const LaunchTarget& target : targets) {
                     candidates.push_back(MakeLaunchCandidate(target));
                 }
-                // Local llama-server (OpenAI /v1/chat/completions); fuzzy if down.
-                judgment = LlamaServerClient::ResolveApp(llamaUrl, request, candidates);
+                if (auto direct = LlamaServerClient::DirectAction(request); direct.has_value()) {
+                    // Fast path 2: explicit URL/domain, known folder or existing path.
+                    agentMode = true;
+                    agent.actions.push_back(std::move(*direct));
+                } else if (LlamaServerClient::LooksLikeAgentGoal(request)) {
+                    const std::wstring appText = LlamaServerClient::StripGoalVerbs(request);
+                    const std::string quickId = LlamaServerClient::ConfidentAppId(appText, candidates);
+                    if (!quickId.empty()) {
+                        // Fast path 3: "open steam" with one unambiguous lexical hit.
+                        judgment = launchJudgment(quickId, 0.95);
+                    } else {
+                        // Agent mode: local llama-server tool loop.
+                        agent = LlamaServerClient::RunAgent(llamaUrl, request, candidates, postStatus,
+                            superseded);
+                        if (agent.serverUnavailable) {
+                            // Server down: classic fuzzy search, no agent claims.
+                            judgment = LlamaServerClient::ResolveAppFuzzy(appText, candidates);
+                        } else {
+                            agentMode = true;
+                        }
+                    }
+                } else {
+                    // Plain search: model ranking, fuzzy if llama-server is down.
+                    judgment = LlamaServerClient::ResolveApp(llamaUrl, request, candidates);
+                }
             }
         } catch (const std::exception&) {
+            agentMode = false;
             judgment.action = LaunchJudgment::Action::Error;
             judgment.error = L"Launch failed before a match could be picked.";
         } catch (...) {
+            agentMode = false;
             judgment.action = LaunchJudgment::Action::Error;
             judgment.error = L"Launch failed unexpectedly.";
         }
         LaunchReply* reply = nullptr;
         try {
-            reply = new LaunchReply{generation, std::move(judgment), std::move(targets)};
+            reply = new LaunchReply{generation, std::move(judgment), std::move(targets), agentMode,
+                std::move(agent)};
         } catch (...) {
             return;
         }
@@ -10158,6 +10220,67 @@ void DockApp::ApplyLaunchJudgment(UINT generation, const LaunchJudgment& judgmen
     }
     CloseLaunchPrompt(false);
     BeginHide();
+}
+
+void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result) {
+    if (generation != m_launchGeneration.load()) {
+        return;
+    }
+
+    m_launchInFlight = false;
+    if (m_launchEdit != nullptr) {
+        SetFocus(m_launchEdit);
+    }
+
+    Log(L"Search agent steps=" + std::to_wstring(result.steps) +
+        L" actions=" + std::to_wstring(result.actions.size()) + L" reply=" + result.reply);
+
+    size_t performed = 0;
+    std::wstring failure;
+    for (const SearchAgentAction& action : result.actions) {
+        switch (action.kind) {
+        case SearchAgentAction::Kind::LaunchApp: {
+            const LaunchTarget* target = FindLaunchTarget(action.appId);
+            if (target != nullptr && ActivateLaunchTarget(*target)) {
+                ++performed;
+            } else {
+                failure = L"Could not open " + action.label + L".";
+            }
+            break;
+        }
+        case SearchAgentAction::Kind::OpenUrl:
+        case SearchAgentAction::Kind::OpenPath: {
+            // Defence in depth: the agent already validated these, but only
+            // http(s) URLs and existing local paths ever reach ShellExecute.
+            const bool isUrl = action.kind == SearchAgentAction::Kind::OpenUrl;
+            const bool allowed = isUrl
+                ? (StartsWithInsensitiveWide(action.target, L"https://") ||
+                      StartsWithInsensitiveWide(action.target, L"http://"))
+                : GetFileAttributesW(action.target.c_str()) != INVALID_FILE_ATTRIBUTES;
+            if (!allowed) {
+                failure = L"Blocked unsafe target.";
+                break;
+            }
+            const HINSTANCE opened = ShellExecuteW(nullptr, L"open", action.target.c_str(), nullptr,
+                nullptr, SW_SHOWNORMAL);
+            if (reinterpret_cast<INT_PTR>(opened) > 32) {
+                ++performed;
+            } else {
+                failure = L"Could not open " + action.label + L".";
+            }
+            break;
+        }
+        }
+    }
+
+    if (performed > 0) {
+        CloseLaunchPrompt(false);
+        BeginHide();
+        return;
+    }
+    SetLaunchPromptStatus(!failure.empty() ? failure
+        : !result.reply.empty() ? result.reply
+        : L"The agent found nothing to do for that.");
 }
 
 std::vector<DockApp::LaunchTarget> DockApp::CollectLaunchTargets(
