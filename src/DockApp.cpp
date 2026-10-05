@@ -2701,7 +2701,13 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
     case kQsCacheResultMessage:
         if (app != nullptr && app->IsOverflowOpen()) {
             if (ApplyQuickSettingsCacheResult(app->m_qsCache)) {
-                app->PaintOverflowPopup();
+                // Home already has a presented frame (fast reopen or prewarm).
+                // PaintQuickSettings is still ~95ms of squircle/text even with
+                // warm glass — never spend that on a background cache fill while
+                // Home is up. Subpages that list wifi/devices still need it.
+                if (app->m_qsPage != QuickSettingsPage::Home) {
+                    app->QueueOverflowPaint(false);
+                }
             }
         }
         return 0;
@@ -2709,7 +2715,7 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
     case kQsEnergyResultMessage:
         if (app != nullptr && app->IsOverflowOpen()) {
             if (ApplyEnergyAppsResult(app->m_qsCache)) {
-                app->PaintOverflowPopup();
+                app->QueueOverflowPaint(false);
             }
         }
         return 0;
@@ -3159,6 +3165,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         // Tray timer is stopped while hidden; pull a fresh clock/battery now that
         // the first frame is on its way instead of before it.
         RefreshTray(true);
+        // Warm Quick Settings HWND/glass/Home frame off the chevron click path.
+        PrewarmOverflowPopup();
         return 0;
     }
 
@@ -5468,20 +5476,37 @@ void DockApp::FinishOverflowHide() noexcept {
     }
     m_overflowVisibility = VisibilityState::Hidden;
     StopQuickSettingsCapture();
+    // Keep the last Home present/base/underlay + glass across hide so the next
+    // chevron click can UpdateLayeredWindow without a BakeGlassPanel / full
+    // Quick Settings rebuild on the UI thread (was the remaining cursor hitch).
+    const bool keepHomeFrame = m_qsPage == QuickSettingsPage::Home &&
+        !m_overflowPresentBits.empty() && m_overflowPresentSize.cx > 0 &&
+        m_overflowPresentSize.cy > 0 && m_overflowPresentSize.cx == m_overflowSize.cx &&
+        m_overflowPresentSize.cy == m_overflowSize.cy;
     m_overflowHover = -1;
     m_qsPage = QuickSettingsPage::Home;
     m_qsReturn = QuickSettingsPage::Home;
     m_qsDragging = false;
-    std::vector<uint8_t>().swap(m_overflowPresentBits);
-    std::vector<uint8_t>().swap(m_overflowBaseBits);
-    std::vector<uint8_t>().swap(m_overflowUnderlayBits);
-    m_qsMeterValid = false;
-    m_qsScrubValid = false;
-    m_qsTempsValid = false;
-    m_qsTempsDirty = false;
-    m_overflowPresentSize = {};
+    if (!keepHomeFrame) {
+        std::vector<uint8_t>().swap(m_overflowPresentBits);
+        std::vector<uint8_t>().swap(m_overflowBaseBits);
+        std::vector<uint8_t>().swap(m_overflowUnderlayBits);
+        m_overflowPresentSize = {};
+        m_qsMeterValid = false;
+        m_qsScrubValid = false;
+        m_qsTempsValid = false;
+        m_qsTempsDirty = false;
+        m_qsMeterRect = {};
+        m_qsScrubRect = {};
+        m_qsTempCpuRect = {};
+        m_qsTempGpuRect = {};
+    }
+    // keepHomeFrame: retain meter/scrub/temps rects + validity so the 40ms live
+    // timer uses PaintOverflowLiveFast instead of falling back to a ~100ms
+    // PaintOverflowPopup (that fallback was the post-chevron cursor hitch).
     m_overflowHoverPaintOnly = false;
-    InvalidateOverflowGlass();
+    m_overflowHoverDirtyValid = false;
+    // Glass stays: origin/caret/frost validity is checked on the next paint.
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
     }
@@ -5621,6 +5646,7 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
 }
 
 void DockApp::PresentOverflowLayer() noexcept {
+    ProfileScope scope("PresentOverflowLayer");
     if (m_overflowWindow == nullptr || m_overflowPresentBits.empty() ||
         m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0) {
         return;
@@ -5640,7 +5666,7 @@ void DockApp::PresentOverflowLayer() noexcept {
     // Do not call PositionDockSettings here: UpdateLayeredWindow already placed
     // the overflow window, and repositioning Dock Settings on every QS hover
     // previously stormed InvalidateSettingsGlass / full panel rebuilds.
-    if (!IsWindowVisible(m_overflowWindow)) {
+    if (!m_overflowPresentSuppressShow && !IsWindowVisible(m_overflowWindow)) {
         ShowWindow(m_overflowWindow, SW_SHOWNA);
     }
 }
@@ -5658,31 +5684,145 @@ void DockApp::CloseOverflowPopup() noexcept {
 }
 
 void DockApp::BeginOverflowShow() {
+    ProfileScope scope("BeginOverflowShow");
     if (IsOverflowOpen()) {
         return;
     }
+
+    LARGE_INTEGER freq{};
+    LARGE_INTEGER t0{};
+    LARGE_INTEGER prev{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    prev = t0;
+    auto qsOpenMark = [&](const wchar_t* step) {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const double stepMs =
+            (now.QuadPart - prev.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+        const double totalMs =
+            (now.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+        wchar_t line[192]{};
+        swprintf_s(line, L"QsOpen %-28s step=%6.2fms total=%6.2fms", step, stepMs, totalMs);
+        Log(line);
+        prev = now;
+    };
+
     HideHoverLabel();
+    qsOpenMark(L"HideHoverLabel");
     // First paint must not block on tray WLAN/COM/DDC or a QS cache refill.
     // Brightness DDC stays on its worker; network/audio/power fill is kicked
     // after Present from RefreshQuickSettingsCache / PaintOverflowPopup.
     RefreshBrightnessAsync();
+    qsOpenMark(L"RefreshBrightnessAsync");
     m_qsPage = QuickSettingsPage::Home;
     m_qsReturn = QuickSettingsPage::Home;
     m_overflowVisibility = VisibilityState::Visible;
-    RebuildOverflowPopup();
-    if (m_overflowWindow == nullptr || m_overflowPresentBits.empty()) {
+
+    bool presented = false;
+    if (TryPresentOverflowFromCache()) {
+        qsOpenMark(L"TryPresentOverflowFromCache");
+        presented = true;
+        // Cached Home pixels are already on-screen. Do not QueueOverflowPaint —
+        // a full rebuild is still ~100ms even with warm glass and would hitch
+        // the cursor one message later. Live meters/temps/network refresh via
+        // the usual async workers + PaintOverflowLiveFast.
+        ArmOverflowLiveWorkers();
+        qsOpenMark(L"ArmOverflowLiveWorkers");
+    } else {
+        RebuildOverflowPopup();
+        qsOpenMark(L"RebuildOverflowPopup");
+        presented = m_overflowWindow != nullptr && !m_overflowPresentBits.empty();
+        // PaintOverflowPopup already PresentOverflowLayer'd — no second ULW.
+    }
+
+    if (!presented) {
         m_overflowVisibility = VisibilityState::Hidden;
+        qsOpenMark(L"abort-no-present");
         return;
     }
-    PresentOverflowLayer();
     InstallOverflowDismissHook();
+    qsOpenMark(L"InstallOverflowDismissHook");
     m_bluetooth.RequestRefresh();
+    qsOpenMark(L"BluetoothRequestRefresh");
     if (m_window != nullptr) {
         SetTimer(m_window, kBluetoothTimerId, 4000, nullptr);
     }
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
     }
+    qsOpenMark(L"BeginOverflowShow-done");
+}
+
+void DockApp::ArmOverflowLiveWorkers() noexcept {
+    if (m_overflowWindow == nullptr) {
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (m_qsCache.stampNetwork == 0 || now - m_qsCache.stampNetwork >= 2500ULL ||
+        m_qsCache.stampNight == 0 || now - m_qsCache.stampNight >= 8000ULL) {
+        RequestQuickSettingsCacheAsync(m_overflowWindow, kQsCacheResultMessage, m_qsPage);
+    }
+    if (m_qsPage == QuickSettingsPage::Power) {
+        SetTimer(m_overflowWindow, kEnergySampleTimerId, 500, nullptr);
+        RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
+    } else {
+        KillTimer(m_overflowWindow, kEnergySampleTimerId);
+    }
+    if (m_qsPage == QuickSettingsPage::Home) {
+        SetTimer(m_overflowWindow, kQsTempsTimerId, 500, nullptr);
+        RequestQuickSettingsTemps(m_overflowWindow, kQsTempsResultMessage);
+    } else {
+        KillTimer(m_overflowWindow, kQsTempsTimerId);
+    }
+    const bool fastMeter = m_qsPage == QuickSettingsPage::Home ||
+        m_qsPage == QuickSettingsPage::Microphone;
+    SetTimer(m_overflowWindow, kQsLiveTimerId, fastMeter ? 40U : 500U, nullptr);
+    EnsureQuickSettingsCaptureAsync();
+}
+
+bool DockApp::TryPresentOverflowFromCache() noexcept {
+    if (m_overflowWindow == nullptr || m_overflowPresentBits.empty() ||
+        m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0 ||
+        m_overflowSize.cx != m_overflowPresentSize.cx ||
+        m_overflowSize.cy != m_overflowPresentSize.cy) {
+        return false;
+    }
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (!OverflowScreenOrigin(origin, caret)) {
+        return false;
+    }
+    m_overflowCaretX = caret;
+    PresentOverflowLayer();
+    return true;
+}
+
+void DockApp::PrewarmOverflowPopup() noexcept {
+    if (IsOverflowOpen()) {
+        return;
+    }
+    if (m_overflowWindow != nullptr && !m_overflowPresentBits.empty() &&
+        m_overflowPresentSize.cx == m_overflowSize.cx &&
+        m_overflowPresentSize.cy == m_overflowSize.cy && m_overflowPresentSize.cx > 0) {
+        return;
+    }
+    ProfileScope scope("PrewarmOverflowPopup");
+    Log(L"QsOpen PrewarmOverflowPopup start");
+    m_qsPage = QuickSettingsPage::Home;
+    m_qsReturn = QuickSettingsPage::Home;
+    m_overflowPresentSuppressShow = true;
+    m_overflowVisibility = VisibilityState::Visible;
+    PaintOverflowPopup();
+    m_overflowVisibility = VisibilityState::Hidden;
+    m_overflowPresentSuppressShow = false;
+    if (m_overflowWindow != nullptr) {
+        KillTimer(m_overflowWindow, kEnergySampleTimerId);
+        KillTimer(m_overflowWindow, kQsLiveTimerId);
+        KillTimer(m_overflowWindow, kQsTempsTimerId);
+        ShowWindow(m_overflowWindow, SW_HIDE);
+    }
+    StopQuickSettingsCapture();
 }
 
 void DockApp::DestroyOverflowPopup() noexcept {
@@ -7687,8 +7827,9 @@ void DockApp::EnsureOverflowFonts(float scale) {
 void DockApp::RebuildOverflowPopup() {
     // UIA Shell_TrayWnd scrape is expensive (~tens of ms). Home/open never
     // needs it; OpenQuickSettingsPage(SystemTray) loads icons on demand.
+    // Do not InvalidateOverflowGlass here: a warm glass buffer is what keeps
+    // chevron open off the BakeGlassPanel / CPU blur path.
     m_overflowHover = -1;
-    InvalidateOverflowGlass();
     PaintOverflowPopup();
 }
 
@@ -7974,6 +8115,7 @@ void DockApp::PaintOverflowLiveFast() {
 }
 
 void DockApp::PaintOverflowPopup() {
+    ProfileScope scope("PaintOverflowPopup");
     const UINT dpi = HostDpi();
     const float scale = static_cast<float>(dpi) / 96.0F;
     const LONG padding = std::max(16L, std::lround(18.0F * scale));
@@ -8055,9 +8197,13 @@ void DockApp::PaintOverflowPopup() {
     const size_t pixelCount =
         static_cast<size_t>(m_overflowSize.cx) * static_cast<size_t>(m_overflowSize.cy);
     ReleaseDC(nullptr, screen);
+    bool glassCacheHit = false;
     if (OverflowGlassValid(origin)) {
+        ProfileScope scopeGlassHit("OverflowGlass-cache-hit");
         std::memcpy(pixels, m_overflowGlass.data(), m_overflowGlass.size());
+        glassCacheHit = true;
     } else {
+        ProfileScope scopeGlassMiss("OverflowGlass-bake");
         std::memset(pixels, 0, pixelCount * 4U);
         const bool gpuGlass = TryBakePopupGlass(origin, m_overflowSize.cx, m_overflowSize.cy, pixels,
             pixelCount * 4U, true, true);
@@ -8193,8 +8339,11 @@ void DockApp::PaintOverflowPopup() {
     // Underlay pass: meter/scrub tracks at empty levels. Live overlays then paint
     // real peaks/progress so meters can update via UpdateLayeredWindowIndirect.
     m_qsPaintUnderlayPass = true;
-    PaintQuickSettings(pixels, width, height, memory, scale, padding, panelWidth, gearSize,
-        headerHeight, titleFont, sectionFont, labelFont, statusFont);
+    {
+        ProfileScope scopeQs("PaintQuickSettings");
+        PaintQuickSettings(pixels, width, height, memory, scale, padding, panelWidth, gearSize,
+            headerHeight, titleFont, sectionFont, labelFont, statusFont);
+    }
     m_qsPaintUnderlayPass = false;
     m_qsTempsDirty = false;
 

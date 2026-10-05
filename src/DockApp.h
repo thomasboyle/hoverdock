@@ -407,6 +407,12 @@ private:
     [[nodiscard]] bool OverflowGlassValid(POINT origin) const noexcept;
     void PositionOverflowPopup();
     void BeginOverflowShow();
+    // Re-present the last Home frame without a full glass/content rebuild.
+    [[nodiscard]] bool TryPresentOverflowFromCache() noexcept;
+    // Create HWND + bake Home off-screen so the first chevron click is warm.
+    void PrewarmOverflowPopup() noexcept;
+    // Timers + async QS workers without a full PaintOverflowPopup.
+    void ArmOverflowLiveWorkers() noexcept;
     void BeginOverflowHide(bool animate) noexcept;
     void FinishOverflowHide() noexcept;
     void PresentOverflowLayer() noexcept;
@@ -806,6 +812,8 @@ private:
     VisibilityState m_overflowVisibility = VisibilityState::Hidden;
     std::vector<TrayNotifyIcon> m_overflowIcons;
     bool m_overflowIconsLoaded = false;
+    // When true, PresentOverflowLayer uploads pixels but does not SW_SHOWNA.
+    bool m_overflowPresentSuppressShow = false;
     std::vector<TrayFlyoutHit> m_overflowHits;
     int m_overflowHover = -1;
     QuickSettingsPage m_qsPage = QuickSettingsPage::Home;
