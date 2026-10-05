@@ -562,6 +562,261 @@ struct SmiSource {
     }
 };
 
+// --- Core Temp shared memory ------------------------------------------------
+// https://www.alcpu.com/CoreTemp/developers.html -- present only while Core Temp
+// is running. Structure is 4-byte aligned. We take the hottest core as a stand-in
+// for package when Core Temp does not publish a separate package field.
+#pragma pack(push, 4)
+struct CoreTempSharedDataEx {
+    unsigned int uiLoad[256];
+    unsigned int uiTjMax[128];
+    unsigned int uiCoreCnt;
+    unsigned int uiCPUCnt;
+    float fTemp[256];
+    float fVID;
+    float fCPUSpeed;
+    float fFSBSpeed;
+    float fMultiplier;
+    char sCPUName[100];
+    unsigned char ucFahrenheit;
+    unsigned char ucDeltaToTjMax;
+    unsigned char ucTdpSupported;
+    unsigned char ucPowerSupported;
+    unsigned int uiStructVersion;
+    unsigned int uiTdp[128];
+    float fPower[128];
+    float fMultipliers[256];
+};
+#pragma pack(pop)
+
+struct CoreTempSource {
+    ULONGLONG retryAt = 0;
+
+    double Read(ULONGLONG now) {
+        if (now < retryAt) {
+            return kNaN;
+        }
+        HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, L"CoreTempMappingObject");
+        if (mapping == nullptr) {
+            mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\CoreTempMappingObject");
+        }
+        if (mapping == nullptr) {
+            retryAt = now + kHwmonRetryMs;
+            return kNaN;
+        }
+        void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(CoreTempSharedDataEx));
+        double best = kNaN;
+        if (view != nullptr) {
+            const auto* data = static_cast<const CoreTempSharedDataEx*>(view);
+            const unsigned int cores = std::min(data->uiCoreCnt, 256U);
+            const unsigned int cpus = std::max(1U, std::min(data->uiCPUCnt, 128U));
+            for (unsigned int index = 0; index < cores; ++index) {
+                double celsius = static_cast<double>(data->fTemp[index]);
+                if (data->ucDeltaToTjMax) {
+                    const unsigned int cpu = std::min(index / std::max(1U, cores / cpus), cpus - 1U);
+                    celsius = static_cast<double>(data->uiTjMax[cpu]) - celsius;
+                }
+                if (data->ucFahrenheit) {
+                    celsius = (celsius - 32.0) * (5.0 / 9.0);
+                }
+                if (PlausibleTemp(celsius)) {
+                    best = std::isfinite(best) ? std::max(best, celsius) : celsius;
+                }
+            }
+            // Optional package power when Core Temp exposes it (struct v2+).
+            UnmapViewOfFile(view);
+        }
+        CloseHandle(mapping);
+        if (!std::isfinite(best)) {
+            retryAt = now + kHwmonRetryMs;
+        }
+        return best;
+    }
+
+    double ReadPower(ULONGLONG /*now*/) {
+        HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, L"CoreTempMappingObject");
+        if (mapping == nullptr) {
+            mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\CoreTempMappingObject");
+        }
+        if (mapping == nullptr) {
+            return kNaN;
+        }
+        void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(CoreTempSharedDataEx));
+        double best = kNaN;
+        if (view != nullptr) {
+            const auto* data = static_cast<const CoreTempSharedDataEx*>(view);
+            if (data->uiStructVersion >= 2 && data->ucPowerSupported) {
+                const unsigned int cpus = std::min(data->uiCPUCnt, 128U);
+                for (unsigned int index = 0; index < cpus; ++index) {
+                    const double watts = static_cast<double>(data->fPower[index]);
+                    if (PlausibleWatts(watts)) {
+                        best = std::isfinite(best) ? std::max(best, watts) : watts;
+                    }
+                }
+            }
+            UnmapViewOfFile(view);
+        }
+        CloseHandle(mapping);
+        return best;
+    }
+};
+
+// --- HWiNFO shared memory ---------------------------------------------------
+// Settings -> HWiNFO Gadget / Shared Memory Support must be enabled. Layout
+// matches HWiNFO's published HWiSENS SM2 header (pack 1). Version 2 strings are
+// UTF-8; version 1 are ANSI -- both fit in the same char buffers.
+#pragma pack(push, 1)
+struct HwiHeader {
+    DWORD signature;  // 'HWiS' when active
+    DWORD version;
+    DWORD revision;
+    __int64 pollTime;
+    DWORD sensorOffset;
+    DWORD sensorSize;
+    DWORD sensorCount;
+    DWORD readingOffset;
+    DWORD readingSize;
+    DWORD readingCount;
+    DWORD pollingPeriod;
+};
+
+struct HwiReading {
+    DWORD type;  // 1 = Temperature, 5 = Power
+    DWORD sensorIndex;
+    DWORD readingId;
+    char labelOrig[128];
+    char labelUser[128];
+    char unit[16];
+    double value;
+    double valueMin;
+    double valueMax;
+    double valueAvg;
+};
+#pragma pack(pop)
+
+struct HwinfoSource {
+    ULONGLONG retryAt = 0;
+
+    static std::wstring NarrowToWide(const char* text, DWORD version) {
+        if (text == nullptr || text[0] == '\0') {
+            return {};
+        }
+        const UINT cp = version >= 2 ? CP_UTF8 : CP_ACP;
+        const int needed = MultiByteToWideChar(cp, 0, text, -1, nullptr, 0);
+        if (needed <= 1) {
+            return {};
+        }
+        std::wstring out(static_cast<size_t>(needed - 1), L'\0');
+        MultiByteToWideChar(cp, 0, text, -1, out.data(), needed);
+        return out;
+    }
+
+    static int CpuTempScore(const std::wstring& label) {
+        if (Has(label, L"distance") || Has(label, L"tjmax")) {
+            return 0;
+        }
+        if (label == L"cpu package" || label == L"cpu (tctl/tdie)" || label == L"cpu tdie" ||
+            label == L"core (tctl/tdie)" || label == L"core (tdie)") {
+            return 4;
+        }
+        if (label == L"cpu (tctl)" || label == L"core (tctl)" || label == L"cpu") {
+            return 3;
+        }
+        if (Has(label, L"package") && Has(label, L"cpu")) {
+            return 3;
+        }
+        if (label == L"core max" || Has(label, L"core average")) {
+            return 2;
+        }
+        return Has(label, L"core") ? 1 : 0;
+    }
+
+    static int CpuPowerScore(const std::wstring& label) {
+        if (label == L"cpu package" || label == L"cpu package power" || label == L"package power") {
+            return 4;
+        }
+        if (Has(label, L"package") && Has(label, L"cpu")) {
+            return 3;
+        }
+        if (Has(label, L"package")) {
+            return 2;
+        }
+        return 0;
+    }
+
+    void Poll(ULONGLONG now, double& cpuTemp, double& cpuPower) {
+        cpuTemp = kNaN;
+        cpuPower = kNaN;
+        if (now < retryAt) {
+            return;
+        }
+        HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Global\\HWiNFO_SENS_SM2");
+        if (mapping == nullptr) {
+            mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, L"HWiNFO_SENS_SM2");
+        }
+        if (mapping == nullptr) {
+            retryAt = now + kHwmonRetryMs;
+            return;
+        }
+        // Map header first, then full section sizes from the header fields.
+        void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        if (view == nullptr) {
+            CloseHandle(mapping);
+            retryAt = now + kHwmonRetryMs;
+            return;
+        }
+        const auto* header = static_cast<const HwiHeader*>(view);
+        constexpr DWORD kSig = 0x53695748U;  // 'HWiS' little-endian
+        if (header->signature != kSig || header->readingSize < sizeof(HwiReading) ||
+            header->readingCount == 0 || header->readingCount > 100000) {
+            UnmapViewOfFile(view);
+            CloseHandle(mapping);
+            retryAt = now + kHwmonRetryMs;
+            return;
+        }
+        const auto* base = static_cast<const unsigned char*>(view);
+        int tempBest = 0;
+        int powerBest = 0;
+        for (DWORD index = 0; index < header->readingCount; ++index) {
+            const auto* reading = reinterpret_cast<const HwiReading*>(
+                base + header->readingOffset + static_cast<size_t>(header->readingSize) * index);
+            const std::wstring label = Lower(NarrowToWide(reading->labelOrig, header->version));
+            if (reading->type == 1) {  // Temperature
+                if (!PlausibleTemp(reading->value)) {
+                    continue;
+                }
+                const int score = CpuTempScore(label);
+                if (score > tempBest || (score == tempBest && score > 0 && reading->value > cpuTemp)) {
+                    tempBest = score;
+                    cpuTemp = reading->value;
+                }
+            } else if (reading->type == 5) {  // Power
+                if (!PlausibleWatts(reading->value)) {
+                    continue;
+                }
+                const int score = CpuPowerScore(label);
+                if (score > powerBest ||
+                    (score == powerBest && score > 0 &&
+                        (!std::isfinite(cpuPower) || reading->value > cpuPower))) {
+                    powerBest = score;
+                    cpuPower = reading->value;
+                }
+            }
+        }
+        if (tempBest <= 0) {
+            cpuTemp = kNaN;
+        }
+        if (powerBest <= 0) {
+            cpuPower = kNaN;
+        }
+        UnmapViewOfFile(view);
+        CloseHandle(mapping);
+        if (!std::isfinite(cpuTemp) && !std::isfinite(cpuPower)) {
+            retryAt = now + kHwmonRetryMs;
+        }
+    }
+};
+
 // --- ACPI thermal zone -----------------------------------------------------
 struct AcpiTrust {
     int first = -1;
@@ -793,6 +1048,8 @@ struct RaplPdhSource {
 
 struct Sensors {
     HwmonSource hwmon;
+    CoreTempSource coreTemp;
+    HwinfoSource hwinfo;
     NvmlSource nvml;
     SmiSource smi;
     AcpiWmiSource acpi;
@@ -814,6 +1071,23 @@ struct Sensors {
             reading.cpuSource = hwmon.name;
         }
         if (!PlausibleTemp(cpuTemp)) {
+            cpuTemp = coreTemp.Read(now);
+            if (PlausibleTemp(cpuTemp)) {
+                reading.cpuSource = L"Core Temp (shared memory)";
+            }
+        }
+        double hwiCpuTemp = kNaN;
+        double hwiCpuPower = kNaN;
+        if (!PlausibleTemp(cpuTemp) || !PlausibleWatts(hwCpuPower)) {
+            hwinfo.Poll(now, hwiCpuTemp, hwiCpuPower);
+        }
+        if (!PlausibleTemp(cpuTemp) && PlausibleTemp(hwiCpuTemp)) {
+            cpuTemp = hwiCpuTemp;
+            reading.cpuSource = L"HWiNFO (shared memory)";
+        }
+        // ACPI / PDH thermal zones: often the fixed 27.85 C Z390 placeholder.
+        // Never prefer them over a real die sensor; still try when nothing else.
+        if (!PlausibleTemp(cpuTemp)) {
             cpuTemp = acpi.Read();
             if (PlausibleTemp(cpuTemp)) {
                 reading.cpuSource = L"ACPI thermal zone (WMI)";
@@ -830,6 +1104,17 @@ struct Sensors {
         if (PlausibleWatts(hwCpuPower)) {
             cpuPower = hwCpuPower;
             reading.cpuPowerSource = hwmon.name;
+        }
+        if (!PlausibleWatts(cpuPower)) {
+            const double ctPower = coreTemp.ReadPower(now);
+            if (PlausibleWatts(ctPower)) {
+                cpuPower = ctPower;
+                reading.cpuPowerSource = L"Core Temp (shared memory)";
+            }
+        }
+        if (!PlausibleWatts(cpuPower) && PlausibleWatts(hwiCpuPower)) {
+            cpuPower = hwiCpuPower;
+            reading.cpuPowerSource = L"HWiNFO (shared memory)";
         }
         if (!PlausibleWatts(cpuPower)) {
             cpuPower = rapl.Read();
