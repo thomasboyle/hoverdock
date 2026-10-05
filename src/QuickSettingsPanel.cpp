@@ -1057,16 +1057,42 @@ struct CaptureMeter {
     std::thread pumpThread;
     std::atomic<float> publishedLevel{0.0F};
     std::wstring publishedNote;
+    // Serialises the pumpThread lifecycle. StopPump/StartPump are reached
+    // concurrently from the UI thread (StopQuickSettingsCapture on prewarm /
+    // hide), the network cache worker (QueryCapture -> Sample) and the
+    // capture-open worker (EnsureQuickSettingsCaptureAsync). Unsynchronised
+    // join()/move-assign on the same std::thread made join() throw inside a
+    // noexcept function -> std::terminate -> abort (0xc0000409 in ucrtbase at
+    // launch, 1.1.67). Lock order: never take this while holding `mutex`; the
+    // pump thread itself never takes it, so joining under it cannot deadlock.
+    std::mutex pumpControlMutex;
 
-    void StopPump() noexcept {
+    void StopPumpLocked() noexcept {
         pumpRun.store(false, std::memory_order_release);
-        if (pumpThread.joinable()) {
+        if (!pumpThread.joinable()) {
+            return;
+        }
+        try {
             if (pumpThread.get_id() == std::this_thread::get_id()) {
                 pumpThread.detach();
             } else {
                 pumpThread.join();
             }
+        } catch (...) {
+            // Never let a join failure escape a noexcept path; drop the handle
+            // so a later StartPump cannot move-assign over a joinable thread.
+            try {
+                if (pumpThread.joinable()) {
+                    pumpThread.detach();
+                }
+            } catch (...) {
+            }
         }
+    }
+
+    void StopPump() noexcept {
+        std::lock_guard<std::mutex> control(pumpControlMutex);
+        StopPumpLocked();
     }
 
     void ReleaseResources() noexcept {
@@ -1099,10 +1125,11 @@ struct CaptureMeter {
     }
 
     void StartPump() {
-        if (pumpRun.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> control(pumpControlMutex);
+        if (pumpRun.load(std::memory_order_acquire) && pumpThread.joinable()) {
             return;
         }
-        StopPump();
+        StopPumpLocked();
         pumpRun.store(true, std::memory_order_release);
         pumpThread = std::thread([this] {
             while (pumpRun.load(std::memory_order_acquire)) {
