@@ -1,4 +1,5 @@
 #include "DockApp.h"
+#include "CodeEditor.h"
 #include "DockTheme.hlsli"
 #include "PerfBoost.h"
 #include "Profile.h"
@@ -10132,17 +10133,67 @@ void DockApp::SubmitLaunchPrompt() {
                 for (const LaunchTarget& target : targets) {
                     candidates.push_back(MakeLaunchCandidate(target));
                 }
-                if (auto replay = LlamaServerClient::TryReplayLastGoal(request); replay.has_value()) {
+                // Coding goals open in the most recently used IDE (focused when
+                // running); resolved lazily, it only touches window Z-order and
+                // a few file timestamps.
+                std::optional<CodeEditorChoice> editor;
+                const auto pickEditor = [&]() -> const CodeEditorChoice& {
+                    if (!editor.has_value()) {
+                        editor = FindPreferredCodeEditor(candidates);
+                    }
+                    return *editor;
+                };
+                const auto attachEditor = [&](SearchAgentResult& result) {
+                    for (SearchAgentAction& action : result.actions) {
+                        if (action.kind == SearchAgentAction::Kind::OpenInEditor) {
+                            const CodeEditorChoice& chosen = pickEditor();
+                            action.editor = chosen.exePath;
+                            action.editorArgs = chosen.args;
+                            action.editorWindow = reinterpret_cast<std::uintptr_t>(chosen.window);
+                            route += L" editor=" + chosen.name + L"(" + chosen.source + L")";
+                        }
+                    }
+                };
+                if (LlamaServerClient::LooksLikeCodingGoal(request)) {
+                    // Coding goal ("write hello world program"): no Google, no
+                    // bare IDE launch. The local model writes the program
+                    // (write_file into Documents\HoverDock) and it opens in the
+                    // user's editor. A repeat of the same goal reopens the file
+                    // without the model.
+                    agentMode = true;
+                    auto replay = LlamaServerClient::TryReplayLastGoal(request);
+                    if (replay.has_value() && !replay->actions.empty() &&
+                        std::ranges::all_of(replay->actions, [](const SearchAgentAction& a) {
+                            return a.kind == SearchAgentAction::Kind::OpenInEditor &&
+                                LlamaServerClient::IsSafeEditorFile(a.target);
+                        })) {
+                        agent = std::move(*replay);
+                        route = L"code-replay";
+                    } else {
+                        const CodeEditorChoice& chosen = pickEditor();
+                        agent = LlamaServerClient::RunCodeAgent(llamaUrl, request, chosen.languageHint,
+                            postStatus, superseded);
+                        route = L"code-agent";
+                        if (agent.serverUnavailable) {
+                            agent.serverUnavailable = false;
+                            agent.actions.clear();
+                            agent.reply = L"Local model is offline - start llama-server to write code.";
+                            route = L"code-offline";
+                        }
+                    }
+                    attachEditor(agent);
+                } else if (auto replay = LlamaServerClient::TryReplayLastGoal(request); replay.has_value()) {
                     // Fast path 2: exact repeat of the last successful goal (no model).
                     agentMode = true;
                     agent = std::move(*replay);
                     route = L"replay";
+                    attachEditor(agent);
                 } else if (auto plan = LlamaServerClient::PlanWithoutModel(request, candidates);
                     plan.has_value()) {
                     // Fast path 3 (first-time goals, no model): URL/domain, site
                     // search/home, folder/path, confident catalog app (alias,
-                    // acronym, typo), question/create-code -> web (+ editor),
-                    // strong keyword match, or a compound of those.
+                    // acronym, typo), question -> web, strong keyword match, or a
+                    // compound of those.
                     route = plan->route;
                     if (plan->actions.size() == 1 &&
                         plan->actions.front().kind == SearchAgentAction::Kind::LaunchApp) {
@@ -10155,7 +10206,7 @@ void DockApp::SubmitLaunchPrompt() {
                     // Agent mode: single-shot local llama-server call (one line,
                     // grammar-constrained); fuzzy if the server is down.
                     agent = LlamaServerClient::RunAgent(llamaUrl, request, candidates, postStatus,
-                        superseded);
+                        superseded, pickEditor().languageHint);
                     if (agent.serverUnavailable) {
                         judgment = LlamaServerClient::ResolveAppFuzzy(
                             LlamaServerClient::StripGoalVerbs(request), candidates);
@@ -10163,6 +10214,7 @@ void DockApp::SubmitLaunchPrompt() {
                     } else {
                         agentMode = true;
                         route = L"agent-" + std::to_wstring(agent.steps) + L"round";
+                        attachEditor(agent);
                     }
                 } else {
                     // Plain search: model ranking (launch-only), fuzzy if llama-server is down.
@@ -10276,8 +10328,58 @@ void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result)
 
     size_t performed = 0;
     std::wstring failure;
+    // write_file results: planned path -> file actually created (CREATE_NEW may
+    // pick name-2.ext). OpenInEditor opens the created file only.
+    std::vector<std::pair<std::wstring, std::wstring>> written;
+    std::vector<std::wstring> failedWrites;
+    std::vector<SearchAgentAction> remember;
     for (const SearchAgentAction& action : result.actions) {
         switch (action.kind) {
+        case SearchAgentAction::Kind::WriteFile: {
+            std::wstring path;
+            std::wstring why;
+            if (LlamaServerClient::WriteAgentFile(action, path, why)) {
+                Log(L"Search agent wrote " + path + L" bytes=" + std::to_wstring(action.content.size()));
+                written.emplace_back(action.target, path);
+                ++performed;
+            } else {
+                Log(L"Search agent write blocked: " + action.target + L" (" + why + L")");
+                failedWrites.push_back(action.target);
+                failure = L"Could not write " + action.label + L" (" + why + L").";
+            }
+            break;
+        }
+        case SearchAgentAction::Kind::OpenInEditor: {
+            if (std::ranges::find(failedWrites, action.target) != failedWrites.end()) {
+                break;
+            }
+            std::wstring file = action.target;
+            for (const auto& [planned, actual] : written) {
+                if (planned == action.target) {
+                    file = actual;
+                }
+            }
+            if (!LlamaServerClient::IsSafeEditorFile(file)) {
+                failure = L"Blocked unsafe file.";
+                break;
+            }
+            HWND editorWindow = reinterpret_cast<HWND>(action.editorWindow);
+            bool opened = OpenFileInCodeEditor(action.editor, action.editorArgs, editorWindow, file);
+            if (!opened && !action.editor.empty()) {
+                opened = OpenFileInCodeEditor(L"", L"", nullptr, file);  // Notepad fallback
+            }
+            Log(L"Search agent open in editor=" + (action.editor.empty() ? std::wstring(L"notepad") : action.editor) +
+                L" file=" + file + L" ok=" + std::to_wstring(opened ? 1 : 0));
+            if (opened) {
+                ++performed;
+                SearchAgentAction again = action;
+                again.target = file;
+                remember.push_back(std::move(again));
+            } else {
+                failure = L"Wrote " + file + L" but could not open an editor.";
+            }
+            break;
+        }
         case SearchAgentAction::Kind::LaunchApp: {
             const LaunchTarget* target = FindLaunchTarget(action.appId);
             if (target != nullptr && ActivateLaunchTarget(*target)) {
@@ -10308,7 +10410,16 @@ void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result)
     }
 
     if (performed > 0) {
-        LlamaServerClient::RememberSuccessfulGoal(m_launchRequest, result.actions);
+        // A code goal is remembered as "reopen the file it wrote", never as a
+        // second write.
+        const bool hasEditorStep = std::ranges::any_of(result.actions, [](const SearchAgentAction& a) {
+            return a.kind == SearchAgentAction::Kind::WriteFile || a.kind == SearchAgentAction::Kind::OpenInEditor;
+        });
+        if (!hasEditorStep) {
+            LlamaServerClient::RememberSuccessfulGoal(m_launchRequest, result.actions);
+        } else if (!remember.empty()) {
+            LlamaServerClient::RememberSuccessfulGoal(m_launchRequest, remember);
+        }
         CloseLaunchPrompt(false);
         BeginHide();
         return;

@@ -455,6 +455,47 @@ std::optional<std::string> ExtractStringField(const std::string& json, std::stri
     return std::nullopt;
 }
 
+// Appends the UTF-8 encoding of a code point.
+void AppendUtf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+// Four hex digits at json[pos..pos+3]; nullopt when malformed.
+std::optional<uint32_t> ParseHex4(const std::string& json, size_t pos) {
+    if (pos + 4 > json.size()) {
+        return std::nullopt;
+    }
+    uint32_t value = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        const char c = json[pos + i];
+        value <<= 4;
+        if (c >= '0' && c <= '9') {
+            value |= static_cast<uint32_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            value |= static_cast<uint32_t>(c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            value |= static_cast<uint32_t>(c - 'A' + 10);
+        } else {
+            return std::nullopt;
+        }
+    }
+    return value;
+}
+
 std::optional<std::string> ExtractAssistantContent(const std::string& response) {
     const std::string key = "\"content\"";
     size_t pos = 0;
@@ -480,6 +521,27 @@ std::optional<std::string> ExtractAssistantContent(const std::string& response) 
                         value.push_back('\r');
                     } else if (ch == 't') {
                         value.push_back('\t');
+                    } else if (ch == 'b' || ch == 'f') {
+                        // control characters: drop
+                    } else if (ch == 'u') {
+                        if (auto unit = ParseHex4(response, colon + 1); unit.has_value()) {
+                            uint32_t cp = *unit;
+                            colon += 4;
+                            if (cp >= 0xD800 && cp <= 0xDBFF && colon + 6 < response.size() &&
+                                response[colon + 1] == '\\' && response[colon + 2] == 'u') {
+                                if (auto low = ParseHex4(response, colon + 3);
+                                    low.has_value() && *low >= 0xDC00 && *low <= 0xDFFF) {
+                                    cp = 0x10000 + ((cp - 0xD800) << 10) + (*low - 0xDC00);
+                                    colon += 6;
+                                }
+                            }
+                            if (cp >= 0xD800 && cp <= 0xDFFF) {
+                                cp = 0xFFFD;
+                            }
+                            if (cp >= 0x20 || cp == 0x09 || cp == 0x0A || cp == 0x0D) {
+                                AppendUtf8(value, cp);
+                            }
+                        }
                     } else {
                         value.push_back(ch);
                     }
@@ -525,16 +587,34 @@ constexpr size_t kAgentMaxUrlChars = 2048;
 constexpr size_t kMaxQueryChars = 120;
 constexpr double kConfidentMinScore = 80.0;
 constexpr double kConfidentMargin = 30.0;
+// Code round ("write hello world program"): one request, the reply is the file
+// name line plus the program. ~0.77 s per output token on the CPU 27B, so the
+// prompt asks for a minimal program and generation is capped: hello world is
+// ~10-40 tokens (~10-30 s), 256 tokens is ~3.3 min worst case.
+constexpr int kCodeMaxTokens = 256;
+constexpr DWORD kCodeReceiveTimeoutMs = 210000;
+constexpr size_t kCodeMaxBytes = 64 * 1024;
+constexpr size_t kCodeMaxNameChars = 48;
 
 // One line, no newline: the grammar ends the reply after a single action so
 // generation stops at EOS instead of running to max_tokens.
 constexpr char kAgentGrammar[] =
-    "root ::= \"L c\" [0-9]{1,4} | \"W \" q | \"Y \" q | \"U http\" \"s\"? \"://\" u | \"P \" p | \"S \" q | \"N\" (\" \" q)?\n"
+    "root ::= \"L c\" [0-9]{1,4} | \"W \" q | \"Y \" q | \"U http\" \"s\"? \"://\" u | \"P \" p | \"S \" q | \"C \" q | \"N\" (\" \" q)?\n"
     "q ::= [^\\n]{1,80}\n"
     "u ::= [^\\n \"<>\\\\]{1,300}\n"
     "p ::= [^\\n\"<>|?*]{1,200}\n";
 // Second round (after S) and plain app ranking: pick a listed app or nothing.
 constexpr char kLaunchOnlyGrammar[] = "root ::= \"L c\" [0-9]{1,4} | \"N\"\n";
+// Code round: "F <name>.<ext>" then the source on the following lines. The
+// extension list is the write_file allowlist (text/source only, nothing the
+// shell executes on double-click except .js/.html, which are only ever opened
+// in an editor by Hoverdock).
+constexpr char kCodeGrammar[] =
+    "root ::= \"F \" n \".\" e \"\\n\" b\n"
+    "n ::= [A-Za-z0-9_-]{1,40}\n"
+    "e ::= \"py\" | \"cpp\" | \"c\" | \"h\" | \"hpp\" | \"cs\" | \"js\" | \"ts\" | \"html\" | \"css\" | "
+    "\"json\" | \"java\" | \"kt\" | \"rs\" | \"go\" | \"rb\" | \"lua\" | \"sql\" | \"md\" | \"txt\"\n"
+    "b ::= ([^\\n] | \"\\n\")+\n";
 
 std::atomic<bool> g_promptWarm{false};
 std::atomic<bool> g_warmInFlight{false};
@@ -1923,16 +2003,22 @@ const std::string& AgentSystemPrompt() {
         "P <folder> open a folder: Downloads, Documents, Desktop, Pictures, Music, Videos, Home, "
         "Screenshots, OneDrive, or an absolute path\n"
         "S <words> search installed apps by purpose\n"
+        "C <task> write a program/script/code file and open it in the user's editor\n"
         "N <short reason> nothing fits\n"
         "Prefer L when a listed app fits. Use S only when no listed app fits but an app might.";
     return prompt;
 }
 
-std::string BuildModelBody(const std::string& user, int maxTokens, const char* grammar) {
+std::string BuildModelBody(const std::string& user, int maxTokens, const char* grammar,
+    bool singleLine = true) {
     std::string body = "{\"model\":\"local\",\"temperature\":0,\"max_tokens\":";
     body += std::to_string(maxTokens);
     body += ",\"cache_prompt\":true,\"chat_template_kwargs\":{\"enable_thinking\":false},"
-            "\"reasoning_format\":\"none\",\"stop\":[\"\\n\"],";
+            "\"reasoning_format\":\"none\",";
+    // Code replies are multi-line (file name line + program): no newline stop.
+    if (singleLine) {
+        body += "\"stop\":[\"\\n\"],";
+    }
     if (grammar != nullptr && !g_grammarRejected.load()) {
         body += "\"grammar\":";
         AppendEscaped(body, grammar);
@@ -1949,16 +2035,17 @@ std::string BuildModelBody(const std::string& user, int maxTokens, const char* g
 
 struct ModelReply {
     bool reached = false;  // got an HTTP response with assistant content
+    bool truncated = false;  // finish_reason "length" (hit max_tokens)
     std::string content;
     std::wstring error;
 };
 
 ModelReply AskModel(const ParsedUrl& url, const std::string& user, int maxTokens, const char* grammar,
-    DWORD receiveTimeoutMs) {
+    DWORD receiveTimeoutMs, bool singleLine = true) {
     ModelReply reply;
     for (int attempt = 0; attempt < 2; ++attempt) {
         const bool withGrammar = grammar != nullptr && !g_grammarRejected.load();
-        const std::string body = BuildModelBody(user, maxTokens, grammar);
+        const std::string body = BuildModelBody(user, maxTokens, grammar, singleLine);
         DWORD status = 0;
         std::string response;
         std::wstring error;
@@ -1970,6 +2057,7 @@ ModelReply AskModel(const ParsedUrl& url, const std::string& user, int maxTokens
         }
         if (status >= 200 && status < 300) {
             reply.reached = true;
+            reply.truncated = response.find("\"finish_reason\":\"length\"") != std::string::npos;
             if (const auto content = ExtractAssistantContent(response); content.has_value()) {
                 reply.content = *content;
             }
@@ -1987,7 +2075,7 @@ ModelReply AskModel(const ParsedUrl& url, const std::string& user, int maxTokens
 }
 
 struct ModelLine {
-    char op = 0;  // L W Y U P S N, or 0 when unparsed
+    char op = 0;  // L W Y U P S C N, or 0 when unparsed
     std::wstring arg;
 };
 
@@ -2008,7 +2096,7 @@ ModelLine ParseModelLine(std::string content) {
     if (!text.empty() && text.front() != L'{') {
         const wchar_t op = static_cast<wchar_t>(std::towupper(text.front()));
         const bool spaced = text.size() == 1 || text[1] == L' ' || text[1] == L':';
-        if (spaced && std::wstring_view(L"LWYUPSN").find(op) != std::wstring_view::npos) {
+        if (spaced && std::wstring_view(L"LWYUPSCN").find(op) != std::wstring_view::npos) {
             line.op = static_cast<char>(op);
             line.arg = text.size() > 1 ? TrimWide(text.substr(2)) : L"";
             return line;
@@ -2048,6 +2136,9 @@ ModelLine ParseModelLine(std::string content) {
     } else if (tool == "search_apps") {
         line.op = 'S';
         line.arg = field({"q", "query", "text"});
+    } else if (tool == "write_file" || tool == "create_file" || tool == "write_code") {
+        line.op = 'C';
+        line.arg = field({"task", "goal", "q", "query", "text"});
     } else if (tool == "done" || tool == "say" || tool == "reply") {
         line.op = 'N';
         line.arg = field({"say", "text", "reply", "message"});
@@ -2289,76 +2380,65 @@ std::optional<std::wstring> BareFolder(const std::wstring& request) {
     return std::nullopt;
 }
 
-// Create / write / code goals the catalog cannot answer -> Google, and open the
-// best installed editor when one is present (Cursor > VS Code > Notepad++ >
-// Notepad). Avoids a dead-end "No matching installed app." for first-time
-// goals like "write hello world program" / "create a script" / "code a bot".
-const LaunchCandidate* BestCodingEditor(const std::vector<LaunchCandidate>& candidates) {
-    for (const std::wstring_view key : {std::wstring_view(L"cursor"), std::wstring_view(L"vscode"),
-             std::wstring_view(L"code"), std::wstring_view(L"notepad++"), std::wstring_view(L"notepad")}) {
-        if (const LaunchCandidate* hit = AliasMatch(std::wstring(key), candidates); hit != nullptr) {
-            return hit;
-        }
-    }
-    return nullptr;
-}
-
+// Create / write / code goals ("write hello world program", "code a bot",
+// "create a python script that renames files", "hello world in rust"). These
+// no longer Google + open an IDE: they go to the code agent (RunCodeAgent),
+// which writes the program into Documents\HoverDock and opens it in the most
+// recently used editor.
 bool LooksLikeCreateOrCodeGoal(const std::wstring& lower) {
-    if (lower.find(L"hello world") != std::wstring::npos) {
+    if (lower.find(L"hello world") != std::wstring::npos || lower.find(L"helloworld") != std::wstring::npos ||
+        lower.find(L"hello, world") != std::wstring::npos) {
         return true;
     }
     static constexpr std::wstring_view starts[] = {
-        L"write ", L"write a ", L"write an ", L"write me ", L"write the ", L"write my ",
-        L"create a ", L"create an ", L"create me ", L"create the ", L"create my ",
-        L"make a ", L"make an ", L"make me ", L"make the ", L"make my ",
-        L"code a ", L"code an ", L"code me ", L"code the ", L"code my ", L"code ",
-        L"build a ", L"build an ", L"build me ", L"build the ",
-        L"generate a ", L"generate an ", L"implement a ", L"implement an ",
-        L"develop a ", L"develop an ", L"draft a ", L"draft an ",
-        L"compose a ", L"compose an ",
+        L"write ", L"create ", L"make ", L"code ", L"build ", L"generate ", L"implement ",
+        L"develop ", L"draft ", L"compose ", L"program ", L"script ",
     };
     if (!std::ranges::any_of(starts, [&](std::wstring_view s) { return lower.starts_with(s); })) {
         return false;
     }
-    // "code ..." is always a coding intent. For write/create/make/build, require a
-    // coding-ish noun so "create a reminder" / "make a playlist" can still fall
-    // through to the model or site catalog when useful.
-    if (lower.starts_with(L"code ") || lower.starts_with(L"code a ") || lower.starts_with(L"code an ") ||
-        lower.starts_with(L"code me ") || lower.starts_with(L"code the ") || lower.starts_with(L"code my ")) {
+    // "code ..." / "program ..." / "script ..." are always coding intents.
+    if (StartsWithAny(lower, {L"code ", L"program ", L"script "})) {
         return true;
     }
-    static constexpr std::wstring_view hints[] = {
+    // write/create/make/build...: require a coding word as a whole token so
+    // "create a reminder", "make a happy birthday card" (app in happy) or
+    // "write an email" keep their old routes.
+    static constexpr std::wstring_view words[] = {
         L"program", L"programme", L"script", L"code", L"function", L"class", L"algorithm",
-        L"webpage", L"website", L"web page", L"html", L"css", L"javascript", L"typescript",
-        L"python", L"java", L"c++", L"cpp", L"csharp", L"c#", L"rust", L"golang", L"go ",
-        L"react", L"node", L"api", L"bot", L"game", L"snippet", L"macro", L"batch",
-        L"powershell", L"bash", L"shell", L"sql", L"regex", L"parser", L"module",
-        L"library", L"package", L"component", L"app", L"application", L"hello", L"world",
-        L"firmware", L"plugin", L"addon", L"add-on", L"extension", L"cli", L"tool",
+        L"webpage", L"website", L"html", L"css", L"javascript", L"js", L"typescript", L"ts",
+        L"python", L"py", L"java", L"kotlin", L"cpp", L"csharp", L"rust", L"golang", L"ruby",
+        L"lua", L"react", L"node", L"nodejs", L"api", L"bot", L"game", L"snippet", L"sql",
+        L"regex", L"parser", L"module", L"library", L"component", L"app", L"application",
+        L"cli", L"calculator", L"fizzbuzz", L"fibonacci", L"sorting", L"scraper", L"hello",
+        L"json", L"markdown",
     };
-    return std::ranges::any_of(hints, [&](std::wstring_view h) { return lower.find(h) != std::wstring::npos; });
+    std::wstring cleaned = lower;
+    for (wchar_t& c : cleaned) {
+        if (c == L',' || c == L'.' || c == L'!' || c == L'?' || c == L'(' || c == L')' || c == L'"' ||
+            c == L'\'' || c == L':' || c == L';') {
+            c = L' ';
+        }
+    }
+    for (const std::wstring& token : Tokenize(cleaned)) {
+        std::wstring_view t = token;
+        if (t.size() > 3 && t.ends_with(L's')) {
+            t.remove_suffix(1);  // programs, scripts, functions, games
+        }
+        if (token == L"c++" || token == L"c#" || token == L"html5" ||
+            std::ranges::any_of(words, [&](std::wstring_view w) { return t == w || token == w; })) {
+            return true;
+        }
+    }
+    return false;
 }
 
-std::optional<SearchFastPlan> CreateCodePlan(const std::wstring& request,
-    const std::vector<LaunchCandidate>& candidates) {
+std::wstring CleanCodingGoal(const std::wstring& request) {
     std::wstring lower = StripPolitePrefix(ToLowerWide(TrimWide(request)));
-    if (Tokenize(lower).size() < 2 || lower.size() > kMaxQueryChars) {
-        return std::nullopt;
-    }
     while (!lower.empty() && (lower.back() == L'?' || lower.back() == L'.' || lower.back() == L'!')) {
         lower.pop_back();
     }
-    lower = TrimWide(lower);
-    if (!LooksLikeCreateOrCodeGoal(lower)) {
-        return std::nullopt;
-    }
-    SearchFastPlan plan;
-    plan.route = L"web-create";
-    if (const LaunchCandidate* editor = BestCodingEditor(candidates); editor != nullptr) {
-        plan.actions.push_back(MakeLaunchAction(*editor));
-    }
-    plan.actions.push_back(GoogleSearch(lower));
-    return plan;
+    return TrimWide(std::move(lower));
 }
 
 std::optional<SearchFastPlan> PlanSingle(const std::wstring& text, const std::vector<LaunchCandidate>& candidates) {
@@ -2391,9 +2471,6 @@ std::optional<SearchFastPlan> PlanSingle(const std::wstring& text, const std::ve
     }
     if (auto question = QuestionAction(text); question.has_value()) {
         return single(std::move(*question), L"web-question");
-    }
-    if (auto create = CreateCodePlan(text, candidates); create.has_value()) {
-        return create;
     }
     if (auto folder = BareFolder(text); folder.has_value()) {
         return single(MakePathAction(*folder, *folder), L"folder");
@@ -2578,7 +2655,7 @@ std::optional<SearchAgentAction> ActionFromModelLine(const ModelLine& line,
 
 SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
     const std::wstring& request, const std::vector<LaunchCandidate>& candidates,
-    const StatusCallback& status, const CancelCallback& cancelled) {
+    const StatusCallback& status, const CancelCallback& cancelled, const std::wstring& codeLanguageHint) {
     SearchAgentResult result;
     const std::wstring goal = TruncateWide(TrimWide(request), kMaxRequestChars);
     if (goal.empty()) {
@@ -2610,6 +2687,18 @@ SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
         return result;
     }
     ModelLine line = ParseModelLine(reply.content);
+
+    if (line.op == 'C') {
+        // The model decided this goal needs code: one code round (write_file +
+        // open in the user's editor) for the original goal.
+        SearchAgentResult code = RunCodeAgent(baseUrl, goal, codeLanguageHint, status, cancelled);
+        code.steps = 2;
+        if (code.serverUnavailable) {
+            code.serverUnavailable = false;
+            code.reply = L"Agent stopped: " + (code.reply.empty() ? std::wstring(L"no reply") : code.reply);
+        }
+        return code;
+    }
 
     if (line.op == 'S') {
         std::wstring query = line.arg.empty() ? goal : TruncateWide(line.arg, 60);
@@ -2674,6 +2763,393 @@ bool LlamaServerClient::IsSafeShellOpenTarget(bool isUrl, const std::wstring& ta
     }
     std::wstring why;
     return ValidateOpenPath(target, why).has_value();
+}
+
+// ---------------------------------------------------------------------------
+// Coding goals: write_file / create_file + open in the user's editor
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::wstring_view kCodeExtensions[] = {
+    L"py", L"cpp", L"c", L"h", L"hpp", L"cs", L"js", L"ts", L"html", L"css", L"json", L"java",
+    L"kt", L"rs", L"go", L"rb", L"lua", L"sql", L"md", L"txt",
+};
+
+bool IsAllowedCodeExtension(std::wstring_view ext) {
+    return std::ranges::any_of(kCodeExtensions, [&](std::wstring_view e) { return ext == e; });
+}
+
+bool IsReservedDeviceName(std::wstring stem) {
+    stem = ToLowerWide(std::move(stem));
+    static constexpr std::wstring_view reserved[] = {
+        L"con", L"prn", L"aux", L"nul", L"clock$", L"conin$", L"conout$",
+    };
+    if (std::ranges::any_of(reserved, [&](std::wstring_view r) { return stem == r; })) {
+        return true;
+    }
+    return stem.size() == 4 && (stem.starts_with(L"com") || stem.starts_with(L"lpt")) &&
+        stem[3] >= L'0' && stem[3] <= L'9';
+}
+
+bool SamePathInsensitive(const std::wstring& a, const std::wstring& b) {
+    std::wstring left = a;
+    std::wstring right = b;
+    while (left.size() > 3 && (left.back() == L'\\' || left.back() == L'/')) {
+        left.pop_back();
+    }
+    while (right.size() > 3 && (right.back() == L'\\' || right.back() == L'/')) {
+        right.pop_back();
+    }
+    return !left.empty() && CompareStringOrdinal(left.c_str(), static_cast<int>(left.size()), right.c_str(),
+        static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
+}
+
+// "F hello_world.py\nprint(...)" -> name, ext, body. Tolerates a missing F
+// line (server rejected the grammar) and stray markdown fences.
+struct CodeReply {
+    std::wstring name;
+    std::wstring ext;
+    std::string body;
+};
+
+std::wstring ExtFromFenceTag(std::string tag) {
+    std::ranges::transform(tag, tag.begin(), [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
+    static constexpr std::pair<std::string_view, std::wstring_view> map[] = {
+        {"python", L"py"}, {"py", L"py"}, {"cpp", L"cpp"}, {"c++", L"cpp"}, {"c", L"c"},
+        {"csharp", L"cs"}, {"cs", L"cs"}, {"c#", L"cs"}, {"javascript", L"js"}, {"js", L"js"},
+        {"typescript", L"ts"}, {"ts", L"ts"}, {"html", L"html"}, {"css", L"css"}, {"json", L"json"},
+        {"java", L"java"}, {"kotlin", L"kt"}, {"rust", L"rs"}, {"go", L"go"}, {"ruby", L"rb"},
+        {"lua", L"lua"}, {"sql", L"sql"}, {"markdown", L"md"}, {"md", L"md"},
+    };
+    for (const auto& [key, ext] : map) {
+        if (tag == key) {
+            return std::wstring(ext);
+        }
+    }
+    return {};
+}
+
+std::optional<CodeReply> ParseCodeReply(std::string content) {
+    if (const size_t endThink = content.find("</think>"); endThink != std::string::npos) {
+        content = content.substr(endThink + 8);
+    }
+    std::erase(content, '\r');
+    std::erase(content, '\0');
+    size_t first = content.find_first_not_of(" \t\n");
+    if (first == std::string::npos) {
+        return std::nullopt;
+    }
+    content = content.substr(first);
+    CodeReply reply;
+    if (content.starts_with("F ") || content.starts_with("F:")) {
+        const size_t eol = content.find('\n');
+        std::string header = content.substr(2, eol == std::string::npos ? std::string::npos : eol - 2);
+        content = eol == std::string::npos ? std::string{} : content.substr(eol + 1);
+        std::wstring file = TrimWide(Utf8ToWide(header));
+        if (const size_t dot = file.rfind(L'.'); dot != std::wstring::npos) {
+            reply.name = file.substr(0, dot);
+            reply.ext = ToLowerWide(file.substr(dot + 1));
+        } else {
+            reply.name = file;
+        }
+    }
+    // Strip markdown fences the model may still emit.
+    std::vector<std::string> lines;
+    {
+        size_t start = 0;
+        while (start <= content.size()) {
+            const size_t eol = content.find('\n', start);
+            lines.push_back(content.substr(start, eol == std::string::npos ? std::string::npos : eol - start));
+            if (eol == std::string::npos) {
+                break;
+            }
+            start = eol + 1;
+        }
+    }
+    const auto blank = [](const std::string& line) { return line.find_first_not_of(" \t") == std::string::npos; };
+    while (!lines.empty() && blank(lines.front())) {
+        lines.erase(lines.begin());
+    }
+    if (!lines.empty() && lines.front().starts_with("```")) {
+        if (reply.ext.empty()) {
+            reply.ext = ExtFromFenceTag(lines.front().substr(3));
+        }
+        lines.erase(lines.begin());
+    }
+    while (!lines.empty() && blank(lines.back())) {
+        lines.pop_back();
+    }
+    if (!lines.empty() && lines.back().starts_with("```")) {
+        lines.pop_back();
+    }
+    for (std::string& line : lines) {
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) {
+            line.pop_back();
+        }
+        reply.body += line;
+        reply.body += '\n';
+    }
+    if (blank(reply.body)) {
+        return std::nullopt;
+    }
+    // File name: [A-Za-z0-9_-] only, never empty, never a device name.
+    std::wstring safeName;
+    for (const wchar_t c : reply.name) {
+        if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'_' ||
+            c == L'-') {
+            safeName.push_back(c);
+        } else if (c == L' ' && !safeName.empty() && safeName.back() != L'_') {
+            safeName.push_back(L'_');
+        }
+    }
+    if (safeName.size() > 40) {
+        safeName.resize(40);
+    }
+    if (safeName.empty() || IsReservedDeviceName(safeName)) {
+        safeName = L"program";
+    }
+    reply.name = safeName;
+    if (!IsAllowedCodeExtension(reply.ext)) {
+        reply.ext = L"txt";
+    }
+    return reply;
+}
+
+}  // namespace
+
+bool LlamaServerClient::LooksLikeCodingGoal(const std::wstring& request) {
+    const std::wstring lower = CleanCodingGoal(request);
+    if (lower.empty() || lower.size() > kMaxRequestChars) {
+        return false;
+    }
+    // Questions keep their web route ("how do i write hello world in python").
+    if (StartsWithAny(lower, {L"how ", L"what ", L"what's ", L"why ", L"who ", L"where ", L"when ",
+            L"is ", L"does ", L"do ", L"should ", L"can i ", L"google ", L"search "})) {
+        return false;
+    }
+    return LooksLikeCreateOrCodeGoal(lower);
+}
+
+std::wstring LlamaServerClient::CodeSandboxFolder(bool create) {
+    const std::wstring documents = KnownFolder(FOLDERID_Documents);
+    if (documents.empty() || !IsDirectory(documents)) {
+        return {};
+    }
+    std::wstring folder = documents;
+    if (folder.back() != L'\\') {
+        folder.push_back(L'\\');
+    }
+    folder += L"HoverDock";
+    DWORD attributes = GetFileAttributesW(folder.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES && create) {
+        if (CreateDirectoryW(folder.c_str(), nullptr) == FALSE && GetLastError() != ERROR_ALREADY_EXISTS) {
+            return {};
+        }
+        attributes = GetFileAttributesW(folder.c_str());
+    }
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return {};  // missing, a file, or a junction/symlink planted elsewhere
+    }
+    return folder;
+}
+
+bool LlamaServerClient::IsSafeWriteTarget(const std::wstring& path, std::wstring& why) {
+    if (path.size() < 8 || path.size() >= MAX_PATH) {
+        why = L"bad path length";
+        return false;
+    }
+    if (!(((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) && path[1] == L':' &&
+            path[2] == L'\\')) {
+        why = L"need a local absolute path";
+        return false;
+    }
+    if (path.find_first_of(L"/<>\"|?*", 0) != std::wstring::npos || path.find(L':', 2) != std::wstring::npos ||
+        std::ranges::any_of(path, [](wchar_t c) { return c < 0x20; })) {
+        why = L"invalid characters";
+        return false;
+    }
+    wchar_t full[MAX_PATH] = {};
+    const DWORD fullLen = GetFullPathNameW(path.c_str(), static_cast<DWORD>(std::size(full)), full, nullptr);
+    if (fullLen == 0 || fullLen >= std::size(full) || !SamePathInsensitive(std::wstring(full, fullLen), path)) {
+        why = L"path is not canonical";
+        return false;
+    }
+    const size_t sep = path.rfind(L'\\');
+    const std::wstring parent = path.substr(0, sep);
+    const std::wstring file = path.substr(sep + 1);
+    const size_t dot = file.rfind(L'.');
+    if (dot == std::wstring::npos || dot == 0 || file.find(L'.') != dot) {
+        why = L"need name.ext";
+        return false;
+    }
+    const std::wstring stem = file.substr(0, dot);
+    const std::wstring ext = ToLowerWide(file.substr(dot + 1));
+    if (stem.size() > kCodeMaxNameChars ||
+        !std::ranges::all_of(stem, [](wchar_t c) {
+            return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') ||
+                c == L'_' || c == L'-';
+        }) ||
+        IsReservedDeviceName(stem)) {
+        why = L"bad file name";
+        return false;
+    }
+    if (!IsAllowedCodeExtension(ext)) {
+        why = L"file type not allowed";
+        return false;
+    }
+    // Directly inside the HoverDock sandbox or Documents / Desktop / Downloads.
+    const std::wstring sandbox = CodeSandboxFolder(false);
+    const std::wstring roots[] = {
+        sandbox, KnownFolder(FOLDERID_Documents), KnownFolder(FOLDERID_Desktop), KnownFolder(FOLDERID_Downloads),
+    };
+    if (!std::ranges::any_of(roots, [&](const std::wstring& root) { return SamePathInsensitive(root, parent); })) {
+        why = L"only Documents\\HoverDock, Documents, Desktop or Downloads";
+        return false;
+    }
+    const DWORD attributes = GetFileAttributesW(parent.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        why = L"folder missing";
+        return false;
+    }
+    if (SamePathInsensitive(parent, sandbox) && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        why = L"sandbox is a link";
+        return false;
+    }
+    return true;
+}
+
+bool LlamaServerClient::WriteAgentFile(const SearchAgentAction& action, std::wstring& writtenPath,
+    std::wstring& why) {
+    if (action.kind != SearchAgentAction::Kind::WriteFile) {
+        why = L"not a write action";
+        return false;
+    }
+    if (action.content.empty() || action.content.size() > kCodeMaxBytes ||
+        action.content.find('\0') != std::string::npos) {
+        why = L"bad content";
+        return false;
+    }
+    (void)CodeSandboxFolder(true);
+    if (!IsSafeWriteTarget(action.target, why)) {
+        return false;
+    }
+    const size_t dot = action.target.rfind(L'.');
+    const std::wstring base = action.target.substr(0, dot);
+    const std::wstring ext = action.target.substr(dot);
+    for (int attempt = 1; attempt <= 50; ++attempt) {
+        const std::wstring candidate = attempt == 1 ? action.target : base + L"-" + std::to_wstring(attempt) + ext;
+        if (!IsSafeWriteTarget(candidate, why)) {
+            return false;
+        }
+        // CREATE_NEW: never overwrites, and fails on an existing file/link.
+        HANDLE file = CreateFileW(candidate.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) {
+                continue;
+            }
+            why = L"could not create file (" + std::to_wstring(error) + L")";
+            return false;
+        }
+        DWORD written = 0;
+        const BOOL ok = ::WriteFile(file, action.content.data(), static_cast<DWORD>(action.content.size()),
+            &written, nullptr);
+        CloseHandle(file);
+        if (ok == FALSE || written != action.content.size()) {
+            DeleteFileW(candidate.c_str());  // only the file this call just created
+            why = L"write failed";
+            return false;
+        }
+        writtenPath = candidate;
+        return true;
+    }
+    why = L"too many files with that name";
+    return false;
+}
+
+bool LlamaServerClient::IsSafeEditorFile(const std::wstring& path) {
+    std::wstring why;
+    if (!IsSafeWriteTarget(path, why)) {
+        return false;
+    }
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+}
+
+SearchAgentResult LlamaServerClient::RunCodeAgent(const std::wstring& baseUrl, const std::wstring& request,
+    const std::wstring& languageHint, const StatusCallback& status, const CancelCallback& cancelled) {
+    SearchAgentResult result;
+    const std::wstring goal = TruncateWide(TrimWide(request), kMaxRequestChars);
+    if (goal.empty()) {
+        result.reply = L"Type what to write.";
+        return result;
+    }
+    if (status) {
+        status(L"Writing code with local model...");
+    }
+    // Same cached system prompt as every other request; the user turn switches
+    // the reply format and the grammar enforces it.
+    std::string user = "goal: ";
+    user += WideToUtf8(goal);
+    user += "\nmode: code (ignore the one-line rule). First line: F <short_snake_case_name>.<ext>. "
+            "Then only the complete, minimal, runnable source code. No markdown fences, no explanation.";
+    if (!languageHint.empty()) {
+        user += " If the goal names no language, use ";
+        user += WideToUtf8(languageHint);
+        user += '.';
+    }
+    const ParsedUrl url = ParseBaseUrl(baseUrl);
+    result.steps = 1;
+    const ModelReply reply = AskModel(url, user, kCodeMaxTokens, kCodeGrammar, kCodeReceiveTimeoutMs, false);
+    if (!reply.reached) {
+        result.serverUnavailable = true;
+        result.reply = reply.error;
+        return result;
+    }
+    if (cancelled && cancelled()) {
+        return result;
+    }
+    const std::optional<CodeReply> code = ParseCodeReply(reply.content);
+    if (!code.has_value()) {
+        result.reply = L"The local model returned no code.";
+        return result;
+    }
+    const std::wstring folder = CodeSandboxFolder(true);
+    if (folder.empty()) {
+        result.reply = L"Could not create Documents\\HoverDock.";
+        return result;
+    }
+    const std::wstring fileName = code->name + L"." + code->ext;
+    const std::wstring path = folder + L"\\" + fileName;
+    std::wstring why;
+    if (!IsSafeWriteTarget(path, why)) {
+        result.reply = L"Blocked write: " + why + L".";
+        return result;
+    }
+    SearchAgentAction write;
+    write.kind = SearchAgentAction::Kind::WriteFile;
+    write.target = path;
+    write.label = fileName;
+    write.content = code->body;
+    if (write.content.size() > kCodeMaxBytes) {
+        result.reply = L"The generated file is too large.";
+        return result;
+    }
+    SearchAgentAction open;
+    open.kind = SearchAgentAction::Kind::OpenInEditor;
+    open.target = path;
+    open.label = fileName;
+    result.actions.push_back(std::move(write));
+    result.actions.push_back(std::move(open));
+    result.reply = L"Wrote " + fileName + (reply.truncated ? L" (cut off at the token limit)." : L".");
+    if (status) {
+        status(L"Writing " + fileName + L"...");
+    }
+    return result;
 }
 
 namespace {

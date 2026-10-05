@@ -2,6 +2,7 @@
 
 #include "TypeSafeClient.h"
 
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -15,12 +16,25 @@ struct SearchAgentAction {
         LaunchApp,  // appId = catalog candidate id (cN)
         OpenUrl,    // target = validated http(s) URL
         OpenPath,   // target = existing local folder or non-executable file
+        // write_file / create_file: target = planned path inside the HoverDock
+        // code sandbox (Documents\HoverDock), content = UTF-8 text. Never
+        // overwrites: DockApp writes with CREATE_NEW and picks name-2.ext etc.
+        WriteFile,
+        // target = code file just written; editor = validated IDE executable
+        // (empty = Notepad); editorWindow = running IDE top-level window to
+        // focus first (0 = none). The file is passed to the editor explicitly,
+        // never ShellExecute'd with its default (possibly script-host) verb.
+        OpenInEditor,
     };
 
     Kind kind = Kind::LaunchApp;
     std::string appId;
     std::wstring target;
     std::wstring label;
+    std::string content;
+    std::wstring editor;
+    std::wstring editorArgs;  // e.g. "/Edit" for Visual Studio
+    std::uintptr_t editorWindow = 0;
 };
 
 struct SearchAgentResult {
@@ -82,8 +96,9 @@ public:
     // Everything that can be answered without the model, in order: direct
     // action (URL/domain, explicit site search, folder, absolute path) ->
     // confident catalog app (exact/alias/lexical/acronym/prefix/typo) -> site
-    // home or site search -> question -> create/write/code goal (Google +
-    // best editor when installed) -> bare folder -> strong keyword match.
+    // home or site search -> question -> bare folder -> strong keyword match.
+    // Coding goals are NOT planned here (no Google + editor): see
+    // LooksLikeCodingGoal / RunCodeAgent.
     // Compound goals ("open spotify and discord") resolve when every part does.
     [[nodiscard]] static std::optional<SearchFastPlan> PlanWithoutModel(const std::wstring& request,
         const std::vector<LaunchCandidate>& candidates);
@@ -94,16 +109,52 @@ public:
     static void WarmPromptCache(const std::wstring& baseUrl);
 
     // Single-shot agent against llama-server: one grammar-constrained line
-    // (L id / W query / Y query / U url / P folder / S words / N). S is answered
-    // locally and only falls through to a second, launch-only round when no
-    // app clearly wins. Blocking; call from a worker thread. status is invoked
+    // (L id / W query / Y query / U url / P folder / S words / C task / N). S is
+    // answered locally and only falls through to a second, launch-only round
+    // when no app clearly wins; C ("write code") hands over to the code round
+    // (RunCodeAgent). Blocking; call from a worker thread. status is invoked
     // from that worker thread; cancelled is polled between rounds.
     [[nodiscard]] static SearchAgentResult RunAgent(const std::wstring& baseUrl,
         const std::wstring& request, const std::vector<LaunchCandidate>& candidates,
-        const StatusCallback& status, const CancelCallback& cancelled);
+        const StatusCallback& status, const CancelCallback& cancelled,
+        const std::wstring& codeLanguageHint = {});
 
     // Defence-in-depth for ShellExecute targets already queued by the agent.
     [[nodiscard]] static bool IsSafeShellOpenTarget(bool isUrl, const std::wstring& target);
+
+    // ---- Coding goals (write_file + open in editor) -----------------------
+
+    // "write hello world program", "code a snake game in python", "create a
+    // python script that renames files", "hello world in rust".
+    [[nodiscard]] static bool LooksLikeCodingGoal(const std::wstring& request);
+
+    // Model writes the program (grammar: "F <name.ext>" line + source), the
+    // client validates the file name/extension and queues WriteFile +
+    // OpenInEditor (editor fields are filled by the caller). languageHint is
+    // the default language when the goal names none (from the chosen IDE).
+    // Blocking; worker thread. serverUnavailable when llama-server is down.
+    [[nodiscard]] static SearchAgentResult RunCodeAgent(const std::wstring& baseUrl,
+        const std::wstring& request, const std::wstring& languageHint,
+        const StatusCallback& status, const CancelCallback& cancelled);
+
+    // Documents\HoverDock (created on demand). Empty when unavailable.
+    [[nodiscard]] static std::wstring CodeSandboxFolder(bool create);
+
+    // True for an absolute path to a regular file name with an allowed text /
+    // source extension (.txt .md .py .cpp .c .h .hpp .js .ts .html .css .json
+    // .java .cs .rs .go .kt .sql .lua .rb) directly inside the HoverDock
+    // sandbox or the user's Documents / Desktop / Downloads folder. Executables,
+    // scripts run by the shell (.bat .ps1 .cmd .vbs .lnk ...), UNC/device paths,
+    // reserved names and alternate data streams are refused.
+    [[nodiscard]] static bool IsSafeWriteTarget(const std::wstring& path, std::wstring& why);
+
+    // Validates and writes action.content (CREATE_NEW, never overwrites:
+    // falls back to name-2.ext ... name-50.ext). writtenPath is the final file.
+    [[nodiscard]] static bool WriteAgentFile(const SearchAgentAction& action, std::wstring& writtenPath,
+        std::wstring& why);
+
+    // OpenInEditor target check: existing file passing IsSafeWriteTarget.
+    [[nodiscard]] static bool IsSafeEditorFile(const std::wstring& path);
 
     // Process-local replay of the last successful goal (exact normalized match).
     // Avoids a model round when the user repeats the same goal.

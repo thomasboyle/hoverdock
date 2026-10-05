@@ -54,7 +54,7 @@ server rejects the grammar) so reasoning stays off and the static system prompt
 stays cached. MTP (when enabled) uses the model's own
 `blk.*.nextn.*` tensors — GGUFs without those heads should leave MTP off.
 
-## Agent-in-search (1.1.72+, first-time fast paths 1.1.74/1.1.75)
+## Agent-in-search (1.1.72+, first-time fast paths 1.1.74/1.1.75, coding goals 1.1.76)
 
 Typing a *goal* into dock Search (instead of an app name) resolves locally
 whenever possible and only asks the model as a last resort. Order for every query:
@@ -81,29 +81,50 @@ whenever possible and only asks the model as a last resort. Order for every quer
      ~55 sites (`open reddit`, `gmail`, `google drive`, `amazon usb c cable`,
      `wikipedia alan turing`, `open chatgpt`). `go to` / `visit` prefer the site.
    - **Questions** -> Google (`what is ...`, `how to ...`, `weather in ...`).
-   - **Create / write / code goals** (`write hello world program`, `create a
-     script`, `code a bot`, `hello world in python`): Google the query and, when
-     installed, also launch the best editor (Cursor > VS Code > Notepad++ >
-     Notepad). Avoids a dead-end empty app miss on first-time coding intents.
    - **Strong keyword match** ("search_apps" done locally): one app clearly wins
      and covers the goal words (`open the steam client`).
    - **Compound goals** when every part resolves: `open spotify and discord`,
      `open downloads then play lofi on youtube`, `open firefox and go to github.com`.
-4. **Model (single shot)** for genuinely novel goals (`find something to edit photos`).
+4. **Coding goals (1.1.76)** - `write hello world program`, `code a snake game in
+   python`, `create a python script that renames files`, `hello world in rust`.
+   No Google, no bare IDE launch (the 1.1.75 `web-create` route is gone). One
+   model request writes the program, Hoverdock saves it and opens it:
+   - Model reply (GBNF): `F <name>.<ext>` then the source, `max_tokens` 256,
+     210 s receive timeout, same cached system prompt (hello world ~10-40 output
+     tokens, ~10-30 s on the CPU 27B).
+   - **write_file**: only `Documents\HoverDock\<name>.<ext>` is planned; the
+     validator also accepts files directly in Documents / Desktop / Downloads and
+     nothing else. Names `[A-Za-z0-9_-]`, no device names / ADS / UNC, extension
+     allowlist `.py .cpp .c .h .hpp .cs .js .ts .html .css .json .java .kt .rs .go
+     .rb .lua .sql .md .txt` (no .exe/.bat/.cmd/.ps1/.vbs/.lnk...). `CREATE_NEW`:
+     never overwrites (`hello_world-2.py` ...), <= 64 KB.
+   - **Editor**: the most recently focused *running* IDE window (Z-order: Cursor,
+     VS Code, Visual Studio, Notepad++, JetBrains IDEs, Android Studio, Sublime,
+     Zed, Windsurf) is focused and the file is opened in it; otherwise the most
+     recently *used* installed IDE (newest per-IDE state file under
+     `%APPDATA%`/`%LOCALAPPDATA%`); otherwise Notepad. The file is passed to the
+     editor executable (`devenv /Edit` for Visual Studio), never ShellExecute'd.
+     The IDE also sets the default language (Visual Studio/CLion C++, Rider C#,
+     PyCharm/VS Code/Cursor Python ...).
+   - Repeating the same goal reopens the written file without the model.
+   - Model offline: status `Local model is offline - start llama-server to write code.`
+   - Novel goals can also reach this via the agent's `C <task>` op.
+5. **Model (single shot)** for genuinely novel goals (`find something to edit photos`).
    One request, one grammar-constrained line (GBNF via llama-server `grammar`):
    `L <id>` launch listed app, `W <query>` Google, `Y <query>` YouTube,
    `U <url>` http(s) URL, `P <folder>` folder/path, `S <words>` app search,
-   `N <reason>` nothing. `S` is answered locally and launches immediately when
+   `C <task>` write code (code round above), `N <reason>` nothing. `S` is answered locally and launches immediately when
    one app clearly wins; only otherwise a second, launch-only round runs.
    Up to 5 compact candidates (`c3=Steam; c9=GIMP`), `max_tokens` 40.
    Plain (non-goal) queries use the same system prompt with a launch-only
    grammar (`L cN` / `N`) over <= 8 candidates.
-5. **Server down** (or first round fails): fuzzy search on the remainder; no agent replies.
+6. **Server down** (or first round fails): fuzzy search on the remainder; no agent replies.
 
 All actions are validated before anything runs: `launch_app` is catalog ids only;
 URLs http/https only; paths must exist, no UNC, and executables/scripts/shortcuts
-(.exe .bat .ps1 .lnk .msi ...) are refused. No shell commands, deletes,
-elevation or file reads.
+(.exe .bat .ps1 .lnk .msi ...) are refused. `write_file` is limited to new
+text/source files in the HoverDock sandbox (see coding goals). No shell commands,
+deletes, overwrites, elevation or file reads.
 
 ### Latency (27B Q4_K_M, CPU `-ngl 0`: ~7 tok/s prompt, ~0.77 s per output token)
 
