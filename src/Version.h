@@ -5,7 +5,7 @@
 // compile definitions; the fallbacks below keep IDE-only builds working.
 
 #ifndef DOCK_VERSION_STRING
-#define DOCK_VERSION_STRING "1.1.70"
+#define DOCK_VERSION_STRING "1.1.71"
 #endif
 
 #ifndef DOCK_REPO_OWNER

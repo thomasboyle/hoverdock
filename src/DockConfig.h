@@ -25,6 +25,8 @@ public:
     void SetDockScale(float scale) noexcept;
     [[nodiscard]] const std::wstring& Path() const noexcept;
     [[nodiscard]] std::wstring TypeSafeApiKey() const;
+    // OpenAI-compatible llama-server base URL for dock Search.
+    [[nodiscard]] std::wstring LlamaServerUrl() const;
     [[nodiscard]] bool LaunchAtStartup() const noexcept;
     void SetLaunchAtStartup(bool enabled) noexcept;
     [[nodiscard]] bool CheckForUpdates() const noexcept;
@@ -74,6 +76,7 @@ private:
     bool m_followsTaskbarPins = true;
     float m_dockScale = 1.0F;
     std::wstring m_typeSafeApiKey;
+    std::wstring m_llamaServerUrl;
     bool m_launchAtStartup = false;
     bool m_checkForUpdates = true;
     bool m_rimLight = true;

@@ -9957,7 +9957,7 @@ bool DockApp::OpenLaunchPrompt() {
     SendMessageW(m_launchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     SendMessageW(m_launchStatus, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     SendMessageW(m_launchEdit, EM_SETCUEBANNER, TRUE,
-        reinterpret_cast<LPARAM>(L"the spreadsheet, chrome, start menu..."));
+        reinterpret_cast<LPARAM>(L"chrome, notepad, documents folder..."));
 
     m_launchEditPrevious = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(m_launchEdit, GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(&DockApp::LaunchEditProcedure)));
@@ -10057,11 +10057,11 @@ void DockApp::SubmitLaunchPrompt() {
     m_launchInFlight = true;
     SetLaunchPromptStatus(L"Looking...");
 
-    const std::wstring apiKey = m_config.TypeSafeApiKey();
+    const std::wstring llamaUrl = m_config.LlamaServerUrl();
     const HWND replyWindow = m_window;
     const std::vector<DisplayApp> displayApps = m_displayApps;
     const std::vector<RunningWindow> runningWindows = m_windows.RunningWindows();
-    std::thread([this, generation, apiKey, request, replyWindow, displayApps, runningWindows]() {
+    std::thread([this, generation, llamaUrl, request, replyWindow, displayApps, runningWindows]() {
         // Never let an exception escape: an uncaught throw in a detached
         // thread calls std::terminate and the dock vanishes with no log.
         std::vector<LaunchTarget> targets;
@@ -10081,7 +10081,8 @@ void DockApp::SubmitLaunchPrompt() {
                 for (const LaunchTarget& target : targets) {
                     candidates.push_back(MakeLaunchCandidate(target));
                 }
-                judgment = TypeSafeClient::ResolveApp(apiKey, request, candidates);
+                // Local llama-server (OpenAI /v1/chat/completions); fuzzy if down.
+                judgment = LlamaServerClient::ResolveApp(llamaUrl, request, candidates);
             }
         } catch (const std::exception&) {
             judgment.action = LaunchJudgment::Action::Error;
@@ -10116,6 +10117,8 @@ void DockApp::ApplyLaunchJudgment(UINT generation, const LaunchJudgment& judgmen
 
     Log(L"Launch judgment action=" + std::to_wstring(static_cast<int>(judgment.action)) +
         L" choice=" + std::wstring(judgment.chosenId.begin(), judgment.chosenId.end()) +
+        L" path=" + judgment.openPath +
+        L" fuzzy=" + std::to_wstring(judgment.usedFuzzyFallback ? 1 : 0) +
         L" exists=" + std::to_wstring(judgment.exists) +
         L" confidence=" + std::to_wstring(judgment.confidence));
 
@@ -10129,6 +10132,18 @@ void DockApp::ApplyLaunchJudgment(UINT generation, const LaunchJudgment& judgmen
     }
     if (judgment.action == LaunchJudgment::Action::None) {
         SetLaunchPromptStatus(L"No matching installed app.");
+        return;
+    }
+
+    if (!judgment.openPath.empty()) {
+        const HINSTANCE opened = ShellExecuteW(nullptr, L"open", judgment.openPath.c_str(), nullptr,
+            nullptr, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(opened) <= 32) {
+            SetLaunchPromptStatus(L"Could not open that path.");
+            return;
+        }
+        CloseLaunchPrompt(false);
+        BeginHide();
         return;
     }
 

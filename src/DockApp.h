@@ -4,6 +4,7 @@
 #include "InstalledApps.h"
 #include "Renderer.h"
 #include "TypeSafeClient.h"
+#include "LlamaServerClient.h"
 #include "WindowCatalog.h"
 #include "SystemTray.h"
 #include "Bluetooth.h"

@@ -32,9 +32,13 @@ struct LaunchJudgment {
 
     Action action = Action::Error;
     std::string chosenId;
+    // Optional filesystem path from local AI (open via ShellExecute).
+    std::wstring openPath;
     double exists = 0.0;
     double confidence = 0.0;
     std::wstring error;
+    // Set when ResolveApp fell back to lexical fuzzy ranking.
+    bool usedFuzzyFallback = false;
 };
 
 struct BoostCandidate {

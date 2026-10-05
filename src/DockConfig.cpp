@@ -940,6 +940,7 @@ bool DockConfig::Load() {
     m_followsTaskbarPins = true;
     m_dockScale = 1.0F;
     m_typeSafeApiKey.clear();
+    m_llamaServerUrl.clear();
     m_launchAtStartup = false;
     m_checkForUpdates = true;
     m_rimLight = true;
@@ -971,6 +972,10 @@ bool DockConfig::Load() {
         const auto typeSafeApiKey = dockSection->second.find(L"typesafeapikey");
         if (typeSafeApiKey != dockSection->second.end()) {
             m_typeSafeApiKey = typeSafeApiKey->second;
+        }
+        const auto llamaServerUrl = dockSection->second.find(L"llamaserverurl");
+        if (llamaServerUrl != dockSection->second.end()) {
+            m_llamaServerUrl = llamaServerUrl->second;
         }
         const auto launchAtStartup = dockSection->second.find(L"launchatstartup");
         if (launchAtStartup != dockSection->second.end()) {
@@ -1108,6 +1113,9 @@ bool DockConfig::Save() const {
     }
     if (!m_typeSafeApiKey.empty()) {
         contents << L"TypeSafeApiKey=" << m_typeSafeApiKey << L"\n";
+    }
+    if (!m_llamaServerUrl.empty()) {
+        contents << L"LlamaServerUrl=" << m_llamaServerUrl << L"\n";
     }
     contents << L"\n";
 
@@ -1281,6 +1289,18 @@ std::wstring DockConfig::TypeSafeApiKey() const {
         return fromEnvironment;
     }
     return Trim(m_typeSafeApiKey);
+}
+
+std::wstring DockConfig::LlamaServerUrl() const {
+    const std::wstring fromEnvironment = Trim(EnvironmentVariable(L"HOVERDOCK_LLAMA_URL"));
+    if (!fromEnvironment.empty()) {
+        return fromEnvironment;
+    }
+    const std::wstring configured = Trim(m_llamaServerUrl);
+    if (!configured.empty()) {
+        return configured;
+    }
+    return L"http://127.0.0.1:8080";
 }
 
 void DockConfig::SetDefaults() {

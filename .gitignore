@@ -14,3 +14,12 @@ tools/_meteocons_build/
 tools/DockCpuTemp/bin/
 tools/DockCpuTemp/obj/
 tools/DockCpuTemp/publish/
+# Llama.cpp server binaries (downloaded release extracts). Keep scripts/docs tracked.
+tools/llama-server/*.dll
+tools/llama-server/*.exe
+tools/llama-server/*.zip
+tools/llama-server/LICENSE*
+
+tools/llama-server/*.log
+_patch_incoming/
+
