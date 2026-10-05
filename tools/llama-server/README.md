@@ -54,7 +54,7 @@ server rejects the grammar) so reasoning stays off and the static system prompt
 stays cached. MTP (when enabled) uses the model's own
 `blk.*.nextn.*` tensors — GGUFs without those heads should leave MTP off.
 
-## Agent-in-search (1.1.72+, first-time fast paths 1.1.74)
+## Agent-in-search (1.1.72+, first-time fast paths 1.1.74/1.1.75)
 
 Typing a *goal* into dock Search (instead of an app name) resolves locally
 whenever possible and only asks the model as a last resort. Order for every query:
@@ -81,6 +81,10 @@ whenever possible and only asks the model as a last resort. Order for every quer
      ~55 sites (`open reddit`, `gmail`, `google drive`, `amazon usb c cable`,
      `wikipedia alan turing`, `open chatgpt`). `go to` / `visit` prefer the site.
    - **Questions** -> Google (`what is ...`, `how to ...`, `weather in ...`).
+   - **Create / write / code goals** (`write hello world program`, `create a
+     script`, `code a bot`, `hello world in python`): Google the query and, when
+     installed, also launch the best editor (Cursor > VS Code > Notepad++ >
+     Notepad). Avoids a dead-end empty app miss on first-time coding intents.
    - **Strong keyword match** ("search_apps" done locally): one app clearly wins
      and covers the goal words (`open the steam client`).
    - **Compound goals** when every part resolves: `open spotify and discord`,

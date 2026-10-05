@@ -10141,8 +10141,8 @@ void DockApp::SubmitLaunchPrompt() {
                     plan.has_value()) {
                     // Fast path 3 (first-time goals, no model): URL/domain, site
                     // search/home, folder/path, confident catalog app (alias,
-                    // acronym, typo), question -> web, strong keyword match, or a
-                    // compound of those.
+                    // acronym, typo), question/create-code -> web (+ editor),
+                    // strong keyword match, or a compound of those.
                     route = plan->route;
                     if (plan->actions.size() == 1 &&
                         plan->actions.front().kind == SearchAgentAction::Kind::LaunchApp) {

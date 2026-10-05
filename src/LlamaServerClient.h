@@ -82,7 +82,8 @@ public:
     // Everything that can be answered without the model, in order: direct
     // action (URL/domain, explicit site search, folder, absolute path) ->
     // confident catalog app (exact/alias/lexical/acronym/prefix/typo) -> site
-    // home or site search -> question -> bare folder -> strong keyword match.
+    // home or site search -> question -> create/write/code goal (Google +
+    // best editor when installed) -> bare folder -> strong keyword match.
     // Compound goals ("open spotify and discord") resolve when every part does.
     [[nodiscard]] static std::optional<SearchFastPlan> PlanWithoutModel(const std::wstring& request,
         const std::vector<LaunchCandidate>& candidates);

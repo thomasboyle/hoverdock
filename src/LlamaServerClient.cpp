@@ -2215,7 +2215,8 @@ bool LlamaServerClient::LooksLikeAgentGoal(const std::wstring& request) {
         L"visit", L"browse", L"navigate", L"show", L"take", L"look", L"google", L"watch",
         L"listen", L"switch", L"bring", L"focus", L"please", L"can", L"could", L"pull", L"fire",
         L"boot", L"load", L"get", L"what", L"what's", L"who", L"how", L"why", L"where", L"when",
-        L"define", L"translate", L"directions", L"youtube", L"yt",
+        L"define", L"translate", L"directions", L"youtube", L"yt", L"write", L"create", L"make",
+        L"code", L"build", L"generate", L"implement", L"develop", L"draft", L"compose",
     };
     if (tokens.size() >= 2 &&
         std::ranges::any_of(verbs, [&](std::wstring_view verb) { return tokens.front() == verb; })) {
@@ -2288,6 +2289,78 @@ std::optional<std::wstring> BareFolder(const std::wstring& request) {
     return std::nullopt;
 }
 
+// Create / write / code goals the catalog cannot answer -> Google, and open the
+// best installed editor when one is present (Cursor > VS Code > Notepad++ >
+// Notepad). Avoids a dead-end "No matching installed app." for first-time
+// goals like "write hello world program" / "create a script" / "code a bot".
+const LaunchCandidate* BestCodingEditor(const std::vector<LaunchCandidate>& candidates) {
+    for (const std::wstring_view key : {std::wstring_view(L"cursor"), std::wstring_view(L"vscode"),
+             std::wstring_view(L"code"), std::wstring_view(L"notepad++"), std::wstring_view(L"notepad")}) {
+        if (const LaunchCandidate* hit = AliasMatch(std::wstring(key), candidates); hit != nullptr) {
+            return hit;
+        }
+    }
+    return nullptr;
+}
+
+bool LooksLikeCreateOrCodeGoal(const std::wstring& lower) {
+    if (lower.find(L"hello world") != std::wstring::npos) {
+        return true;
+    }
+    static constexpr std::wstring_view starts[] = {
+        L"write ", L"write a ", L"write an ", L"write me ", L"write the ", L"write my ",
+        L"create a ", L"create an ", L"create me ", L"create the ", L"create my ",
+        L"make a ", L"make an ", L"make me ", L"make the ", L"make my ",
+        L"code a ", L"code an ", L"code me ", L"code the ", L"code my ", L"code ",
+        L"build a ", L"build an ", L"build me ", L"build the ",
+        L"generate a ", L"generate an ", L"implement a ", L"implement an ",
+        L"develop a ", L"develop an ", L"draft a ", L"draft an ",
+        L"compose a ", L"compose an ",
+    };
+    if (!std::ranges::any_of(starts, [&](std::wstring_view s) { return lower.starts_with(s); })) {
+        return false;
+    }
+    // "code ..." is always a coding intent. For write/create/make/build, require a
+    // coding-ish noun so "create a reminder" / "make a playlist" can still fall
+    // through to the model or site catalog when useful.
+    if (lower.starts_with(L"code ") || lower.starts_with(L"code a ") || lower.starts_with(L"code an ") ||
+        lower.starts_with(L"code me ") || lower.starts_with(L"code the ") || lower.starts_with(L"code my ")) {
+        return true;
+    }
+    static constexpr std::wstring_view hints[] = {
+        L"program", L"programme", L"script", L"code", L"function", L"class", L"algorithm",
+        L"webpage", L"website", L"web page", L"html", L"css", L"javascript", L"typescript",
+        L"python", L"java", L"c++", L"cpp", L"csharp", L"c#", L"rust", L"golang", L"go ",
+        L"react", L"node", L"api", L"bot", L"game", L"snippet", L"macro", L"batch",
+        L"powershell", L"bash", L"shell", L"sql", L"regex", L"parser", L"module",
+        L"library", L"package", L"component", L"app", L"application", L"hello", L"world",
+        L"firmware", L"plugin", L"addon", L"add-on", L"extension", L"cli", L"tool",
+    };
+    return std::ranges::any_of(hints, [&](std::wstring_view h) { return lower.find(h) != std::wstring::npos; });
+}
+
+std::optional<SearchFastPlan> CreateCodePlan(const std::wstring& request,
+    const std::vector<LaunchCandidate>& candidates) {
+    std::wstring lower = StripPolitePrefix(ToLowerWide(TrimWide(request)));
+    if (Tokenize(lower).size() < 2 || lower.size() > kMaxQueryChars) {
+        return std::nullopt;
+    }
+    while (!lower.empty() && (lower.back() == L'?' || lower.back() == L'.' || lower.back() == L'!')) {
+        lower.pop_back();
+    }
+    lower = TrimWide(lower);
+    if (!LooksLikeCreateOrCodeGoal(lower)) {
+        return std::nullopt;
+    }
+    SearchFastPlan plan;
+    plan.route = L"web-create";
+    if (const LaunchCandidate* editor = BestCodingEditor(candidates); editor != nullptr) {
+        plan.actions.push_back(MakeLaunchAction(*editor));
+    }
+    plan.actions.push_back(GoogleSearch(lower));
+    return plan;
+}
+
 std::optional<SearchFastPlan> PlanSingle(const std::wstring& text, const std::vector<LaunchCandidate>& candidates) {
     SearchFastPlan plan;
     const auto single = [&plan](SearchAgentAction action, const wchar_t* route) {
@@ -2318,6 +2391,9 @@ std::optional<SearchFastPlan> PlanSingle(const std::wstring& text, const std::ve
     }
     if (auto question = QuestionAction(text); question.has_value()) {
         return single(std::move(*question), L"web-question");
+    }
+    if (auto create = CreateCodePlan(text, candidates); create.has_value()) {
+        return create;
     }
     if (auto folder = BareFolder(text); folder.has_value()) {
         return single(MakePathAction(*folder, *folder), L"folder");
