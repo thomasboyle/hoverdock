@@ -126,3 +126,11 @@ bool ApplyEnergyAppsResult(QuickSettingsCache& cache);
 void RequestQuickSettingsTemps(HWND notifyHwnd, UINT notifyMsg) noexcept;
 // Copy the latest worker temperatures into cache. True when a value changed.
 bool ApplyQuickSettingsTemps(QuickSettingsCache& cache);
+// Fill wifi/adapters/endpoints/power/HDR/night/capture on a worker. Posts
+// notifyMsg when ready; never blocks the UI thread. First paint should use
+// whatever is already in cache (possibly stale).
+void RequestQuickSettingsCacheAsync(HWND notifyHwnd, UINT notifyMsg, QuickSettingsPage page);
+// Merge the worker network/audio/power snapshot into cache. True on change.
+bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache);
+// Open the mic capture client on a worker if the peak pump is not running.
+void EnsureQuickSettingsCaptureAsync() noexcept;

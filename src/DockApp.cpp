@@ -2698,6 +2698,14 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         }
         return 0;
 
+    case kQsCacheResultMessage:
+        if (app != nullptr && app->IsOverflowOpen()) {
+            if (ApplyQuickSettingsCacheResult(app->m_qsCache)) {
+                app->PaintOverflowPopup();
+            }
+        }
+        return 0;
+
     case kQsEnergyResultMessage:
         if (app != nullptr && app->IsOverflowOpen()) {
             if (ApplyEnergyAppsResult(app->m_qsCache)) {
@@ -5654,13 +5662,12 @@ void DockApp::BeginOverflowShow() {
         return;
     }
     HideHoverLabel();
-    static_cast<void>(m_tray.Refresh());
+    // First paint must not block on tray WLAN/COM/DDC or a QS cache refill.
+    // Brightness DDC stays on its worker; network/audio/power fill is kicked
+    // after Present from RefreshQuickSettingsCache / PaintOverflowPopup.
     RefreshBrightnessAsync();
     m_qsPage = QuickSettingsPage::Home;
     m_qsReturn = QuickSettingsPage::Home;
-    m_qsCache.stamp = 0;
-    m_qsCache.stampNetwork = 0;
-    m_qsCache.stampNight = 0;
     m_overflowVisibility = VisibilityState::Visible;
     RebuildOverflowPopup();
     if (m_overflowWindow == nullptr || m_overflowPresentBits.empty()) {
@@ -5683,6 +5690,7 @@ void DockApp::DestroyOverflowPopup() noexcept {
     BeginOverflowHide(false);
     m_overflowPaintQueued = false;
     m_overflowIcons.clear();
+    m_overflowIconsLoaded = false;
     m_overflowHits.clear();
     InvalidateOverflowGlass();
     DestroyOverflowFonts();
@@ -7677,7 +7685,8 @@ void DockApp::EnsureOverflowFonts(float scale) {
 }
 
 void DockApp::RebuildOverflowPopup() {
-    m_overflowIcons = m_tray.EnumerateNotifyIcons();
+    // UIA Shell_TrayWnd scrape is expensive (~tens of ms). Home/open never
+    // needs it; OpenQuickSettingsPage(SystemTray) loads icons on demand.
     m_overflowHover = -1;
     InvalidateOverflowGlass();
     PaintOverflowPopup();
@@ -8208,6 +8217,13 @@ void DockApp::PaintOverflowPopup() {
     DeleteDC(memory);
     PresentOverflowLayer();
     if (m_overflowWindow != nullptr) {
+        // Window now exists: kick (or re-arm) the network/COM cache worker.
+        // RefreshQuickSettingsCache may have run before CreateWindow on first open.
+        const ULONGLONG now = GetTickCount64();
+        if (m_qsCache.stampNetwork == 0 || now - m_qsCache.stampNetwork >= 2500ULL ||
+            m_qsCache.stampNight == 0 || now - m_qsCache.stampNight >= 8000ULL) {
+            RequestQuickSettingsCacheAsync(m_overflowWindow, kQsCacheResultMessage, m_qsPage);
+        }
         if (m_qsPage == QuickSettingsPage::Power) {
             SetTimer(m_overflowWindow, kEnergySampleTimerId, 500, nullptr);
             RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
@@ -8215,7 +8231,7 @@ void DockApp::PaintOverflowPopup() {
             KillTimer(m_overflowWindow, kEnergySampleTimerId);
         }
         if (m_qsPage == QuickSettingsPage::Home) {
-            // Temperature worker keep-alive; the worker itself polls every ~2 s.
+            // Temperature worker keep-alive; the worker itself polls every ~500 ms.
             SetTimer(m_overflowWindow, kQsTempsTimerId, 500, nullptr);
             RequestQuickSettingsTemps(m_overflowWindow, kQsTempsResultMessage);
         } else {

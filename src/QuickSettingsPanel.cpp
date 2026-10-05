@@ -631,6 +631,19 @@ struct EnergyBridge {
 
 EnergyBridge g_energy;
 
+struct NetworkBridge {
+    std::mutex mutex;
+    bool inFlight = false;
+    bool haveResult = false;
+    QuickSettingsCache result{};
+    HWND notifyHwnd = nullptr;
+    UINT notifyMsg = 0;
+    QuickSettingsPage page = QuickSettingsPage::Home;
+};
+
+NetworkBridge g_network;
+std::atomic<bool> g_captureOpenInFlight{false};
+
 // Two toolhelp snapshots. The first open of Energy has no delta yet and is
 // labeled pending; the follow-up paint (about a second later) reports real
 // CPU share. Snapshot failure is an explicit stub, not a fake app list.
@@ -1669,6 +1682,28 @@ void QueryCapture(QuickSettingsCache& cache) {
     }
 }
 
+void FillQsNetworkCache(QuickSettingsCache& cache, QuickSettingsPage page) {
+    // Heavy WLAN / IP helper / MMDevice / WASAPI / power / HDR / Night Light.
+    // Runs only on the network worker — never on the UI thread.
+    QueryWifiRadio(cache);
+    if (page == QuickSettingsPage::Wifi) {
+        QueryWifiNetworks(cache);
+    } else {
+        cache.wifi.clear();
+    }
+    QueryAdapters(cache);
+    CollectEndpoints(eRender, cache.renderDevices, cache.renderDefaultId, cache.outputName);
+    CollectEndpoints(eCapture, cache.captureDevices, cache.captureDefaultId, cache.inputName);
+    QueryCapture(cache);
+    QueryPower(cache);
+    QueryHdr(cache);
+    QueryNightLight(cache);
+    const ULONGLONG now = GetTickCount64();
+    cache.stampNetwork = now;
+    cache.stampNight = now;
+    cache.stamp = now;
+}
+
 bool SetCaptureMuted(bool muted) {
     return WithEndpoint(eCapture, [&](IMMDevice* device) {
         IAudioEndpointVolume* volume = nullptr;
@@ -2035,6 +2070,139 @@ void StopQuickSettingsCapture() noexcept {
     g_captureMeter.retryAt = 0;
 }
 
+void EnsureQuickSettingsCaptureAsync() noexcept {
+    bool needOpen = false;
+    {
+        std::lock_guard<std::mutex> lock(g_captureMeter.mutex);
+        needOpen = g_captureMeter.client == nullptr || g_captureMeter.capture == nullptr;
+        if (needOpen && GetTickCount64() < g_captureMeter.retryAt && !g_captureMeter.note.empty() &&
+            g_captureMeter.deviceId.empty()) {
+            return;
+        }
+    }
+    if (!needOpen) {
+        return;
+    }
+    if (g_captureOpenInFlight.exchange(true)) {
+        return;
+    }
+    std::thread([] {
+        const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        QuickSettingsCache local{};
+        const bool opened = WithEndpoint(eCapture, [&](IMMDevice* device) {
+            g_captureMeter.Sample(local, device);
+            return true;
+        });
+        if (!opened) {
+            g_captureMeter.Close();
+            std::lock_guard<std::mutex> lock(g_captureMeter.mutex);
+            g_captureMeter.note = L"No microphone";
+            g_captureMeter.publishedNote = g_captureMeter.note;
+            g_captureMeter.publishedLevel.store(0.0F, std::memory_order_relaxed);
+        }
+        if (SUCCEEDED(hr)) {
+            CoUninitialize();
+        }
+        g_captureOpenInFlight.store(false);
+    }).detach();
+}
+
+void RequestQuickSettingsCacheAsync(HWND notifyHwnd, UINT notifyMsg, QuickSettingsPage page) {
+    if (notifyHwnd == nullptr || notifyMsg == 0) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_network.mutex);
+        g_network.notifyHwnd = notifyHwnd;
+        g_network.notifyMsg = notifyMsg;
+        g_network.page = page;
+        if (g_network.inFlight) {
+            return;
+        }
+        g_network.inFlight = true;
+    }
+    std::thread([] {
+        const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        QuickSettingsPage page = QuickSettingsPage::Home;
+        {
+            std::lock_guard<std::mutex> lock(g_network.mutex);
+            page = g_network.page;
+        }
+        QuickSettingsCache local{};
+        FillQsNetworkCache(local, page);
+        HWND hwnd = nullptr;
+        UINT msg = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_network.mutex);
+            g_network.result = std::move(local);
+            g_network.haveResult = true;
+            g_network.inFlight = false;
+            hwnd = g_network.notifyHwnd;
+            msg = g_network.notifyMsg;
+        }
+        if (hwnd != nullptr && msg != 0) {
+            PostMessageW(hwnd, msg, 0, 0);
+        }
+        if (SUCCEEDED(hr)) {
+            CoUninitialize();
+        }
+    }).detach();
+}
+
+bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache) {
+    std::lock_guard<std::mutex> lock(g_network.mutex);
+    if (!g_network.haveResult) {
+        return false;
+    }
+    g_network.haveResult = false;
+    const QuickSettingsCache& r = g_network.result;
+    bool changed = cache.wifiRadioOn != r.wifiRadioOn || cache.haveWifiInterface != r.haveWifiInterface ||
+        cache.ethernetUp != r.ethernetUp || cache.ethernetStatus != r.ethernetStatus ||
+        cache.ethernetSpeed != r.ethernetSpeed || cache.ethernetIpv4 != r.ethernetIpv4 ||
+        cache.ethernetAdapter != r.ethernetAdapter || cache.outputName != r.outputName ||
+        cache.inputName != r.inputName || cache.inputGain != r.inputGain ||
+        cache.inputMuted != r.inputMuted || cache.inputNote != r.inputNote ||
+        cache.powerName != r.powerName || cache.powerMode != r.powerMode ||
+        cache.usbSuspend != r.usbSuspend || cache.usbKnown != r.usbKnown ||
+        cache.hdrOn != r.hdrOn || cache.hdrSupported != r.hdrSupported ||
+        cache.nightLight != r.nightLight || cache.nightKnown != r.nightKnown ||
+        cache.wifi.size() != r.wifi.size() || cache.vpn.size() != r.vpn.size() ||
+        cache.renderDevices.size() != r.renderDevices.size() ||
+        cache.captureDevices.size() != r.captureDevices.size();
+    cache.wifiRadioOn = r.wifiRadioOn;
+    cache.haveWifiInterface = r.haveWifiInterface;
+    cache.wifiInterface = r.wifiInterface;
+    cache.wifi = r.wifi;
+    cache.ethernetUp = r.ethernetUp;
+    cache.ethernetStatus = r.ethernetStatus;
+    cache.ethernetSpeed = r.ethernetSpeed;
+    cache.ethernetIpv4 = r.ethernetIpv4;
+    cache.ethernetAdapter = r.ethernetAdapter;
+    cache.vpn = r.vpn;
+    cache.outputName = r.outputName;
+    cache.inputName = r.inputName;
+    cache.renderDefaultId = r.renderDefaultId;
+    cache.captureDefaultId = r.captureDefaultId;
+    cache.renderDevices = r.renderDevices;
+    cache.captureDevices = r.captureDevices;
+    cache.inputPeak = r.inputPeak;
+    cache.inputGain = r.inputGain;
+    cache.inputMuted = r.inputMuted;
+    cache.inputNote = r.inputNote;
+    cache.powerName = r.powerName;
+    cache.powerMode = r.powerMode;
+    cache.usbSuspend = r.usbSuspend;
+    cache.usbKnown = r.usbKnown;
+    cache.hdrOn = r.hdrOn;
+    cache.hdrSupported = r.hdrSupported;
+    cache.nightLight = r.nightLight;
+    cache.nightKnown = r.nightKnown;
+    cache.stampNetwork = r.stampNetwork;
+    cache.stampNight = r.stampNight;
+    cache.stamp = r.stamp;
+    return changed;
+}
+
 void RequestEnergyAppsAsync(HWND notifyHwnd, UINT notifyMsg) {
     if (notifyHwnd == nullptr || notifyMsg == 0) {
         return;
@@ -2134,30 +2302,18 @@ QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
     const std::wstring beforeNote = cache.inputNote;
 
     // Mic peak comes from the ~25 Hz background pump; UI only publishes it.
+    // WASAPI Open/Initialize stays on EnsureQuickSettingsCaptureAsync (worker).
     bool pumpAlive = false;
     {
         std::lock_guard<std::mutex> lock(g_captureMeter.mutex);
         pumpAlive = g_captureMeter.client != nullptr && g_captureMeter.capture != nullptr;
     }
-    if (pumpAlive) {
-        g_captureMeter.ReadPublished(cache);
-    } else if (GetTickCount64() >= g_captureMeter.retryAt) {
-        const bool opened = WithEndpoint(eCapture, [&](IMMDevice* device) {
-            if (cache.inputName.empty()) {
-                cache.inputName = DeviceName(device);
-            }
-            g_captureMeter.Sample(cache, device);
-            return true;
-        });
-        if (!opened) {
-            cache.inputPeak = 0.0F;
-            cache.inputNote = L"No microphone";
-        }
-    } else {
-        g_captureMeter.ReadPublished(cache);
-        if (cache.inputNote.empty() && !pumpAlive) {
-            cache.inputPeak = 0.0F;
-        }
+    if (!pumpAlive) {
+        EnsureQuickSettingsCaptureAsync();
+    }
+    g_captureMeter.ReadPublished(cache);
+    if (!pumpAlive && cache.inputNote.empty()) {
+        cache.inputPeak = 0.0F;
     }
 
     // GSMTC: session ~1 Hz, scrub/progress ~5 Hz.
@@ -2179,26 +2335,13 @@ QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
 
 void DockApp::RefreshQuickSettingsCache() {
     const ULONGLONG now = GetTickCount64();
-    // Network / adapters / endpoints / power / HDR: ~2.5 s.
-    if (m_qsCache.stampNetwork == 0 || now - m_qsCache.stampNetwork >= 2500ULL) {
-        QueryWifiRadio(m_qsCache);
-        if (m_qsPage == QuickSettingsPage::Wifi) {
-            QueryWifiNetworks(m_qsCache);
-        } else if (m_qsPage != QuickSettingsPage::Wifi) {
-            m_qsCache.wifi.clear();
-        }
-        QueryAdapters(m_qsCache);
-        CollectEndpoints(eRender, m_qsCache.renderDevices, m_qsCache.renderDefaultId, m_qsCache.outputName);
-        CollectEndpoints(eCapture, m_qsCache.captureDevices, m_qsCache.captureDefaultId, m_qsCache.inputName);
-        QueryCapture(m_qsCache);
-        QueryPower(m_qsCache);
-        QueryHdr(m_qsCache);
-        m_qsCache.stampNetwork = now;
-    }
-    // Night Light CloudStore: ~8 s.
-    if (m_qsCache.stampNight == 0 || now - m_qsCache.stampNight >= 8000ULL) {
-        QueryNightLight(m_qsCache);
-        m_qsCache.stampNight = now;
+    // WLAN / adapters / endpoints / WASAPI / power / HDR / Night Light: worker.
+    // First paint keeps whatever is already cached (possibly stale).
+    const bool networkDue =
+        m_qsCache.stampNetwork == 0 || now - m_qsCache.stampNetwork >= 2500ULL;
+    const bool nightDue = m_qsCache.stampNight == 0 || now - m_qsCache.stampNight >= 8000ULL;
+    if ((networkDue || nightDue) && m_overflowWindow != nullptr) {
+        RequestQuickSettingsCacheAsync(m_overflowWindow, kQsCacheResultMessage, m_qsPage);
     }
     if (m_qsPage == QuickSettingsPage::Power) {
         if (!m_qsCache.energyLive && !m_qsCache.energyPending) {
@@ -2223,8 +2366,10 @@ void DockApp::RefreshQuickSettingsCache() {
             RequestQuickSettingsTemps(m_overflowWindow, kQsTempsResultMessage);
         }
     }
-    // Keep media labels fresh without forcing a session pick every paint.
-    QueryMedia(m_qsCache, false, false);
+    // Publish last GSMTC snapshot only — session/scrub polls stay on the live
+    // timer so opening never blocks on WinRT media IPC.
+    PublishMedia(m_qsCache);
+    EnsureQuickSettingsCaptureAsync();
     m_qsCache.stamp = now;
 }
 
@@ -2237,9 +2382,14 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     m_overflowHover = -1;
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
-    m_qsCache.stamp = 0;
+    // Expire TTLs so the worker refreshes page-specific data (wifi list, etc.)
+    // after this paint — never run WLAN/COM/UIA on the UI thread here.
     m_qsCache.stampNetwork = 0;
     m_qsCache.stampNight = 0;
+    if (page == QuickSettingsPage::SystemTray && !m_overflowIconsLoaded) {
+        m_overflowIcons = m_tray.EnumerateNotifyIcons();
+        m_overflowIconsLoaded = true;
+    }
     InvalidateOverflowGlass();
     PaintOverflowPopup();
 }
@@ -2780,7 +2930,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             TrayFlyoutHitKind::Boost, false);
         x += tileWidths[2] + tileGap;
         tile({x, y, x + tileWidths[3], y + homeTileH}, L'\uE7F4', L"System Tray",
-            m_overflowIcons.empty() ? L"No icons" : L"Hidden", TrayFlyoutHitKind::SystemTrayPage);
+            (m_overflowIconsLoaded && m_overflowIcons.empty()) ? L"No icons" : L"Hidden",
+            TrayFlyoutHitKind::SystemTrayPage);
         x += tileWidths[3] + tileGap;
         std::wstring vpnLabel = L"Off";
         for (const QsVpnEntry& entry : m_qsCache.vpn) {

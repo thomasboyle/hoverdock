@@ -184,6 +184,7 @@ private:
     static constexpr UINT kOverflowDismissMessage = WM_APP + 24;
     static constexpr UINT kQsEnergyResultMessage = WM_APP + 25;
     static constexpr UINT kQsTempsResultMessage = WM_APP + 26;
+    static constexpr UINT kQsCacheResultMessage = WM_APP + 27;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -804,6 +805,7 @@ private:
     HWND m_overflowWindow = nullptr;
     VisibilityState m_overflowVisibility = VisibilityState::Hidden;
     std::vector<TrayNotifyIcon> m_overflowIcons;
+    bool m_overflowIconsLoaded = false;
     std::vector<TrayFlyoutHit> m_overflowHits;
     int m_overflowHover = -1;
     QuickSettingsPage m_qsPage = QuickSettingsPage::Home;
