@@ -1277,7 +1277,7 @@ void FillRectColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT boun
     CompositeConstantPremulRect(dest, destWidth, destHeight, bounds, pixel);
 }
 
-// Concept D Minimal Sage — panel toggles/slider (#98A869).
+// Concept D Minimal Sage - panel toggles/slider (#98A869).
 // Dock running-indicator dot stays amber in Shaders.hlsl. DIB order: B, G, R.
 constexpr uint8_t kAmberB = DOCK_PANEL_TOGGLE_B;
 constexpr uint8_t kAmberG = DOCK_PANEL_TOGGLE_G;
@@ -2697,7 +2697,7 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
             if (ApplyQuickSettingsCacheResult(app->m_qsCache)) {
                 // Home already has a presented frame (fast reopen or prewarm).
                 // PaintQuickSettings is still ~95ms of squircle/text even with
-                // warm glass — never spend that on a background cache fill while
+                // warm glass - never spend that on a background cache fill while
                 // Home is up. Subpages that list wifi/devices still need it.
                 if (app->m_qsPage != QuickSettingsPage::Home) {
                     app->QueueOverflowPaint(false);
@@ -3113,6 +3113,11 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 HandlePointer(cursor);
             }
         }
+        // App launch / focus while the dock is tucked away: refresh the running
+        // set now so RebuildLayout lands before the next reveal (no icon flash).
+        if (m_visibility == VisibilityState::Hidden) {
+            ScheduleDeferredRefresh();
+        }
         return 0;
     }
     case kPointerMessage: {
@@ -3433,7 +3438,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             RefreshRunningWindows();
         } else if (wParam == kDeferredRefreshTimerId) {
             CancelDeferredRefresh();
-            if (m_visibility == VisibilityState::Visible) {
+            if (m_visibility == VisibilityState::Visible ||
+                m_visibility == VisibilityState::Hidden) {
                 RefreshRunningWindows(true);
             }
         } else if (wParam == kConfigSaveTimerId) {
@@ -5717,7 +5723,7 @@ void DockApp::BeginOverflowShow() {
     if (TryPresentOverflowFromCache()) {
         qsOpenMark(L"TryPresentOverflowFromCache");
         presented = true;
-        // Cached Home pixels are already on-screen. Do not QueueOverflowPaint —
+        // Cached Home pixels are already on-screen. Do not QueueOverflowPaint -
         // a full rebuild is still ~100ms even with warm glass and would hitch
         // the cursor one message later. Live meters/temps/network refresh via
         // the usual async workers + PaintOverflowLiveFast.
@@ -5727,7 +5733,7 @@ void DockApp::BeginOverflowShow() {
         RebuildOverflowPopup();
         qsOpenMark(L"RebuildOverflowPopup");
         presented = m_overflowWindow != nullptr && !m_overflowPresentBits.empty();
-        // PaintOverflowPopup already PresentOverflowLayer'd — no second ULW.
+        // PaintOverflowPopup already PresentOverflowLayer'd - no second ULW.
     }
 
     if (!presented) {
@@ -8519,6 +8525,19 @@ void DockApp::BeginShow() {
     HideHoverLabel();
     ++m_showSessionId;
 
+    // Drain a catalog refresh that finished while Hidden so the first revealed
+    // frame already matches the current app set (avoids a mid-slide width jump).
+    {
+        bool havePending = false;
+        {
+            const std::lock_guard lock(m_refreshSnapshotMutex);
+            havePending = m_refreshSnapshot.has_value();
+        }
+        if (havePending) {
+            ApplyBackgroundRefresh(m_refreshGeneration.load());
+        }
+    }
+
     // Fresh desktop under the dock before the first painted frame. The prior
     // hot-path diet started the slide on the cached backdrop and let the timer
     // catch up, which left a few frames of stale frost after the user hid the
@@ -8617,7 +8636,9 @@ void DockApp::AdvanceAnimation() {
     m_currentY = m_hiddenY;
     StopBackdropTimer();
     StopGlint();
-    StopRefreshTimer();
+    // Keep the 15 s catalog timer while Hidden so new apps still reshape the
+    // dock off-screen. Tray/backdrop stay stopped (nothing is painted).
+    StartRefreshTimer();
     StopTrayTimer();
     BeginOverflowHide(false);
     CloseContextMenu();
@@ -8873,7 +8894,7 @@ void DockApp::HandlePointer(POINT cursor) {
         (cursor.y < m_visibleY + DockShadowMarginPx(static_cast<float>(HostDpi()) / 96.0F) ||
             MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) != m_hostMonitor)) {
         // Quick Settings stays up when a drill-in resizes out from under the
-        // cursor. Dismiss is an outside click, Escape, or Back — not mouse-leave.
+        // cursor. Dismiss is an outside click, Escape, or Back - not mouse-leave.
         BeginHide();
         return;
     }
@@ -11085,7 +11106,11 @@ void DockApp::RefreshRunningWindows(bool force) {
 }
 
 void DockApp::BeginBackgroundRefresh(bool force) {
-    if (m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding) {
+    // Still refresh while Hidden so an app that opens off-screen updates
+    // m_displayApps / layout before the next reveal (no width flash). Skip
+    // only while Hiding - BeginHide bumps the generation and the slide owns
+    // the frame.
+    if (m_visibility == VisibilityState::Hiding) {
         return;
     }
 
@@ -11185,8 +11210,13 @@ void DockApp::BeginBackgroundRefresh(bool force) {
 
 void DockApp::ApplyBackgroundRefresh(UINT generation) {
     ProfileScope scope("ApplyBackgroundRefresh");
-    if (generation != m_refreshGeneration.load() ||
-        (m_visibility != VisibilityState::Visible && m_visibility != VisibilityState::Showing)) {
+    if (generation != m_refreshGeneration.load()) {
+        return;
+    }
+    // Apply while Hidden too: RebuildLayout + icon uploads update the dormant
+    // dock so BeginShow already has the correct width/icons. QueueRenderFrame
+    // no-ops when Hidden. Skip Hiding so we do not fight the slide.
+    if (m_visibility == VisibilityState::Hiding) {
         return;
     }
 

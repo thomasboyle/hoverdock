@@ -700,10 +700,19 @@ void QueryEnergyApps(QuickSettingsCache& cache) {
 
     const ULONGLONG now = GetTickCount64();
     const ULONGLONG elapsed = g_energyBaseline.tick == 0 ? 0 : now - g_energyBaseline.tick;
-    const bool usable = elapsed >= 250ULL && elapsed <= 8000ULL && !g_energyBaseline.samples.empty();
+    const bool haveBaseline = !g_energyBaseline.samples.empty() && g_energyBaseline.tick != 0;
+    const bool tooSoon = haveBaseline && elapsed < 250ULL;
+    const bool tooStale = haveBaseline && elapsed > 8000ULL;
+    const bool usable = haveBaseline && !tooSoon && !tooStale;
     if (!usable) {
-        g_energyBaseline.tick = now;
-        g_energyBaseline.samples = std::move(current);
+        // First sample or a stale baseline: seed/re-seed. A too-soon follow-up
+        // (paint -> RefreshQuickSettingsCache -> RequestEnergyAppsAsync) must NOT
+        // reset the tick - that kept the Power page stuck on Measuring forever
+        // whenever ToolHelp finished under 250 ms.
+        if (!haveBaseline || tooStale) {
+            g_energyBaseline.tick = now;
+            g_energyBaseline.samples = std::move(current);
+        }
         cache.energyPending = true;
         cache.energyNote = L"Measuring energy use\u2026";
         return;
@@ -1711,7 +1720,7 @@ void QueryCapture(QuickSettingsCache& cache) {
 
 void FillQsNetworkCache(QuickSettingsCache& cache, QuickSettingsPage page) {
     // Heavy WLAN / IP helper / MMDevice / WASAPI / power / HDR / Night Light.
-    // Runs only on the network worker — never on the UI thread.
+    // Runs only on the network worker - never on the UI thread.
     QueryWifiRadio(cache);
     if (page == QuickSettingsPage::Wifi) {
         QueryWifiNetworks(cache);
@@ -2000,7 +2009,7 @@ std::wstring TempPowerText(int celsius, int watts) {
     // Two lines when both values exist so the narrow CPU/GPU columns can show
     // the full reading (single-line "XX°C · YYW" clipped on the home row).
     if (celsius < 0 && watts < 0) {
-        return std::wstring(L"—");
+        return std::wstring(L"-");
     }
     std::wstring out;
     if (celsius >= 0) {
@@ -2241,6 +2250,15 @@ void RequestEnergyAppsAsync(HWND notifyHwnd, UINT notifyMsg) {
         if (g_energy.inFlight) {
             return;
         }
+        // Paint-driven re-entry can land within a few ms of the previous sample.
+        // Starting another ToolHelp then would either reset the baseline (stuck
+        // Measuring) or publish an empty pending snapshot over live rows.
+        if (!g_energyBaseline.samples.empty() && g_energyBaseline.tick != 0) {
+            const ULONGLONG since = GetTickCount64() - g_energyBaseline.tick;
+            if (since < 250ULL) {
+                return;
+            }
+        }
         g_energy.inFlight = true;
     }
     std::thread([] {
@@ -2373,11 +2391,13 @@ void DockApp::RefreshQuickSettingsCache() {
     if (m_qsPage == QuickSettingsPage::Power) {
         if (!m_qsCache.energyLive && !m_qsCache.energyPending) {
             m_qsCache.energyPending = true;
-            m_qsCache.energyNote = L"Measuring energy use…";
-        }
-        // ToolHelp runs on the energy worker (~500 ms), never on this thread.
-        if (m_overflowWindow != nullptr) {
-            RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
+            m_qsCache.energyNote = L"Measuring energy use\u2026";
+            // First entry only: the 500 ms timer + ArmOverflowLiveWorkers own the
+            // steady sample cadence. Re-requesting from every paint was racing the
+            // 250 ms baseline window and left the list empty on Measuring.
+            if (m_overflowWindow != nullptr) {
+                RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
+            }
         }
     } else {
         m_qsCache.energyApps.clear();
@@ -2393,7 +2413,7 @@ void DockApp::RefreshQuickSettingsCache() {
             RequestQuickSettingsTemps(m_overflowWindow, kQsTempsResultMessage);
         }
     }
-    // Publish last GSMTC snapshot only — session/scrub polls stay on the live
+    // Publish last GSMTC snapshot only - session/scrub polls stay on the live
     // timer so opening never blocks on WinRT media IPC.
     PublishMedia(m_qsCache);
     EnsureQuickSettingsCaptureAsync();
@@ -2410,7 +2430,7 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
     // Expire TTLs so the worker refreshes page-specific data (wifi list, etc.)
-    // after this paint — never run WLAN/COM/UIA on the UI thread here.
+    // after this paint - never run WLAN/COM/UIA on the UI thread here.
     m_qsCache.stampNetwork = 0;
     m_qsCache.stampNight = 0;
     if (page == QuickSettingsPage::SystemTray && !m_overflowIconsLoaded) {
@@ -3469,7 +3489,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                         BlitIcon(pixels, width, height, memory, m_overflowIcons[index].icon,
                             static_cast<int>(iconLeft), static_cast<int>(iconTop), 18);
                     } else {
-                        // No grey placeholder plate — use a Fluent app glyph instead.
+                        // No grey placeholder plate - use a Fluent app glyph instead.
                         icon(iconLeft, iconTop, static_cast<wchar_t>(0xE8A5), 18, inkR, inkG, inkB);
                     }
                 }
