@@ -1,20 +1,22 @@
 ﻿Third-party notices for Hoverdock
 =================================
 
-LibreHardwareMonitor (Intel CPU package temperature algorithm)
+LibreHardwareMonitor (Intel / AMD CPU package temperature algorithm)
 --------------------------------------------------------------
-Portions of the native Intel package-temperature path in src/SystemTemps.cpp
-follow the MSR usage in LibreHardwareMonitor's IntelCpu (IA32_TEMPERATURE_TARGET,
-IA32_PACKAGE_THERM_STATUS, TjMax - digital readout).
+Portions of the native CPU package-temperature path in src/SystemTemps.cpp
+follow LibreHardwareMonitor's IntelCpu (IA32_TEMPERATURE_TARGET,
+IA32_PACKAGE_THERM_STATUS, TjMax - digital readout) and Amd17Cpu (SMN
+THM_TCON_CUR_TMP / Tctl/Tdie decode, including early-Zen Tctl offsets).
 
   https://github.com/LibreHardwareMonitor/LibreHardwareMonitor
   License: Mozilla Public License 2.0 / Apache License 2.0
 
-PawnIO IntelMSR module (third_party/pawnio/IntelMSR.bin)
---------------------------------------------------------
-Signed PawnIO AMX blob used to read whitelisted Intel MSRs via the PawnIO
-kernel driver (\\?\GLOBALROOT\Device\PawnIO). Redistributed from the
-LibreHardwareMonitorLib resources / namazso PawnIO.Modules releases.
+PawnIO IntelMSR + AMDFamily17 modules (third_party/pawnio/)
+----------------------------------------------------------
+Signed PawnIO AMX blobs used to read whitelisted Intel MSRs and AMD Zen
+SMN registers via the PawnIO kernel driver (\\?\GLOBALROOT\Device\PawnIO).
+Redistributed from LibreHardwareMonitorLib resources / namazso
+PawnIO.Modules releases (AMDFamily17.bin from release 0.2.11).
 
   https://github.com/namazso/PawnIO.Modules
   https://pawnio.eu/
@@ -24,3 +26,13 @@ The PawnIO driver itself is a separate system install (not bundled with
 Hoverdock). Opening the device typically requires an elevated process on
 Windows; Hoverdock uses a one-time elevated scheduled task that runs
 Dock.exe --cpu-sensor (same binary, no .NET helper).
+
+AMD Display Library (ADL) — runtime only
+----------------------------------------
+AMD GPU temperature and board/ASIC watts are read by dynamically loading
+atiadlxx.dll from the AMD graphics driver (ADL2_Main_Control_Create,
+ADL2_New_QueryPMLogData_Get, Overdrive5/6 fallbacks). The ADL SDK headers /
+library are not redistributed; only documented public exports are used at
+runtime when an AMD GPU driver is installed.
+
+  https://gpuopen.com/adl/

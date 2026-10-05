@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <Windows.h>
 
@@ -20,9 +20,10 @@
 // CPU temperature (prefer real package/die sensors; skip the fixed ACPI
 // 27.85 C / 301.0 K placeholder many Z390 boards report):
 //   1. LibreHardwareMonitor / OpenHardwareMonitor WMI (needs LHM/OHM GUI running).
-//   2. Native PawnIO Intel MSR path (LibreHardwareMonitor algorithm): open
-//      \\?\GLOBALROOT\Device\PawnIO, load the signed IntelMSR module, read
-//      IA32_PACKAGE_THERM_STATUS + IA32_TEMPERATURE_TARGET for "CPU Package".
+//   2. Native PawnIO path (LibreHardwareMonitor algorithm), vendor-selected via
+//      CPUID: Intel loads IntelMSR (IA32_PACKAGE_THERM_STATUS /
+//      IA32_TEMPERATURE_TARGET -> "CPU Package"); AMD Zen family 17h/19h/1Ah
+//      loads AMDFamily17 and reads SMN THM_TCON_CUR_TMP (Tctl/Tdie).
 //      CreateFile requires elevation on Windows; when Dock is not elevated a
 //      one-time UAC installs scheduled task HoverDockCpuSensor (ONLOGON /
 //      RL HIGHEST) that runs Dock.exe --cpu-sensor (same binary, no .NET) and
@@ -35,21 +36,19 @@
 //      the ACPI placeholder).
 //   6. PDH Thermal Zone Information (same ACPI data, no admin).
 //
-// Without PawnIO (or LHM/Core Temp/HWiNFO), Intel package C is unavailable
-// on this class of hardware -- Dock will show watts-only (RAPL) rather than a
-// fake 27.85 C.
+// Without PawnIO (or LHM/Core Temp/HWiNFO), native package/die C is unavailable
+// -- Dock will show watts-only (RAPL / ADL) rather than a fake 27.85 C.
 //
 // CPU package watts (RAPL), undelevated when possible:
 //   1. LHM/OHM SensorType=Power ("CPU Package") when running.
 //   2. PDH Energy Meter RAPL_Package*_PKG\Power (milliwatts -> W). Available
 //      without admin on this Z390 + 9900K class hardware.
 //
-// GPU temperature: NVML, then LHM/OHM, then nvidia-smi.
-// GPU board watts: NVML nvmlDeviceGetPowerUsage (mW). On pre-Turing cards
-// (GTX 1070 Ti / Pascal) this is entire-board draw -- the same figure
-// nvidia-smi reports as power.draw ("entire board"). Newer MODULE/scope APIs
-// are used when present; otherwise this legacy reading is documented as board
-// total for Pascal.
+// GPU temperature: NVML and/or ADL (atiadlxx); prefer discrete when both
+// present; then LHM/OHM; then nvidia-smi.
+// GPU board watts: NVML nvmlDeviceGetPowerUsage (mW) or ADL PM log / OD6.
+// On pre-Turing NVIDIA cards (GTX 1070 Ti / Pascal) NVML is entire-board
+// draw -- the same figure nvidia-smi reports as power.draw ("entire board").
 struct SystemTempsReading {
     // Whole degrees Celsius, or -1 when no trustworthy sensor is available.
     int cpuC = -1;

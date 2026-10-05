@@ -26,6 +26,8 @@
 #include <cstring>
 
 #include "IntelMsrBin.h"
+#include "AmdFamily17Bin.h"
+#include <intrin.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -400,6 +402,327 @@ struct NvmlSource {
             }
         }
         return best;
+    }
+};
+
+
+// --- ADL (atiadlxx.dll) AMD GPU temp + board/ASIC watts ----------------------
+// Parallel to NVML. Dynamically loads atiadlxx when present. Prefers discrete
+// adapters (ADL_ASIC_DISCRETE). Uses Overdrive8 PM log when available, with
+// OD5 temperature / OD6 power fallbacks for older cards.
+struct AdlGpuSource {
+    static constexpr int kAdlOk = 0;
+    static constexpr int kAdlMaxAdapters = 40;
+    static constexpr int kAdlPmLogMaxSensors = 256;
+    static constexpr int kPmLogTempEdge = 8;
+    static constexpr int kPmLogTempGfx = 28;
+    static constexpr int kPmLogAsicPower = 23;
+    static constexpr int kPmLogBoardPower = 73;
+    static constexpr int kAsicDiscrete = 1 << 0;
+
+    struct AdlSingleSensor {
+        int supported;
+        int value;
+    };
+    struct AdlPmLogDataOutput {
+        int size;
+        AdlSingleSensor sensors[kAdlPmLogMaxSensors];
+    };
+
+    using AdlMainMemoryAlloc = void* (__stdcall*)(int);
+    using MainCreateFn = int (__stdcall*)(AdlMainMemoryAlloc, int, void**);
+    using MainDestroyFn = int (__stdcall*)(void*);
+    using NumberOfAdaptersFn = int (__stdcall*)(void*, int*);
+    using AdapterActiveGetFn = int (__stdcall*)(void*, int, int*);
+    using AsicFamilyTypeGetFn = int (__stdcall*)(void*, int, int*, int*);
+    using OverdriveCapsFn = int (__stdcall*)(void*, int, int*, int*, int*);
+    using QueryPmLogFn = int (__stdcall*)(void*, int, AdlPmLogDataOutput*);
+    using Od5TempStructFn = int (__stdcall*)(void*, int, int, void*);
+    using Od6PowerFn = int (__stdcall*)(void*, int, int, int*);
+
+    struct AdlTemperature {
+        int size;
+        int temperature;  // millidegrees C
+    };
+
+    HMODULE module = nullptr;
+    void* context = nullptr;
+    MainDestroyFn destroy = nullptr;
+    QueryPmLogFn queryPmLog = nullptr;
+    Od5TempStructFn od5Temp = nullptr;
+    Od6PowerFn od6Power = nullptr;
+    OverdriveCapsFn odCaps = nullptr;
+    AsicFamilyTypeGetFn asicFamily = nullptr;
+    std::vector<int> adapterIndices;
+    std::vector<bool> adapterDiscrete;
+    bool tried = false;
+    bool hasDiscrete = false;
+    int failures = 0;
+
+    static void* __stdcall AdlAlloc(int size) {
+        return size > 0 ? std::malloc(static_cast<size_t>(size)) : nullptr;
+    }
+
+    void Close() noexcept {
+        if (context != nullptr && destroy != nullptr) {
+            destroy(context);
+            context = nullptr;
+        }
+        if (module != nullptr) {
+            FreeLibrary(module);
+            module = nullptr;
+        }
+        adapterIndices.clear();
+        adapterDiscrete.clear();
+        queryPmLog = nullptr;
+        od5Temp = nullptr;
+        od6Power = nullptr;
+        odCaps = nullptr;
+        asicFamily = nullptr;
+        destroy = nullptr;
+        hasDiscrete = false;
+    }
+
+    ~AdlGpuSource() { Close(); }
+
+    void Load() {
+        tried = true;
+        Close();
+        module = LoadLibraryExW(L"atiadlxx.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (module == nullptr) {
+            return;
+        }
+        const auto create = reinterpret_cast<MainCreateFn>(GetProcAddress(module, "ADL2_Main_Control_Create"));
+        destroy = reinterpret_cast<MainDestroyFn>(GetProcAddress(module, "ADL2_Main_Control_Destroy"));
+        const auto number = reinterpret_cast<NumberOfAdaptersFn>(
+            GetProcAddress(module, "ADL2_Adapter_NumberOfAdapters_Get"));
+        const auto activeGet =
+            reinterpret_cast<AdapterActiveGetFn>(GetProcAddress(module, "ADL2_Adapter_Active_Get"));
+        asicFamily = reinterpret_cast<AsicFamilyTypeGetFn>(
+            GetProcAddress(module, "ADL2_Adapter_ASICFamilyType_Get"));
+        odCaps = reinterpret_cast<OverdriveCapsFn>(GetProcAddress(module, "ADL2_Overdrive_Caps"));
+        queryPmLog = reinterpret_cast<QueryPmLogFn>(GetProcAddress(module, "ADL2_New_QueryPMLogData_Get"));
+        od5Temp = reinterpret_cast<Od5TempStructFn>(GetProcAddress(module, "ADL2_Overdrive5_Temperature_Get"));
+        od6Power = reinterpret_cast<Od6PowerFn>(GetProcAddress(module, "ADL2_Overdrive6_CurrentPower_Get"));
+        if (create == nullptr || destroy == nullptr || number == nullptr ||
+            create(&AdlAlloc, 1, &context) != kAdlOk || context == nullptr) {
+            Close();
+            return;
+        }
+        int count = 0;
+        if (number(context, &count) != kAdlOk || count <= 0) {
+            Close();
+            return;
+        }
+        count = std::min(count, kAdlMaxAdapters);
+        // Avoid depending on ADLAdapterInfo binary layout across driver SDKs:
+        // probe each adapter index for activity + a readable temp/power sensor.
+        for (int index = 0; index < count; ++index) {
+            if (activeGet != nullptr) {
+                int active = 0;
+                if (activeGet(context, index, &active) == kAdlOk && active == 0) {
+                    continue;
+                }
+            }
+            bool discrete = true;
+            if (asicFamily != nullptr) {
+                int familyType = 0;
+                int valid = 0;
+                if (asicFamily(context, index, &familyType, &valid) == kAdlOk) {
+                    // Skip obvious integrated-only when discrete bit is clear and
+                    // integrated bit is set; still accept unknown.
+                    constexpr int kIntegrated = 1 << 1;
+                    if ((familyType & kAsicDiscrete) == 0 && (familyType & kIntegrated) != 0) {
+                        discrete = false;
+                    } else if ((familyType & kAsicDiscrete) != 0) {
+                        discrete = true;
+                    }
+                }
+            }
+            double probeTemp = kNaN;
+            double probePower = kNaN;
+            bool usable = false;
+            {
+                AdlPmLogDataOutput log{};
+                log.size = static_cast<int>(sizeof(log));
+                if (queryPmLog != nullptr && queryPmLog(context, index, &log) == kAdlOk) {
+                    auto sens = [&](int s) -> double {
+                        if (s < 0 || s >= kAdlPmLogMaxSensors || log.sensors[s].supported == 0) {
+                            return kNaN;
+                        }
+                        return static_cast<double>(log.sensors[s].value);
+                    };
+                    probeTemp = sens(kPmLogTempEdge);
+                    if (!PlausibleTemp(probeTemp)) {
+                        probeTemp = sens(kPmLogTempGfx);
+                    }
+                    probePower = sens(kPmLogBoardPower);
+                    if (!PlausibleWatts(probePower)) {
+                        probePower = sens(kPmLogAsicPower);
+                    }
+                    usable = PlausibleTemp(probeTemp) || PlausibleWatts(probePower);
+                }
+            }
+            if (!usable && od5Temp != nullptr) {
+                AdlTemperature t{};
+                t.size = static_cast<int>(sizeof(t));
+                if (od5Temp(context, index, 0, &t) == kAdlOk) {
+                    probeTemp = static_cast<double>(t.temperature) * 0.001;
+                    usable = PlausibleTemp(probeTemp);
+                }
+            }
+            if (!usable) {
+                continue;
+            }
+            adapterIndices.push_back(index);
+            adapterDiscrete.push_back(discrete);
+            if (discrete) {
+                hasDiscrete = true;
+            }
+        }
+        if (adapterIndices.empty()) {
+            Close();
+        }
+    }
+
+    bool ReadPmLog(int adapter, double& tempC, double& powerW) const {
+        tempC = kNaN;
+        powerW = kNaN;
+        if (queryPmLog == nullptr || context == nullptr) {
+            return false;
+        }
+        AdlPmLogDataOutput log{};
+        log.size = static_cast<int>(sizeof(log));
+        if (queryPmLog(context, adapter, &log) != kAdlOk) {
+            return false;
+        }
+        auto sensor = [&](int index) -> double {
+            if (index < 0 || index >= kAdlPmLogMaxSensors) {
+                return kNaN;
+            }
+            if (log.sensors[index].supported == 0) {
+                return kNaN;
+            }
+            return static_cast<double>(log.sensors[index].value);
+        };
+        const double edge = sensor(kPmLogTempEdge);
+        const double gfx = sensor(kPmLogTempGfx);
+        if (PlausibleTemp(edge)) {
+            tempC = edge;
+        } else if (PlausibleTemp(gfx)) {
+            tempC = gfx;
+        }
+        const double board = sensor(kPmLogBoardPower);
+        const double asic = sensor(kPmLogAsicPower);
+        if (PlausibleWatts(board)) {
+            powerW = board;
+        } else if (PlausibleWatts(asic)) {
+            powerW = asic;
+        }
+        return PlausibleTemp(tempC) || PlausibleWatts(powerW);
+    }
+
+    bool ReadOd5Temp(int adapter, double& tempC) const {
+        tempC = kNaN;
+        if (od5Temp == nullptr || context == nullptr) {
+            return false;
+        }
+        AdlTemperature t{};
+        t.size = static_cast<int>(sizeof(t));
+        if (od5Temp(context, adapter, 0, &t) != kAdlOk) {
+            return false;
+        }
+        const double celsius = static_cast<double>(t.temperature) * 0.001;
+        if (PlausibleTemp(celsius)) {
+            tempC = celsius;
+            return true;
+        }
+        return false;
+    }
+
+    bool ReadOd6Power(int adapter, double& powerW) const {
+        powerW = kNaN;
+        if (od6Power == nullptr || context == nullptr) {
+            return false;
+        }
+        // ODN_GPU_TOTAL_POWER = 0
+        int raw = 0;
+        if (od6Power(context, adapter, 0, &raw) != kAdlOk) {
+            return false;
+        }
+        const double watts = static_cast<double>(raw >> 8);
+        if (PlausibleWatts(watts)) {
+            powerW = watts;
+            return true;
+        }
+        return false;
+    }
+
+    void ReadBest(double& tempC, double& powerW, bool& usedDiscrete) {
+        tempC = kNaN;
+        powerW = kNaN;
+        usedDiscrete = false;
+        if (!tried) {
+            Load();
+        }
+        if (context == nullptr || adapterIndices.empty()) {
+            return;
+        }
+        // Prefer discrete adapters when present.
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool wantDiscrete = (pass == 0);
+            if (wantDiscrete && !hasDiscrete) {
+                continue;
+            }
+            for (size_t i = 0; i < adapterIndices.size(); ++i) {
+                if (adapterDiscrete[i] != wantDiscrete && hasDiscrete) {
+                    continue;
+                }
+                const int adapter = adapterIndices[i];
+                double t = kNaN;
+                double p = kNaN;
+                ReadPmLog(adapter, t, p);
+                if (!PlausibleTemp(t)) {
+                    ReadOd5Temp(adapter, t);
+                }
+                if (!PlausibleWatts(p)) {
+                    ReadOd6Power(adapter, p);
+                }
+                if (PlausibleTemp(t) && (!std::isfinite(tempC) || t > tempC)) {
+                    tempC = t;
+                    usedDiscrete = adapterDiscrete[i];
+                }
+                if (PlausibleWatts(p) && (!std::isfinite(powerW) || p > powerW)) {
+                    powerW = p;
+                    usedDiscrete = usedDiscrete || adapterDiscrete[i];
+                }
+            }
+            if (PlausibleTemp(tempC) || PlausibleWatts(powerW)) {
+                return;
+            }
+        }
+    }
+
+    double ReadTemp() {
+        double t = kNaN;
+        double p = kNaN;
+        bool disc = false;
+        ReadBest(t, p, disc);
+        if (!PlausibleTemp(t) && ++failures >= 5) {
+            Close();
+            tried = true;
+        } else if (PlausibleTemp(t)) {
+            failures = 0;
+        }
+        return t;
+    }
+
+    double ReadPower() {
+        double t = kNaN;
+        double p = kNaN;
+        bool disc = false;
+        ReadBest(t, p, disc);
+        return p;
     }
 };
 
@@ -828,10 +1151,236 @@ struct PawnIoIntelPackage {
     }
 };
 
+
+// --- CPU vendor (CPUID) -----------------------------------------------------
+enum class CpuVendorKind { Unknown, Intel, Amd };
+
+struct CpuIdentity {
+    CpuVendorKind vendor = CpuVendorKind::Unknown;
+    unsigned family = 0;
+    unsigned model = 0;
+    char brand[49]{};
+    bool detected = false;
+};
+
+CpuIdentity DetectCpuIdentity() noexcept {
+    CpuIdentity id;
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    char vendor[13] = {};
+    *reinterpret_cast<int*>(vendor + 0) = regs[1];
+    *reinterpret_cast<int*>(vendor + 4) = regs[3];
+    *reinterpret_cast<int*>(vendor + 8) = regs[2];
+    if (std::strncmp(vendor, "GenuineIntel", 12) == 0) {
+        id.vendor = CpuVendorKind::Intel;
+    } else if (std::strncmp(vendor, "AuthenticAMD", 12) == 0) {
+        id.vendor = CpuVendorKind::Amd;
+    }
+    __cpuid(regs, 1);
+    const unsigned stepping = static_cast<unsigned>(regs[0] & 0xF);
+    const unsigned baseModel = static_cast<unsigned>((regs[0] >> 4) & 0xF);
+    const unsigned baseFamily = static_cast<unsigned>((regs[0] >> 8) & 0xF);
+    const unsigned extModel = static_cast<unsigned>((regs[0] >> 16) & 0xF);
+    const unsigned extFamily = static_cast<unsigned>((regs[0] >> 20) & 0xFF);
+    id.family = (baseFamily == 0xF) ? (baseFamily + extFamily) : baseFamily;
+    id.model = (baseFamily == 0xF || baseFamily == 0x6) ? ((extModel << 4) | baseModel) : baseModel;
+    (void)stepping;
+    __cpuid(regs, static_cast<int>(0x80000000u));
+    const unsigned maxExt = static_cast<unsigned>(regs[0]);
+    if (maxExt >= 0x80000004u) {
+        char* cursor = id.brand;
+        for (unsigned leaf = 0x80000002u; leaf <= 0x80000004u; ++leaf) {
+            __cpuid(regs, static_cast<int>(leaf));
+            std::memcpy(cursor, regs, sizeof(regs));
+            cursor += 16;
+        }
+        id.brand[48] = '\0';
+    }
+    id.detected = true;
+    return id;
+}
+
+const CpuIdentity& CpuIdCached() {
+    static const CpuIdentity id = DetectCpuIdentity();
+    return id;
+}
+
+// LibreHardwareMonitor / Linux k10temp Tctl offset for early Zen parts.
+float AmdTctlOffsetC(const char* brand) noexcept {
+    if (brand == nullptr || brand[0] == '\0') {
+        return 0.0f;
+    }
+    if (std::strstr(brand, "1600X") || std::strstr(brand, "1700X") || std::strstr(brand, "1800X")) {
+        return -20.0f;
+    }
+    if (std::strstr(brand, "Threadripper 19") || std::strstr(brand, "Threadripper 29")) {
+        return -27.0f;
+    }
+    if (std::strstr(brand, "2700X")) {
+        return -10.0f;
+    }
+    return 0.0f;
+}
+
+// Pure decode of AMD Zen THM_TCON_CUR_TMP (SMN 0x59800). Exposed for dry tests.
+// Returns package-equivalent die Celsius (Tdie when a Tctl offset applies, else Tctl/Tdie).
+double DecodeAmdZenSmnTempC(uint32_t smnRaw, float tctlOffset) noexcept {
+    constexpr uint32_t kRangeSel = 0x80000u;
+    constexpr uint32_t kTjSel = 0x30000u;
+    const bool tempOffsetFlag =
+        (smnRaw & kRangeSel) != 0 || (smnRaw & kTjSel) == kTjSel;
+    const uint32_t milliScaled = ((smnRaw >> 21) & 0x7FFu) * 125u;
+    float t = static_cast<float>(milliScaled) * 0.001f;
+    if (tempOffsetFlag) {
+        t += -49.0f;
+    }
+    // Prefer Tdie when the historical Tctl offset applies; otherwise Tctl == Tdie.
+    const float celsius = (tctlOffset < 0.0f) ? (t + tctlOffset) : t;
+    return PlausibleTemp(static_cast<double>(celsius)) ? static_cast<double>(celsius) : kNaN;
+}
+
+bool AmdZenFamilySupported(unsigned family) noexcept {
+    return family == 0x17u || family == 0x19u || family == 0x1Au;
+}
+
+// --- Native AMD Zen package temp via PawnIO AMDFamily17 (LHM approach) -------
+// Loads AMDFamily17.bin and reads SMN F17H_M01H_THM_TCON_CUR_TMP (0x59800)
+// through ioctl_read_smn. Acquire Global\Access_PCI around SMN (same as LHM).
+constexpr uint32_t kAmdThmTconCurTmp = 0x00059800u;
+
+struct ScopedPciBusMutex {
+    HANDLE handle = nullptr;
+    bool owned = false;
+
+    explicit ScopedPciBusMutex(DWORD timeoutMs) {
+        handle = OpenMutexW(SYNCHRONIZE, FALSE, L"Global\\Access_PCI");
+        if (handle == nullptr) {
+            handle = CreateMutexW(nullptr, FALSE, L"Global\\Access_PCI");
+        }
+        if (handle != nullptr && WaitForSingleObject(handle, timeoutMs) == WAIT_OBJECT_0) {
+            owned = true;
+        }
+    }
+
+    ~ScopedPciBusMutex() {
+        if (owned && handle != nullptr) {
+            ReleaseMutex(handle);
+        }
+        if (handle != nullptr) {
+            CloseHandle(handle);
+        }
+    }
+
+    ScopedPciBusMutex(const ScopedPciBusMutex&) = delete;
+    ScopedPciBusMutex& operator=(const ScopedPciBusMutex&) = delete;
+
+    bool Ok() const noexcept { return owned; }
+};
+
+struct PawnIoAmdPackage {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    bool loaded = false;
+    bool tried = false;
+    bool needAdmin = false;
+    bool unavailable = false;
+    float tctlOffset = 0.0f;
+
+    ~PawnIoAmdPackage() { Close(); }
+
+    void Close() noexcept {
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
+        }
+        loaded = false;
+    }
+
+    bool ReadSmn(uint32_t offset, uint32_t& value) const {
+        ScopedPciBusMutex pci(50);
+        if (!pci.Ok()) {
+            return false;
+        }
+        alignas(8) unsigned char inBuf[kPawnFnNameLength + sizeof(uint64_t)]{};
+        strncpy_s(reinterpret_cast<char*>(inBuf), kPawnFnNameLength, "ioctl_read_smn", _TRUNCATE);
+        const uint64_t arg = offset;
+        memcpy(inBuf + kPawnFnNameLength, &arg, sizeof(arg));
+        uint64_t out = 0;
+        DWORD returned = 0;
+        if (!DeviceIoControl(handle, kIoctlExecuteFn, inBuf, sizeof(inBuf), &out, sizeof(out), &returned,
+                nullptr)) {
+            return false;
+        }
+        value = static_cast<uint32_t>(out);
+        return true;
+    }
+
+    bool Open() {
+        tried = true;
+        needAdmin = false;
+        unavailable = false;
+        Close();
+        const CpuIdentity& id = CpuIdCached();
+        if (id.vendor != CpuVendorKind::Amd || !AmdZenFamilySupported(id.family)) {
+            unavailable = true;
+            return false;
+        }
+        tctlOffset = AmdTctlOffsetC(id.brand);
+        handle = CreateFileW(L"\\\\?\\GLOBALROOT\\Device\\PawnIO", GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_ACCESS_DENIED || err == ERROR_PRIVILEGE_NOT_HELD) {
+                needAdmin = true;
+            } else {
+                unavailable = true;
+            }
+            return false;
+        }
+        DWORD returned = 0;
+        if (!DeviceIoControl(handle, kIoctlLoadBinary,
+                const_cast<unsigned char*>(HoverDockPawnIo::kAmdFamily17Bin),
+                static_cast<DWORD>(HoverDockPawnIo::kAmdFamily17BinSize), nullptr, 0, &returned, nullptr)) {
+            Close();
+            unavailable = true;
+            return false;
+        }
+        loaded = true;
+        return true;
+    }
+
+    double ReadPackageC() {
+        if (!tried) {
+            Open();
+        }
+        if (!loaded) {
+            return kNaN;
+        }
+        uint32_t raw = 0;
+        if (!ReadSmn(kAmdThmTconCurTmp, raw) || raw == 0) {
+            return kNaN;
+        }
+        return DecodeAmdZenSmnTempC(raw, tctlOffset);
+    }
+};
+
 struct NativeCpuPackageSource {
-    PawnIoIntelPackage pawn;
+    PawnIoIntelPackage intel;
+    PawnIoAmdPackage amd;
     ULONGLONG nextEnsureAt = 0;
     bool promptedInstall = false;
+
+    bool UsesAmd() const noexcept {
+        const CpuIdentity& id = CpuIdCached();
+        return id.vendor == CpuVendorKind::Amd && AmdZenFamilySupported(id.family);
+    }
+
+    bool NeedAdmin() const noexcept {
+        return UsesAmd() ? amd.needAdmin : intel.needAdmin;
+    }
+
+    bool Loaded() const noexcept {
+        return UsesAmd() ? amd.loaded : intel.loaded;
+    }
 
     void EnsureElevatedSibling(ULONGLONG now) {
         if (now < nextEnsureAt) {
@@ -873,24 +1422,42 @@ struct NativeCpuPackageSource {
     bool Read(ULONGLONG now, double& tempC, std::wstring& sensorName) {
         tempC = kNaN;
         sensorName.clear();
+        const bool amdPath = UsesAmd();
 
-        // Prefer in-process PawnIO when Dock is already elevated (or ACL allows).
-        if (!pawn.tried || (pawn.needAdmin && IsCurrentProcessElevated())) {
-            if (pawn.needAdmin) {
-                pawn.tried = false;
+        if (amdPath) {
+            if (!amd.tried || (amd.needAdmin && IsCurrentProcessElevated())) {
+                if (amd.needAdmin) {
+                    amd.tried = false;
+                }
+                amd.Open();
             }
-            pawn.Open();
-        }
-        if (pawn.loaded) {
-            const double value = pawn.ReadPackageC();
-            if (PlausibleTemp(value)) {
-                tempC = value;
-                sensorName = L"CPU Package";
-                return true;
+            if (amd.loaded) {
+                const double value = amd.ReadPackageC();
+                if (PlausibleTemp(value)) {
+                    tempC = value;
+                    sensorName = amd.tctlOffset < 0.0f ? L"Core (Tdie)" : L"Core (Tctl/Tdie)";
+                    return true;
+                }
+            }
+        } else {
+            // Prefer in-process PawnIO when Dock is already elevated (or ACL allows).
+            if (!intel.tried || (intel.needAdmin && IsCurrentProcessElevated())) {
+                if (intel.needAdmin) {
+                    intel.tried = false;
+                }
+                intel.Open();
+            }
+            if (intel.loaded) {
+                const double value = intel.ReadPackageC();
+                if (PlausibleTemp(value)) {
+                    tempC = value;
+                    sensorName = L"CPU Package";
+                    return true;
+                }
             }
         }
 
-        if (pawn.needAdmin) {
+        if (NeedAdmin()) {
             EnsureElevatedSibling(now);
             HoverDockCpuTempFile file{};
             if (!ReadCpuTempFile(file) || !CpuTempFileFresh(file, now)) {
@@ -899,7 +1466,7 @@ struct NativeCpuPackageSource {
             if (file.cpuPackageC > 0 && PlausibleTemp(static_cast<double>(file.cpuPackageC))) {
                 tempC = static_cast<double>(file.cpuPackageC);
                 file.name[63] = L'\0';
-                sensorName = file.name[0] != L'\0' ? file.name : L"CPU Package";
+                sensorName = file.name[0] != L'\0' ? file.name : (amdPath ? L"Core (Tctl/Tdie)" : L"CPU Package");
                 return true;
             }
         }
@@ -1397,6 +1964,7 @@ struct Sensors {
     CoreTempSource coreTemp;
     HwinfoSource hwinfo;
     NvmlSource nvml;
+    AdlGpuSource adl;
     SmiSource smi;
     AcpiWmiSource acpi;
     PdhThermalSource pdhThermal;
@@ -1421,7 +1989,9 @@ struct Sensors {
             double nativeTemp = kNaN;
             if (nativeCpuPackage.Read(now, nativeTemp, dockSensor) && PlausibleTemp(nativeTemp)) {
                 cpuTemp = nativeTemp;
-                reading.cpuSource = L"PawnIO Intel MSR (" + dockSensor + L")";
+                const bool amd = nativeCpuPackage.UsesAmd();
+                reading.cpuSource = amd ? (L"PawnIO AMD SMN (" + dockSensor + L")")
+                                        : (L"PawnIO Intel MSR (" + dockSensor + L")");
             }
         }
         if (!PlausibleTemp(cpuTemp)) {
@@ -1477,26 +2047,75 @@ struct Sensors {
             }
         }
 
-        double gpuTemp = nvml.ReadTemp();
-        if (PlausibleTemp(gpuTemp)) {
-            reading.gpuSource = L"NVML";
-        } else if (PlausibleTemp(hwGpuTemp)) {
+        // GPU: try NVML and ADL; prefer a discrete adapter when both report.
+        const double nvmlTemp = nvml.ReadTemp();
+        const double nvmlPower = nvml.ReadPower();
+        double adlTemp = kNaN;
+        double adlPower = kNaN;
+        bool adlDiscrete = false;
+        adl.ReadBest(adlTemp, adlPower, adlDiscrete);
+        // NVML devices are discrete GPUs for our purposes (laptop mux still reports NVML dGPU).
+        const bool nvmlOk = PlausibleTemp(nvmlTemp) || PlausibleWatts(nvmlPower);
+        const bool adlOk = PlausibleTemp(adlTemp) || PlausibleWatts(adlPower);
+
+        double gpuTemp = kNaN;
+        double gpuPower = kNaN;
+        if (nvmlOk && adlOk) {
+            // Prefer discrete AMD when ADL says discrete; otherwise keep NVML (NVIDIA dGPU).
+            if (adlDiscrete && adl.hasDiscrete) {
+                gpuTemp = adlTemp;
+                gpuPower = adlPower;
+                if (PlausibleTemp(gpuTemp)) {
+                    reading.gpuSource = L"ADL (discrete)";
+                }
+                if (PlausibleWatts(gpuPower)) {
+                    reading.gpuPowerSource = L"ADL (board/ASIC power)";
+                }
+            } else {
+                gpuTemp = nvmlTemp;
+                gpuPower = nvmlPower;
+                if (PlausibleTemp(gpuTemp)) {
+                    reading.gpuSource = L"NVML";
+                }
+                if (PlausibleWatts(gpuPower)) {
+                    reading.gpuPowerSource = L"NVML (board power.draw)";
+                }
+            }
+        } else if (nvmlOk) {
+            gpuTemp = nvmlTemp;
+            gpuPower = nvmlPower;
+            if (PlausibleTemp(gpuTemp)) {
+                reading.gpuSource = L"NVML";
+            }
+            if (PlausibleWatts(gpuPower)) {
+                reading.gpuPowerSource = L"NVML (board power.draw)";
+            }
+        } else if (adlOk) {
+            gpuTemp = adlTemp;
+            gpuPower = adlPower;
+            if (PlausibleTemp(gpuTemp)) {
+                reading.gpuSource = adlDiscrete ? L"ADL (discrete)" : L"ADL";
+            }
+            if (PlausibleWatts(gpuPower)) {
+                reading.gpuPowerSource = L"ADL (board/ASIC power)";
+            }
+        }
+
+        if (!PlausibleTemp(gpuTemp) && PlausibleTemp(hwGpuTemp)) {
             gpuTemp = hwGpuTemp;
             reading.gpuSource = hwmon.name;
-        } else {
+        }
+        if (!PlausibleTemp(gpuTemp)) {
             gpuTemp = smi.ReadTemp(now);
             if (PlausibleTemp(gpuTemp)) {
                 reading.gpuSource = L"nvidia-smi";
             }
         }
-
-        double gpuPower = nvml.ReadPower();
-        if (PlausibleWatts(gpuPower)) {
-            reading.gpuPowerSource = L"NVML (board power.draw)";
-        } else if (PlausibleWatts(hwGpuPower)) {
+        if (!PlausibleWatts(gpuPower) && PlausibleWatts(hwGpuPower)) {
             gpuPower = hwGpuPower;
             reading.gpuPowerSource = hwmon.name;
-        } else {
+        }
+        if (!PlausibleWatts(gpuPower)) {
             gpuPower = smi.ReadPower(now);
             if (PlausibleWatts(gpuPower)) {
                 reading.gpuPowerSource = L"nvidia-smi power.draw";
@@ -1611,8 +2230,12 @@ int RunCpuSensorWorkerImpl() {
         return 1;
     }
 
-    PawnIoIntelPackage pawn;
-    if (!pawn.Open()) {
+    const CpuIdentity& id = CpuIdCached();
+    const bool amdPath = id.vendor == CpuVendorKind::Amd && AmdZenFamilySupported(id.family);
+    PawnIoIntelPackage intel;
+    PawnIoAmdPackage amd;
+    bool opened = amdPath ? amd.Open() : intel.Open();
+    if (!opened) {
         HoverDockCpuTempFile fail{};
         fail.magic = kCpuTempMagic;
         fail.version = kCpuTempVersion;
@@ -1629,16 +2252,20 @@ int RunCpuSensorWorkerImpl() {
 
     uint32_t seq = 0;
     for (;;) {
-        const double celsius = pawn.ReadPackageC();
+        const double celsius = amdPath ? amd.ReadPackageC() : intel.ReadPackageC();
         HoverDockCpuTempFile file{};
         file.magic = kCpuTempMagic;
         file.version = kCpuTempVersion;
         file.sequence = ++seq;
         file.cpuPackageC = PlausibleTemp(celsius) ? static_cast<int>(std::lround(celsius)) : -1;
-        file.cpuPackageW = -1;  // RAPL watts stay on the unelevated PDH path in Dock
+        file.cpuPackageW = -1;  // RAPL / MSR package watts stay on the unelevated Dock path
         file.stampMs = GetTickCount64();
         file.status = file.cpuPackageC > 0 ? 0 : 2;
-        wcsncpy_s(file.name, L"CPU Package", _TRUNCATE);
+        if (amdPath) {
+            wcsncpy_s(file.name, amd.tctlOffset < 0.0f ? L"Core (Tdie)" : L"Core (Tctl/Tdie)", _TRUNCATE);
+        } else {
+            wcsncpy_s(file.name, L"CPU Package", _TRUNCATE);
+        }
         WriteCpuTempFile(file);
         Sleep(1500);
     }
