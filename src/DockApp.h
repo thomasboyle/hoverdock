@@ -814,6 +814,8 @@ private:
     std::vector<LaunchTarget> m_launchTargets;
     std::atomic<UINT> m_launchGeneration{0};
     std::atomic<bool> m_launchInFlight{false};
+    // Last submitted Search query (for last-goal replay memory).
+    std::wstring m_launchRequest;
     WNDPROC m_launchEditPrevious = nullptr;
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;

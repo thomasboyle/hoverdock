@@ -74,4 +74,16 @@ public:
     [[nodiscard]] static SearchAgentResult RunAgent(const std::wstring& baseUrl,
         const std::wstring& request, const std::vector<LaunchCandidate>& candidates,
         const StatusCallback& status, const CancelCallback& cancelled);
+
+    // Defence-in-depth for ShellExecute targets already queued by the agent.
+    [[nodiscard]] static bool IsSafeShellOpenTarget(bool isUrl, const std::wstring& target);
+
+    // Process-local replay of the last successful goal (exact normalized match).
+    // Avoids a model round when the user repeats the same goal.
+    [[nodiscard]] static std::optional<SearchAgentResult> TryReplayLastGoal(
+        const std::wstring& request);
+    static void RememberSuccessfulGoal(const std::wstring& request,
+        const std::vector<SearchAgentAction>& actions);
+    static void RememberSuccessfulLaunch(const std::wstring& request, const std::string& appId,
+        const std::wstring& label);
 };

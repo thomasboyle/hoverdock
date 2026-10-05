@@ -11,8 +11,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cwchar>
 #include <cwctype>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -25,9 +27,10 @@ constexpr INTERNET_PORT kDefaultPort = 8080;
 constexpr DWORD kConnectTimeoutMs = 1500;
 constexpr DWORD kSendTimeoutMs = 8000;
 constexpr DWORD kReceiveTimeoutMs = 45000;
-constexpr size_t kMaxCandidates = 48;
+constexpr size_t kMaxCandidates = 16;
 constexpr size_t kMaxRequestChars = 200;
-constexpr size_t kMaxFieldChars = 96;
+constexpr size_t kMaxFieldChars = 64;
+constexpr size_t kMaxResponseBytes = 256 * 1024;
 constexpr double kFuzzyMinScore = 40.0;
 
 std::wstring Utf8ToWide(const std::string& text) {
@@ -203,22 +206,46 @@ LaunchJudgment MakeError(std::wstring message) {
     return judgment;
 }
 
+// One WinHTTP session per worker thread so TCP/TLS stay warm across health,
+// ranking, and agent steps (Connection: keep-alive by default).
+thread_local WinHttpHandle g_httpSession;
+thread_local std::wstring g_httpSessionHost;
+thread_local INTERNET_PORT g_httpSessionPort = 0;
+
+HINTERNET HttpSessionFor(const ParsedUrl& url, std::wstring& error) {
+    if (g_httpSession.Get() == nullptr || g_httpSessionHost != url.host ||
+        g_httpSessionPort != url.port) {
+        g_httpSession.Reset();
+        g_httpSession = WinHttpHandle(WinHttpOpen(L"HoverdockLlama/1.1", WINHTTP_ACCESS_TYPE_NO_PROXY,
+            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+        if (g_httpSession.Get() == nullptr) {
+            error = L"Could not open HTTP session.";
+            return nullptr;
+        }
+        g_httpSessionHost = url.host;
+        g_httpSessionPort = url.port;
+    }
+    return g_httpSession.Get();
+}
+
 bool HttpExchange(const ParsedUrl& url, const wchar_t* method, const wchar_t* path,
     const std::string* body, DWORD& status, std::string& response, std::wstring& error,
     DWORD receiveTimeoutMs = kReceiveTimeoutMs) {
     status = 0;
     response.clear();
-    WinHttpHandle session(WinHttpOpen(L"HoverdockLlama/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
-    if (session.Get() == nullptr) {
-        error = L"Could not open HTTP session.";
+    HINTERNET session = HttpSessionFor(url, error);
+    if (session == nullptr) {
         return false;
     }
-    WinHttpSetTimeouts(session.Get(), kConnectTimeoutMs, kConnectTimeoutMs, kSendTimeoutMs,
+    WinHttpSetTimeouts(session, kConnectTimeoutMs, kConnectTimeoutMs, kSendTimeoutMs,
         static_cast<int>(receiveTimeoutMs));
-    WinHttpHandle connection(WinHttpConnect(session.Get(), url.host.c_str(), url.port, 0));
+    WinHttpHandle connection(WinHttpConnect(session, url.host.c_str(), url.port, 0));
     if (connection.Get() == nullptr) {
         error = L"Could not connect to llama-server.";
+        // Drop the cached session so the next try re-opens cleanly.
+        g_httpSession.Reset();
+        g_httpSessionHost.clear();
+        g_httpSessionPort = 0;
         return false;
     }
     const DWORD flags = url.https ? WINHTTP_FLAG_SECURE : 0;
@@ -228,7 +255,7 @@ bool HttpExchange(const ParsedUrl& url, const wchar_t* method, const wchar_t* pa
         error = L"Could not create HTTP request.";
         return false;
     }
-    std::wstring headers = L"Accept: application/json\r\n";
+    std::wstring headers = L"Accept: application/json\r\nConnection: keep-alive\r\n";
     if (body != nullptr) {
         headers += L"Content-Type: application/json\r\n";
     }
@@ -244,6 +271,9 @@ bool HttpExchange(const ParsedUrl& url, const wchar_t* method, const wchar_t* pa
     if (WinHttpSendRequest(request.Get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, bodyPtr, bodyLen, bodyLen,
             0) == FALSE) {
         error = L"llama-server request failed (is the server running?).";
+        g_httpSession.Reset();
+        g_httpSessionHost.clear();
+        g_httpSessionPort = 0;
         return false;
     }
     if (WinHttpReceiveResponse(request.Get(), nullptr) == FALSE) {
@@ -265,6 +295,11 @@ bool HttpExchange(const ParsedUrl& url, const wchar_t* method, const wchar_t* pa
         }
         if (available == 0) {
             break;
+        }
+        if (response.size() + available > kMaxResponseBytes) {
+            error = L"llama-server response too large.";
+            response.clear();
+            return false;
         }
         const size_t offset = response.size();
         response.resize(offset + available);
@@ -399,14 +434,14 @@ void AppendCandidate(std::string& out, const LaunchCandidate& candidate) {
 }
 
 std::string BuildChatBody(const std::wstring& request, const std::vector<LaunchCandidate>& candidates) {
+    // Keep byte-identical across requests so llama-server prompt cache hits.
     constexpr char kSystem[] =
-        "You are Hoverdock Search. Pick the best installed app for the user request, "
-        "or a filesystem path to open. Reply with ONLY compact JSON: "
-        "{\"id\":\"cN\"} to launch candidate id, {\"id\":\"none\"} if nothing fits, "
-        "or {\"path\":\"C:\\\\...\"} for a local file/folder. Prefer primary-purpose matches "
-        "(browser vs editor with AI). Never explain. Thinking off.";
+        "Hoverdock Search. Pick best installed app. JSON only: "
+        "{\"id\":\"cN\"} or {\"id\":\"none\"} or {\"path\":\"C:\\\\folder\"}. "
+        "Prefer primary purpose. No prose.";
 
-    std::string body = "{\"model\":\"local\",\"temperature\":0,\"max_tokens\":80,"
+    std::string body = "{\"model\":\"local\",\"temperature\":0,\"max_tokens\":48,"
+                       "\"cache_prompt\":true,"
                        "\"chat_template_kwargs\":{\"enable_thinking\":false},"
                        "\"reasoning_format\":\"none\",\"messages\":[";
     body += "{\"role\":\"system\",\"content\":";
@@ -414,12 +449,24 @@ std::string BuildChatBody(const std::wstring& request, const std::vector<LaunchC
     body += "},{\"role\":\"user\",\"content\":";
     std::string user = "/no_think\nrequest=";
     user += WideToUtf8(TruncateWide(TrimWide(request), kMaxRequestChars));
-    user += "\ncandidates=[";
+    user += "\napps=[";
     for (size_t i = 0; i < candidates.size(); ++i) {
         if (i > 0) {
             user += ',';
         }
-        AppendCandidate(user, candidates[i]);
+        const LaunchCandidate& c = candidates[i];
+        user += '{';
+        AppendUtf8Field(user, "id", Utf8ToWide(c.id));
+        user += ',';
+        AppendUtf8Field(user, "name", TruncateWide(c.name, 40));
+        if (!c.executable.empty()) {
+            user += ',';
+            AppendUtf8Field(user, "exe", TruncateWide(c.executable, 28));
+        }
+        if (c.running) {
+            user += ",\"running\":true";
+        }
+        user += '}';
     }
     user += "]";
     AppendEscaped(body, user);
@@ -549,6 +596,8 @@ std::optional<std::string> ExtractAssistantContent(const std::string& response) 
     return std::nullopt;
 }
 
+std::optional<std::wstring> ValidateOpenPath(std::wstring raw, std::wstring& why);
+
 bool IsKnownCandidateId(const std::string& id, const std::vector<LaunchCandidate>& candidates) {
     return std::ranges::any_of(candidates, [&](const LaunchCandidate& c) { return c.id == id; });
 }
@@ -563,11 +612,18 @@ LaunchJudgment ParseModelJudgment(const std::string& response,
     const std::string& json = object.has_value() ? *object : *content;
 
     if (const auto path = ExtractStringField(json, "path"); path.has_value() && !path->empty()) {
+        std::wstring why;
+        if (const auto safe = ValidateOpenPath(Utf8ToWide(*path), why); safe.has_value()) {
+            LaunchJudgment judgment;
+            judgment.action = LaunchJudgment::Action::Launch;
+            judgment.openPath = *safe;
+            judgment.exists = 1.0;
+            judgment.confidence = 0.85;
+            return judgment;
+        }
+        // Model suggested an unsafe/missing path: treat as uncertain so fuzzy can try.
         LaunchJudgment judgment;
-        judgment.action = LaunchJudgment::Action::Launch;
-        judgment.openPath = Utf8ToWide(*path);
-        judgment.exists = 1.0;
-        judgment.confidence = 0.85;
+        judgment.action = LaunchJudgment::Action::Uncertain;
         return judgment;
     }
 
@@ -608,8 +664,8 @@ constexpr int kAgentMaxSteps = 3;
 constexpr size_t kAgentMaxActions = 3;
 constexpr size_t kAgentContextApps = 6;
 constexpr size_t kAgentSearchResults = 6;
-constexpr int kAgentMaxTokens = 96;
-constexpr DWORD kAgentReceiveTimeoutMs = 240000;
+constexpr int kAgentMaxTokens = 64;
+constexpr DWORD kAgentReceiveTimeoutMs = 120000;
 constexpr size_t kAgentMaxReplyChars = 120;
 constexpr size_t kAgentMaxUrlChars = 2048;
 constexpr double kConfidentMinScore = 80.0;
@@ -927,18 +983,15 @@ std::string CandidateListJson(const std::vector<const LaunchCandidate*>& list) {
 const std::string& AgentSystemPrompt() {
     static const std::string prompt = [] {
         std::string text =
-            "You are Hoverdock Search, a local Windows agent. Do the user's goal with tools.\n"
-            "Reply ONLY with JSON objects, one per line, no other text:\n"
-            "{\"tool\":\"launch_app\",\"id\":\"c3\"} launch an app by id from apps/results\n"
-            "{\"tool\":\"open_url\",\"url\":\"https://...\"} open a website in the default browser\n"
-            "{\"tool\":\"open_path\",\"path\":\"C:\\\\...\"} open an existing folder or document\n"
-            "{\"tool\":\"search_apps\",\"q\":\"words\"} find installed apps, then wait for results\n"
-            "{\"tool\":\"done\",\"say\":\"short reply\"} finish (max 10 words)\n"
-            "Rules: use ids exactly as given, never invent ids. open_url already opens the browser; "
-            "do not also launch one. Web goals: build a URL, e.g. "
-            "https://www.youtube.com/results?search_query=lofi or https://www.google.com/search?q=x. "
-            "If nothing fits, reply only done with a short reason. End with done unless you used "
-            "search_apps.\nfolders:";
+            "Hoverdock Search agent. JSON lines only:\n"
+            "{\"tool\":\"launch_app\",\"id\":\"c3\"}\n"
+            "{\"tool\":\"open_url\",\"url\":\"https://...\"}\n"
+            "{\"tool\":\"open_path\",\"path\":\"C:\\\\...\"}\n"
+            "{\"tool\":\"search_apps\",\"q\":\"words\"}\n"
+            "{\"tool\":\"done\",\"say\":\"short\"}\n"
+            "Use exact ids. open_url opens the browser (do not also launch_app). "
+            "Web: youtube.com/results?search_query=... or google.com/search?q=... "
+            "End with done unless search_apps.\nfolders:";
         for (const NamedFolder& folder : UserFolders()) {
             text += ' ';
             text += WideToUtf8(folder.label);
@@ -1089,13 +1142,21 @@ LaunchJudgment LlamaServerClient::ResolveApp(const std::wstring& baseUrl,
         return judgment;
     }
 
+    // Lexical confident hit: skip the model entirely for clear app names.
+    if (const std::string quickId = ConfidentAppId(cleanRequest, candidates); !quickId.empty()) {
+        LaunchJudgment judgment;
+        judgment.action = LaunchJudgment::Action::Launch;
+        judgment.chosenId = quickId;
+        judgment.exists = 1.0;
+        judgment.confidence = 0.95;
+        judgment.usedFuzzyFallback = true;
+        return judgment;
+    }
+
     const std::vector<LaunchCandidate> ranked =
         SelectTopCandidates(candidates, cleanRequest, kMaxCandidates);
 
-    if (!IsServerReachable(baseUrl)) {
-        return ResolveAppFuzzy(cleanRequest, ranked);
-    }
-
+    // No separate /health round-trip: a failed POST falls back to fuzzy.
     const ParsedUrl url = ParseBaseUrl(baseUrl);
     const std::string body = BuildChatBody(cleanRequest, ranked);
     DWORD status = 0;
@@ -1163,8 +1224,150 @@ bool LlamaServerClient::LooksLikeAgentGoal(const std::wstring& request) {
     });
 }
 
+
+std::wstring UrlEncodeQuery(const std::wstring& value) {
+    auto appendHex = [](std::wstring& out, unsigned char byte) {
+        constexpr wchar_t kHex[] = L"0123456789ABCDEF";
+        out.push_back(L'%');
+        out.push_back(kHex[(byte >> 4) & 0xf]);
+        out.push_back(kHex[byte & 0xf]);
+    };
+    std::wstring out;
+    out.reserve(value.size() * 3);
+    for (const wchar_t c : value) {
+        if ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9') ||
+            c == L'-' || c == L'_' || c == L'.' || c == L'~') {
+            out.push_back(c);
+        } else if (c == L' ') {
+            out.push_back(L'+');
+        } else if (c < 0x80) {
+            appendHex(out, static_cast<unsigned char>(c));
+        } else {
+            const std::string utf8 = WideToUtf8(std::wstring(1, c));
+            for (const unsigned char byte : utf8) {
+                appendHex(out, byte);
+            }
+        }
+    }
+    return out;
+}
+
+std::optional<SearchAgentAction> WebGoalAction(const std::wstring& request) {
+    const std::wstring lower = ToLowerWide(TrimWide(request));
+    if (lower.empty()) {
+        return std::nullopt;
+    }
+
+    auto makeUrl = [](std::wstring url, std::wstring label) -> SearchAgentAction {
+        SearchAgentAction action;
+        action.kind = SearchAgentAction::Kind::OpenUrl;
+        action.target = std::move(url);
+        action.label = std::move(label);
+        return action;
+    };
+
+    // "play/search/watch/find/listen X on/in youtube" or "... youtube for X"
+    const std::wstring_view ytMarkers[] = {
+        L" on youtube", L" in youtube", L" youtube for ", L" on yt", L" in yt",
+    };
+    for (const std::wstring_view marker : ytMarkers) {
+        const size_t at = lower.find(marker);
+        if (at == std::wstring::npos) {
+            continue;
+        }
+        std::wstring query;
+        if (marker == L" youtube for ") {
+            query = TrimWide(lower.substr(at + marker.size()));
+        } else {
+            // Strip leading verb from the prefix.
+            query = StripLeadingPhrases(lower.substr(0, at));
+            // Also drop a trailing "videos"/"music" filler.
+            for (const std::wstring_view tail : {std::wstring_view(L" videos"), std::wstring_view(L" music"),
+                     std::wstring_view(L" songs")}) {
+                if (query.size() > tail.size() && query.ends_with(tail)) {
+                    query = TrimWide(query.substr(0, query.size() - tail.size()));
+                }
+            }
+        }
+        if (query.empty() || query.size() > 120) {
+            continue;
+        }
+        return makeUrl(L"https://www.youtube.com/results?search_query=" + UrlEncodeQuery(query),
+            L"YouTube: " + Utf8ToWide(WideToUtf8(query)));
+    }
+
+    // "youtube <query>" / "yt <query>" when first token is youtube/yt
+    {
+        const std::vector<std::wstring> tokens = Tokenize(lower);
+        if (tokens.size() >= 2 && (tokens[0] == L"youtube" || tokens[0] == L"yt")) {
+            std::wstring query = TrimWide(lower.substr(tokens[0].size()));
+            if (!query.empty() && query.size() <= 120) {
+                return makeUrl(L"https://www.youtube.com/results?search_query=" + UrlEncodeQuery(query),
+                    L"YouTube: " + query);
+            }
+        }
+    }
+
+    // "google X" / "search google for X" / "search for X on google"
+    auto googleQuery = [&]() -> std::wstring {
+        if (lower.starts_with(L"google ")) {
+            return TrimWide(lower.substr(7));
+        }
+        for (const std::wstring_view prefix : {std::wstring_view(L"search google for "),
+                 std::wstring_view(L"google search for "), std::wstring_view(L"search on google for "),
+                 std::wstring_view(L"look up "), std::wstring_view(L"lookup ")}) {
+            if (lower.starts_with(prefix)) {
+                return TrimWide(lower.substr(prefix.size()));
+            }
+        }
+        const size_t onGoogle = lower.rfind(L" on google");
+        if (onGoogle != std::wstring::npos && onGoogle > 0) {
+            return StripLeadingPhrases(lower.substr(0, onGoogle));
+        }
+        // "search for X" / "search X" — only when clearly a web search (no folder/app cues).
+        if (lower.starts_with(L"search for ") || lower.starts_with(L"search ")) {
+            std::wstring q = lower.starts_with(L"search for ")
+                ? TrimWide(lower.substr(11))
+                : TrimWide(lower.substr(7));
+            if (q.empty() || q.find(L"folder") != std::wstring::npos ||
+                q.find(L"app") != std::wstring::npos) {
+                return {};
+            }
+            // Avoid stealing "search photos" style catalog goals with 1 short token.
+            const auto words = Tokenize(q);
+            if (words.size() >= 2) {
+                return q;
+            }
+        }
+        return {};
+    };
+    if (const std::wstring q = googleQuery(); !q.empty() && q.size() <= 120) {
+        return makeUrl(L"https://www.google.com/search?q=" + UrlEncodeQuery(q), L"Google: " + q);
+    }
+
+    return std::nullopt;
+}
+
+std::wstring NormalizeGoalKey(const std::wstring& request) {
+    return ToLowerWide(TrimWide(request));
+}
+
+struct LastGoalMemory {
+    std::mutex mutex;
+    std::wstring key;
+    std::vector<SearchAgentAction> actions;
+};
+
+LastGoalMemory& GoalMemory() {
+    static LastGoalMemory memory;
+    return memory;
+}
+
 std::optional<SearchAgentAction> LlamaServerClient::DirectAction(const std::wstring& request) {
     const std::wstring trimmed = TrimWide(request);
+    if (auto web = WebGoalAction(trimmed); web.has_value()) {
+        return web;
+    }
     const std::wstring rest = StripLeadingPhrases(trimmed);
     if (rest.empty()) {
         return std::nullopt;
@@ -1245,11 +1448,7 @@ SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
     };
     const auto isCancelled = [&cancelled]() { return cancelled && cancelled(); };
 
-    if (!IsServerReachable(baseUrl)) {
-        result.serverUnavailable = true;
-        return result;
-    }
-
+    // Skip /health: first failed completion marks the server unavailable.
     const ParsedUrl url = ParseBaseUrl(baseUrl);
     std::vector<ChatMessage> messages;
     {
@@ -1266,7 +1465,7 @@ SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
         }
         result.steps = step;
         notify(L"Agent working (step " + std::to_wstring(step) + L"/" +
-            std::to_wstring(kAgentMaxSteps) + L", local CPU model, may take ~1 min)...");
+            std::to_wstring(kAgentMaxSteps) + L", local CPU)...");
 
         const std::string body = BuildAgentBody(messages);
         DWORD httpStatus = 0;
@@ -1414,4 +1613,60 @@ SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
         result.reply = L"The agent could not finish that. Try naming the app.";
     }
     return result;
+}
+
+
+bool LlamaServerClient::IsSafeShellOpenTarget(bool isUrl, const std::wstring& target) {
+    if (target.empty()) {
+        return false;
+    }
+    if (isUrl) {
+        return NormalizeUrl(target).has_value();
+    }
+    std::wstring why;
+    return ValidateOpenPath(target, why).has_value();
+}
+
+std::optional<SearchAgentResult> LlamaServerClient::TryReplayLastGoal(const std::wstring& request) {
+    const std::wstring key = NormalizeGoalKey(request);
+    if (key.empty()) {
+        return std::nullopt;
+    }
+    LastGoalMemory& memory = GoalMemory();
+    std::lock_guard<std::mutex> lock(memory.mutex);
+    if (memory.key != key || memory.actions.empty()) {
+        return std::nullopt;
+    }
+    SearchAgentResult result;
+    result.actions = memory.actions;
+    result.reply = L"Replaying last goal.";
+    result.steps = 0;
+    return result;
+}
+
+void LlamaServerClient::RememberSuccessfulGoal(const std::wstring& request,
+    const std::vector<SearchAgentAction>& actions) {
+    if (actions.empty()) {
+        return;
+    }
+    const std::wstring key = NormalizeGoalKey(request);
+    if (key.empty()) {
+        return;
+    }
+    LastGoalMemory& memory = GoalMemory();
+    std::lock_guard<std::mutex> lock(memory.mutex);
+    memory.key = key;
+    memory.actions = actions;
+}
+
+void LlamaServerClient::RememberSuccessfulLaunch(const std::wstring& request, const std::string& appId,
+    const std::wstring& label) {
+    if (appId.empty()) {
+        return;
+    }
+    SearchAgentAction action;
+    action.kind = SearchAgentAction::Kind::LaunchApp;
+    action.appId = appId;
+    action.label = label;
+    RememberSuccessfulGoal(request, {action});
 }

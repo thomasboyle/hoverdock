@@ -10067,6 +10067,7 @@ void DockApp::SubmitLaunchPrompt() {
 
     const UINT generation = ++m_launchGeneration;
     m_launchInFlight = true;
+    m_launchRequest = request;
     SetLaunchPromptStatus(L"Looking...");
 
     const std::wstring llamaUrl = m_config.LlamaServerUrl();
@@ -10118,9 +10119,15 @@ void DockApp::SubmitLaunchPrompt() {
                     candidates.push_back(MakeLaunchCandidate(target));
                 }
                 if (auto direct = LlamaServerClient::DirectAction(request); direct.has_value()) {
-                    // Fast path 2: explicit URL/domain, known folder or existing path.
+                    // Fast path 2: URL/domain, folder/path, or common web goals (YouTube/Google).
                     agentMode = true;
                     agent.actions.push_back(std::move(*direct));
+                } else if (auto replay = LlamaServerClient::TryReplayLastGoal(request);
+                    replay.has_value()) {
+                    // Fast path 2b: exact repeat of the last successful goal (no model).
+                    agentMode = true;
+                    agent = std::move(*replay);
+                    postStatus(L"Replaying last goal...");
                 } else if (LlamaServerClient::LooksLikeAgentGoal(request)) {
                     const std::wstring appText = LlamaServerClient::StripGoalVerbs(request);
                     const std::string quickId = LlamaServerClient::ConfidentAppId(appText, candidates);
@@ -10198,12 +10205,21 @@ void DockApp::ApplyLaunchJudgment(UINT generation, const LaunchJudgment& judgmen
     }
 
     if (!judgment.openPath.empty()) {
+        if (!LlamaServerClient::IsSafeShellOpenTarget(false, judgment.openPath)) {
+            SetLaunchPromptStatus(L"Blocked unsafe path.");
+            return;
+        }
         const HINSTANCE opened = ShellExecuteW(nullptr, L"open", judgment.openPath.c_str(), nullptr,
             nullptr, SW_SHOWNORMAL);
         if (reinterpret_cast<INT_PTR>(opened) <= 32) {
             SetLaunchPromptStatus(L"Could not open that path.");
             return;
         }
+        SearchAgentAction remembered;
+        remembered.kind = SearchAgentAction::Kind::OpenPath;
+        remembered.target = judgment.openPath;
+        remembered.label = judgment.openPath;
+        LlamaServerClient::RememberSuccessfulGoal(m_launchRequest, {remembered});
         CloseLaunchPrompt(false);
         BeginHide();
         return;
@@ -10218,6 +10234,7 @@ void DockApp::ApplyLaunchJudgment(UINT generation, const LaunchJudgment& judgmen
         SetLaunchPromptStatus(L"The selected app could not be opened.");
         return;
     }
+    LlamaServerClient::RememberSuccessfulLaunch(m_launchRequest, judgment.chosenId, target->app.name);
     CloseLaunchPrompt(false);
     BeginHide();
 }
@@ -10250,14 +10267,9 @@ void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result)
         }
         case SearchAgentAction::Kind::OpenUrl:
         case SearchAgentAction::Kind::OpenPath: {
-            // Defence in depth: the agent already validated these, but only
-            // http(s) URLs and existing local paths ever reach ShellExecute.
+            // Defence in depth: re-validate before ShellExecute.
             const bool isUrl = action.kind == SearchAgentAction::Kind::OpenUrl;
-            const bool allowed = isUrl
-                ? (StartsWithInsensitiveWide(action.target, L"https://") ||
-                      StartsWithInsensitiveWide(action.target, L"http://"))
-                : GetFileAttributesW(action.target.c_str()) != INVALID_FILE_ATTRIBUTES;
-            if (!allowed) {
+            if (!LlamaServerClient::IsSafeShellOpenTarget(isUrl, action.target)) {
                 failure = L"Blocked unsafe target.";
                 break;
             }
@@ -10274,6 +10286,7 @@ void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result)
     }
 
     if (performed > 0) {
+        LlamaServerClient::RememberSuccessfulGoal(m_launchRequest, result.actions);
         CloseLaunchPrompt(false);
         BeginHide();
         return;
