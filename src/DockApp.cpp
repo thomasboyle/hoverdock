@@ -2706,6 +2706,17 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         }
         return 0;
 
+    case kQsTempsResultMessage:
+        // Worker posted a changed CPU/GPU reading: present just the two value
+        // rects over the cached underlay (no blur / layout rebuild).
+        if (app != nullptr && app->IsOverflowOpen() && app->m_qsPage == QuickSettingsPage::Home) {
+            if (ApplyQuickSettingsTemps(app->m_qsCache)) {
+                app->m_qsTempsDirty = true;
+                app->PaintOverflowLiveFast();
+            }
+        }
+        return 0;
+
     case WM_TIMER:
         if (wParam == kEnergySampleTimerId && app != nullptr) {
             if (app->m_qsPage != QuickSettingsPage::Power || !app->IsOverflowOpen()) {
@@ -2713,6 +2724,15 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
                 return 0;
             }
             RequestEnergyAppsAsync(window, DockApp::kQsEnergyResultMessage);
+            return 0;
+        }
+        if (wParam == kQsTempsTimerId && app != nullptr) {
+            if (app->m_qsPage != QuickSettingsPage::Home || !app->IsOverflowOpen()) {
+                KillTimer(window, kQsTempsTimerId);
+                return 0;
+            }
+            // Keep-alive only; sensor reads stay on the temperature worker.
+            RequestQuickSettingsTemps(window, DockApp::kQsTempsResultMessage);
             return 0;
         }
         if (wParam == kQsLiveTimerId && app != nullptr) {
@@ -5435,6 +5455,7 @@ void DockApp::FinishOverflowHide() noexcept {
     if (m_overflowWindow != nullptr) {
         KillTimer(m_overflowWindow, kEnergySampleTimerId);
         KillTimer(m_overflowWindow, kQsLiveTimerId);
+        KillTimer(m_overflowWindow, kQsTempsTimerId);
         ShowWindow(m_overflowWindow, SW_HIDE);
     }
     m_overflowVisibility = VisibilityState::Hidden;
@@ -5448,6 +5469,8 @@ void DockApp::FinishOverflowHide() noexcept {
     std::vector<uint8_t>().swap(m_overflowUnderlayBits);
     m_qsMeterValid = false;
     m_qsScrubValid = false;
+    m_qsTempsValid = false;
+    m_qsTempsDirty = false;
     m_overflowPresentSize = {};
     m_overflowHoverPaintOnly = false;
     InvalidateOverflowGlass();
@@ -7548,7 +7571,6 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::Display:
     case TrayFlyoutHitKind::Hdr:
     case TrayFlyoutHitKind::Power:
-    case TrayFlyoutHitKind::Nearby:
     case TrayFlyoutHitKind::Airplane:
     case TrayFlyoutHitKind::SystemTrayPage:
     case TrayFlyoutHitKind::VolumeSlider:
@@ -7556,7 +7578,6 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::CaptureGain:
     case TrayFlyoutHitKind::Toggle:
     case TrayFlyoutHitKind::PowerMode:
-    case TrayFlyoutHitKind::NearbyMode:
     case TrayFlyoutHitKind::WifiNetwork:
     case TrayFlyoutHitKind::AudioOutput:
     case TrayFlyoutHitKind::AudioInput:
@@ -7704,7 +7725,6 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::Display:
     case TrayFlyoutHitKind::Hdr:
     case TrayFlyoutHitKind::Power:
-    case TrayFlyoutHitKind::Nearby:
     case TrayFlyoutHitKind::Airplane:
     case TrayFlyoutHitKind::SystemTrayPage:
     case TrayFlyoutHitKind::VolumeSlider:
@@ -7712,7 +7732,6 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::CaptureGain:
     case TrayFlyoutHitKind::Toggle:
     case TrayFlyoutHitKind::PowerMode:
-    case TrayFlyoutHitKind::NearbyMode:
     case TrayFlyoutHitKind::WifiNetwork:
     case TrayFlyoutHitKind::AudioOutput:
     case TrayFlyoutHitKind::AudioInput:
@@ -7841,7 +7860,7 @@ void DockApp::PaintOverflowLiveFast() {
         m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0 ||
         m_overflowPresentSize.cx != m_overflowSize.cx ||
         m_overflowPresentSize.cy != m_overflowSize.cy ||
-        (!m_qsMeterValid && !m_qsScrubValid) ||
+        (!m_qsMeterValid && !m_qsScrubValid && !m_qsTempsValid) ||
         m_overflowUnderlayBits.size() != m_overflowPresentBits.size() ||
         !OverflowScreenOrigin(origin, caret)) {
         PaintOverflowPopup();
@@ -7903,11 +7922,19 @@ void DockApp::PaintOverflowLiveFast() {
     if (m_qsScrubValid) {
         addDirty(m_qsScrubRect);
     }
+    // Temperature values only when a new reading arrived; mic-meter frames
+    // leave those rects (and their text) untouched.
+    const bool temps = m_qsTempsValid && m_qsTempsDirty;
+    m_qsTempsDirty = false;
+    if (temps) {
+        addDirty(m_qsTempCpuRect);
+        addDirty(m_qsTempGpuRect);
+    }
     if (!haveDirty) {
         return;
     }
 
-    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale);
+    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps);
     if (m_overflowBaseBits.size() == m_overflowPresentBits.size()) {
         // Keep base in sync so hover-fast restores still show live meters.
         const LONG left = dirty.left;
@@ -8160,6 +8187,7 @@ void DockApp::PaintOverflowPopup() {
     PaintQuickSettings(pixels, width, height, memory, scale, padding, panelWidth, gearSize,
         headerHeight, titleFont, sectionFont, labelFont, statusFont);
     m_qsPaintUnderlayPass = false;
+    m_qsTempsDirty = false;
 
     const size_t bytes = pixelCount * 4U;
     m_overflowUnderlayBits.resize(bytes);
@@ -8185,6 +8213,13 @@ void DockApp::PaintOverflowPopup() {
             RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
         } else {
             KillTimer(m_overflowWindow, kEnergySampleTimerId);
+        }
+        if (m_qsPage == QuickSettingsPage::Home) {
+            // Temperature worker keep-alive; the worker itself polls every ~2 s.
+            SetTimer(m_overflowWindow, kQsTempsTimerId, 2000, nullptr);
+            RequestQuickSettingsTemps(m_overflowWindow, kQsTempsResultMessage);
+        } else {
+            KillTimer(m_overflowWindow, kQsTempsTimerId);
         }
         // UI live timer only publishes background peak / rate-limited media; keep
         // ~40 ms on meter pages so the underlay present stays smooth.

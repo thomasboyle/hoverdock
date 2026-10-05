@@ -38,6 +38,7 @@ add_executable(Dock WIN32
     src/Renderer.cpp
     src/Startup.cpp
     src/SystemTray.cpp
+    src/SystemTemps.cpp
     src/Weather.cpp
     src/TypeSafeClient.cpp
     src/Updater.cpp
@@ -129,6 +130,8 @@ target_link_libraries(Dock PRIVATE
     powrprof
     dxva2
     UIAutomationCore
+    wbemuuid
+    pdh
 )
 
 set(DOCK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.hlsl")

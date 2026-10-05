@@ -138,6 +138,7 @@ private:
     static constexpr UINT_PTR kBluetoothTimerId = 16;
     static constexpr UINT_PTR kEnergySampleTimerId = 17;
     static constexpr UINT_PTR kQsLiveTimerId = 18;
+    static constexpr UINT_PTR kQsTempsTimerId = 19;
     // Pointer glint easing cadence (~60 Hz); the timer only runs while the
     // glint is still converging on the cursor, so an idle dock costs nothing.
     static constexpr UINT kGlintIntervalMs = 16;
@@ -182,6 +183,7 @@ private:
     static constexpr UINT kTrashDropMessage = WM_APP + 21;
     static constexpr UINT kOverflowDismissMessage = WM_APP + 24;
     static constexpr UINT kQsEnergyResultMessage = WM_APP + 25;
+    static constexpr UINT kQsTempsResultMessage = WM_APP + 26;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -203,7 +205,6 @@ private:
         Display,
         Hdr,
         Power,
-        Nearby,
         Airplane,
         SystemTrayPage,
         VolumeSlider,
@@ -211,7 +212,6 @@ private:
         CaptureGain,
         Toggle,
         PowerMode,
-        NearbyMode,
         WifiNetwork,
         AudioOutput,
         AudioInput,
@@ -413,7 +413,8 @@ private:
     void PaintOverflowHoverFast();
     // Meter/scrub-only present from underlay via UpdateLayeredWindowIndirect.
     void PaintOverflowLiveFast();
-    void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale) const;
+    void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
+        bool includeTemps = true) const;
     void ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
         const TrayFlyoutHit& hit) const;
     void DestroyOverflowPopup() noexcept;
@@ -891,6 +892,17 @@ private:
     RECT m_qsScrubRect{};
     bool m_qsMeterValid = false;
     bool m_qsScrubValid = false;
+    // Home temperature tile value rects (live overlay) and the ink they were
+    // laid out with, so a fast present matches the full paint exactly.
+    RECT m_qsTempCpuRect{};
+    RECT m_qsTempGpuRect{};
+    bool m_qsTempsValid = false;
+    // Set when a new reading arrives; the next fast present restores/redraws
+    // the value rects. Mic-meter frames leave them untouched.
+    bool m_qsTempsDirty = false;
+    uint8_t m_qsTempsInkR = 0;
+    uint8_t m_qsTempsInkG = 0;
+    uint8_t m_qsTempsInkB = 0;
     // When true, LayoutQuickSettings paints meter/scrub tracks at empty levels and
     // records their rects for PaintOverflowLiveFast.
     bool m_qsPaintUnderlayPass = false;

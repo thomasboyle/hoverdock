@@ -17,7 +17,6 @@ enum class QuickSettingsPage : uint8_t {
     Microphone,
     Power,
     SystemTray,
-    Nearby,
     Airplane,
     Bluetooth,
     Display,
@@ -53,7 +52,7 @@ struct QsEnergyApp {
 struct QuickSettingsCache {
     ULONGLONG stamp = 0;
     // Independent TTLs so heavy queries are not all tied to the 800 ms stamp.
-    ULONGLONG stampNetwork = 0;  // wifi / adapters / endpoints / power / HDR / nearby
+    ULONGLONG stampNetwork = 0;  // wifi / adapters / endpoints / power / HDR
     ULONGLONG stampNight = 0;    // Night Light CloudStore
     bool wifiRadioOn = true;
     bool haveWifiInterface = false;
@@ -88,7 +87,9 @@ struct QuickSettingsCache {
     bool hdrSupported = false;
     bool nightLight = false;
     bool nightKnown = false;
-    int nearby = 0;
+    // Home temperature tile. Whole degrees C; -1 shows an em dash.
+    int cpuTempC = -1;
+    int gpuTempC = -1;
     // Set when WASAPI capture cannot be opened (permission, missing device).
     std::wstring inputNote;
     std::wstring mediaTitle;
@@ -118,3 +119,8 @@ void SeekQuickSettingsMedia(float level) noexcept;
 void RequestEnergyAppsAsync(HWND notifyHwnd, UINT notifyMsg);
 // Copy the latest worker energy snapshot into cache. True when values changed.
 bool ApplyEnergyAppsResult(QuickSettingsCache& cache);
+// Keep the background CPU/GPU temperature worker polling (~2 s). Posts
+// notifyMsg to notifyHwnd when a displayed value changes; never blocks.
+void RequestQuickSettingsTemps(HWND notifyHwnd, UINT notifyMsg) noexcept;
+// Copy the latest worker temperatures into cache. True when a value changed.
+bool ApplyQuickSettingsTemps(QuickSettingsCache& cache);

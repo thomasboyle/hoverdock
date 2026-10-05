@@ -1,6 +1,7 @@
 #include "DockApp.h"
 
 #include "QuickSettingsPanel.h"
+#include "SystemTemps.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -52,6 +53,9 @@ void FillSquirclePremul(uint8_t* dest, int destWidth, int destHeight, RECT bound
 float ContentSquircleRadius(const RECT& bounds, float scale) noexcept;
 void RemapPremulInkColor(std::vector<uint8_t>& pixels, uint8_t r, uint8_t g, uint8_t b);
 void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept;
+extern uint8_t g_flyoutInkR;
+extern uint8_t g_flyoutInkG;
+extern uint8_t g_flyoutInkB;
 std::wstring NotifyIconTitle(const TrayNotifyIcon& icon);
 std::wstring NotifyIconStatus(const TrayNotifyIcon& icon);
 }  // namespace dock_detail
@@ -75,7 +79,6 @@ constexpr int kLinkVpn = 2;
 constexpr int kLinkSound = 3;
 constexpr int kLinkPower = 4;
 constexpr int kLinkTaskbar = 5;
-constexpr int kLinkNearby = 6;
 constexpr int kLinkBluetooth = 7;
 constexpr int kLinkDisplay = 8;
 constexpr int kLinkNight = 9;
@@ -87,7 +90,6 @@ constexpr int kToggleMic = 2;
 constexpr int kToggleUsb = 3;
 constexpr int kToggleAirplane = 4;
 constexpr int kToggleHdr = 5;
-constexpr int kToggleNearby = 6;
 
 const GUID kUsbSubgroup = {
     0x2a737441, 0x1930, 0x4402, {0x8d, 0x77, 0xb2, 0xbe, 0xbb, 0xa3, 0x08, 0xa3}};
@@ -1636,51 +1638,6 @@ void QueryNightLight(QuickSettingsCache& cache) {
     RegCloseKey(key);
 }
 
-int ReadDword(HKEY root, const wchar_t* subkey, const wchar_t* name, int fallback) {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
-        return fallback;
-    }
-    DWORD value = 0;
-    DWORD size = sizeof(value);
-    DWORD type = 0;
-    const LSTATUS status = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(&value),
-        &size);
-    RegCloseKey(key);
-    if (status != ERROR_SUCCESS || type != REG_DWORD) {
-        return fallback;
-    }
-    return static_cast<int>(value);
-}
-
-void WriteDword(HKEY root, const wchar_t* subkey, const wchar_t* name, DWORD value) {
-    HKEY key = nullptr;
-    if (RegCreateKeyExW(root, subkey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) !=
-        ERROR_SUCCESS) {
-        return;
-    }
-    RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
-    RegCloseKey(key);
-}
-
-void QueryNearby(QuickSettingsCache& cache) {
-    cache.nearby = ReadDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\CDP",
-        L"NearShareChannelUserAuthzPolicy", 0);
-    if (cache.nearby < 0 || cache.nearby > 2) {
-        cache.nearby = 0;
-    }
-}
-
-void SetNearbyMode(int mode) {
-    const DWORD value = static_cast<DWORD>(std::clamp(mode, 0, 2));
-    WriteDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\CDP",
-        L"NearShareChannelUserAuthzPolicy", value);
-    WriteDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\CDP",
-        L"CdpSessionUserAuthzPolicy", value == 0 ? 0U : value);
-    WriteDword(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\CDP\\SettingsPage",
-        L"NearShareChannelUserAuthzPolicy", value == 0 ? 0U : value);
-}
-
 void QueryCapture(QuickSettingsCache& cache) {
     cache.inputPeak = 0.0F;
     cache.inputGain = 1.0F;
@@ -1926,6 +1883,61 @@ void FillAlbumDisc(uint8_t* dest, int destWidth, int destHeight, float cx, float
     }
 }
 
+// Outline thermometer (stem capsule + bulb) with a filled bulb and mercury
+// column, stroked to match the Fluent glyphs on the neighbouring tiles. No
+// Segoe Fluent/MDL2 thermometer glyph exists, so it is drawn from an SDF.
+void FillThermometerPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float top,
+    float extent, float stroke, uint8_t red, uint8_t green, uint8_t blue) {
+    if (dest == nullptr || extent < 4.0F) {
+        return;
+    }
+    const float bulbR = extent * 0.25F;
+    const float stemR = extent * 0.14F;
+    const float bulbCy = top + extent - bulbR;
+    const float stemTop = top + stemR;
+    const float half = stroke * 0.5F;
+    const float dotR = std::max(1.0F, bulbR - stroke * 1.7F);
+    const float columnR = std::max(0.7F, stroke * 0.55F);
+    const float columnTop = top + extent * 0.38F;
+    const int left = static_cast<int>(std::floor(cx - bulbR - 2.0F));
+    const int right = static_cast<int>(std::ceil(cx + bulbR + 2.0F));
+    const int y0 = static_cast<int>(std::floor(top - 2.0F));
+    const int y1 = static_cast<int>(std::ceil(top + extent + 2.0F));
+    const int boxW = right - left;
+    const int boxH = y1 - y0;
+    if (boxW <= 0 || boxH <= 0) {
+        return;
+    }
+    std::vector<uint8_t> glyph(static_cast<size_t>(boxW) * static_cast<size_t>(boxH) * 4U, 0);
+    for (int y = 0; y < boxH; ++y) {
+        for (int x = 0; x < boxW; ++x) {
+            const float px = static_cast<float>(left + x) + 0.5F;
+            const float py = static_cast<float>(y0 + y) + 0.5F;
+            const float dx = px - cx;
+            const float stemY = std::clamp(py, stemTop, bulbCy);
+            const float outline = std::min(std::hypot(dx, py - stemY) - stemR, std::hypot(dx, py - bulbCy) - bulbR);
+            const float colY = std::clamp(py, columnTop, bulbCy);
+            const float fill = std::min(std::hypot(dx, py - bulbCy) - dotR, std::hypot(dx, py - colY) - columnR);
+            const float ring = std::clamp(half + 0.5F - std::fabs(outline), 0.0F, 1.0F);
+            const float core = std::clamp(0.5F - fill, 0.0F, 1.0F);
+            const float coverage = std::max(ring, core);
+            if (coverage <= 0.0F) {
+                continue;
+            }
+            uint8_t* out = glyph.data() + (static_cast<size_t>(y) * static_cast<size_t>(boxW) + static_cast<size_t>(x)) * 4U;
+            out[0] = static_cast<uint8_t>(std::lround(static_cast<float>(blue) * coverage));
+            out[1] = static_cast<uint8_t>(std::lround(static_cast<float>(green) * coverage));
+            out[2] = static_cast<uint8_t>(std::lround(static_cast<float>(red) * coverage));
+            out[3] = static_cast<uint8_t>(std::lround(255.0F * coverage));
+        }
+    }
+    CompositePremul(dest, destWidth, destHeight, left, y0, glyph.data(), boxW, boxH);
+}
+
+std::wstring TempText(int celsius) {
+    return celsius < 0 ? std::wstring(L"\u2014") : std::to_wstring(celsius) + L"\u00B0C";
+}
+
 }  // namespace
 
 namespace {
@@ -2067,6 +2079,26 @@ bool ApplyEnergyAppsResult(QuickSettingsCache& cache) {
     return changed;
 }
 
+void RequestQuickSettingsTemps(HWND notifyHwnd, UINT notifyMsg) noexcept {
+    RequestSystemTemps(notifyHwnd, notifyMsg);
+}
+
+bool ApplyQuickSettingsTemps(QuickSettingsCache& cache) {
+    // A reading older than this (panel reopened after a long idle) is shown as
+    // unavailable until the worker's first fresh poll lands (~0.1-0.5 s).
+    constexpr ULONGLONG kStaleMs = 60000;
+    SystemTempsReading reading;
+    int cpu = -1;
+    int gpu = -1;
+    if (LatestSystemTemps(reading) && GetTickCount64() - reading.stamp <= kStaleMs) {
+        cpu = reading.cpuC;
+        gpu = reading.gpuC;
+    }
+    const bool changed = cpu != cache.cpuTempC || gpu != cache.gpuTempC;
+    cache.cpuTempC = cpu;
+    cache.gpuTempC = gpu;
+    return changed;
+}
 
 QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
     const int beforeBucket = MeterBucket(cache.inputPeak);
@@ -2123,7 +2155,7 @@ QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
 
 void DockApp::RefreshQuickSettingsCache() {
     const ULONGLONG now = GetTickCount64();
-    // Network / adapters / endpoints / power / HDR / nearby: ~2.5 s.
+    // Network / adapters / endpoints / power / HDR: ~2.5 s.
     if (m_qsCache.stampNetwork == 0 || now - m_qsCache.stampNetwork >= 2500ULL) {
         QueryWifiRadio(m_qsCache);
         if (m_qsPage == QuickSettingsPage::Wifi) {
@@ -2137,7 +2169,6 @@ void DockApp::RefreshQuickSettingsCache() {
         QueryCapture(m_qsCache);
         QueryPower(m_qsCache);
         QueryHdr(m_qsCache);
-        QueryNearby(m_qsCache);
         m_qsCache.stampNetwork = now;
     }
     // Night Light CloudStore: ~8 s.
@@ -2159,6 +2190,14 @@ void DockApp::RefreshQuickSettingsCache() {
         m_qsCache.energyLive = false;
         m_qsCache.energyPending = false;
         m_qsCache.energyNote.clear();
+    }
+    if (m_qsPage == QuickSettingsPage::Home) {
+        // Sensors are read on the temperature worker; this only copies the
+        // last published values and re-arms its ~2 s poll.
+        ApplyQuickSettingsTemps(m_qsCache);
+        if (m_overflowWindow != nullptr) {
+            RequestQuickSettingsTemps(m_overflowWindow, kQsTempsResultMessage);
+        }
     }
     // Keep media labels fresh without forcing a session pick every paint.
     QueryMedia(m_qsCache, false, false);
@@ -2281,11 +2320,16 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
     if (m_qsScrubValid) {
         OffsetRect(&m_qsScrubRect, shadowMargin, shadowMargin);
     }
+    if (m_qsTempsValid) {
+        OffsetRect(&m_qsTempCpuRect, shadowMargin, shadowMargin);
+        OffsetRect(&m_qsTempGpuRect, shadowMargin, shadowMargin);
+    }
     m_overflowGearX += static_cast<int>(shadowMargin);
     m_overflowGearY += static_cast<int>(shadowMargin);
 }
 
-void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale) const {
+void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
+    bool includeTemps) const {
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
@@ -2358,6 +2402,21 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
         FillSoftDisc(pixels, width, height, fill, cy, thumb, 1.0F, 245, 120, 210);
         FillSoftDisc(pixels, width, height, fill, cy, thumb * 0.62F, 1.0F, 255, 236, 252);
     }
+    if (includeTemps && m_qsTempsValid && m_qsPage == QuickSettingsPage::Home &&
+        m_overflowLabelFont != nullptr) {
+        // Values live outside the underlay so a new reading presents only
+        // these two rects (PaintOverflowLiveFast) instead of a full rebuild.
+        const uint8_t savedR = g_flyoutInkR;
+        const uint8_t savedG = g_flyoutInkG;
+        const uint8_t savedB = g_flyoutInkB;
+        SetFlyoutChromeInk(m_qsTempsInkR, m_qsTempsInkG, m_qsTempsInkB);
+        constexpr UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE;
+        DrawFlyoutText(pixels, width, height, m_qsTempCpuRect, m_overflowLabelFont,
+            TempText(m_qsCache.cpuTempC), format, 255);
+        DrawFlyoutText(pixels, width, height, m_qsTempGpuRect, m_overflowLabelFont,
+            TempText(m_qsCache.gpuTempC), format, 255);
+        SetFlyoutChromeInk(savedR, savedG, savedB);
+    }
 }
 
 void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int height, HDC memory,
@@ -2366,8 +2425,11 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     if (draw) {
         m_qsMeterValid = false;
         m_qsScrubValid = false;
+        m_qsTempsValid = false;
         m_qsMeterRect = {};
         m_qsScrubRect = {};
+        m_qsTempCpuRect = {};
+        m_qsTempGpuRect = {};
     }
     const bool home = m_qsPage == QuickSettingsPage::Home;
     panelWidth = std::max(320L, std::lround((home ? 600.0F : 380.0F) * scale));
@@ -2795,7 +2857,6 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         if (m_qsCache.nightKnown && m_qsCache.nightLight) {
             displayStatus = L"Night light";
         }
-        const std::wstring nearbyLabel = m_qsCache.nearby == 0 ? L"Off" : L"On";
         x = padding;
         smallTile({x, y, x + cell, y + homeSmallH}, L'\uE706', L"Display", displayStatus,
             TrayFlyoutHitKind::Display);
@@ -2803,8 +2864,46 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         smallTile({x, y, x + cell, y + homeSmallH}, L'\uE708', L"Power", EnergyModeLabel(m_qsCache.powerMode),
             TrayFlyoutHitKind::Power);
         x += cell + homeGap;
-        smallTile({x, y, panelWidth - padding, y + homeSmallH}, L'\uE716', L"Nearby sharing", nearbyLabel,
-            TrayFlyoutHitKind::Nearby);
+        {
+            // Temperatures: thermometer, then CPU / GPU label-over-value
+            // columns. Read-only, so no hit target, hover, or chevron.
+            const RECT temps{x, y, panelWidth - padding, y + homeSmallH};
+            homeCard(temps);
+            const float glyphH = static_cast<float>(tileIcon) * 1.3F;
+            const float glyphCx = static_cast<float>(temps.left + inset) + static_cast<float>(tileIcon) * 0.5F;
+            const float glyphTop = static_cast<float>(temps.top + temps.bottom) * 0.5F - glyphH * 0.5F;
+            if (draw) {
+                FillThermometerPremul(pixels, width, height, glyphCx, glyphTop, glyphH,
+                    std::max(1.0F, 1.05F * scale), inkR, inkG, inkB);
+            }
+            const LONG columnsLeft = temps.left + inset + static_cast<LONG>(tileIcon) +
+                std::max(10L, std::lround(12.0F * scale));
+            const LONG columnsRight = temps.right - inset;
+            const LONG columnW = std::max(1L, (columnsRight - columnsLeft) / 2L);
+            const LONG lineH = std::max(18L, std::lround(21.0F * scale));
+            const LONG blockTop = (temps.top + temps.bottom) / 2L - lineH;
+            const RECT cpuLabel{columnsLeft, blockTop, columnsLeft + columnW, blockTop + lineH};
+            const RECT gpuLabel{columnsLeft + columnW, blockTop, columnsRight, blockTop + lineH};
+            const RECT cpuValue{cpuLabel.left, cpuLabel.bottom, cpuLabel.right, cpuLabel.bottom + lineH};
+            const RECT gpuValue{gpuLabel.left, gpuLabel.bottom, gpuLabel.right, gpuLabel.bottom + lineH};
+            constexpr UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE;
+            text(cpuLabel, labelFont, L"CPU", format, 255);
+            text(gpuLabel, labelFont, L"GPU", format, 255);
+            if (draw) {
+                m_qsTempCpuRect = cpuValue;
+                m_qsTempGpuRect = gpuValue;
+                m_qsTempsValid = true;
+                m_qsTempsInkR = g_flyoutInkR;
+                m_qsTempsInkG = g_flyoutInkG;
+                m_qsTempsInkB = g_flyoutInkB;
+            }
+            // Values are a live overlay (see PaintQsLiveOverlays); only an
+            // overlay-less paint draws them into the plate.
+            if (!m_qsPaintUnderlayPass) {
+                text(cpuValue, labelFont, TempText(m_qsCache.cpuTempC), format, 255);
+                text(gpuValue, labelFont, TempText(m_qsCache.gpuTempC), format, 255);
+            }
+        }
         y += homeSmallH + homeGap;
 
         const RECT media{padding, y, panelWidth - padding, y + homeMediaH};
@@ -3161,30 +3260,6 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             y += static_cast<LONG>(shown) * listRow + gap;
         }
         footer(L"Manage tray icons", kLinkTaskbar);
-    } else if (m_qsPage == QuickSettingsPage::Nearby) {
-        beginHeader(L"Nearby sharing", false, kToggleNearby, m_qsCache.nearby != 0);
-        y += gap;
-        const RECT group{padding, y, panelWidth - padding, y + listRow * 3L};
-        card(group, false);
-        const wchar_t* choices[3] = {L"My devices only", L"Everyone nearby", L"Off"};
-        const int values[3] = {1, 2, 0};
-        for (int index = 0; index < 3; ++index) {
-            const RECT row{group.left, group.top + index * listRow, group.right,
-                group.top + (index + 1) * listRow};
-            radio(static_cast<float>(row.left + 22), static_cast<float>(row.top + listRow / 2L),
-                m_qsCache.nearby == values[index]);
-            text({row.left + 40, row.top, row.right - 12, row.bottom}, labelFont, choices[index],
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-            push(TrayFlyoutHitKind::NearbyMode, row, values[index]);
-        }
-        y += listRow * 3L + gap;
-        section(L"Device discovery");
-        card({padding, y, panelWidth - padding, y + listRow}, false);
-        text({padding + 14, y, panelWidth - padding - 14, y + listRow}, statusFont,
-            L"Phones and PCs appear here while sharing is on",
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
-        y += listRow + gap;
-        footer(L"More sharing settings", kLinkNearby);
     } else if (m_qsPage == QuickSettingsPage::Airplane) {
         const bool airplane = !m_qsCache.wifiRadioOn &&
             (!m_bluetoothSnapshot.radioPresent || !m_bluetoothSnapshot.radioOn);
@@ -3333,9 +3408,6 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
     case TrayFlyoutHitKind::Power:
         navigate(QuickSettingsPage::Power, L"ms-settings:powersleep");
         break;
-    case TrayFlyoutHitKind::Nearby:
-        navigate(QuickSettingsPage::Nearby, L"ms-settings:crossdevice");
-        break;
     case TrayFlyoutHitKind::Airplane:
         navigate(QuickSettingsPage::Airplane, L"ms-settings:network-airplanemode");
         break;
@@ -3399,11 +3471,6 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             m_qsCache.stamp = 0;
             PaintOverflowPopup();
             break;
-        case kToggleNearby:
-            SetNearbyMode(m_qsCache.nearby == 0 ? 1 : 0);
-            m_qsCache.stamp = 0;
-            PaintOverflowPopup();
-            break;
         default:
             break;
         }
@@ -3414,12 +3481,6 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             m_qsCache.stamp = 0;
             PaintOverflowPopup();
         }
-        break;
-    case TrayFlyoutHitKind::NearbyMode:
-        SetNearbyMode(hit.index);
-        m_qsCache.nearby = std::clamp(hit.index, 0, 2);
-        m_qsCache.stamp = GetTickCount64();
-        PaintOverflowPopup();
         break;
     case TrayFlyoutHitKind::WifiNetwork:
         if (hit.index >= 0 && static_cast<size_t>(hit.index) < m_qsCache.wifi.size()) {
@@ -3483,9 +3544,6 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             break;
         case kLinkTaskbar:
             openUri(L"ms-settings:taskbar");
-            break;
-        case kLinkNearby:
-            openUri(L"ms-settings:crossdevice");
             break;
         case kLinkBluetooth:
             openUri(L"ms-settings:bluetooth");
