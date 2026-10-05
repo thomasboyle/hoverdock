@@ -3378,6 +3378,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
     case kLaunchResultMessage: {
         std::unique_ptr<LaunchReply> reply(reinterpret_cast<LaunchReply*>(lParam));
         if (reply != nullptr) {
+            Log(L"Search route=" + reply->route + L" worker_ms=" + std::to_wstring(reply->workerMs));
             if (!reply->targets.empty()) {
                 m_launchTargets = std::move(reply->targets);
             }
@@ -9916,6 +9917,16 @@ bool DockApp::OpenLaunchPrompt() {
     }
     HideHoverLabel();
 
+    // Prime llama-server's prompt cache with the shared system prompt while the
+    // user types, so a first-time goal that needs the model only pays for its
+    // own short user message. No-op once warm or while the server is down.
+    std::thread([llamaUrl = m_config.LlamaServerUrl()]() {
+        try {
+            LlamaServerClient::WarmPromptCache(llamaUrl);
+        } catch (...) {
+        }
+    }).detach();
+
     if (m_launchPromptWindow != nullptr) {
         PositionLaunchPrompt();
         if (m_launchEdit != nullptr) {
@@ -10105,6 +10116,8 @@ void DockApp::SubmitLaunchPrompt() {
             picked.confidence = confidence;
             return picked;
         };
+        const auto started = std::chrono::steady_clock::now();
+        std::wstring route = L"none";
         try {
             m_installedApps.EnsureLoaded();
             targets = CollectLaunchTargets(displayApps, runningWindows);
@@ -10112,42 +10125,49 @@ void DockApp::SubmitLaunchPrompt() {
             if (!exactId.empty()) {
                 // Fast path 1: exact app name.
                 judgment = launchJudgment(exactId, 1.0);
+                route = L"exact";
             } else {
                 std::vector<LaunchCandidate> candidates;
                 candidates.reserve(targets.size());
                 for (const LaunchTarget& target : targets) {
                     candidates.push_back(MakeLaunchCandidate(target));
                 }
-                if (auto direct = LlamaServerClient::DirectAction(request); direct.has_value()) {
-                    // Fast path 2: URL/domain, folder/path, or common web goals (YouTube/Google).
-                    agentMode = true;
-                    agent.actions.push_back(std::move(*direct));
-                } else if (auto replay = LlamaServerClient::TryReplayLastGoal(request);
-                    replay.has_value()) {
-                    // Fast path 2b: exact repeat of the last successful goal (no model).
+                if (auto replay = LlamaServerClient::TryReplayLastGoal(request); replay.has_value()) {
+                    // Fast path 2: exact repeat of the last successful goal (no model).
                     agentMode = true;
                     agent = std::move(*replay);
-                    postStatus(L"Replaying last goal...");
-                } else if (LlamaServerClient::LooksLikeAgentGoal(request)) {
-                    const std::wstring appText = LlamaServerClient::StripGoalVerbs(request);
-                    const std::string quickId = LlamaServerClient::ConfidentAppId(appText, candidates);
-                    if (!quickId.empty()) {
-                        // Fast path 3: "open steam" with one unambiguous lexical hit.
-                        judgment = launchJudgment(quickId, 0.95);
+                    route = L"replay";
+                } else if (auto plan = LlamaServerClient::PlanWithoutModel(request, candidates);
+                    plan.has_value()) {
+                    // Fast path 3 (first-time goals, no model): URL/domain, site
+                    // search/home, folder/path, confident catalog app (alias,
+                    // acronym, typo), question -> web, strong keyword match, or a
+                    // compound of those.
+                    route = plan->route;
+                    if (plan->actions.size() == 1 &&
+                        plan->actions.front().kind == SearchAgentAction::Kind::LaunchApp) {
+                        judgment = launchJudgment(plan->actions.front().appId, 0.95);
                     } else {
-                        // Agent mode: local llama-server tool loop.
-                        agent = LlamaServerClient::RunAgent(llamaUrl, request, candidates, postStatus,
-                            superseded);
-                        if (agent.serverUnavailable) {
-                            // Server down: classic fuzzy search, no agent claims.
-                            judgment = LlamaServerClient::ResolveAppFuzzy(appText, candidates);
-                        } else {
-                            agentMode = true;
-                        }
+                        agentMode = true;
+                        agent.actions = std::move(plan->actions);
+                    }
+                } else if (LlamaServerClient::LooksLikeAgentGoal(request)) {
+                    // Agent mode: single-shot local llama-server call (one line,
+                    // grammar-constrained); fuzzy if the server is down.
+                    agent = LlamaServerClient::RunAgent(llamaUrl, request, candidates, postStatus,
+                        superseded);
+                    if (agent.serverUnavailable) {
+                        judgment = LlamaServerClient::ResolveAppFuzzy(
+                            LlamaServerClient::StripGoalVerbs(request), candidates);
+                        route = L"fuzzy-offline";
+                    } else {
+                        agentMode = true;
+                        route = L"agent-" + std::to_wstring(agent.steps) + L"round";
                     }
                 } else {
-                    // Plain search: model ranking, fuzzy if llama-server is down.
+                    // Plain search: model ranking (launch-only), fuzzy if llama-server is down.
                     judgment = LlamaServerClient::ResolveApp(llamaUrl, request, candidates);
+                    route = judgment.usedFuzzyFallback ? L"rank-fuzzy" : L"rank-model";
                 }
             }
         } catch (const std::exception&) {
@@ -10159,10 +10179,12 @@ void DockApp::SubmitLaunchPrompt() {
             judgment.action = LaunchJudgment::Action::Error;
             judgment.error = L"Launch failed unexpectedly.";
         }
+        const long long workerMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
         LaunchReply* reply = nullptr;
         try {
             reply = new LaunchReply{generation, std::move(judgment), std::move(targets), agentMode,
-                std::move(agent)};
+                std::move(agent), std::move(route), workerMs};
         } catch (...) {
             return;
         }

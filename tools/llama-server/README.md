@@ -49,50 +49,75 @@ Check it is up: `curl.exe http://127.0.0.1:8080/health` -> `{"status":"ok"}`.
 
 Qwen3.8 uses hybrid Gated DeltaNet; recent llama.cpp builds (including b11405)
 support it. Dock Search sends `chat_template_kwargs.enable_thinking=false`,
-`cache_prompt=true`, and `/no_think` so reasoning stays off and the static
-system prompt stays cached. MTP (when enabled) uses the model's own
+`cache_prompt=true`, and a one-line GBNF grammar (falls back to `/no_think` when a
+server rejects the grammar) so reasoning stays off and the static system prompt
+stays cached. MTP (when enabled) uses the model's own
 `blk.*.nextn.*` tensors — GGUFs without those heads should leave MTP off.
 
-## Agent-in-search (1.1.72+)
+## Agent-in-search (1.1.72+, first-time fast paths 1.1.74)
 
-Typing a *goal* into dock Search (instead of an app name) runs a small local
-agent loop against llama-server. Order of resolution for every query:
+Typing a *goal* into dock Search (instead of an app name) resolves locally
+whenever possible and only asks the model as a last resort. Order for every query:
 
 1. **Exact app name** ("steam", "open steam" when an app is literally named Steam) - instant.
-2. **Direct action, no model** - instant, works with the server down:
-   - URL / domain: `go to github.com`, `https://news.ycombinator.com`
-   - Known user folder: `open downloads folder`, `open documents`, `desktop folder`
-     (Downloads, Documents, Desktop, Pictures, Music, Videos, Home)
-   - Existing absolute path: `C:\Users\thoma\Downloads`
-   - Common web goals: `play lofi on youtube`, `youtube lofi`, `google rtx 5090`,
-     `search for rtx 5090 price`
-3. **Replay last successful goal** (exact normalized match, process-local) - instant.
-4. **Goal?** The query is treated as a goal when it starts with a verb
-   (open, launch, run, play, find, search, go, visit, show, watch, listen, ...)
-   and has 2+ words, has 4+ words, contains a URL/domain, or mentions
-   folder/website. Otherwise it is a **plain search** (model ranking, fuzzy fallback).
-5. For goals, a **confident lexical hit** on the remainder skips the model
-   (`open chrome`, `launch steam` when only one app clearly matches). Plain
-   search also skips the model when ConfidentAppId is unambiguous.
-6. Otherwise **agent mode**: up to 3 model rounds, max 3 actions, ~64 output
-   tokens per round. Tools (all validated before anything runs):
-   - `search_apps {q}` - catalog lookup, result fed back to the model
-   - `launch_app {id}` - catalog id only (same launch/focus path as clicking)
-   - `open_url {url}` - http/https only
-   - `open_path {path}` - existing local folder or document; UNC paths and
-     executables/scripts/shortcuts (.exe .bat .ps1 .lnk .msi ...) are refused
-   - `done {say}` - short reply shown on the Search status line
-   No shell commands, deletes, elevation or file reads. Status lines show the
-   current step; a successful action closes Search like a normal launch.
-7. **Server down** (or first round fails): falls back to fuzzy search on the
-   remainder; no agent replies are shown.
+2. **Replay last successful goal** (exact normalized match, process-local) - instant.
+3. **Model-free plan** (`PlanWithoutModel`, sub-millisecond, works with the server down):
+   - **Direct**: URL/domain (`go to github.com`), absolute path (`C:\Windows`),
+     explicit site searches - `play lofi on youtube`, `cats on reddit`,
+     `search amazon for usb c cable`, `listen to jazz on spotify`,
+     `google rtx 5090 price`, `youtube lofi beats`, `search for rtx 5090 price`,
+     `look up tom hanks`, `images of red pandas`, `directions to kings cross`.
+   - **Folders**: Downloads, Documents, Desktop, Pictures, Music, Videos, Home,
+     Screenshots, OneDrive, AppData, LocalAppData, Temp, Program Files, Saved Games,
+     Startup, Recent, Fonts, drives (`c drive`, `d:`), and `<name> folder` for an
+     existing folder directly under the profile/known folders/fixed-drive roots
+     (`open c++ folder` -> `D:\C++`). `in explorer` suffix is ignored.
+   - **Confident catalog app** after verb/filler stripping: exact or normalized
+     name (`vs code`), alias table (`vscode`, `word`, `cmd`, `calc`,
+     `task manager`, `ps`, `obs`, `epic games`...), lexical score with margin and
+     full keyword coverage, acronym (`vsc`), unique name prefix, 1-2 edit typos
+     (`chorme`, `spotfy`, `dicsord`).
+   - **Site home / site search** (after the catalog so installed apps win):
+     ~55 sites (`open reddit`, `gmail`, `google drive`, `amazon usb c cable`,
+     `wikipedia alan turing`, `open chatgpt`). `go to` / `visit` prefer the site.
+   - **Questions** -> Google (`what is ...`, `how to ...`, `weather in ...`).
+   - **Strong keyword match** ("search_apps" done locally): one app clearly wins
+     and covers the goal words (`open the steam client`).
+   - **Compound goals** when every part resolves: `open spotify and discord`,
+     `open downloads then play lofi on youtube`, `open firefox and go to github.com`.
+4. **Model (single shot)** for genuinely novel goals (`find something to edit photos`).
+   One request, one grammar-constrained line (GBNF via llama-server `grammar`):
+   `L <id>` launch listed app, `W <query>` Google, `Y <query>` YouTube,
+   `U <url>` http(s) URL, `P <folder>` folder/path, `S <words>` app search,
+   `N <reason>` nothing. `S` is answered locally and launches immediately when
+   one app clearly wins; only otherwise a second, launch-only round runs.
+   Up to 5 compact candidates (`c3=Steam; c9=GIMP`), `max_tokens` 40.
+   Plain (non-goal) queries use the same system prompt with a launch-only
+   grammar (`L cN` / `N`) over <= 8 candidates.
+5. **Server down** (or first round fails): fuzzy search on the remainder; no agent replies.
 
-Example goals: `open chrome`, `launch steam`, `open downloads folder`,
-`go to github.com`, `play lofi on youtube`, `search google for rtx 5090 price`,
-`find something to edit photos`.
+All actions are validated before anything runs: `launch_app` is catalog ids only;
+URLs http/https only; paths must exist, no UNC, and executables/scripts/shortcuts
+(.exe .bat .ps1 .lnk .msi ...) are refused. No shell commands, deletes,
+elevation or file reads.
 
-Speed: on CPU (`-ngl 0`) the 27B model does ~6–8 tok/s prompt and ~1–2 tok/s
-generation, so a model round still takes tens of seconds. Fast paths 1–3 and 5
-never touch the model. Ranking prompts send ≤16 compact candidates with
-`cache_prompt=true`; HTTP keepalive reuses the WinHTTP session on the worker
-thread. Prefer those client speedups over MTP.
+### Latency (27B Q4_K_M, CPU `-ngl 0`: ~7 tok/s prompt, ~0.77 s per output token)
+
+Token counts measured with the Qwen tokenizer against llama-server b11405:
+
+| Path | 1.1.73 | 1.1.74 |
+|---|---|---|
+| Agent launch (`L c7` vs JSON launch+done) | ~109 prompt + ~21 out tok -> ~30 s | ~50 prompt + ~4 out -> ~10 s |
+| Agent web search (`W q` vs JSON open_url) | ~109 + ~35 tok -> ~43 s | mostly local now (0 s); model: ~50 + ~10 -> ~15 s |
+| `S` then launch | 2 rounds | local search_apps, 1 round |
+| Plain ranking (8 compact vs 16 JSON) | ~351 + ~7 tok -> ~55 s | ~80 + ~4 tok -> ~15 s |
+| Cold system prompt (~132 tok, ~19 s) | paid by first query; agent/ranking prompts evicted each other | shared prompt, primed by `WarmPromptCache` when Search opens |
+
+Ranking and agent share one byte-identical system prompt so the single slot
+(`-np 1`) keeps it cached (checked with Qwen3-0.6B on b11405: grammar accepted,
+`cache_n=132` on follow-up requests, 4 predicted tokens per launch reply; the hybrid
+27B relies on llama-server context checkpoints for the same reuse). The
+Search worker logs `Search route=<path> worker_ms=<n>` for every query.
+If a server rejects the `grammar` field (HTTP 4xx) the client retries once
+without it and parses the same compact protocol (plus legacy JSON tool calls).
+Prefer these client speedups over MTP (still opt-in via `-EnableMtp`).

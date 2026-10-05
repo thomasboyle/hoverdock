@@ -89,6 +89,9 @@ private:
         // reply instead of `judgment`.
         bool agentMode = false;
         SearchAgentResult agent;
+        // Latency log: which path resolved the query and worker time.
+        std::wstring route;
+        long long workerMs = 0;
     };
 
     struct AgentStatusReply {

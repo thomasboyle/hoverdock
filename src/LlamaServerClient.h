@@ -33,6 +33,14 @@ struct SearchAgentResult {
     int steps = 0;
 };
 
+// Model-free resolution of a Search query (first-time goals included).
+struct SearchFastPlan {
+    std::vector<SearchAgentAction> actions;
+    // Which fast path matched (direct, app-confident, site, web-question,
+    // folder, app-keywords, compound) for latency logs.
+    std::wstring route;
+};
+
 // Local OpenAI-compatible client for llama-server (llama.cpp).
 // Used by dock Search / launch prompt. Falls back to classic fuzzy ranking
 // when the server is unreachable so Search still works offline.
@@ -64,13 +72,31 @@ public:
     // existing absolute paths ("go to github.com", "open downloads folder").
     [[nodiscard]] static std::optional<SearchAgentAction> DirectAction(const std::wstring& request);
 
-    // Strong, unambiguous lexical app hit ("steam" -> Steam). Empty when unsure.
+    // Strong, unambiguous catalog hit after verb/filler stripping: exact or
+    // normalized name, alias ("vscode", "word", "task manager"), lexical score
+    // with margin, acronym ("vsc"), unique prefix, or a 1-2 edit typo
+    // ("chorme"). Empty when unsure.
     [[nodiscard]] static std::string ConfidentAppId(const std::wstring& appText,
         const std::vector<LaunchCandidate>& candidates);
 
-    // Small tool loop (search_apps / launch_app / open_url / open_path / done)
-    // against llama-server. Blocking; call from a worker thread. status is
-    // invoked from that worker thread; cancelled is polled between steps.
+    // Everything that can be answered without the model, in order: direct
+    // action (URL/domain, explicit site search, folder, absolute path) ->
+    // confident catalog app (exact/alias/lexical/acronym/prefix/typo) -> site
+    // home or site search -> question -> bare folder -> strong keyword match.
+    // Compound goals ("open spotify and discord") resolve when every part does.
+    [[nodiscard]] static std::optional<SearchFastPlan> PlanWithoutModel(const std::wstring& request,
+        const std::vector<LaunchCandidate>& candidates);
+
+    // Primes llama-server's prompt cache with the shared static system prompt
+    // so the first model request only evaluates its short user message.
+    // Blocking; call from a worker thread. No-op once warm / while backing off.
+    static void WarmPromptCache(const std::wstring& baseUrl);
+
+    // Single-shot agent against llama-server: one grammar-constrained line
+    // (L id / W query / Y query / U url / P folder / S words / N). S is answered
+    // locally and only falls through to a second, launch-only round when no
+    // app clearly wins. Blocking; call from a worker thread. status is invoked
+    // from that worker thread; cancelled is polled between rounds.
     [[nodiscard]] static SearchAgentResult RunAgent(const std::wstring& baseUrl,
         const std::wstring& request, const std::vector<LaunchCandidate>& candidates,
         const StatusCallback& status, const CancelCallback& cancelled);
