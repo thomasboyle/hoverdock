@@ -522,82 +522,51 @@ float4 GlassPS(VertexOutput input) : SV_Target
     plateMix = lerp(plateMix, 1.0, saturate(scene2.w) * labelFace);
     float3 color = lerp(frostedBackground, toneMapped, plateMix);
 
-    // ---- 4. Fresnel reflection + specular ---------------------------------
-    // N = normalize(grad * slopeMag, 1): flat in the field, tilted outward on
-    // the bevel. Schlick F0 = 0.04. Light is a virtual top-left key (desktop
-    // has no gyroscope): speculars ride the bevel, strongest at the rim.
+    // ---- 4. Soft edge + pointer-reactive glint (no corner speculars) ------
+    // Removed the sharp top-left key specular (pow(ndl, 110)) and NdotL-boosted
+    // white rimFacing that painted bright white corner pixels on the dock and
+    // labels. Idle: uniform soft rim only. Pointer: local rim flare + bloom.
     const float3 surfN = normalize(float3(outward * slopeMag, 1.0));
     const float cosTheta = saturate(surfN.z);
     const float fresnel = 0.04 + 0.96 * pow(1.0 - cosTheta, 5.0);
-    const float3 lightDir = normalize(float3(-0.35, -0.6, 0.7));
-    const float ndl = saturate(dot(surfN, lightDir));
-    // Sharp key specular (Apple white rim lights): tighter lobe, rim-weighted.
-    const float specular = pow(ndl, 110.0) * (bevelFactor * 0.45 + rim * 0.85);
-    // Cool bounce fill from the opposite side so highlights travel instead
-    // of sitting in one static lobe.
-    const float3 fillDir = normalize(float3(0.55, 0.6, 0.45));
-    const float fillSpec = pow(saturate(dot(surfN, fillDir)), 28.0) * bevelFactor;
-    // Narrow Fresnel veil + thin bright rim caustic (not a chalk outline).
-    color += fresnel * float3(0.92, 0.96, 1.0) * 0.32 * pow(rim, 2.2) * rimGain * rimLightDamp;
-    // Static key/fill speculars read as frozen corner glints. Keep a faint
-    // ambient key; the opposite-corner fill only rides the pointer glint.
-    const float pointerLit = saturate(scene2.z) * specOn;
-    color += specular * float3(1.0, 1.0, 1.0) * 0.78 * specOn * lerp(0.20, 1.0, pointerLit);
-    color += fillSpec * float3(0.75, 0.85, 1.0) * 0.12 * specOn * pointerLit;
+    // Cool, low Fresnel veil — no white hotspot.
+    color += fresnel * float3(0.88, 0.92, 0.98) * 0.12 * pow(rim, 2.8) * rimGain * rimLightDamp;
 
-    // Established edge treatment: faint thickness shading, bright rim
-    // caustic (the focused edge-lensing highlight, following the key light
-    // around the squircle via NdotL rather than a uniform ring), and top
-    // key sheen.
-    // Edge thickness shading: darkens just inside the silhouette (peaks at
-    // the rim, gone by 0.6 bevel) so the bright caustic sits against a
-    // grounded edge. True outer shadow is drawn outside the mask below.
     const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
     color *= lerp(1.0, thicknessShade, thickOn);
-    color += glassTint * rim * 0.03 * rimGain * rimLightDamp;
-    // Thin bright rim specular (Apple-style white edge light).
-    // Panels: slightly stronger light-gray edge so the charcoal plate
-    // separates from busy wallpaper without a chalk outline, lit via NdotL.
-    // Pointer glint (dock + hover labels): axis swings toward the cursor.
-    // Idle dock no longer paints dual corner speculars — only a soft NdotL rim.
-    // scene2.w is label milk (labels) / unused (dock); xy/z are glint.
+    color += glassTint * rim * 0.02 * rimGain * rimLightDamp;
+
+    // Uniform soft rim (no NdotL / dual-corner lobes).
+    float rimStrength = lerp(0.28, 0.22, charcoalOn);
+    rimStrength = lerp(rimStrength, 0.34, textPanel);
+    const float3 rimEdge = lerp(float3(0.78, 0.82, 0.88), float3(0.70, 0.72, 0.76), charcoalOn);
+    color += rimEdge * pow(rim, 8.0) * rimStrength * rimGain * rimLightDamp;
+
+    // Pointer glint (dock + LABEL_FACE): local flare near cursor only.
     const float glintStrength = ((isPanel && labelFace < 0.5) ? 0.0 : 1.0) * saturate(scene2.z) * specOn;
-    const float2 glintPos = scene2.xy;
-    float2 glintAxis = float2(-0.70710678, -0.70710678);
     if (glintStrength > 0.0)
     {
+        const float2 glintPos = scene2.xy;
+        float2 glintAxis = float2(-0.70710678, -0.70710678);
         const float2 fromCenter = (glintPos - outputSize * 0.5) / max(halfSize, float2(1.0, 1.0));
         const float fromLen = length(fromCenter);
         const float2 toward = fromCenter / max(fromLen, 1e-4);
         const float swing = glintStrength * saturate(fromLen * 2.0);
         const float2 swung = lerp(glintAxis, toward, swing);
         glintAxis = swung / max(length(swung), 1e-4);
-    }
-    float rimFacing = 0.30 + 0.70 * ndl;
-    if (charcoalOn < 0.5 && glintStrength > 0.0)
-    {
         const float facing = dot(outward, glintAxis);
-        rimFacing = 0.15 + 0.85 * pow(saturate(facing), 4.0) + 0.55 * pow(saturate(-facing), 4.0);
-    }
-    float rimStrength = lerp(0.85, 0.78, charcoalOn);
-    rimStrength = lerp(rimStrength, 1.05, textPanel);
-    const float3 rimEdge = lerp(float3(1.0, 1.0, 1.0), float3(0.82, 0.84, 0.88), charcoalOn);
-    color += rimEdge * pow(rim, 10.0) * rimStrength * rimFacing * rimGain * rimLightDamp;
-    if (glintStrength > 0.0)
-    {
-        // Local rim flare nearest the cursor plus a faint in-slab bloom.
+        const float pointerRim = pow(saturate(facing), 3.0);
         const float2 toGlint = pixel - glintPos;
         const float glintDist2 = dot(toGlint, toGlint);
         const float rimSigma = 48.0 * dpi;
         const float bloomSigma = 70.0 * dpi;
         const float nearRim = exp(-glintDist2 / (2.0 * rimSigma * rimSigma));
         const float bloom = exp(-glintDist2 / (2.0 * bloomSigma * bloomSigma));
-        color += float3(1.0, 1.0, 1.0) * pow(rim, 6.0) * 0.60 * nearRim * glintStrength * rimGain;
-        color += float3(0.92, 0.96, 1.0) * pow(rim, 2.2) * 0.12 * nearRim * glintStrength * rimGain;
-        color += float3(1.0, 1.0, 1.0) * 0.04 * bloom * glintStrength;
+        // Soft cool flare — avoid pure-white corner dots.
+        color += float3(0.85, 0.90, 1.0) * pow(rim, 5.0) * 0.28 * nearRim * pointerRim * glintStrength * rimGain;
+        color += float3(0.80, 0.88, 1.0) * pow(rim, 2.5) * 0.08 * nearRim * glintStrength * rimGain;
+        color += float3(0.90, 0.94, 1.0) * 0.03 * bloom * glintStrength;
     }
-    const float topSheen = saturate(1.0 - pixel.y / max(11.0 * dpi, 7.0));
-    color += float3(0.96, 0.97, 0.98) * topSheen * rim * 0.06 * rimGain * rimLightDamp;
 
     if (scene1.z > 0.5)
     {
