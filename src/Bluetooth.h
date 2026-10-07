@@ -39,7 +39,8 @@ public:
     void Start(HWND notifyWindow, UINT notifyMessage);
     void Stop() noexcept;
 
-    void RequestRefresh();
+    // forcePaired bypasses the paired-list cache (BT page open / user action).
+    void RequestRefresh(bool forcePaired = false);
     void SetRadioEnabled(bool enabled);
     void Connect(const std::wstring& id);
     void Disconnect(const std::wstring& id);

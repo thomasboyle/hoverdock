@@ -81,6 +81,7 @@ struct Job {
     JobKind kind = JobKind::Refresh;
     bool enableRadio = false;
     std::wstring id;
+    bool forcePaired = false;
 };
 
 struct RadioDevice {
@@ -736,6 +737,7 @@ struct BluetoothService::Impl {
     bool discovering = false;
     bool enumerationCompleted = false;
     ULONGLONG lastRadioRefreshMs = 0;
+    ULONGLONG lastPairedRefreshMs = 0;
     std::wstring hint;
     std::wstring busyId;
     std::wstring busyText;
@@ -872,8 +874,11 @@ struct BluetoothService::Impl {
                 return false;
             }
             if (job.kind == JobKind::Refresh) {
-                for (const Job& pending : queue) {
+                for (Job& pending : queue) {
                     if (pending.kind == JobKind::Refresh) {
+                        if (job.forcePaired) {
+                            pending.forcePaired = true;
+                        }
                         return true;
                     }
                 }
@@ -908,6 +913,30 @@ struct BluetoothService::Impl {
     BluetoothSnapshot CopySnapshot() const {
         std::lock_guard<std::mutex> lock(stateMutex);
         return snapshot;
+    }
+
+    static bool DeviceInfoEqual(const BluetoothDeviceInfo& a, const BluetoothDeviceInfo& b) {
+        return a.id == b.id && a.name == b.name && a.status == b.status && a.connected == b.connected &&
+            a.busy == b.busy;
+    }
+
+    static bool SnapshotEqual(const BluetoothSnapshot& a, const BluetoothSnapshot& b) {
+        if (a.ready != b.ready || a.radioPresent != b.radioPresent || a.radioOn != b.radioOn ||
+            a.discovering != b.discovering || a.hiddenPaired != b.hiddenPaired || a.hint != b.hint ||
+            a.paired.size() != b.paired.size() || a.discovered.size() != b.discovered.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < a.paired.size(); ++i) {
+            if (!DeviceInfoEqual(a.paired[i], b.paired[i])) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < a.discovered.size(); ++i) {
+            if (!DeviceInfoEqual(a.discovered[i], b.discovered[i])) {
+                return false;
+            }
+        }
+        return true;
     }
 
     void Publish() {
@@ -982,11 +1011,15 @@ struct BluetoothService::Impl {
             next.hint = L"Put the device in pairing mode";
         }
 
+        bool changed = true;
         {
             std::lock_guard<std::mutex> lock(stateMutex);
+            changed = !SnapshotEqual(snapshot, next);
             snapshot = std::move(next);
         }
-        Notify();
+        if (changed) {
+            Notify();
+        }
     }
 
     RadioDevice* FindMutable(const std::wstring& id) {
@@ -1474,6 +1507,7 @@ struct BluetoothService::Impl {
         if (classicOk || leOk) {
             ReconcileClassicLinks(next);
             paired = std::move(next);
+            lastPairedRefreshMs = GetTickCount64();
         }
     }
 
@@ -1653,7 +1687,13 @@ struct BluetoothService::Impl {
             ProfileScope profileScope("Bluetooth::HandleRefresh");
             RefreshRadio();
             if (!discovering && !pairing.load()) {
-                RefreshPaired();
+                constexpr ULONGLONG kPairedCacheMs = 12000;
+                const ULONGLONG now = GetTickCount64();
+                const bool cacheFresh = lastPairedRefreshMs != 0 &&
+                    (now - lastPairedRefreshMs) < kPairedCacheMs && !paired.empty();
+                if (job.forcePaired || !cacheFresh) {
+                    RefreshPaired();
+                }
             }
             ready = true;
             Publish();
@@ -1718,7 +1758,9 @@ struct BluetoothService::Impl {
             Publish();
             // Reconcile with the radio shortly after â€” do not block this job.
             if (ok && running.load()) {
-                Enqueue(Job{JobKind::Refresh, false, {}});
+                Job refresh{JobKind::Refresh, false, {}};
+                refresh.forcePaired = true;
+                Enqueue(std::move(refresh));
             }
             break;
         }
@@ -1931,9 +1973,11 @@ void BluetoothService::Stop() noexcept {
     }
 }
 
-void BluetoothService::RequestRefresh() {
+void BluetoothService::RequestRefresh(bool forcePaired) {
     if (m_impl != nullptr) {
-        m_impl->Enqueue(Job{JobKind::Refresh, false, {}});
+        Job job{JobKind::Refresh, false, {}};
+        job.forcePaired = forcePaired;
+        m_impl->Enqueue(std::move(job));
     }
 }
 

@@ -710,6 +710,9 @@ private:
     // dock is open (or QS / Dock Settings / context) so BitBlt / Present cannot
     // stall WH_MOUSE_LL mid-move — including pointer motion over empty desktop.
     double m_lastPointerMotionAt = 0.0;
+    // Bluetooth QS page: last UI interaction / last periodic refresh (QPC seconds).
+    double m_lastBluetoothUiAt = 0.0;
+    double m_lastBluetoothRefreshAt = 0.0;
     // Pointer-reactive rim glint (dock-client px). The eased values feed
     // DockRenderState; targets follow the cursor while it is over the dock.
     float m_glintX = 0.0F;
