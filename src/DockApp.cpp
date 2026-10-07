@@ -2757,7 +2757,7 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
             }
             const QsLiveChange change = RefreshQuickSettingsLive(app->m_qsCache);
             if (change == QsLiveChange::Labels) {
-                app->PaintOverflowPopup();
+                app->QueueOverflowPaint();
             } else if (change == QsLiveChange::MetersOnly) {
                 app->PaintOverflowLiveFast();
             }
@@ -3373,7 +3373,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             }
             if (adjusted) {
                 EnsureTrayIcons();
-                PaintOverflowPopup();
+                QueueOverflowPaint();
                 QueueRenderFrame();
             }
             return 0;
@@ -4766,7 +4766,7 @@ void DockApp::RefreshTray(bool forceLayout) {
     }
     RebuildLayout(false);
     if (IsOverflowOpen()) {
-        PaintOverflowPopup();
+        QueueOverflowPaint();
     }
     // Non-blocking: the 1 Hz clock tick must not Present(1)/vsync-wait on the
     // UI thread that services WH_MOUSE_LL (hitch while hovering the dock).
@@ -5153,7 +5153,7 @@ void DockApp::OpenTraySlot(TraySlot slot) {
         }
         EnsureTrayIcons();
         if (IsOverflowOpen()) {
-            PaintOverflowPopup();
+            QueueOverflowPaint();
         }
         QueueRenderFrame();
         return;
@@ -5561,7 +5561,7 @@ void DockApp::ScrollBrightness(int delta) {
     }
     target = std::clamp(target + steps * 5, 0, 100);
     m_brightnessTarget.store(target);
-    PaintOverflowPopup();
+    QueueOverflowPaint();
     if (!m_brightnessAdjustInFlight.exchange(true)) {
         std::thread([this] { DrainBrightnessWheel(); }).detach();
     }
@@ -6954,7 +6954,7 @@ void DockApp::ApplyFrostSliderAt(LONG clientX) {
     InvalidateContextGlass();
     PaintSettingsPopup();
     if (m_overflowWindow != nullptr && IsWindowVisible(m_overflowWindow)) {
-        PaintOverflowPopup();
+        QueueOverflowPaint();
     }
     QueueRenderFrame();
 }
@@ -7052,7 +7052,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         InvalidateOverflowGlass();
         PaintSettingsPopup();
         if (IsOverflowOpen()) {
-            PaintOverflowPopup();
+            QueueOverflowPaint();
         }
         break;
     }
@@ -7699,7 +7699,7 @@ void DockApp::ApplyBluetoothSnapshot() {
         return;
     }
     m_overflowHover = -1;
-    PaintOverflowPopup();
+    QueueOverflowPaint();
 }
 
 int DockApp::AppSlotCount() const noexcept {
@@ -7818,7 +7818,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
             m_bluetoothSnapshot.hint.clear();
         }
         m_bluetooth.SetRadioEnabled(m_bluetoothSnapshot.radioOn);
-        PaintOverflowPopup();
+        QueueOverflowPaint();
         break;
     case TrayFlyoutHitKind::BluetoothConnect:
         m_lastBluetoothUiAt = QpcSeconds();
@@ -7865,7 +7865,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
             m_bluetoothSnapshot.hint = L"Searching...";
             m_bluetooth.StartDiscovery();
         }
-        PaintOverflowPopup();
+        QueueOverflowPaint();
         break;
     case TrayFlyoutHitKind::BluetoothSettings:
         CloseOverflowPopup();
