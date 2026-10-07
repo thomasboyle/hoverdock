@@ -56,6 +56,8 @@ struct DockRenderState {
     float glintX = 0.0F;
     float glintY = 0.0F;
     float glintStrength = 0.0F;
+    // Dock glass appearance (scene2.w): light vs dark Liquid Glass face.
+    bool lightGlass = false;
     bool showDevBounds = false;
     bool allowBlockingGpuWait = true;
     bool skipIfGpuBusy = false;

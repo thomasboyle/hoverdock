@@ -279,11 +279,207 @@ float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
     return acc;
 }
 
+// ---------------------------------------------------------------------------
+// Dock: macOS 26 Liquid Glass (NSGlassEffectView, Regular style, key window).
+// Every constant below was read from the live CA layer tree on macOS 26.7
+// (glassBackground backdrop filter + CASDFKeyFillHighlightEffect) and the
+// pipeline was fitted against CARenderer output of the same tree. All math
+// runs on sRGB-encoded values, which is also what CoreAnimation does here.
+// Units are points; m is the pill's shorter side in points.
+// ---------------------------------------------------------------------------
+static const float kAppleCornerScale = 1.61; // continuous-corner extent / cornerRadius
+static const float kAppleCornerExp = 3.5;    // superellipse fit of cornerCurve=continuous
+static const float kAppleRefractAmountPt = 60.0; // inputInnerRefractionAmount
+static const float kAppleRefractHeightPt = 20.0; // inputInnerRefractionHeight
+static const float kAppleSdrHold = 0.97;         // inputSDRHoldingToneWhite
+
+struct DockGlassShape
+{
+    float2 halfSize;
+    float cornerExtent;
+    float minSidePt;
+};
+
+DockGlassShape GetDockGlassShape(float2 outputSize, float dpi)
+{
+    DockGlassShape s;
+    s.halfSize = max(outputSize * 0.5 - DOCK_SHADOW_MARGIN_PT * dpi - 1.5 * dpi, float2(1.0, 1.0));
+    const float halfMin = min(s.halfSize.x, s.halfSize.y);
+    s.cornerExtent = max(min(DOCK_CORNER_RADIUS_PT * kAppleCornerScale * dpi, halfMin), 1.0);
+    s.minSidePt = 2.0 * halfMin / dpi;
+    return s;
+}
+
+// Signed distance (px, negative inside) to an L3.5 superellipse-cornered box,
+// first-order corrected to Euclidean, plus the outward unit normal.
+float SdAppleGlass(float2 p, float2 halfSize, float a, out float2 outward)
+{
+    const float2 q = abs(p) - (halfSize - a);
+    const float2 m = max(q, 0.0);
+    const float2 sgn = float2(p.x < 0.0 ? -1.0 : 1.0, p.y < 0.0 ? -1.0 : 1.0);
+    if (m.x > 0.0 && m.y > 0.0)
+    {
+        const float n = kAppleCornerExp;
+        const float norm = pow(pow(m.x, n) + pow(m.y, n), 1.0 / n);
+        const float2 g = pow(m / max(norm, 1e-4), n - 1.0);
+        const float gLen = max(length(g), 1e-4);
+        outward = sgn * g / gLen;
+        return (norm - a) / gLen;
+    }
+    if (m.x > 0.0 || m.y > 0.0)
+    {
+        outward = m.x > 0.0 ? float2(sgn.x, 0.0) : float2(0.0, sgn.y);
+        return max(m.x, m.y) - a;
+    }
+    outward = q.x > q.y ? float2(sgn.x, 0.0) : float2(0.0, sgn.y);
+    return max(q.x, q.y) - a;
+}
+
+// Gaussian sigma (pt) equivalent to CA's quantized backdrop blur at this size.
+float DockBlurSigmaPt(float minSidePt)
+{
+    const float radius = lerp(4.0 / 3.0, 4.0, saturate((minSidePt - 48.0) / 112.0));
+    return lerp(3.46, 4.4, saturate((radius - 4.0 / 3.0) / 1.5));
+}
+
+// Per-pass sigma in px. Frost (bits 16-23) widens it; extra H/V pairs compound.
+float DockBlurSigmaPx(float2 outputSize, float dpi)
+{
+    const DockGlassShape shape = GetDockGlassShape(outputSize, dpi);
+    const float frost = saturate(((uint)scene1.x >> 16) / 255.0);
+    return DockBlurSigmaPt(shape.minSidePt) * dpi * (1.0 + frost);
+}
+
+// 33-tap Gaussian (kGaussW is sigma = 8 taps), stretched so sigma = sigmaPx.
+float3 SampleDockAxis(Texture2D tex, float2 uv, float2 texel, float sigmaPx, float2 axis)
+{
+    const float2 lo = texel * 0.5;
+    const float2 hi = 1.0 - texel * 0.5;
+    const float step = sigmaPx / 8.0;
+    float3 acc = tex.Sample(linearClamp, clamp(uv, lo, hi)).rgb * kGaussW[0];
+    [unroll]
+    for (int k = 1; k <= 16; ++k)
+    {
+        const float2 off = axis * (float(k) * step) * texel;
+        acc += (tex.Sample(linearClamp, clamp(uv + off, lo, hi)).rgb +
+            tex.Sample(linearClamp, clamp(uv - off, lo, hi)).rgb) * kGaussW[k];
+    }
+    return acc;
+}
+
+float DockLuma(float3 c)
+{
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+float4 DockGlassPS(float2 pixel, float2 outputSize, float dpi)
+{
+    const float fxBits = scene1.x;
+    const float rimOn = FxEnabled(fxBits, (float)DOCK_FX_RIM);
+    const float lensOn = FxEnabled(fxBits, (float)DOCK_FX_LENS);
+    const float frostOn = FxEnabled(fxBits, (float)DOCK_FX_BLUR);
+    const float specOn = FxEnabled(fxBits, (float)DOCK_FX_SPECULAR);
+    const float shadowOn = FxEnabled(fxBits, (float)DOCK_FX_SHADOW);
+    const bool light = scene2.w > 0.5;
+    const DockGlassShape shape = GetDockGlassShape(outputSize, dpi);
+    const float m = shape.minSidePt;
+    const float sizeRamp = saturate((m - 48.0) / 112.0);
+    const float2 center = outputSize * 0.5;
+
+    float2 outward;
+    const float distance = SdAppleGlass(pixel - center, shape.halfSize, shape.cornerExtent, outward);
+    const float mask = saturate(0.5 - distance);
+    if (mask <= 0.0)
+    {
+        // inputShadow*: faint shade from the shape lifted 8pt, alpha scales
+        // with inputShadowOpacity = lerp(0.5, 0.25, sizeRamp).
+        if (shadowOn < 0.5)
+        {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
+        float2 unused;
+        const float shadowDist = SdAppleGlass(pixel - center + float2(0.0, 8.0 * dpi), shape.halfSize,
+            shape.cornerExtent, unused) / dpi;
+        const float2 toWindowEdge = min(pixel, outputSize - pixel);
+        const float windowFade = smoothstep(0.0, 6.0 * dpi, min(toWindowEdge.x, toWindowEdge.y));
+        const float peak = 0.0776 * lerp(0.5, 0.25, sizeRamp);
+        const float shade = peak * pow(saturate(1.0 - shadowDist / 32.0), 1.6) * windowFade;
+        return float4(0.0, 0.0, 0.0, shade);
+    }
+
+    const bool hasBackdrop = scene1.w > 0.5;
+    const float2 texel = 1.0 / outputSize;
+    const float2 lo = texel * 0.5;
+    const float2 hi = 1.0 - texel * 0.5;
+    const float insidePt = max(-distance, 0.0) / dpi;
+
+    // Inner refraction: circular bevel, sample pulled inward along -outward.
+    const float x = saturate(insidePt / kAppleRefractHeightPt);
+    const float oneMinusX = 1.0 - x;
+    const float pullPt = kAppleRefractAmountPt * (1.0 - sqrt(saturate(1.0 - oneMinusX * oneMinusX)));
+    const float2 uv = clamp((pixel - outward * pullPt * dpi * lensOn) * texel, lo, hi);
+
+    float3 backdrop = light ? float3(1.0, 1.0, 1.0) : float3(0.0, 0.0, 0.0);
+    if (hasBackdrop)
+    {
+        backdrop = frostOn > 0.5
+            ? SampleDockAxis(blurTemp, uv, texel, DockBlurSigmaPx(outputSize, dpi), float2(0.0, 1.0))
+            : backdropTexture.Sample(linearClamp, uv).rgb;
+    }
+
+    // Face color matrix: black + (white - black) * luma + saturation * chroma,
+    // then the fill color at its alpha, clamp, SDR holding tone.
+    const float faceWhite = light ? 1.03 : 0.6;
+    const float faceBlack = light ? 0.5 : 0.2;
+    const float4 faceFill = light ? float4(1.0, 1.0, 1.0, 0.4) : float4(0.0, 0.0, 0.0, 0.4);
+    const float faceClamp = light ? 1.06961 : 1.0;
+    const float y = DockLuma(backdrop);
+    float3 color = faceBlack + (faceWhite - faceBlack) * y + (backdrop - y);
+    color = lerp(color, faceFill.rgb, faceFill.a);
+    color = clamp(color, 0.0, faceClamp) * kAppleSdrHold;
+
+    // CASDFKeyFillHighlightEffect: key -45deg / fill 135deg, 90deg spread,
+    // amount 0.5 each, 1pt rim. Lights sit on the top-right / bottom-left
+    // axis; the pointer glint swings that axis toward the cursor.
+    float2 lightAxis = float2(0.70710678, -0.70710678);
+    const float glintStrength = saturate(scene2.z) * specOn;
+    if (glintStrength > 0.0)
+    {
+        const float2 fromCenter = (scene2.xy - center) / max(shape.halfSize, float2(1.0, 1.0));
+        const float fromLen = length(fromCenter);
+        const float2 toward = fromCenter / max(fromLen, 1e-4);
+        const float2 swung = lerp(lightAxis, toward, glintStrength * saturate(fromLen * 2.0));
+        lightAxis = swung / max(length(swung), 1e-4);
+    }
+    const float facing = 0.5 * abs(dot(outward, lightAxis));
+    const float rimProfile = insidePt < 1.0 ? 1.9 * sqrt(1.0 - insidePt) : 0.0;
+    const float highlight = saturate(facing * rimProfile) * rimOn;
+    // Backdrop-aware vibrantColorMatrix on the highlight.
+    const float3 tintBase = light ? float3(0.9, 0.1, 1.5) : float3(0.15, 1.35, 3.0);
+    const float glassY = DockLuma(color);
+    const float3 highlightTint = clamp(tintBase.x + tintBase.y * glassY + tintBase.z * (color - glassY), 0.0, 1.5);
+    color = highlightTint * highlight + color * (1.0 - highlight);
+
+    if (scene1.z > 0.5)
+    {
+        const float outline = 1.0 - smoothstep(0.0, 1.0, abs(distance));
+        color = lerp(color, float3(1.0, 0.18, 0.58), outline);
+    }
+
+    color = saturate(color);
+    const float alpha = saturate(mask * scene0.z * (hasBackdrop ? scene1.w : 1.0));
+    return float4(color * alpha, alpha);
+}
+
 float4 GlassPS(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 pixel = input.position.xy;
     const float dpi = max(scene1.y, 1.0);
+    if (FxEnabled(scene1.x, (float)DOCK_FX_PANEL) < 0.5)
+    {
+        return DockGlassPS(pixel, outputSize, dpi);
+    }
     // Pill geometry: the window carries a shadow margin ring (shared
     // DOCK_SHADOW_MARGIN_PT); the glass sits inset, the shader draws the
     // drop shade into the margin outside the mask.
@@ -687,6 +883,11 @@ float4 BlurHPS(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 texel = 1.0 / outputSize;
+    if (FxEnabled(scene1.x, (float)DOCK_FX_PANEL) < 0.5)
+    {
+        return float4(SampleDockAxis(backdropTexture, input.position.xy * texel, texel,
+            DockBlurSigmaPx(outputSize, max(scene1.y, 1.0)), float2(1.0, 0.0)), 1.0);
+    }
     float2 uvR;
     float2 uvG;
     float2 uvB;
@@ -701,6 +902,11 @@ float4 BlurVPS(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 texel = 1.0 / outputSize;
+    if (FxEnabled(scene1.x, (float)DOCK_FX_PANEL) < 0.5)
+    {
+        return float4(SampleDockAxis(blurTemp, input.position.xy * texel, texel,
+            DockBlurSigmaPx(outputSize, max(scene1.y, 1.0)), float2(0.0, 1.0)), 1.0);
+    }
     float2 uvR;
     float2 uvG;
     float2 uvB;
@@ -716,6 +922,11 @@ float4 BlurHPS2(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 texel = 1.0 / outputSize;
+    if (FxEnabled(scene1.x, (float)DOCK_FX_PANEL) < 0.5)
+    {
+        return float4(SampleDockAxis(blurTemp2, input.position.xy * texel, texel,
+            DockBlurSigmaPx(outputSize, max(scene1.y, 1.0)), float2(1.0, 0.0)), 1.0);
+    }
     float2 uvR;
     float2 uvG;
     float2 uvB;
@@ -734,6 +945,11 @@ float3 AdaptiveChromeInk(float2 outputSize)
     // wrongly pulled ink dark on black desks). Dark desk -> light chrome.
     const float3 darkInk = float3(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B) / 255.0;
     const float3 lightInk = float3(0.96, 0.96, 0.97);
+    // Dock glass face is light (light mode) or dark (dark mode) at any wallpaper.
+    if (FxEnabled(scene1.x, (float)DOCK_FX_PANEL) < 0.5)
+    {
+        return scene2.w > 0.5 ? darkInk : lightInk;
+    }
     if (scene1.w < 0.5)
     {
         return lightInk;

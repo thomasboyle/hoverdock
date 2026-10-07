@@ -2157,7 +2157,7 @@ bool Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene2[0] = state.glintX;
     frame.mappedConstants->scene2[1] = state.glintY;
     frame.mappedConstants->scene2[2] = state.glintStrength;
-    frame.mappedConstants->scene2[3] = 0.0F;
+    frame.mappedConstants->scene2[3] = state.lightGlass ? 1.0F : 0.0F;
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

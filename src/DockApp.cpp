@@ -6936,6 +6936,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         if (IsOverflowOpen()) {
             PaintOverflowPopup();
         }
+        QueueRenderFrame();
         break;
     }
     case SettingsHitKind::CheckNow:
@@ -7077,7 +7078,7 @@ void DockApp::PaintSettingsPopup() {
     };
     const SettingsRow rows[] = {
         {SettingsHitKind::LightPanels, L"Light mode",
-            L"Light glass for Quick Settings and Dock Settings", false, m_config.LightPanels(),
+            L"Light glass for the dock, Quick Settings and Dock Settings", false, m_config.LightPanels(),
             0.0F},
         {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows", false,
             m_config.LaunchAtStartup(), 0.0F},
@@ -8696,12 +8697,11 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     DockRenderState state;
     state.width = m_dockWidth;
     state.height = m_dockHeight;
-    // FrostAmount 0 = clear glass (legacy toggle off): translucent optics.
-    // FrostAmount 1 = full mica (legacy toggle on): opaque frosted plate.
-    // In between, alpha and blur strength track the slider continuously.
+    // Liquid Glass is opaque with a built-in backdrop blur; FrostAmount only
+    // widens that blur beyond the macOS default.
     const float frostAmount = m_config.FrostAmount();
-    state.glassAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
-    UINT glassFx = 0;
+    state.glassAlpha = 1.0F;
+    UINT glassFx = DOCK_FX_BLUR;
     if (m_config.RimLight()) {
         glassFx |= DOCK_FX_RIM;
     }
@@ -8710,9 +8710,6 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     }
     if (m_config.Dispersion()) {
         glassFx |= DOCK_FX_DISPERSION;
-    }
-    if (frostAmount > 0.001f) {
-        glassFx |= DOCK_FX_BLUR;
     }
     // Tint is no longer a settings toggle Ã¢â‚¬â€ the calibrated face tone map is
     // always applied; keep the FX bit set so older shader paths stay armed.
@@ -8733,6 +8730,7 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     const UINT frostByte = static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0f, 1.0f) * 255.0f));
     state.fxFlags = (frostByte << 16) | (haloSlots << 8) | glassFx;
     state.dockScale = m_dockScale;
+    state.lightGlass = m_config.LightPanels();
     if (m_config.Specular() && m_glintStrength > 0.001F) {
         state.glintX = m_glintX;
         state.glintY = m_glintY;
