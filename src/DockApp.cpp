@@ -4161,7 +4161,7 @@ void DockApp::PositionOverlayWindows() {
     PositionContextMenu();
 }
 
-void DockApp::UpdateHoverLabel() {
+void DockApp::UpdateHoverLabel(bool forceGlassRefresh) {
     if (IsDragActive() || m_draggedIcon >= 0 || m_hoveredDivider >= 0 || IsOverflowOpen() ||
         IsContextMenuOpen()) {
         HideHoverLabel();
@@ -4174,7 +4174,7 @@ void DockApp::UpdateHoverLabel() {
         return;
     }
 
-    if (m_hoveredIcon == m_hoverLabelIcon) {
+    if (m_hoveredIcon == m_hoverLabelIcon && !forceGlassRefresh) {
         // Label sits above the dock; dock HWND_TOPMOST bumps can still sink it.
         // Re-assert topmost without re-baking glass.
         if (m_hoverLabelWindow != nullptr && IsWindowVisible(m_hoverLabelWindow) != FALSE) {
@@ -4220,9 +4220,13 @@ void DockApp::UpdateHoverLabel() {
         HideHoverLabel();
         return;
     }
-    // Uniform pill + caret; tip sits just above the dock window top.
-    // Sit much closer to the dock (~25% of the previous 5px@96dpi gap).
-    const LONG gap = GreaterOf(1L, static_cast<LONG>(std::lround(1.25F * scale)));
+    // Uniform pill + caret. Position against the *glass* top (window top +
+    // shadow margin), not the HWND top — otherwise labels float in the
+    // 18pt shadow band and look far above the dock face.
+    // gap = 0: caret tip flush with the glass top edge.
+    const LONG gap = 0;
+    const LONG shadowMargin = DockShadowMarginPx(scale);
+    const LONG glassTop = dockScreen.top + shadowMargin;
     const LONG bubbleHeight = GreaterOf(28L, static_cast<LONG>(std::lround(28.0F * scale)));
     const LONG triangleHeight = GreaterOf(6L, static_cast<LONG>(std::lround(7.0F * scale)));
     const LONG horizontalPadding = GreaterOf(12L, static_cast<LONG>(std::lround(16.0F * scale)));
@@ -4259,10 +4263,11 @@ void DockApp::UpdateHoverLabel() {
     const LONG totalHeight = bubbleHeight + triangleHeight;
     POINT destination{
         iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L - bubbleWidth / 2L,
-        dockScreen.top - totalHeight - gap};
+        glassTop - totalHeight - gap};
 
-    // Hide before bake so the previous layered bubble is not in the capture.
-    if (m_hoverLabelWindow != nullptr) {
+    // Hide before bake on icon change so the previous bubble is not captured.
+    // Glint refresh keeps the window up to avoid flicker.
+    if (!forceGlassRefresh && m_hoverLabelWindow != nullptr) {
         ShowWindow(m_hoverLabelWindow, SW_HIDE);
     }
 
@@ -4423,10 +4428,15 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, POINT s
     bool baked = false;
     if (m_rendererInitialized) {
         std::vector<uint8_t> glass;
+        // Map dock-client glint into label-local pixels for pointer-reactive rim.
+        const float labelGlintX = m_glintX + static_cast<float>(m_windowX - screenOrigin.x);
+        const float labelGlintY = m_glintY + static_cast<float>(m_currentY - screenOrigin.y);
+        const float labelGlintStrength =
+            (m_config.Specular() && m_glintStrength > 0.001F) ? m_glintStrength : 0.0F;
         baked = m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(labelSize.cx),
             static_cast<UINT>(labelSize.cy), labelFx, glassAlpha, dpiScale, m_settingsWindow,
             m_overflowWindow, m_hoverLabelWindow, m_config.LightPanels(), glass,
-            0.5F /* faceMilkBoost */);
+            0.5F /* faceMilkBoost */, labelGlintX, labelGlintY, labelGlintStrength);
         if (baked && glass.size() == byteCount) {
             bits = std::move(glass);
         } else {
@@ -9075,6 +9085,11 @@ void DockApp::TickGlint() {
         m_glintTimerRunning = false;
     }
     QueueRenderFrame(false);
+    // Keep the hover label's specular in sync with the dock glint.
+    if (m_hoverLabelIcon >= 0 && m_hoveredIcon == m_hoverLabelIcon &&
+        m_hoverLabelWindow != nullptr && IsWindowVisible(m_hoverLabelWindow) != FALSE) {
+        UpdateHoverLabel(true);
+    }
 }
 
 void DockApp::StopGlint() noexcept {

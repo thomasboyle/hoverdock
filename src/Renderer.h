@@ -116,7 +116,8 @@ public:
     [[nodiscard]] bool BakeGlassPanel(const RECT& screenRect, UINT width, UINT height,
         UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB,
         HWND excludeC, bool lightPlate, std::vector<uint8_t>& outBgra,
-        float faceMilkBoost = 0.0F);
+        float faceMilkBoost = 0.0F, float glintX = 0.0F, float glintY = 0.0F,
+        float glintStrength = 0.0F);
     // Non-blocking GlassPS bake for open menus (Quick/Dock Settings / context).
     // Begin submits BitBlt + GPU work without waiting; Take copies readback when
     // the fence is signaled. Dedicated panel command list so this never races the

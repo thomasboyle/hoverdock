@@ -539,8 +539,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float fillSpec = pow(saturate(dot(surfN, fillDir)), 28.0) * bevelFactor;
     // Narrow Fresnel veil + thin bright rim caustic (not a chalk outline).
     color += fresnel * float3(0.92, 0.96, 1.0) * 0.32 * pow(rim, 2.2) * rimGain * rimLightDamp;
-    color += specular * float3(1.0, 1.0, 1.0) * 0.78 * specOn;
-    color += fillSpec * float3(0.75, 0.85, 1.0) * 0.12 * specOn;
+    // Static key/fill speculars read as frozen corner glints. Keep a faint
+    // ambient key; the opposite-corner fill only rides the pointer glint.
+    const float pointerLit = saturate(scene2.z) * specOn;
+    color += specular * float3(1.0, 1.0, 1.0) * 0.78 * specOn * lerp(0.20, 1.0, pointerLit);
+    color += fillSpec * float3(0.75, 0.85, 1.0) * 0.12 * specOn * pointerLit;
 
     // Established edge treatment: faint thickness shading, bright rim
     // caustic (the focused edge-lensing highlight, following the key light
@@ -555,12 +558,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Thin bright rim specular (Apple-style white edge light).
     // Panels: slightly stronger light-gray edge so the charcoal plate
     // separates from busy wallpaper without a chalk outline, lit via NdotL.
-    // Dock: Apple dual glint - the key light catches the top-left corner,
-    // internal reflection lights the opposite bottom-right corner, and the
-    // long edges keep only a faint line (no uniform outline).
-    // Pointer glint (dock only, scene2): the glint axis swings toward the
-    // cursor, as if the light source followed it.
-    const float glintStrength = isPanel ? 0.0 : saturate(scene2.z) * specOn;
+    // Pointer glint (dock + hover labels): axis swings toward the cursor.
+    // Idle dock no longer paints dual corner speculars — only a soft NdotL rim.
+    // scene2.w is label milk (labels) / unused (dock); xy/z are glint.
+    const float glintStrength = ((isPanel && labelFace < 0.5) ? 0.0 : 1.0) * saturate(scene2.z) * specOn;
     const float2 glintPos = scene2.xy;
     float2 glintAxis = float2(-0.70710678, -0.70710678);
     if (glintStrength > 0.0)
@@ -573,7 +574,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
         glintAxis = swung / max(length(swung), 1e-4);
     }
     float rimFacing = 0.30 + 0.70 * ndl;
-    if (charcoalOn < 0.5)
+    if (charcoalOn < 0.5 && glintStrength > 0.0)
     {
         const float facing = dot(outward, glintAxis);
         rimFacing = 0.15 + 0.85 * pow(saturate(facing), 4.0) + 0.55 * pow(saturate(-facing), 4.0);

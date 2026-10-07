@@ -307,7 +307,7 @@ private:
     void RebuildLayout(bool reloadIcons);
     void UpdateInputRegion();
     void PositionOverlayWindows();
-    void UpdateHoverLabel();
+    void UpdateHoverLabel(bool forceGlassRefresh = false);
     void HideHoverLabel() noexcept;
     // Liquid-glass hover label: BakeGlassPanel plate + flyout ink glyphs.
     // screenOrigin is the layered-window top-left (label sits above the dock).
