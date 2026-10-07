@@ -2573,6 +2573,9 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
         OffsetRect(&m_qsTempCpuRect, shadowMargin, shadowMargin);
         OffsetRect(&m_qsTempGpuRect, shadowMargin, shadowMargin);
     }
+    if (m_qsBoostStatusValid) {
+        OffsetRect(&m_qsBoostStatusRect, shadowMargin, shadowMargin);
+    }
     m_overflowGearX += static_cast<int>(shadowMargin);
     m_overflowGearY += static_cast<int>(shadowMargin);
 }
@@ -2668,6 +2671,20 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
             TempPowerText(m_qsCache.gpuTempC, m_qsCache.gpuWatts), format, 255);
         SetFlyoutChromeInk(savedR, savedG, savedB);
     }
+    if (m_qsBoostStatusValid && m_qsPage == QuickSettingsPage::Home &&
+        !m_boostStatus.empty()) {
+        HFONT statusFont =
+            m_overflowStatusFont != nullptr ? m_overflowStatusFont : m_overflowLabelFont;
+        if (statusFont != nullptr) {
+            const uint8_t savedR = g_flyoutInkR;
+            const uint8_t savedG = g_flyoutInkG;
+            const uint8_t savedB = g_flyoutInkB;
+            SetFlyoutChromeInk(m_qsBoostStatusInkR, m_qsBoostStatusInkG, m_qsBoostStatusInkB);
+            DrawFlyoutText(pixels, width, height, m_qsBoostStatusRect, statusFont,
+                m_boostStatus, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 196);
+            SetFlyoutChromeInk(savedR, savedG, savedB);
+        }
+    }
 }
 
 void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int height, HDC memory,
@@ -2677,10 +2694,12 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         m_qsMeterValid = false;
         m_qsScrubValid = false;
         m_qsTempsValid = false;
+        m_qsBoostStatusValid = false;
         m_qsMeterRect = {};
         m_qsScrubRect = {};
         m_qsTempCpuRect = {};
         m_qsTempGpuRect = {};
+        m_qsBoostStatusRect = {};
     }
     const bool home = m_qsPage == QuickSettingsPage::Home;
     panelWidth = std::max(320L, std::lround((home ? 600.0F : 380.0F) * scale));
@@ -2933,8 +2952,20 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const LONG chevW = chevron ? std::max(12L, std::lround(14.0F * scale)) : 0L;
             const LONG statusBottom = bounds.bottom - std::max(8L, std::lround(10.0F * scale));
             const LONG statusTop = statusBottom - std::max(16L, std::lround(18.0F * scale));
-            text({bounds.left + inset, statusTop, bounds.right - inset - chevW, statusBottom},
-                statusFont, subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 196);
+            const RECT statusBounds{bounds.left + inset, statusTop,
+                bounds.right - inset - chevW, statusBottom};
+            // Boost status is a live overlay (PaintQsLiveOverlays) so worker
+            // status posts never force a full PaintOverflowPopup.
+            if (kind == TrayFlyoutHitKind::Boost) {
+                m_qsBoostStatusRect = statusBounds;
+                m_qsBoostStatusValid = true;
+                m_qsBoostStatusInkR = inkR;
+                m_qsBoostStatusInkG = inkG;
+                m_qsBoostStatusInkB = inkB;
+            } else {
+                text(statusBounds, statusFont, subtitle,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 196);
+            }
             if (chevron) {
                 text({bounds.right - inset - chevW, statusTop, bounds.right - std::max(6L, std::lround(8.0F * scale)),
                          statusBottom},
