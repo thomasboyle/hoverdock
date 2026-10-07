@@ -9924,16 +9924,6 @@ bool DockApp::OpenLaunchPrompt() {
     }
     HideHoverLabel();
 
-    // Prime llama-server's prompt cache with the shared system prompt while the
-    // user types, so a first-time goal that needs the model only pays for its
-    // own short user message. No-op once warm or while the server is down.
-    std::thread([llamaUrl = m_config.LlamaServerUrl()]() {
-        try {
-            LlamaServerClient::WarmPromptCache(llamaUrl);
-        } catch (...) {
-        }
-    }).detach();
-
     if (m_launchPromptWindow != nullptr) {
         PositionLaunchPrompt();
         if (m_launchEdit != nullptr) {
@@ -9979,7 +9969,7 @@ bool DockApp::OpenLaunchPrompt() {
     m_launchEdit = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT, 0, 0, 1, 1, m_launchPromptWindow,
         reinterpret_cast<HMENU>(1), m_instance, nullptr);
-    m_launchStatus = CreateWindowExW(0, L"STATIC", L"Type an app, a question, or a goal for the local agent",
+    m_launchStatus = CreateWindowExW(0, L"STATIC", L"Type an app name, folder, URL, or site search",
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 0, 0, 1, 1, m_launchPromptWindow,
         reinterpret_cast<HMENU>(2), m_instance, nullptr);
     if (m_launchEdit == nullptr || m_launchStatus == nullptr || m_launchAnswer == nullptr) {
@@ -10136,7 +10126,7 @@ void DockApp::SubmitLaunchPrompt() {
 
     const std::wstring request = TrimWide(WindowText(m_launchEdit));
     if (request.empty()) {
-        SetLaunchPromptStatus(L"Type an app, a question, or a goal for the local agent");
+        SetLaunchPromptStatus(L"Type an app name, folder, URL, or site search");
         return;
     }
 
@@ -10146,11 +10136,10 @@ void DockApp::SubmitLaunchPrompt() {
     SetLaunchPromptAnswer(L"");
     SetLaunchPromptStatus(L"Looking...");
 
-    const std::wstring llamaUrl = m_config.LlamaServerUrl();
     const HWND replyWindow = m_window;
     const std::vector<DisplayApp> displayApps = m_displayApps;
     const std::vector<RunningWindow> runningWindows = m_windows.RunningWindows();
-    std::thread([this, generation, llamaUrl, request, replyWindow, displayApps, runningWindows]() {
+    std::thread([this, generation, request, replyWindow, displayApps, runningWindows]() {
         // Never let an exception escape: an uncaught throw in a detached
         // thread calls std::terminate and the dock vanishes with no log.
         std::vector<LaunchTarget> targets;
@@ -10219,11 +10208,8 @@ void DockApp::SubmitLaunchPrompt() {
                     }
                 };
                 if (LlamaServerClient::LooksLikeCodingGoal(request)) {
-                    // Coding goal ("write hello world program"): no Google, no
-                    // bare IDE launch. The local model writes the program
-                    // (write_file into Documents\HoverDock) and it opens in the
-                    // user's editor. A repeat of the same goal reopens the file
-                    // without the model.
+                    // Coding agent needs the local LLM; left out for now. Replays
+                    // of a previously written file still reopen it without a model.
                     agentMode = true;
                     auto replay = LlamaServerClient::TryReplayLastGoal(request);
                     if (replay.has_value() && !replay->actions.empty() &&
@@ -10233,43 +10219,22 @@ void DockApp::SubmitLaunchPrompt() {
                         })) {
                         agent = std::move(*replay);
                         route = L"code-replay";
+                        attachEditor(agent);
                     } else {
-                        const CodeEditorChoice& chosen = pickEditor();
-                        agent = LlamaServerClient::RunCodeAgent(llamaUrl, request, chosen.languageHint,
-                            postStatus, superseded);
-                        route = L"code-agent";
-                        if (agent.serverUnavailable) {
-                            agent.serverUnavailable = false;
-                            agent.actions.clear();
-                            agent.reply = L"Local model is offline - start llama-server to write code.";
-                            route = L"code-offline";
-                        }
+                        agent.reply = L"Local coding agent is disabled for now.";
+                        route = L"code-disabled";
                     }
-                    attachEditor(agent);
                 } else if (auto replay = LlamaServerClient::TryReplayLastGoal(request); replay.has_value()) {
-                    // Fast path 2: exact repeat of the last successful goal (no model).
+                    // Exact repeat of the last successful goal (no model).
                     agentMode = true;
                     agent = std::move(*replay);
                     route = L"replay";
                     attachEditor(agent);
-                } else if (LlamaServerClient::LooksLikeInfoQuery(request)) {
-                    // Specs / factual Q&A: answer as text above Search — never
-                    // ShellExecute a fuzzy catalog match (e.g. Games for Windows).
-                    agentMode = true;
-                    agent = LlamaServerClient::RunAnswerAgent(llamaUrl, request, postStatus, superseded);
-                    route = L"answer";
-                    if (agent.serverUnavailable) {
-                        agent.serverUnavailable = false;
-                        agent.actions.clear();
-                        agent.reply = L"Local model is offline - start llama-server for answers.";
-                        route = L"answer-offline";
-                    }
                 } else if (auto plan = LlamaServerClient::PlanWithoutModel(request, candidates);
                     plan.has_value()) {
-                    // Fast path 3 (first-time goals, no model): URL/domain, site
-                    // search/home, folder/path, confident catalog app (alias,
-                    // acronym, typo), question -> web, strong keyword match, or a
-                    // compound of those.
+                    // Model-free: URL/domain, site search/home, folder/path, confident
+                    // catalog app (alias/acronym/typo), question -> web, keyword match,
+                    // or a compound of those.
                     route = plan->route;
                     if (plan->actions.size() == 1 &&
                         plan->actions.front().kind == SearchAgentAction::Kind::LaunchApp) {
@@ -10279,23 +10244,13 @@ void DockApp::SubmitLaunchPrompt() {
                         agent.actions = std::move(plan->actions);
                     }
                 } else if (LlamaServerClient::LooksLikeAgentGoal(request)) {
-                    // Agent mode: single-shot local llama-server call (one line,
-                    // grammar-constrained); fuzzy if the server is down.
-                    agent = LlamaServerClient::RunAgent(llamaUrl, request, candidates, postStatus,
-                        superseded, pickEditor().languageHint);
-                    if (agent.serverUnavailable) {
-                        judgment = LlamaServerClient::ResolveAppFuzzy(
-                            LlamaServerClient::StripGoalVerbs(request), candidates);
-                        route = L"fuzzy-offline";
-                    } else {
-                        agentMode = true;
-                        route = L"agent-" + std::to_wstring(agent.steps) + L"round";
-                        attachEditor(agent);
-                    }
+                    judgment = LlamaServerClient::ResolveAppFuzzy(
+                        LlamaServerClient::StripGoalVerbs(request), candidates);
+                    route = L"fuzzy-goal";
                 } else {
-                    // Plain search: model ranking (launch-only), fuzzy if llama-server is down.
-                    judgment = LlamaServerClient::ResolveApp(llamaUrl, request, candidates);
-                    route = judgment.usedFuzzyFallback ? L"rank-fuzzy" : L"rank-model";
+                    // Plain search: lexical / substring ranking only (no llama-server).
+                    judgment = LlamaServerClient::ResolveAppFuzzy(request, candidates);
+                    route = L"fuzzy";
                 }
             }
         } catch (const std::exception&) {
@@ -10504,22 +10459,15 @@ void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result)
         return;
     }
     if (failure.empty() && !result.reply.empty()) {
-        // Q&A / specs: keep Search open and show the answer above the textbox.
-        // Footer shows generation speed from llama-server timings when available.
-        Log(L"Search agent answer shown chars=" + std::to_wstring(result.reply.size()) +
-            L" tok_s=" + std::to_wstring(result.predictedPerSecond));
+        // Status / disabled-feature reply: keep Search open and show text above
+        // the edit (no local LLM answers or tok/s).
+        Log(L"Search reply shown chars=" + std::to_wstring(result.reply.size()));
         SetLaunchPromptAnswer(result.reply);
-        if (result.predictedPerSecond > 0.05) {
-            wchar_t speed[64];
-            swprintf_s(speed, L"%.1f tok/s", result.predictedPerSecond);
-            SetLaunchPromptStatus(speed);
-        } else {
-            SetLaunchPromptStatus(L"-");
-        }
+        SetLaunchPromptStatus(L"-");
         return;
     }
     SetLaunchPromptStatus(!failure.empty() ? failure
-        : L"The agent found nothing to do for that.");
+        : L"No matching app, folder, or site for that.");
 }
 
 std::vector<DockApp::LaunchTarget> DockApp::CollectLaunchTargets(
