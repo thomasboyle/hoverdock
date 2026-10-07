@@ -5240,7 +5240,7 @@ void DockApp::RunPerformanceBoost() {
         return;
     }
     m_boostStatus = L"Profiling...";
-    PaintOverflowPopup();
+    QueueOverflowPaint();
 
     const std::wstring apiKey = m_config.TypeSafeApiKey();
     const HWND replyWindow = m_window;
@@ -5520,7 +5520,7 @@ void DockApp::ApplyBoostResult(const std::wstring& status, bool finished) {
     }
     Log(L"Boost: " + m_boostStatus);
     if (IsOverflowOpen()) {
-        PaintOverflowPopup();
+        QueueOverflowPaint();
     }
 }
 

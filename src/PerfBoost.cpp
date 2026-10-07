@@ -140,12 +140,16 @@ uint64_t ProcessAgeSeconds(HANDLE process) {
 }
 
 uint64_t ProcessMemoryBytes(HANDLE process) {
+    // Reuse caller's handle when possible; skip a second OpenProcess per PID.
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (GetProcessMemoryInfo(process, &counters, sizeof(counters)) != FALSE) {
+        return static_cast<uint64_t>(counters.WorkingSetSize);
+    }
     HANDLE memoryProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE,
         GetProcessId(process));
     if (memoryProcess == nullptr) {
         return 0;
     }
-    PROCESS_MEMORY_COUNTERS counters{};
     const BOOL ok = GetProcessMemoryInfo(memoryProcess, &counters, sizeof(counters));
     CloseHandle(memoryProcess);
     return ok == FALSE ? 0 : static_cast<uint64_t>(counters.WorkingSetSize);
