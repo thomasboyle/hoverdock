@@ -3248,6 +3248,14 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         }
         return 0;
 
+    case kOpenDockSettingsMessage:
+        // Deferred from ToggleDockSettings (QS cog) so the click/hook path
+        // never sync-bakes Dock Settings.
+        if (!IsDockSettingsOpen()) {
+            OpenDockSettings();
+        }
+        return 0;
+
     case kSettingsPaintMessage:
         m_settingsPaintQueued = false;
         // Guarded: a paint queued before the panel closed must not re-show it.
@@ -5868,12 +5876,21 @@ void DockApp::BeginOverflowShow() {
     if (TryPresentOverflowFromCache()) {
         qsOpenMark(L"TryPresentOverflowFromCache");
         presented = true;
+        // Cached pixels without a hit map: Settings cog / tiles would silently
+        // ignore clicks. Rebuild once (warm glass) rather than leave hits empty.
+        if (m_overflowHits.empty()) {
+            RebuildOverflowPopup();
+            qsOpenMark(L"RebuildOverflowPopup-emptyHits");
+            presented = m_overflowWindow != nullptr && !m_overflowPresentBits.empty();
+        }
         // Cached Home pixels are already on-screen. Do not QueueOverflowPaint -
         // a full rebuild is still ~100ms even with warm glass and would hitch
         // the cursor one message later. Live meters/temps/network refresh via
         // the usual async workers + PaintOverflowLiveFast.
-        ArmOverflowLiveWorkers();
-        qsOpenMark(L"ArmOverflowLiveWorkers");
+        if (presented) {
+            ArmOverflowLiveWorkers();
+            qsOpenMark(L"ArmOverflowLiveWorkers");
+        }
     } else {
         RebuildOverflowPopup();
         qsOpenMark(L"RebuildOverflowPopup");
@@ -6012,7 +6029,7 @@ void DockApp::SetUpdateStatus(const std::wstring& status) {
     m_updateStatus = status;
     Log(L"Update: " + status);
     if (IsDockSettingsOpen()) {
-        PaintSettingsPopup();
+        QueueSettingsPaint();
     }
 }
 
@@ -6321,6 +6338,21 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
     }
 
     switch (message) {
+    case WM_DESTROY:
+        if (app != nullptr && app->m_settingsWindow == window) {
+            app->m_settingsWindow = nullptr;
+            app->m_settingsHits.clear();
+            app->m_settingsHover = -1;
+            app->m_settingsPaintQueued = false;
+            app->m_settingsHoverPaintOnly = false;
+            std::vector<uint8_t>().swap(app->m_settingsBaseBits);
+            std::vector<uint8_t>().swap(app->m_settingsPresentBits);
+            app->m_settingsPresentSize = {};
+            app->InvalidateSettingsGlass();
+            app->ReleaseLayerPresentDib(app->m_settingsLayerDib);
+        }
+        return 0;
+
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
 
@@ -6412,7 +6444,7 @@ void DockApp::RefreshSettingsControls() {
     // State lives in m_config / m_updateStatus; the glass panel reads it at
     // paint time, so a refresh is just a repaint when open.
     if (IsDockSettingsOpen()) {
-        PaintSettingsPopup();
+        QueueSettingsPaint();
     }
 }
 
@@ -6959,11 +6991,11 @@ void DockApp::ApplyFrostSliderAt(LONG clientX) {
         }
         return;
     }
-    // Slider released: one full GPU GlassPS bake at the committed frost amount.
+    // Slider released: queue full GPU GlassPS bake (do not sync-block click/hook).
     InvalidateSettingsGlass();
     InvalidateOverflowGlass();
     InvalidateContextGlass();
-    PaintSettingsPopup();
+    QueueSettingsPaint();
     if (m_overflowWindow != nullptr && IsWindowVisible(m_overflowWindow)) {
         QueueOverflowPaint();
     }
@@ -6984,7 +7016,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
             Log(L"Startup registry update failed.");
         }
         ScheduleConfigSave();
-        PaintSettingsPopup();
+        QueueSettingsPaint();
         break;
     }
     case SettingsHitKind::Updates: {
@@ -6996,7 +7028,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
             std::wstring wide(current.begin(), current.end());
             SetUpdateStatus(L"Version " + wide + L" - automatic updates off.");
         } else {
-            PaintSettingsPopup();
+            QueueSettingsPaint();
             if (!m_updateInFlight.load()) {
                 CheckForUpdatesAsync(false);
             }
@@ -7007,7 +7039,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         const bool enabled = !m_config.RimLight();
         m_config.SetRimLight(enabled);
         ScheduleConfigSave();
-        PaintSettingsPopup();
+        QueueSettingsPaint();
         QueueRenderFrame();
         break;
     }
@@ -7015,7 +7047,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         const bool enabled = !m_config.Lensing();
         m_config.SetLensing(enabled);
         ScheduleConfigSave();
-        PaintSettingsPopup();
+        QueueSettingsPaint();
         QueueRenderFrame();
         break;
     }
@@ -7023,7 +7055,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         const bool enabled = !m_config.Dispersion();
         m_config.SetDispersion(enabled);
         ScheduleConfigSave();
-        PaintSettingsPopup();
+        QueueSettingsPaint();
         QueueRenderFrame();
         break;
     }
@@ -7036,7 +7068,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         const bool enabled = !m_config.Specular();
         m_config.SetSpecular(enabled);
         ScheduleConfigSave();
-        PaintSettingsPopup();
+        QueueSettingsPaint();
         QueueRenderFrame();
         break;
     }
@@ -7044,7 +7076,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         const bool enabled = !m_config.DropShadow();
         m_config.SetDropShadow(enabled);
         ScheduleConfigSave();
-        PaintSettingsPopup();
+        QueueSettingsPaint();
         QueueRenderFrame();
         break;
     }
@@ -7052,7 +7084,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         const bool enabled = !m_config.DepthShade();
         m_config.SetDepthShade(enabled);
         ScheduleConfigSave();
-        PaintSettingsPopup();
+        QueueSettingsPaint();
         QueueRenderFrame();
         break;
     }
@@ -7061,7 +7093,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         ScheduleConfigSave();
         InvalidateSettingsGlass();
         InvalidateOverflowGlass();
-        PaintSettingsPopup();
+        QueueSettingsPaint();
         if (IsOverflowOpen()) {
             QueueOverflowPaint();
         }
@@ -7096,7 +7128,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
                 Log(L"Performance profile failed to start.");
             }
         }
-        PaintSettingsPopup();
+        QueueSettingsPaint();
         break;
     }
     case SettingsHitKind::PerfLog: {
@@ -7136,15 +7168,30 @@ void DockApp::OpenDockSettings() {
     // paint the panel to its right (or left when there is no room).
     HideHoverLabel();
     RebuildSettingsPopup();
-    if (m_settingsWindow != nullptr) {
+    if (m_settingsWindow != nullptr && IsWindow(m_settingsWindow) != FALSE) {
         ShowWindow(m_settingsWindow, SW_SHOWNA);
         PositionDockSettings();
+        // Ensure visible even if Present skipped ShowWindow on a cached path.
+        if (IsWindowVisible(m_settingsWindow) == FALSE) {
+            ShowWindow(m_settingsWindow, SW_SHOWNA);
+        }
+        Log(L"Dock Settings opened.");
+    } else {
+        Log(L"Dock Settings open failed (no window).");
     }
 }
 
 void DockApp::ToggleDockSettings() {
     if (IsDockSettingsOpen()) {
         CloseDockSettings();
+        return;
+    }
+    // Cog click runs on the overflow UI thread that also services WH_MOUSE_LL.
+    // RebuildSettingsPopup / PaintSettingsPopup is a full glass bake (~tens of
+    // ms). Defer via the same timer OpenPerfMenus uses so the click handler
+    // returns immediately and OpenDockSettings runs on the next WM_TIMER.
+    if (m_window != nullptr) {
+        SetTimer(m_window, kPerfOpenSettingsTimerId, 1, nullptr);
         return;
     }
     OpenDockSettings();
@@ -7243,6 +7290,18 @@ void DockApp::PaintSettingsPopup() {
     m_settingsSize.cx = panelWidth;
     m_settingsSize.cy = contentY;
 
+    // WM_CLOSE / external destroy can kill the HWND while leaving a dangling
+    // m_settingsWindow; without this check OpenDockSettings silently no-ops
+    // (create is skipped) and the QS cog appears dead.
+    if (m_settingsWindow != nullptr && IsWindow(m_settingsWindow) == FALSE) {
+        m_settingsWindow = nullptr;
+        m_settingsHits.clear();
+        std::vector<uint8_t>().swap(m_settingsBaseBits);
+        std::vector<uint8_t>().swap(m_settingsPresentBits);
+        m_settingsPresentSize = {};
+        InvalidateSettingsGlass();
+        ReleaseLayerPresentDib(m_settingsLayerDib);
+    }
     if (m_settingsWindow == nullptr) {
         const wchar_t className[] = L"LiquidGlassDockSettings";
         WNDCLASSEXW windowClass{sizeof(windowClass)};
@@ -8267,7 +8326,9 @@ void DockApp::PaintOverflowLiveFast() {
         return;
     }
 
-    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps);
+    // includeBoost only when its rect was restored; otherwise meter ticks
+    // would DrawFlyoutText over existing glyphs (fake-bold regression).
+    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps, boost);
     if (m_overflowBaseBits.size() == m_overflowPresentBits.size()) {
         // Keep base in sync so hover-fast restores still show live meters.
         const LONG left = dirty.left;

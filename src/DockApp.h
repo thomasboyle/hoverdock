@@ -199,6 +199,7 @@ private:
     static constexpr UINT kQsEnergyResultMessage = WM_APP + 25;
     static constexpr UINT kQsTempsResultMessage = WM_APP + 26;
     static constexpr UINT kQsCacheResultMessage = WM_APP + 27;
+    static constexpr UINT kOpenDockSettingsMessage = WM_APP + 29;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -431,7 +432,7 @@ private:
     // Meter/scrub-only present from underlay via UpdateLayeredWindowIndirect.
     void PaintOverflowLiveFast();
     void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
-        bool includeTemps = true) const;
+        bool includeTemps = true, bool includeBoost = true) const;
     void ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
         const TrayFlyoutHit& hit) const;
     void DestroyOverflowPopup() noexcept;
