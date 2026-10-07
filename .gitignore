@@ -1,25 +1,40 @@
 # Build outputs
 out/
+out-pf/
 *.obj
 *.pdb
 *.ilk
 *.log
 
-# Local profiling / analysis scratch
+# Local profiling / analysis scratch (never product)
 .system-analysis/
+.cursor/
+perf/
 
-tools/_meteocons_build/
+# Patch / agent scratch
+_patch_incoming/
+
+# Unfinished / experimental sources not in CMake
+src/SearchUsageMemory.cpp
+src/SearchUsageMemory.h
 
 # DockCpuTemp helper build
 tools/DockCpuTemp/bin/
 tools/DockCpuTemp/obj/
 tools/DockCpuTemp/publish/
-# Llama.cpp server binaries (downloaded release extracts). Keep scripts/docs tracked.
+
+# Llama.cpp server: keep scripts/docs tracked; ignore binaries, benches, experiments
 tools/llama-server/*.dll
 tools/llama-server/*.exe
 tools/llama-server/*.zip
 tools/llama-server/LICENSE*
-
 tools/llama-server/*.log
-_patch_incoming/
+tools/llama-server/*.err
+tools/llama-server/*.out
+tools/llama-server/bench*
+tools/llama-server/cuda/
+tools/llama-cpp-adaptive-mtp/
+tools/llama-server-adaptive/
+tools/llama-server-new/
 
+tools/_meteocons_build/
