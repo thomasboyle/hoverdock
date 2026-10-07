@@ -2504,7 +2504,7 @@ void DockApp::ApplyQuickSettingsSlider(TrayFlyoutHitKind kind, const RECT& track
     if (kind == TrayFlyoutHitKind::VolumeSlider) {
         if (m_tray.SetVolumeLevel(level)) {
             EnsureTrayIcons();
-            PaintOverflowPopup();
+            QueueOverflowPaint();
             QueueRenderFrame();
         }
         return;
@@ -2515,7 +2515,7 @@ void DockApp::ApplyQuickSettingsSlider(TrayFlyoutHitKind kind, const RECT& track
             return;
         }
         ProjectBrightness(static_cast<int>(std::lround(level * 100.0F)));
-        PaintOverflowPopup();
+        QueueOverflowPaint();
         return;
     }
     if (kind == TrayFlyoutHitKind::CaptureGain) {
@@ -2523,14 +2523,14 @@ void DockApp::ApplyQuickSettingsSlider(TrayFlyoutHitKind kind, const RECT& track
             m_qsCache.inputGain = level;
             m_qsCache.inputMuted = false;
             m_qsCache.stamp = GetTickCount64();
-            PaintOverflowPopup();
+            QueueOverflowPaint();
         }
         return;
     }
     if (kind == TrayFlyoutHitKind::MediaSeek) {
         SeekQuickSettingsMedia(level);
         m_qsCache.mediaProgress = level;
-        PaintOverflowPopup();
+        QueueOverflowPaint();
     }
 }
 
@@ -3701,7 +3701,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             static_cast<void>(m_tray.Refresh());
             m_qsCache.stamp = 0;
             EnsureTrayIcons();
-            PaintOverflowPopup();
+            QueueOverflowPaint();
             QueueRenderFrame();
             break;
         case kToggleMute:
@@ -3710,18 +3710,18 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
                 break;
             }
             EnsureTrayIcons();
-            PaintOverflowPopup();
+            QueueOverflowPaint();
             QueueRenderFrame();
             break;
         case kToggleMic:
             SetCaptureMuted(!m_qsCache.inputMuted);
             m_qsCache.stamp = 0;
-            PaintOverflowPopup();
+            QueueOverflowPaint();
             break;
         case kToggleUsb:
             SetUsbSuspend(!m_qsCache.usbSuspend);
             m_qsCache.stamp = 0;
-            PaintOverflowPopup();
+            QueueOverflowPaint();
             break;
         case kToggleAirplane: {
             const bool radiosOn = !m_qsCache.wifiRadioOn &&
@@ -3738,14 +3738,14 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             static_cast<void>(m_tray.Refresh());
             m_qsCache.stamp = 0;
             EnsureTrayIcons();
-            PaintOverflowPopup();
+            QueueOverflowPaint();
             QueueRenderFrame();
             break;
         }
         case kToggleHdr:
             SetHdrEnabled(!m_qsCache.hdrOn);
             m_qsCache.stamp = 0;
-            PaintOverflowPopup();
+            QueueOverflowPaint();
             break;
         default:
             break;
@@ -3755,7 +3755,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
         if (SetPowerMode(hit.index)) {
             m_qsCache.powerMode = hit.index;
             m_qsCache.stamp = 0;
-            PaintOverflowPopup();
+            QueueOverflowPaint();
         }
         break;
     case TrayFlyoutHitKind::WifiNetwork:
@@ -3766,7 +3766,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
                 static_cast<void>(m_tray.Refresh());
                 m_qsCache.stamp = 0;
                 EnsureTrayIcons();
-                PaintOverflowPopup();
+                QueueOverflowPaint();
                 QueueRenderFrame();
             } else if (!network.connected) {
                 openUri(L"ms-settings:network-wifi");
@@ -3783,7 +3783,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             static_cast<void>(m_tray.Refresh());
             m_qsCache.stamp = 0;
             EnsureTrayIcons();
-            PaintOverflowPopup();
+            QueueOverflowPaint();
             QueueRenderFrame();
         }
         break;
@@ -3795,7 +3795,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
                 break;
             }
             m_qsCache.stamp = 0;
-            PaintOverflowPopup();
+            QueueOverflowPaint();
         }
         break;
     case TrayFlyoutHitKind::VpnEntry:
@@ -3846,6 +3846,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
     case TrayFlyoutHitKind::MediaTransport:
         ControlMediaSession(hit.index == 0 ? 0 : (hit.index == 2 ? 2 : 1));
         m_qsCache.stamp = 0;
+        QueueOverflowPaint();
         break;
     }
 }
@@ -3860,5 +3861,5 @@ void DockApp::AdjustCaptureGain(float delta) {
         m_qsCache.inputMuted = false;
     }
     m_qsCache.stamp = GetTickCount64();
-    PaintOverflowPopup();
+    QueueOverflowPaint();
 }
