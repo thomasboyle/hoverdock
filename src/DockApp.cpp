@@ -3509,8 +3509,28 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         } else if (wParam == kWeatherTimerId) {
             m_weather.RequestRefresh();
         } else if (wParam == kBluetoothTimerId) {
-            if (IsOverflowOpen() && !m_bluetoothSnapshot.discovering && !m_bluetooth.IsPairing()) {
-                m_bluetooth.RequestRefresh();
+            // Paired list is only on the Bluetooth QS page; skip CollectPaired
+            // polling elsewhere. While pointer is hot, defer refresh; otherwise
+            // 12s idle / 4s after recent BT UI interaction.
+            if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Bluetooth &&
+                !m_bluetoothSnapshot.discovering && !m_bluetooth.IsPairing()) {
+                constexpr double kBluetoothHotPointerSec = 0.35;
+                constexpr double kBluetoothIdleRefreshSec = 12.0;
+                constexpr double kBluetoothActiveRefreshSec = 4.0;
+                constexpr double kBluetoothUiHotSec = 8.0;
+                const double now = QpcSeconds();
+                const bool pointerHot = m_lastPointerMotionAt > 0.0 &&
+                    (now - m_lastPointerMotionAt) < kBluetoothHotPointerSec;
+                const bool btUiHot = m_lastBluetoothUiAt > 0.0 &&
+                    (now - m_lastBluetoothUiAt) < kBluetoothUiHotSec;
+                const double minInterval =
+                    btUiHot ? kBluetoothActiveRefreshSec : kBluetoothIdleRefreshSec;
+                if (!pointerHot &&
+                    (m_lastBluetoothRefreshAt <= 0.0 ||
+                        (now - m_lastBluetoothRefreshAt) >= minInterval)) {
+                    m_bluetooth.RequestRefresh(false);
+                    m_lastBluetoothRefreshAt = now;
+                }
             }
         } else if (wParam == kUpdateTimerId) {
             // First tick is the delayed startup check; re-arm for the steady
@@ -5857,11 +5877,9 @@ void DockApp::BeginOverflowShow() {
     }
     InstallOverflowDismissHook();
     qsOpenMark(L"InstallOverflowDismissHook");
-    m_bluetooth.RequestRefresh();
+    // Soft refresh for radio/ready; periodic CollectPaired only while on BT page.
+    m_bluetooth.RequestRefresh(false);
     qsOpenMark(L"BluetoothRequestRefresh");
-    if (m_window != nullptr) {
-        SetTimer(m_window, kBluetoothTimerId, 4000, nullptr);
-    }
     if (m_visibility == VisibilityState::Visible) {
         StartTrayTimer();
     }
@@ -7652,8 +7670,32 @@ void DockApp::OnWeatherUpdated() {
 
 void DockApp::ApplyBluetoothSnapshot() {
     m_bluetooth.AllowNextNotify();
-    m_bluetoothSnapshot = m_bluetooth.GetSnapshot();
-    if (!IsOverflowOpen()) {
+    BluetoothSnapshot next = m_bluetooth.GetSnapshot();
+    auto deviceEqual = [](const BluetoothDeviceInfo& a, const BluetoothDeviceInfo& b) {
+        return a.id == b.id && a.name == b.name && a.status == b.status && a.connected == b.connected &&
+            a.busy == b.busy;
+    };
+    auto listEqual = [&](const std::vector<BluetoothDeviceInfo>& a,
+                         const std::vector<BluetoothDeviceInfo>& b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (!deviceEqual(a[i], b[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const bool unchanged = next.ready == m_bluetoothSnapshot.ready &&
+        next.radioPresent == m_bluetoothSnapshot.radioPresent &&
+        next.radioOn == m_bluetoothSnapshot.radioOn &&
+        next.discovering == m_bluetoothSnapshot.discovering &&
+        next.hiddenPaired == m_bluetoothSnapshot.hiddenPaired &&
+        next.hint == m_bluetoothSnapshot.hint && listEqual(next.paired, m_bluetoothSnapshot.paired) &&
+        listEqual(next.discovered, m_bluetoothSnapshot.discovered);
+    m_bluetoothSnapshot = std::move(next);
+    if (!IsOverflowOpen() || unchanged) {
         return;
     }
     m_overflowHover = -1;
@@ -7765,6 +7807,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         RunPerformanceBoost();
         break;
     case TrayFlyoutHitKind::BluetoothRadio:
+        m_lastBluetoothUiAt = QpcSeconds();
         if (!m_bluetoothSnapshot.ready || !m_bluetoothSnapshot.radioPresent) {
             break;
         }
@@ -7778,6 +7821,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         PaintOverflowPopup();
         break;
     case TrayFlyoutHitKind::BluetoothConnect:
+        m_lastBluetoothUiAt = QpcSeconds();
         if (hit.index < 0 ||
             static_cast<size_t>(hit.index) >= m_bluetoothSnapshot.paired.size()) {
             break;
@@ -7795,6 +7839,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         }
         break;
     case TrayFlyoutHitKind::BluetoothPair:
+        m_lastBluetoothUiAt = QpcSeconds();
         if (m_bluetooth.IsPairing() || hit.index < 0 ||
             static_cast<size_t>(hit.index) >= m_bluetoothSnapshot.discovered.size()) {
             break;
@@ -7809,6 +7854,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         }
         break;
     case TrayFlyoutHitKind::BluetoothDiscover:
+        m_lastBluetoothUiAt = QpcSeconds();
         if (m_bluetoothSnapshot.discovering) {
             m_bluetoothSnapshot.discovering = false;
             m_bluetoothSnapshot.discovered.clear();
@@ -9085,9 +9131,11 @@ void DockApp::TickGlint() {
         m_glintTimerRunning = false;
     }
     QueueRenderFrame(false);
-    // Keep the hover label's specular in sync with the dock glint.
-    if (m_hoverLabelIcon >= 0 && m_hoveredIcon == m_hoverLabelIcon &&
-        m_hoverLabelWindow != nullptr && IsWindowVisible(m_hoverLabelWindow) != FALSE) {
+    // BakeGlassPanel is expensive; rebake the hover label only once glint settles.
+    // Icon changes already call UpdateHoverLabel().
+    if (positionSettled && strengthSettled && m_hoverLabelIcon >= 0 &&
+        m_hoveredIcon == m_hoverLabelIcon && m_hoverLabelWindow != nullptr &&
+        IsWindowVisible(m_hoverLabelWindow) != FALSE) {
         UpdateHoverLabel(true);
     }
 }

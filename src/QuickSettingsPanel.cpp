@@ -2426,6 +2426,7 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     if (page == m_qsPage) {
         return;
     }
+    const QuickSettingsPage previous = m_qsPage;
     m_qsReturn = m_qsPage;
     m_qsPage = page;
     m_overflowHover = -1;
@@ -2439,6 +2440,17 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
         m_overflowIcons = m_tray.EnumerateNotifyIcons();
         m_overflowIconsLoaded = true;
     }
+    if (page == QuickSettingsPage::Bluetooth) {
+        m_lastBluetoothUiAt = QpcSeconds();
+        m_lastBluetoothRefreshAt = m_lastBluetoothUiAt;
+        m_bluetooth.RequestRefresh(true);
+        if (m_window != nullptr) {
+            SetTimer(m_window, kBluetoothTimerId, 4000, nullptr);
+        }
+    } else if (previous == QuickSettingsPage::Bluetooth && m_window != nullptr &&
+        !m_bluetoothSnapshot.discovering && !m_bluetooth.IsPairing()) {
+        KillTimer(m_window, kBluetoothTimerId);
+    }
     InvalidateOverflowGlass();
     PaintOverflowPopup();
 }
@@ -2448,11 +2460,22 @@ void DockApp::CloseQuickSettingsPage() {
     if (back == m_qsPage) {
         back = QuickSettingsPage::Home;
     }
+    const QuickSettingsPage leaving = m_qsPage;
     m_qsReturn = QuickSettingsPage::Home;
     m_qsPage = back;
     m_overflowHover = -1;
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
+    if (leaving == QuickSettingsPage::Bluetooth && back != QuickSettingsPage::Bluetooth &&
+        m_window != nullptr && !m_bluetoothSnapshot.discovering && !m_bluetooth.IsPairing()) {
+        KillTimer(m_window, kBluetoothTimerId);
+    } else if (back == QuickSettingsPage::Bluetooth) {
+        m_lastBluetoothUiAt = QpcSeconds();
+        m_bluetooth.RequestRefresh(true);
+        if (m_window != nullptr) {
+            SetTimer(m_window, kBluetoothTimerId, 4000, nullptr);
+        }
+    }
     InvalidateOverflowGlass();
     PaintOverflowPopup();
 }

@@ -173,7 +173,7 @@ BITMAPV5HEADER IconBitmapHeader(UINT width, UINT height) {
     return header;
 }
 
-// Explicit sRGB V5 DIB for desktop / panel capture — avoids GDI probing the
+// Explicit sRGB V5 DIB for desktop / panel capture - avoids GDI probing the
 // default ICM profile (GetFileAttributesW / IcmGetDefaultCamp) on every create.
 BITMAPV5HEADER CaptureDibHeader(UINT width, UINT height) {
     return IconBitmapHeader(width, height);
@@ -1745,6 +1745,31 @@ bool RectsIntersect(const RECT& left, const RECT& right) noexcept {
     return IntersectRect(&intersection, &left, &right) != FALSE;
 }
 
+bool RectContainsRect(const RECT& outer, const RECT& inner) noexcept {
+    return inner.left >= outer.left && inner.top >= outer.top && inner.right <= outer.right &&
+        inner.bottom <= outer.bottom && inner.left < inner.right && inner.top < inner.bottom;
+}
+
+// True when dirty intersect region has pixels outside every self-exclude rect (real desktop
+// change under the strip). Dock/glint Present dirt that sits entirely inside the
+// dock HWND is ignored - CaptureScreenExcluding already omits those pixels.
+bool DirtyAffectsOutsideSelf(const RECT& dirty, const RECT& region, const RECT* selfExclude,
+    UINT selfExcludeCount) noexcept {
+    RECT hit{};
+    if (IntersectRect(&hit, &dirty, &region) == FALSE) {
+        return false;
+    }
+    if (selfExclude == nullptr || selfExcludeCount == 0) {
+        return true;
+    }
+    for (UINT index = 0; index < selfExcludeCount; ++index) {
+        if (RectContainsRect(selfExclude[index], hit)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool EnsureStripWatch(HMONITOR monitor) {
     if (monitor == nullptr) {
         return false;
@@ -1908,17 +1933,27 @@ void PollDesktopDirt(HMONITOR monitor) noexcept {
     g_stripWatch.duplication->ReleaseFrame();
 }
 
-StripDirt DirtForRegion(const RECT& region) noexcept {
+StripDirt DirtForRegion(const RECT& region, const RECT* selfExclude = nullptr,
+    UINT selfExcludeCount = 0) noexcept {
     if (!g_desktopDirt.valid || g_desktopDirt.failed || g_desktopDirt.overflow) {
         return StripDirt::Dirty;
     }
     if (!g_desktopDirt.fresh) {
         return StripDirt::Pending;
     }
+    bool sawSelfOnly = false;
     for (UINT index = 0; index < g_desktopDirt.count; ++index) {
-        if (RectsIntersect(g_desktopDirt.rects[index], region)) {
+        if (!RectsIntersect(g_desktopDirt.rects[index], region)) {
+            continue;
+        }
+        if (DirtyAffectsOutsideSelf(g_desktopDirt.rects[index], region, selfExclude,
+                selfExcludeCount)) {
             return StripDirt::Dirty;
         }
+        sawSelfOnly = true;
+    }
+    if (sawSelfOnly) {
+        ProfileScope::Mark("Renderer::SkipBackdropSelfDirt");
     }
     return StripDirt::Clean;
 }
@@ -1927,12 +1962,13 @@ StripDirt DirtForRegion(const RECT& region) noexcept {
 // Clean and must not touch GDI (BitBlt demand-zeros a fresh mirror every call).
 // Uses the tick's shared poll when one is active so the menu plates see the
 // same frame as the dock strip.
-StripDirt QueryStripDirt(const RECT& strip) {
+StripDirt QueryStripDirt(const RECT& strip, const RECT* selfExclude = nullptr,
+    UINT selfExcludeCount = 0) {
     const bool shared = g_desktopDirt.valid;
     if (!shared) {
         PollDesktopDirt(MonitorFromRect(&strip, MONITOR_DEFAULTTONEAREST));
     }
-    const StripDirt dirt = DirtForRegion(strip);
+    const StripDirt dirt = DirtForRegion(strip, selfExclude, selfExcludeCount);
     if (!shared) {
         g_desktopDirt.valid = false;
     }
@@ -1976,6 +2012,14 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     // unrelated presents, so probing on that signal faulted at the timer rate.
     // Dirty rects come from duplication metadata (no map). A clean strip
     // returns here. Focus changes request one real read.
+    // Dock Present / pointer glint mark DXGI dirty rects over the strip even when
+    // wallpaper under glass is unchanged; ignore dirt wholly inside the dock HWND
+    // (same window CaptureScreenExcluding omits from the sample).
+    RECT selfExclude[1]{};
+    UINT selfExcludeCount = 0;
+    if (m_window != nullptr && GetWindowRect(m_window, &selfExclude[0]) != FALSE) {
+        selfExcludeCount = 1;
+    }
     if (m_backdropValid && !m_backdropRefreshRequested) {
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
@@ -1991,7 +2035,9 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
             // A shared poll can see new dirty rects before our cached cFrame
             // moves. Fall through and BitBlt only then; cursor motion advances
             // cFrame without dirty rects and stays on this early return.
-            if (!g_desktopDirt.valid || DirtForRegion(screenRectangle) != StripDirt::Dirty) {
+            if (!g_desktopDirt.valid ||
+                DirtForRegion(screenRectangle, selfExclude, selfExcludeCount) !=
+                    StripDirt::Dirty) {
                 if (changed != nullptr) {
                     *changed = false;
                 }
@@ -2000,7 +2046,7 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         }
         // Duplication frames trail DWM frames: a timeout means the change is not
         // delivered yet, so keep the DWM frame unconsumed and ask again.
-        StripDirt dirt = QueryStripDirt(screenRectangle);
+        StripDirt dirt = QueryStripDirt(screenRectangle, selfExclude, selfExcludeCount);
         if (dirt == StripDirt::Pending) {
             if (m_stripDirtyPending) {
                 dirt = StripDirt::Dirty;
@@ -2052,6 +2098,7 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     // omitted here so its swapchain does not refract back through the glass.
     // Magnifier exclusion leaves display affinity at WDA_NONE, so a recording
     // still sees the dock on every frame.
+    ProfileScope::Mark("Renderer::BackdropBitBlt");
     HWND excludeDock[] = {m_window};
     if (!CaptureScreenExcluding(screenRectangle, m_backdropDibPixels, m_backdropDc, excludeDock, 1)) {
         return false;
@@ -3373,7 +3420,7 @@ bool Renderer::EnsurePanelCaptureDib(UINT width, UINT height)
         return false;
     }
     // ICM_OFF: CreateDIBSection otherwise probes the default color profile
-    // (GetFileAttributesW / IcmGetDefaultCamp) on every create — dominant when
+    // (GetFileAttributesW / IcmGetDefaultCamp) on every create - dominant when
     // the single-slot pool thrashed across menu sizes. LCS_sRGB alone was not
     // enough on this OS.
     SetICMMode(screen, ICM_OFF);
