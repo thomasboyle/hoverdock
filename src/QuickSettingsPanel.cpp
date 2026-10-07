@@ -2581,7 +2581,7 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
 }
 
 void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
-    bool includeTemps) const {
+    bool includeTemps, bool includeBoost) const {
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
@@ -2671,7 +2671,9 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
             TempPowerText(m_qsCache.gpuTempC, m_qsCache.gpuWatts), format, 255);
         SetFlyoutChromeInk(savedR, savedG, savedB);
     }
-    if (m_qsBoostStatusValid && m_qsPage == QuickSettingsPage::Home &&
+    // Gate like temps: LiveFast meter ticks must not redraw Boost without
+    // restoring the underlay rect first, or glyphs overstrike and look bold.
+    if (includeBoost && m_qsBoostStatusValid && m_qsPage == QuickSettingsPage::Home &&
         !m_boostStatus.empty()) {
         HFONT statusFont =
             m_overflowStatusFont != nullptr ? m_overflowStatusFont : m_overflowLabelFont;
