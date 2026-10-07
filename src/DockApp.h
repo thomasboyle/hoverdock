@@ -931,6 +931,15 @@ private:
     uint8_t m_qsTempsInkR = 0;
     uint8_t m_qsTempsInkG = 0;
     uint8_t m_qsTempsInkB = 0;
+    // Boost tile status line lives outside the underlay (like temps) so
+    // ApplyBoostResult can present via PaintOverflowLiveFast without a
+    // ~100ms PaintOverflowPopup on the WH_MOUSE_LL thread.
+    RECT m_qsBoostStatusRect{};
+    bool m_qsBoostStatusValid = false;
+    bool m_qsBoostStatusDirty = false;
+    uint8_t m_qsBoostStatusInkR = 0;
+    uint8_t m_qsBoostStatusInkG = 0;
+    uint8_t m_qsBoostStatusInkB = 0;
     // When true, LayoutQuickSettings paints meter/scrub tracks at empty levels and
     // records their rects for PaintOverflowLiveFast.
     bool m_qsPaintUnderlayPass = false;

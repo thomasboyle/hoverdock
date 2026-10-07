@@ -5240,7 +5240,11 @@ void DockApp::RunPerformanceBoost() {
         return;
     }
     m_boostStatus = L"Profiling...";
-    QueueOverflowPaint();
+    // Status-only: live overlay, never a full PaintOverflowPopup on click.
+    if (IsOverflowOpen()) {
+        m_qsBoostStatusDirty = true;
+        PaintOverflowLiveFast();
+    }
 
     const std::wstring apiKey = m_config.TypeSafeApiKey();
     const HWND replyWindow = m_window;
@@ -5520,7 +5524,11 @@ void DockApp::ApplyBoostResult(const std::wstring& status, bool finished) {
     }
     Log(L"Boost: " + m_boostStatus);
     if (IsOverflowOpen()) {
-        QueueOverflowPaint();
+        // Worker status posts used to QueueOverflowPaint -> ~100ms
+        // PaintQuickSettings on the WH_MOUSE_LL thread (cursor hitch every
+        // "Profiling..." / "Closing..." / "Freed N MB"). Live-fast only.
+        m_qsBoostStatusDirty = true;
+        PaintOverflowLiveFast();
     }
 }
 
@@ -5630,10 +5638,13 @@ void DockApp::FinishOverflowHide() noexcept {
         m_qsScrubValid = false;
         m_qsTempsValid = false;
         m_qsTempsDirty = false;
+        m_qsBoostStatusValid = false;
+        m_qsBoostStatusDirty = false;
         m_qsMeterRect = {};
         m_qsScrubRect = {};
         m_qsTempCpuRect = {};
         m_qsTempGpuRect = {};
+        m_qsBoostStatusRect = {};
     }
     // keepHomeFrame: retain meter/scrub/temps rects + validity so the 40ms live
     // timer uses PaintOverflowLiveFast instead of falling back to a ~100ms
@@ -8176,7 +8187,8 @@ void DockApp::PaintOverflowLiveFast() {
         m_overflowPresentSize.cx <= 0 || m_overflowPresentSize.cy <= 0 ||
         m_overflowPresentSize.cx != m_overflowSize.cx ||
         m_overflowPresentSize.cy != m_overflowSize.cy ||
-        (!m_qsMeterValid && !m_qsScrubValid && !m_qsTempsValid) ||
+        (!m_qsMeterValid && !m_qsScrubValid && !m_qsTempsValid &&
+            !m_qsBoostStatusValid) ||
         m_overflowUnderlayBits.size() != m_overflowPresentBits.size() ||
         !OverflowScreenOrigin(origin, caret)) {
         PaintOverflowPopup();
@@ -8245,6 +8257,11 @@ void DockApp::PaintOverflowLiveFast() {
     if (temps) {
         addDirty(m_qsTempCpuRect);
         addDirty(m_qsTempGpuRect);
+    }
+    const bool boost = m_qsBoostStatusValid && m_qsBoostStatusDirty;
+    m_qsBoostStatusDirty = false;
+    if (boost) {
+        addDirty(m_qsBoostStatusRect);
     }
     if (!haveDirty) {
         return;
