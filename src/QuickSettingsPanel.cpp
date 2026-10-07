@@ -2707,6 +2707,12 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     auto restoreInk = [&]() {
         SetFlyoutChromeInk(inkR, inkG, inkB);
     };
+    // Bind flyout ink before any DrawFlyoutText: LightPanels white tiles need
+    // dark ink, dark tiles need chrome ink. Without this, leftover chrome ink
+    // from dock glyphs paints white-on-white QS labels when LightPanels is on.
+    if (draw) {
+        restoreInk();
+    }
     auto text = [&](RECT bounds, HFONT font, const std::wstring& value, UINT format, uint8_t alpha) {
         if (!draw || value.empty() || font == nullptr) {
             return;
