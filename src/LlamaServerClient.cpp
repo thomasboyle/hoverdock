@@ -583,6 +583,8 @@ constexpr int kAgentMaxTokens = 40;
 constexpr int kRankMaxTokens = 8;
 constexpr DWORD kAgentReceiveTimeoutMs = 120000;
 constexpr size_t kAgentMaxReplyChars = 120;
+constexpr size_t kAnswerMaxReplyChars = 360;
+constexpr int kAnswerMaxTokens = 120;
 constexpr size_t kAgentMaxUrlChars = 2048;
 constexpr size_t kMaxQueryChars = 120;
 constexpr double kConfidentMinScore = 80.0;
@@ -599,10 +601,15 @@ constexpr size_t kCodeMaxNameChars = 48;
 // One line, no newline: the grammar ends the reply after a single action so
 // generation stops at EOS instead of running to max_tokens.
 constexpr char kAgentGrammar[] =
-    "root ::= \"L c\" [0-9]{1,4} | \"W \" q | \"Y \" q | \"U http\" \"s\"? \"://\" u | \"P \" p | \"S \" q | \"C \" q | \"N\" (\" \" q)?\n"
+    "root ::= \"L c\" [0-9]{1,4} | \"A \" a | \"W \" q | \"Y \" q | \"U http\" \"s\"? \"://\" u | \"P \" p | \"S \" q | \"C \" q | \"N\" (\" \" q)?\n"
+    "a ::= [^\\n]{1,280}\n"
     "q ::= [^\\n]{1,80}\n"
     "u ::= [^\\n \"<>\\\\]{1,300}\n"
     "p ::= [^\\n\"<>|?*]{1,200}\n";
+// Info / specs questions: answer only (no launch / no browser).
+constexpr char kAnswerGrammar[] =
+    "root ::= \"A \" a\n"
+    "a ::= [^\\n]{1,280}\n";
 // Second round (after S) and plain app ranking: pick a listed app or nothing.
 constexpr char kLaunchOnlyGrammar[] = "root ::= \"L c\" [0-9]{1,4} | \"N\"\n";
 // Code round: "F <name>.<ext>" then the source on the following lines. The
@@ -1997,6 +2004,7 @@ const std::string& AgentSystemPrompt() {
     static const std::string prompt =
         "Hoverdock Search. Reply with exactly ONE line, no prose:\n"
         "L <id> launch a listed app (L c3)\n"
+        "A <text> short factual answer shown above Search (specs, what/who/how, prices) — do not launch\n"
         "W <query> Google search\n"
         "Y <query> YouTube search\n"
         "U <url> open an https URL\n"
@@ -2005,7 +2013,9 @@ const std::string& AgentSystemPrompt() {
         "S <words> search installed apps by purpose\n"
         "C <task> write a program/script/code file and open it in the user's editor\n"
         "N <short reason> nothing fits\n"
-        "Prefer L when a listed app fits. Use S only when no listed app fits but an app might.";
+        "For questions, specs, definitions, prices, comparisons: use A. Prefer L only when the "
+        "user clearly wants to open, launch, start, run, or play an app. Use S only when no "
+        "listed app fits but an app might.";
     return prompt;
 }
 
@@ -2096,7 +2106,7 @@ ModelLine ParseModelLine(std::string content) {
     if (!text.empty() && text.front() != L'{') {
         const wchar_t op = static_cast<wchar_t>(std::towupper(text.front()));
         const bool spaced = text.size() == 1 || text[1] == L' ' || text[1] == L':';
-        if (spaced && std::wstring_view(L"LWYUPSCN").find(op) != std::wstring_view::npos) {
+        if (spaced && std::wstring_view(L"ALWYUPSCN").find(op) != std::wstring_view::npos) {
             line.op = static_cast<char>(op);
             line.arg = text.size() > 1 ? TrimWide(text.substr(2)) : L"";
             return line;
@@ -2139,6 +2149,9 @@ ModelLine ParseModelLine(std::string content) {
     } else if (tool == "write_file" || tool == "create_file" || tool == "write_code") {
         line.op = 'C';
         line.arg = field({"task", "goal", "q", "query", "text"});
+    } else if (tool == "answer" || tool == "say_answer") {
+        line.op = 'A';
+        line.arg = field({"say", "text", "reply", "message", "answer"});
     } else if (tool == "done" || tool == "say" || tool == "reply") {
         line.op = 'N';
         line.arg = field({"say", "text", "reply", "message"});
@@ -2157,6 +2170,10 @@ const LaunchCandidate* FindCandidate(const std::vector<LaunchCandidate>& candida
 
 std::wstring Sentence(std::wstring text) {
     return TruncateWide(TrimWide(std::move(text)), kAgentMaxReplyChars);
+}
+
+std::wstring AnswerSentence(std::wstring text) {
+    return TruncateWide(TrimWide(std::move(text)), kAnswerMaxReplyChars);
 }
 
 }  // namespace
@@ -2319,6 +2336,60 @@ bool LlamaServerClient::LooksLikeAgentGoal(const std::wstring& request) {
     });
 }
 
+bool LlamaServerClient::LooksLikeInfoQuery(const std::wstring& request) {
+    const std::wstring lower = StripPolitePrefix(ToLowerWide(TrimWide(request)));
+    if (lower.empty() || lower.size() > kMaxRequestChars) {
+        return false;
+    }
+    // Explicit action verbs win: "open Spotify", "launch chrome", "play lofi".
+    if (StartsWithAny(lower, {L"open ", L"launch ", L"start ", L"run ", L"play ", L"goto ",
+            L"go to ", L"visit ", L"browse to ", L"navigate to ", L"take me to ", L"head to ",
+            L"fire up ", L"boot up ", L"switch to ", L"focus ", L"bring up ", L"pull up ",
+            L"write ", L"create ", L"code ", L"make a program", L"make a script"})) {
+        return false;
+    }
+    std::wstring trimmed = lower;
+    while (!trimmed.empty() && (trimmed.back() == L'?' || trimmed.back() == L'.' || trimmed.back() == L'!')) {
+        trimmed.pop_back();
+    }
+    trimmed = TrimWide(std::move(trimmed));
+    if (lower.find(L'?') != std::wstring::npos) {
+        return true;
+    }
+    if (StartsWithAny(trimmed, {L"what ", L"what's ", L"whats ", L"who ", L"who's ", L"whos ", L"how ",
+            L"why ", L"when ", L"where ", L"which ", L"is ", L"are ", L"does ", L"did ", L"will ",
+            L"should ", L"define ", L"definition of ", L"meaning of ", L"weather ", L"time in ",
+            L"convert ", L"translate ", L"news about ", L"latest news ", L"price of ", L"score ",
+            L"lyrics ", L"recipe ", L"recipes ", L"tell me ", L"explain ", L"describe ",
+            L"compare ", L"difference between ", L"differences between "})) {
+        return true;
+    }
+    // Phrase markers (substring is OK — multi-word).
+    static constexpr std::wstring_view phrases[] = {
+        L"feature list", L"release notes", L"how much", L"how many", L"how long", L"how big",
+        L"how tall", L"battery life", L"screen size", L" vs ",
+    };
+    if (std::ranges::any_of(phrases, [&](std::wstring_view m) {
+            return trimmed.find(m) != std::wstring::npos;
+        })) {
+        return true;
+    }
+    // Whole-token markers so "preview"/"special"/"microsoft" do not fire.
+    static constexpr std::wstring_view tokens[] = {
+        L"specs", L"spec", L"specification", L"specifications", L"features", L"price", L"pricing",
+        L"cost", L"msrp", L"review", L"reviews", L"versus", L"difference", L"differences",
+        L"meaning", L"definition", L"wikipedia", L"changelog", L"dimensions", L"weight",
+        L"compatibility",
+    };
+    for (const std::wstring& token : Tokenize(trimmed)) {
+        if (std::ranges::any_of(tokens, [&](std::wstring_view t) { return token == t; })) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
 std::optional<SearchAgentAction> LlamaServerClient::DirectAction(const std::wstring& request) {
     const std::wstring trimmed = TrimWide(request);
     if (auto web = ExplicitWebAction(trimmed); web.has_value()) {
@@ -2451,6 +2522,11 @@ std::optional<SearchFastPlan> PlanSingle(const std::wstring& text, const std::ve
     if (auto direct = LlamaServerClient::DirectAction(text); direct.has_value()) {
         return single(std::move(*direct), L"direct");
     }
+    // Info / specs questions are answered as text above Search (RunAnswerAgent),
+    // never by launching a fuzzy catalog hit or opening Google here.
+    if (LlamaServerClient::LooksLikeInfoQuery(text)) {
+        return std::nullopt;
+    }
     // "go to github" / "visit reddit": web verbs prefer the site over an app
     // that merely shares the name (GitHub Desktop).
     {
@@ -2468,9 +2544,6 @@ std::optional<SearchFastPlan> PlanSingle(const std::wstring& text, const std::ve
     }
     if (auto site = SiteAction(text); site.has_value()) {
         return single(std::move(*site), L"site");
-    }
-    if (auto question = QuestionAction(text); question.has_value()) {
-        return single(std::move(*question), L"web-question");
     }
     if (auto folder = BareFolder(text); folder.has_value()) {
         return single(MakePathAction(*folder, *folder), L"folder");
@@ -2662,6 +2735,10 @@ SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
         result.reply = L"Type an app or a goal.";
         return result;
     }
+    // Specs / factual questions never go through the launch-preferring agent.
+    if (LooksLikeInfoQuery(goal)) {
+        return RunAnswerAgent(baseUrl, goal, status, cancelled);
+    }
     const auto notify = [&status](const std::wstring& text) {
         if (status) {
             status(text);
@@ -2736,6 +2813,11 @@ SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
         line = ParseModelLine(reply.content);
     }
 
+    if (line.op == 'A') {
+        result.reply = line.arg.empty() ? L"No answer." : AnswerSentence(line.arg);
+        notify(L"Answer ready");
+        return result;
+    }
     std::wstring note;
     if (auto action = ActionFromModelLine(line, candidates, note); action.has_value()) {
         notify(L"Opening " + TruncateWide(action->label, 60) + L"...");
@@ -2750,6 +2832,58 @@ SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
         result.reply = Sentence(line.arg);
     } else {
         result.reply = L"The agent could not finish that. Try naming the app.";
+    }
+    return result;
+}
+
+SearchAgentResult LlamaServerClient::RunAnswerAgent(const std::wstring& baseUrl,
+    const std::wstring& request, const StatusCallback& status, const CancelCallback& cancelled) {
+    SearchAgentResult result;
+    const std::wstring goal = TruncateWide(TrimWide(request), kMaxRequestChars);
+    if (goal.empty()) {
+        result.reply = L"Type a question.";
+        return result;
+    }
+    const auto notify = [&status](const std::wstring& text) {
+        if (status) {
+            status(text);
+        }
+    };
+    if (cancelled && cancelled()) {
+        return result;
+    }
+    result.steps = 1;
+    notify(L"Answering...");
+    const ParsedUrl url = ParseBaseUrl(baseUrl);
+    std::string user = "question: ";
+    user += WideToUtf8(goal);
+    user += "\nReply with A <short factual answer>. Do not launch apps or open URLs.";
+    ModelReply reply = AskModel(url, user, kAnswerMaxTokens, kAnswerGrammar, kAgentReceiveTimeoutMs);
+    if (!reply.reached) {
+        result.serverUnavailable = true;
+        return result;
+    }
+    if (cancelled && cancelled()) {
+        return result;
+    }
+    ModelLine line = ParseModelLine(reply.content);
+    if (line.op == 'A' && !line.arg.empty()) {
+        result.reply = AnswerSentence(line.arg);
+        return result;
+    }
+    // Grammar rejected / free prose: treat the whole reply as the answer.
+    std::wstring text = TrimWide(Utf8ToWide(reply.content));
+    if (const size_t endThink = reply.content.find("</think>"); endThink != std::string::npos) {
+        text = TrimWide(Utf8ToWide(reply.content.substr(endThink + 8)));
+    }
+    if (!text.empty() && (text.front() == L'A' || text.front() == L'a') &&
+        (text.size() == 1 || text[1] == L' ' || text[1] == L':')) {
+        text = TrimWide(text.substr(2));
+    }
+    if (text.empty()) {
+        result.reply = L"No answer from the local model.";
+    } else {
+        result.reply = AnswerSentence(std::move(text));
     }
     return result;
 }

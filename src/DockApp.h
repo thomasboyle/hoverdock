@@ -495,6 +495,7 @@ private:
     void CloseLaunchPrompt(bool hideDockIfAway = true);
     void PositionLaunchPrompt();
     void SetLaunchPromptStatus(const std::wstring& text);
+    void SetLaunchPromptAnswer(const std::wstring& text);
     void SubmitLaunchPrompt();
     void ApplyLaunchJudgment(UINT generation, const LaunchJudgment& judgment);
     void ApplyAgentResult(UINT generation, const SearchAgentResult& result);
@@ -640,6 +641,7 @@ private:
     HWND m_hoverLabelWindow = nullptr;
     HWND m_dragGhostWindow = nullptr;
     HWND m_launchPromptWindow = nullptr;
+    HWND m_launchAnswer = nullptr;  // multi-line Q&A strip above the Search edit
     HWND m_launchEdit = nullptr;
     HWND m_launchStatus = nullptr;
     HHOOK m_mouseHook = nullptr;

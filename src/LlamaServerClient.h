@@ -79,6 +79,11 @@ public:
     // "open downloads folder") rather than a bare app name ("chrome").
     [[nodiscard]] static bool LooksLikeAgentGoal(const std::wstring& request);
 
+    // True for factual / specs / definition questions that should be answered
+    // as text above Search ("Apple Watch Ultra 5 specs", "what is HTTP").
+    // Explicit open/launch/start/run/play goals stay false so tools still run.
+    [[nodiscard]] static bool LooksLikeInfoQuery(const std::wstring& request);
+
     // Goal with leading command verbs/fillers removed ("open the chrome" -> "chrome").
     [[nodiscard]] static std::wstring StripGoalVerbs(const std::wstring& request);
 
@@ -109,15 +114,22 @@ public:
     static void WarmPromptCache(const std::wstring& baseUrl);
 
     // Single-shot agent against llama-server: one grammar-constrained line
-    // (L id / W query / Y query / U url / P folder / S words / C task / N). S is
-    // answered locally and only falls through to a second, launch-only round
+    // (L id / A text / W query / Y query / U url / P folder / S words / C task / N).
+    // S is answered locally and only falls through to a second, launch-only round
     // when no app clearly wins; C ("write code") hands over to the code round
-    // (RunCodeAgent). Blocking; call from a worker thread. status is invoked
-    // from that worker thread; cancelled is polled between rounds.
+    // (RunCodeAgent); A shows a short answer above Search (no ShellExecute).
+    // Blocking; call from a worker thread. status is invoked from that worker
+    // thread; cancelled is polled between rounds.
     [[nodiscard]] static SearchAgentResult RunAgent(const std::wstring& baseUrl,
         const std::wstring& request, const std::vector<LaunchCandidate>& candidates,
         const StatusCallback& status, const CancelCallback& cancelled,
         const std::wstring& codeLanguageHint = {});
+
+    // Factual / specs Q&A only: grammar forces A <answer>, never L/W/Y/... .
+    // result.actions stays empty; result.reply is shown above the Search box.
+    [[nodiscard]] static SearchAgentResult RunAnswerAgent(const std::wstring& baseUrl,
+        const std::wstring& request, const StatusCallback& status,
+        const CancelCallback& cancelled);
 
     // Defence-in-depth for ShellExecute targets already queued by the agent.
     [[nodiscard]] static bool IsSafeShellOpenTarget(bool isUrl, const std::wstring& target);

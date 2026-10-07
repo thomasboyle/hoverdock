@@ -2526,7 +2526,13 @@ LRESULT CALLBACK DockApp::LaunchPromptWindowProcedure(HWND window, UINT message,
     case WM_CTLCOLORSTATIC: {
         const HDC context = reinterpret_cast<HDC>(wParam);
         SetBkColor(context, RGB(42, 42, 46));
-        SetTextColor(context, RGB(245, 245, 247));
+        // Answer strip (child id 3): slightly cooler text so it reads as a reply.
+        if (message == WM_CTLCOLOREDIT && app != nullptr &&
+            reinterpret_cast<HWND>(lParam) == app->m_launchAnswer) {
+            SetTextColor(context, RGB(186, 220, 255));
+        } else {
+            SetTextColor(context, RGB(245, 245, 247));
+        }
         static HBRUSH background = CreateSolidBrush(RGB(42, 42, 46));
         return reinterpret_cast<LRESULT>(background);
     }
@@ -9966,22 +9972,27 @@ bool DockApp::OpenLaunchPrompt() {
         sizeof(corner));
 
     HFONT font = HoverLabelFont();
+    // Read-only multi-line strip above the edit for factual / specs answers.
+    m_launchAnswer = CreateWindowExW(0, L"EDIT", L"",
+        WS_CHILD | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_LEFT, 0, 0, 1, 1,
+        m_launchPromptWindow, reinterpret_cast<HMENU>(3), m_instance, nullptr);
     m_launchEdit = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT, 0, 0, 1, 1, m_launchPromptWindow,
         reinterpret_cast<HMENU>(1), m_instance, nullptr);
-    m_launchStatus = CreateWindowExW(0, L"STATIC", L"Type an app, or a goal for the local agent",
+    m_launchStatus = CreateWindowExW(0, L"STATIC", L"Type an app, a question, or a goal for the local agent",
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 0, 0, 1, 1, m_launchPromptWindow,
         reinterpret_cast<HMENU>(2), m_instance, nullptr);
-    if (m_launchEdit == nullptr || m_launchStatus == nullptr) {
+    if (m_launchEdit == nullptr || m_launchStatus == nullptr || m_launchAnswer == nullptr) {
         Log(L"Could not create the launch prompt controls.");
         CloseLaunchPrompt(false);
         return false;
     }
 
+    SendMessageW(m_launchAnswer, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     SendMessageW(m_launchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     SendMessageW(m_launchStatus, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     SendMessageW(m_launchEdit, EM_SETCUEBANNER, TRUE,
-        reinterpret_cast<LPARAM>(L"chrome, open downloads folder, play lofi on youtube..."));
+        reinterpret_cast<LPARAM>(L"chrome, Apple Watch Ultra 5 specs, open downloads..."));
 
     m_launchEditPrevious = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(m_launchEdit, GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(&DockApp::LaunchEditProcedure)));
@@ -10006,6 +10017,7 @@ void DockApp::CloseLaunchPrompt(bool hideDockIfAway) {
             reinterpret_cast<LONG_PTR>(m_launchEditPrevious));
     }
     m_launchEditPrevious = nullptr;
+    m_launchAnswer = nullptr;
     m_launchEdit = nullptr;
     m_launchStatus = nullptr;
 
@@ -10042,21 +10054,64 @@ void DockApp::PositionLaunchPrompt() {
     const LONG width = std::clamp(static_cast<LONG>(m_dockWidth) - padding * 2L,
         GreaterOf(240L, static_cast<LONG>(std::lround(280.0F * scale))),
         GreaterOf(320L, static_cast<LONG>(std::lround(420.0F * scale))));
-    const LONG height = padding + editHeight + gap + statusHeight + padding;
+
+    std::wstring answerText;
+    if (m_launchAnswer != nullptr) {
+        answerText = WindowText(m_launchAnswer);
+    }
+    const bool showAnswer = !answerText.empty();
+    LONG answerHeight = 0;
+    if (showAnswer) {
+        // ~3 wrapped lines above the edit for short specs / Q&A answers.
+        answerHeight = GreaterOf(48L, static_cast<LONG>(std::lround(54.0F * scale)));
+        HDC dc = GetDC(m_launchPromptWindow);
+        if (dc != nullptr) {
+            HFONT font = HoverLabelFont();
+            HGDIOBJ old = font != nullptr ? SelectObject(dc, font) : nullptr;
+            RECT calc{0, 0, width - padding * 2L, 0};
+            DrawTextW(dc, answerText.c_str(), -1, &calc,
+                DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+            if (old != nullptr) {
+                SelectObject(dc, old);
+            }
+            ReleaseDC(m_launchPromptWindow, dc);
+            const LONG measured = (calc.bottom - calc.top) + GreaterOf(4L, static_cast<LONG>(std::lround(6.0F * scale)));
+            answerHeight = std::clamp(measured, answerHeight,
+                GreaterOf(96L, static_cast<LONG>(std::lround(110.0F * scale))));
+        }
+    }
+
+    const LONG height = padding + (showAnswer ? answerHeight + gap : 0L) + editHeight + gap +
+        statusHeight + padding;
     const LONG x = m_windowX + (static_cast<LONG>(m_dockWidth) - width) / 2L;
     const LONG y = m_visibleY - height - GreaterOf(8L, static_cast<LONG>(std::lround(10.0F * scale)));
 
     SetWindowPos(m_launchPromptWindow, HWND_TOPMOST, SaturatedInt(x), SaturatedInt(y),
         SaturatedInt(width), SaturatedInt(height), SWP_NOOWNERZORDER);
+
+    LONG yCursor = padding;
+    if (m_launchAnswer != nullptr) {
+        if (showAnswer) {
+            ShowWindow(m_launchAnswer, SW_SHOW);
+            SetWindowPos(m_launchAnswer, nullptr, SaturatedInt(padding), SaturatedInt(yCursor),
+                SaturatedInt(width - padding * 2L), SaturatedInt(answerHeight),
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            yCursor += answerHeight + gap;
+        } else {
+            ShowWindow(m_launchAnswer, SW_HIDE);
+            SetWindowPos(m_launchAnswer, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
     if (m_launchEdit != nullptr) {
-        SetWindowPos(m_launchEdit, nullptr, SaturatedInt(padding), SaturatedInt(padding),
+        SetWindowPos(m_launchEdit, nullptr, SaturatedInt(padding), SaturatedInt(yCursor),
             SaturatedInt(width - padding * 2L), SaturatedInt(editHeight),
             SWP_NOZORDER | SWP_NOACTIVATE);
+        yCursor += editHeight + gap;
     }
     if (m_launchStatus != nullptr) {
-        SetWindowPos(m_launchStatus, nullptr, SaturatedInt(padding),
-            SaturatedInt(padding + editHeight + gap), SaturatedInt(width - padding * 2L),
-            SaturatedInt(statusHeight), SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(m_launchStatus, nullptr, SaturatedInt(padding), SaturatedInt(yCursor),
+            SaturatedInt(width - padding * 2L), SaturatedInt(statusHeight),
+            SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -10066,6 +10121,14 @@ void DockApp::SetLaunchPromptStatus(const std::wstring& text) {
     }
 }
 
+void DockApp::SetLaunchPromptAnswer(const std::wstring& text) {
+    if (m_launchAnswer == nullptr) {
+        return;
+    }
+    SetWindowTextW(m_launchAnswer, text.c_str());
+    PositionLaunchPrompt();
+}
+
 void DockApp::SubmitLaunchPrompt() {
     if (m_launchInFlight || m_launchEdit == nullptr) {
         return;
@@ -10073,13 +10136,14 @@ void DockApp::SubmitLaunchPrompt() {
 
     const std::wstring request = TrimWide(WindowText(m_launchEdit));
     if (request.empty()) {
-        SetLaunchPromptStatus(L"Type an app, or a goal for the local agent");
+        SetLaunchPromptStatus(L"Type an app, a question, or a goal for the local agent");
         return;
     }
 
     const UINT generation = ++m_launchGeneration;
     m_launchInFlight = true;
     m_launchRequest = request;
+    SetLaunchPromptAnswer(L"");
     SetLaunchPromptStatus(L"Looking...");
 
     const std::wstring llamaUrl = m_config.LlamaServerUrl();
@@ -10188,6 +10252,18 @@ void DockApp::SubmitLaunchPrompt() {
                     agent = std::move(*replay);
                     route = L"replay";
                     attachEditor(agent);
+                } else if (LlamaServerClient::LooksLikeInfoQuery(request)) {
+                    // Specs / factual Q&A: answer as text above Search — never
+                    // ShellExecute a fuzzy catalog match (e.g. Games for Windows).
+                    agentMode = true;
+                    agent = LlamaServerClient::RunAnswerAgent(llamaUrl, request, postStatus, superseded);
+                    route = L"answer";
+                    if (agent.serverUnavailable) {
+                        agent.serverUnavailable = false;
+                        agent.actions.clear();
+                        agent.reply = L"Local model is offline - start llama-server for answers.";
+                        route = L"answer-offline";
+                    }
                 } else if (auto plan = LlamaServerClient::PlanWithoutModel(request, candidates);
                     plan.has_value()) {
                     // Fast path 3 (first-time goals, no model): URL/domain, site
@@ -10382,6 +10458,8 @@ void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result)
         }
         case SearchAgentAction::Kind::LaunchApp: {
             const LaunchTarget* target = FindLaunchTarget(action.appId);
+            Log(L"Search agent launch id=" + std::wstring(action.appId.begin(), action.appId.end()) +
+                L" label=" + action.label);
             if (target != nullptr && ActivateLaunchTarget(*target)) {
                 ++performed;
             } else {
@@ -10397,6 +10475,7 @@ void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result)
                 failure = L"Blocked unsafe target.";
                 break;
             }
+            Log(L"Search agent ShellExecute " + std::wstring(isUrl ? L"url=" : L"path=") + action.target);
             const HINSTANCE opened = ShellExecuteW(nullptr, L"open", action.target.c_str(), nullptr,
                 nullptr, SW_SHOWNORMAL);
             if (reinterpret_cast<INT_PTR>(opened) > 32) {
@@ -10424,8 +10503,14 @@ void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result)
         BeginHide();
         return;
     }
+    if (failure.empty() && !result.reply.empty()) {
+        // Q&A / specs: keep Search open and show the answer above the textbox.
+        Log(L"Search agent answer shown chars=" + std::to_wstring(result.reply.size()));
+        SetLaunchPromptAnswer(result.reply);
+        SetLaunchPromptStatus(L"Answer above — ask another question or open an app");
+        return;
+    }
     SetLaunchPromptStatus(!failure.empty() ? failure
-        : !result.reply.empty() ? result.reply
         : L"The agent found nothing to do for that.");
 }
 
