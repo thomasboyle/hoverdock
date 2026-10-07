@@ -612,6 +612,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
 // the first only run when frost is on and the backdrop is live (C++ skips
 // them otherwise), so the mica radii are unconditional. GlassPS finishes
 // the final vertical axis from temp.
+// Dock backdrop + blur temps are quarter-res (1/2 x 1/2); blur passes remap
+// RT pixels to full dock space and keep texel = 1/outputSize so blurPx (in
+// screen pixels) matches the pre-downsample look. GlassPS upsamples with
+// linearClamp.
 // ---------------------------------------------------------------------------
 // Shared lens-UV computation for every frost pass. Must stay identical to
 // the UV block in GlassPS above.
@@ -682,16 +686,31 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     blurPx = lerp(micaRim, micaCore, height01) * dpi;
 }
 
+
+// Quarter-res frost RTs: SV_Position is in backdrop texels. Remap into the
+// full dock pixel space so ComputeFrostUVs / icon halos match GlassPS, while
+// SampleGlassAxis keeps full-res texel steps (blurPx stays in screen pixels;
+// linear filter upsamples the low-res buffer).
+float2 FrostPixelFromBackdropRT(float2 rtPixel, float2 outputSize, Texture2D blurLike)
+{
+    uint bw = 1;
+    uint bh = 1;
+    blurLike.GetDimensions(bw, bh);
+    const float2 blurSize = max(float2((float)bw, (float)bh), float2(1.0, 1.0));
+    return rtPixel * (outputSize / blurSize);
+}
+
 // Pass 1: horizontal Gaussian axis from the live backdrop into temp.
 float4 BlurHPS(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 texel = 1.0 / outputSize;
+    const float2 pixel = FrostPixelFromBackdropRT(input.position.xy, outputSize, backdropTexture);
     float2 uvR;
     float2 uvG;
     float2 uvB;
     float blurPx;
-    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
+    ComputeFrostUVs(pixel, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
     const float3 h = SampleGlassAxis(backdropTexture, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
     return float4(h, 1.0);
 }
@@ -701,26 +720,28 @@ float4 BlurVPS(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 texel = 1.0 / outputSize;
+    const float2 pixel = FrostPixelFromBackdropRT(input.position.xy, outputSize, blurTemp);
     float2 uvR;
     float2 uvG;
     float2 uvB;
     float blurPx;
-    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
+    ComputeFrostUVs(pixel, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
     const float3 v = SampleGlassAxis(blurTemp, uvR, uvG, uvB, texel, blurPx, float2(0.0, 1.0));
     return float4(v, 1.0);
 }
 
 // Pass 3: horizontal Gaussian axis from temp2 back into temp; GlassPS
-// finishes the final vertical axis from temp.
+// finishes the final vertical axis from temp (full-res sample of quarter-res).
 float4 BlurHPS2(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 texel = 1.0 / outputSize;
+    const float2 pixel = FrostPixelFromBackdropRT(input.position.xy, outputSize, blurTemp2);
     float2 uvR;
     float2 uvG;
     float2 uvB;
     float blurPx;
-    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
+    ComputeFrostUVs(pixel, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
     const float3 h = SampleGlassAxis(blurTemp2, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
     return float4(h, 1.0);
 }

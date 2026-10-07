@@ -1294,8 +1294,8 @@ bool BackdropRgbDiffers(uint32_t left, uint32_t right) noexcept {
 // capturer for a frame, which flickers them in recordings. The dock strip must
 // not pass the dock HWND here. Menu plates pass only their layered popups.
 // POD-only so __try is legal (C2712).
-BOOL BitBltExcludingByAffinity(HDC destDc, int width, int height, int left, int top,
-    const HWND* exclude, UINT excludeCount) noexcept {
+BOOL BitBltExcludingByAffinity(HDC destDc, int destWidth, int destHeight, int srcWidth,
+    int srcHeight, int left, int top, const HWND* exclude, UINT excludeCount) noexcept {
     constexpr UINT kMaxExclude = 8;
     HWND windows[kMaxExclude]{};
     DWORD previous[kMaxExclude]{};
@@ -1327,7 +1327,16 @@ BOOL BitBltExcludingByAffinity(HDC destDc, int width, int height, int left, int 
     BOOL copied = FALSE;
     __try {
         if (screen != nullptr) {
-            copied = BitBlt(destDc, 0, 0, width, height, screen, left, top, SRCCOPY);
+            if (destWidth == srcWidth && destHeight == srcHeight) {
+                copied = BitBlt(destDc, 0, 0, destWidth, destHeight, screen, left, top, SRCCOPY);
+            } else {
+                // Quarter-res dock backdrop: stretch once at capture time.
+                const int prevMode = SetStretchBltMode(destDc, HALFTONE);
+                SetBrushOrgEx(destDc, 0, 0, nullptr);
+                copied = StretchBlt(destDc, 0, 0, destWidth, destHeight, screen, left, top,
+                    srcWidth, srcHeight, SRCCOPY);
+                SetStretchBltMode(destDc, prevMode);
+            }
         }
     } __finally {
         for (UINT index = 0; index < count; ++index) {
@@ -1446,21 +1455,29 @@ bool EnsureMagnifierSampler() noexcept {
 }
 
 bool SampleWithMagnifier(const RECT& screen, uint8_t* destBits, const HWND* exclude,
-    UINT excludeCount) noexcept {
-    const LONG width = screen.right - screen.left;
-    const LONG height = screen.bottom - screen.top;
-    if (destBits == nullptr || width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+    UINT excludeCount, int destWidth, int destHeight) noexcept {
+    const LONG srcWidth = screen.right - screen.left;
+    const LONG srcHeight = screen.bottom - screen.top;
+    const LONG width = destWidth > 0 ? destWidth : srcWidth;
+    const LONG height = destHeight > 0 ? destHeight : srcHeight;
+    if (destBits == nullptr || srcWidth <= 0 || srcHeight <= 0 || width <= 0 || height <= 0 ||
+        srcWidth > 16384 || srcHeight > 16384 || width > 16384 || height > 16384) {
         return false;
     }
     if (!EnsureMagnifierSampler()) {
         return false;
     }
 
+    // Host/child sized to the *output* bitmap. MagSetWindowSource still names
+    // the full desktop rect; a smaller child stretches that region into the
+    // callback (quarter-res dock backdrop).
     const bool sameRect = g_magnifier.placed && g_magnifier.source.left == screen.left &&
         g_magnifier.source.top == screen.top && g_magnifier.source.right == screen.right &&
-        g_magnifier.source.bottom == screen.bottom;
+        g_magnifier.source.bottom == screen.bottom &&
+        g_magFrame.width == static_cast<UINT>(width) &&
+        g_magFrame.height == static_cast<UINT>(height);
     if (!sameRect) {
-        // The scaling callback returns `screen` only when the magnifier child's
+        // The scaling callback returns content only when the magnifier child's
         // screen origin is (0, 0): host at -origin, child at +origin. The host
         // stays hidden, so that child is not visible and does not take clicks,
         // while the exclude list still omits the dock from the sample.
@@ -1514,6 +1531,7 @@ bool SampleWithMagnifier(const RECT& screen, uint8_t* destBits, const HWND* excl
         g_magFrame.width = static_cast<UINT>(width);
         g_magFrame.height = static_cast<UINT>(height);
         g_magFrame.copied = false;
+        // Source is always the full dock strip; a half-size child downscales.
         if (MagSetWindowSource(g_magnifier.magnifier, screen) == FALSE) {
             return false;
         }
@@ -1541,6 +1559,10 @@ struct ScreenSampleJob {
     HWND exclude[8]{};
     UINT excludeCount = 0;
     uint8_t* dest = nullptr;
+    // 0 = dest size matches screen rect (legacy). Non-zero = stretch/mag into
+    // destWidth x destHeight (dock glass quarter-res backdrop).
+    int destWidth = 0;
+    int destHeight = 0;
     ScreenSampleKind kind = ScreenSampleKind::Magnifier;
     bool ok = false;
 };
@@ -1601,17 +1623,21 @@ bool EnsureWorkerBlitTarget(int width, int height) noexcept {
 }
 
 bool BlitScreenToBuffer(const RECT& screen, uint8_t* dest, const HWND* exclude,
-    UINT excludeCount) noexcept {
-    const int width = static_cast<int>(screen.right - screen.left);
-    const int height = static_cast<int>(screen.bottom - screen.top);
-    if (dest == nullptr || width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+    UINT excludeCount, int destWidth, int destHeight) noexcept {
+    const int srcWidth = static_cast<int>(screen.right - screen.left);
+    const int srcHeight = static_cast<int>(screen.bottom - screen.top);
+    const int width = destWidth > 0 ? destWidth : srcWidth;
+    const int height = destHeight > 0 ? destHeight : srcHeight;
+    if (dest == nullptr || srcWidth <= 0 || srcHeight <= 0 || width <= 0 || height <= 0 ||
+        srcWidth > 16384 || srcHeight > 16384 || width > 16384 || height > 16384) {
         return false;
     }
     if (!EnsureWorkerBlitTarget(width, height)) {
         return false;
     }
-    if (BitBltExcludingByAffinity(g_workerBlit.dc, width, height, static_cast<int>(screen.left),
-            static_cast<int>(screen.top), exclude, excludeCount) == FALSE) {
+    if (BitBltExcludingByAffinity(g_workerBlit.dc, width, height, srcWidth, srcHeight,
+            static_cast<int>(screen.left), static_cast<int>(screen.top), exclude,
+            excludeCount) == FALSE) {
         return false;
     }
     std::memcpy(dest, g_workerBlit.bits,
@@ -1628,9 +1654,9 @@ DWORD WINAPI ScreenSampleThread(void*) noexcept {
         }
         const bool ok = g_sampleJob.kind == ScreenSampleKind::Magnifier
             ? SampleWithMagnifier(g_sampleJob.screen, g_sampleJob.dest, g_sampleJob.exclude,
-                  g_sampleJob.excludeCount)
+                  g_sampleJob.excludeCount, g_sampleJob.destWidth, g_sampleJob.destHeight)
             : BlitScreenToBuffer(g_sampleJob.screen, g_sampleJob.dest, g_sampleJob.exclude,
-                  g_sampleJob.excludeCount);
+                  g_sampleJob.excludeCount, g_sampleJob.destWidth, g_sampleJob.destHeight);
         g_sampleJob.ok = ok;
         SetEvent(g_sampleDone);
     }
@@ -1674,7 +1700,7 @@ bool WaitForSampleDone() noexcept {
 }
 
 ScreenSampleStatus RunScreenSample(ScreenSampleKind kind, const RECT& screen, uint8_t* dest,
-    const HWND* exclude, UINT excludeCount) noexcept {
+    const HWND* exclude, UINT excludeCount, int destWidth = 0, int destHeight = 0) noexcept {
     if (g_sampleWaitDepth > 0 || dest == nullptr) {
         return ScreenSampleStatus::Busy;
     }
@@ -1684,6 +1710,8 @@ ScreenSampleStatus RunScreenSample(ScreenSampleKind kind, const RECT& screen, ui
     g_sampleJob = {};
     g_sampleJob.screen = screen;
     g_sampleJob.dest = dest;
+    g_sampleJob.destWidth = destWidth;
+    g_sampleJob.destHeight = destHeight;
     g_sampleJob.kind = kind;
     g_sampleJob.excludeCount = excludeCount < 8U ? excludeCount : 8U;
     if (exclude != nullptr) {
@@ -1704,9 +1732,9 @@ ScreenSampleStatus RunScreenSample(ScreenSampleKind kind, const RECT& screen, ui
 // and Snipping Tool keep seeing those windows. Falls back to an affinity
 // BitBlt only if the magnifier cannot sample.
 bool CaptureScreenExcluding(const RECT& screen, uint8_t* destBits, HDC fallbackDc,
-    const HWND* exclude, UINT excludeCount) noexcept {
-    const ScreenSampleStatus magnified =
-        RunScreenSample(ScreenSampleKind::Magnifier, screen, destBits, exclude, excludeCount);
+    const HWND* exclude, UINT excludeCount, int destWidth = 0, int destHeight = 0) noexcept {
+    const ScreenSampleStatus magnified = RunScreenSample(ScreenSampleKind::Magnifier, screen,
+        destBits, exclude, excludeCount, destWidth, destHeight);
     if (magnified == ScreenSampleStatus::Ok) {
         return true;
     }
@@ -1718,8 +1746,8 @@ bool CaptureScreenExcluding(const RECT& screen, uint8_t* destBits, HDC fallbackD
     if (width <= 0 || height <= 0) {
         return false;
     }
-    return RunScreenSample(ScreenSampleKind::BitBlt, screen, destBits, exclude, excludeCount) ==
-        ScreenSampleStatus::Ok;
+    return RunScreenSample(ScreenSampleKind::BitBlt, screen, destBits, exclude, excludeCount,
+               destWidth, destHeight) == ScreenSampleStatus::Ok;
 }
 
 struct StripWatchState {
@@ -2053,7 +2081,9 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     // Magnifier exclusion leaves display affinity at WDA_NONE, so a recording
     // still sees the dock on every frame.
     HWND excludeDock[] = {m_window};
-    if (!CaptureScreenExcluding(screenRectangle, m_backdropDibPixels, m_backdropDc, excludeDock, 1)) {
+    // Capture already stretched into the quarter-res DIB (1/2 x 1/2).
+    if (!CaptureScreenExcluding(screenRectangle, m_backdropDibPixels, m_backdropDc, excludeDock, 1,
+            static_cast<int>(m_backdropWidth), static_cast<int>(m_backdropHeight))) {
         return false;
     }
     m_backdropOriginX = screenRectangle.left;
@@ -2064,8 +2094,12 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     // Noise-tolerant change check (preferred over raw FNV hash): a few flapping
     // pixels must not upload or advance BackdropChangeSerial.
     const size_t sampleDiffs = CountBackdropSampleDiffs();
+    // Quarter-res backdrop has ~1/4 the samples; keep a similar relative trip.
+    const size_t changeMinSamples = (std::max)(static_cast<size_t>(24),
+        static_cast<size_t>(kBackdropChangeMinSamples) /
+            (static_cast<size_t>(kBackdropDownsample) * static_cast<size_t>(kBackdropDownsample)));
     const bool meaningfullyChanged =
-        !m_backdropValid || sampleDiffs > kBackdropChangeMinSamples;
+        !m_backdropValid || sampleDiffs > changeMinSamples;
     if (!meaningfullyChanged) {
         m_stripConfirmedClean = true;
         if (m_stripRechecksLeft > 0) {
@@ -2193,7 +2227,8 @@ bool Renderer::Render(const DockRenderState& state) {
     // finishes the last vertical axis from blurTemp. Compounded passes
     // give heavy frost without sparse-tap pixelation.
     const bool frostPass = (state.fxFlags & DOCK_FX_BLUR) != 0 && m_backdropValid &&
-        m_blurTemp != nullptr && m_blurTemp2 != nullptr;
+        m_blurTemp != nullptr && m_blurTemp2 != nullptr && m_backdropWidth > 0 &&
+        m_backdropHeight > 0;
     if (frostPass) {
         const D3D12_CPU_DESCRIPTOR_HANDLE rtvHeapStart =
             m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -2211,6 +2246,16 @@ bool Renderer::Render(const DockRenderState& state) {
         blurView.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         blurView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         blurView.Texture2D.MipLevels = 1;
+
+        // Frost RTs are quarter-res; keep scene0 at full dock size so lens UVs /
+        // icon halos stay in chrome space. Shaders remap SV_Position into that
+        // space (see BlurHPS).
+        D3D12_VIEWPORT blurViewport{0.0F, 0.0F, static_cast<float>(m_backdropWidth),
+            static_cast<float>(m_backdropHeight), 0.0F, 1.0F};
+        D3D12_RECT blurScissor{0, 0, static_cast<LONG>(m_backdropWidth),
+            static_cast<LONG>(m_backdropHeight)};
+        m_commandList->RSSetViewports(1, &blurViewport);
+        m_commandList->RSSetScissorRects(1, &blurScissor);
 
         const auto blurPass = [&](ID3D12Resource* target, bool& isShaderResource,
                                   SIZE_T rtvIndex, UINT srvIndex,
@@ -2265,6 +2310,9 @@ bool Renderer::Render(const DockRenderState& state) {
                 kTempBlurDescriptor, m_blurH2Pipeline.Get());
         }
 
+        // Back to full-res swap chain for glass face + chrome.
+        m_commandList->RSSetViewports(1, &viewport);
+        m_commandList->RSSetScissorRects(1, &scissor);
         m_commandList->OMSetRenderTargets(1, &renderTarget, FALSE, nullptr);
     }
     m_commandList->SetPipelineState(m_glassPipeline.Get());
@@ -2634,17 +2682,28 @@ void Renderer::CreateRenderTargets() {
     }
 }
 
+UINT Renderer::BackdropWidth() const noexcept {
+    return (std::max)(1U, (m_width + kBackdropDownsample - 1U) / kBackdropDownsample);
+}
+
+UINT Renderer::BackdropHeight() const noexcept {
+    return (std::max)(1U, (m_height + kBackdropDownsample - 1U) / kBackdropDownsample);
+}
+
 void Renderer::CreateBackdropResources() {
     ReleaseBackdropResources();
 
     try {
+        m_backdropWidth = BackdropWidth();
+        m_backdropHeight = BackdropHeight();
+
         HDC screen = GetDC(nullptr);
         if (screen == nullptr) {
             throw std::runtime_error("GetDC for desktop backdrop failed.");
         }
 
         m_backdropDc = CreateCompatibleDC(screen);
-        BITMAPV5HEADER header = CaptureDibHeader(m_width, m_height);
+        BITMAPV5HEADER header = CaptureDibHeader(m_backdropWidth, m_backdropHeight);
         void* bits = nullptr;
         m_backdropBitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
             DIB_RGB_COLORS, &bits, nullptr, 0);
@@ -2662,9 +2721,9 @@ void Renderer::CreateBackdropResources() {
             throw std::runtime_error("Select desktop backdrop DIB failed.");
         }
         std::memset(m_backdropDibPixels, 0,
-            static_cast<size_t>(m_width) * static_cast<size_t>(m_height) * 4U);
+            static_cast<size_t>(m_backdropWidth) * static_cast<size_t>(m_backdropHeight) * 4U);
 
-        const D3D12_RESOURCE_DESC texture = TextureDescription(m_width, m_height);
+        const D3D12_RESOURCE_DESC texture = TextureDescription(m_backdropWidth, m_backdropHeight);
         const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
         Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &texture,
                   D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_backdropTexture)),
@@ -2740,9 +2799,9 @@ void Renderer::CreateBackdropResources() {
         m_device->CreateShaderResourceView(m_backdropTexture.Get(), &view, backdropDescriptor);
 
         // Separable-frost temp target (pass 1 horizontal blur lands here).
-        // Same size/format as the backdrop; recreated on every resize. Starts
-        // life as a render target (see m_blurTempIsShaderResource).
-        D3D12_RESOURCE_DESC blurDesc = TextureDescription(m_width, m_height);
+        // Same size/format as the quarter-res backdrop; recreated on resize.
+        // Starts life as a render target (see m_blurTempIsShaderResource).
+        D3D12_RESOURCE_DESC blurDesc = TextureDescription(m_backdropWidth, m_backdropHeight);
         blurDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         const D3D12_HEAP_PROPERTIES blurHeapProps = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
         Check(m_device->CreateCommittedResource(&blurHeapProps, D3D12_HEAP_FLAG_NONE, &blurDesc,
@@ -2806,6 +2865,8 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_blurTemp2IsShaderResource = false;
     m_backdropFootprint = {};
     m_backdropRowCount = 0;
+    m_backdropWidth = 0;
+    m_backdropHeight = 0;
     m_backdropInitialized = false;
     m_backdropValid = false;
     m_backdropHash = 0;
@@ -2838,12 +2899,12 @@ void Renderer::ReleaseBackdropResources() noexcept {
 }
 
 uint64_t Renderer::HashBackdropPixels() const noexcept {
-    if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0) {
+    if (m_backdropDibPixels == nullptr || m_backdropWidth == 0 || m_backdropHeight == 0) {
         return 0;
     }
 
     const uint32_t* words = reinterpret_cast<const uint32_t*>(m_backdropDibPixels);
-    const size_t count = static_cast<size_t>(m_width) * static_cast<size_t>(m_height);
+    const size_t count = static_cast<size_t>(m_backdropWidth) * static_cast<size_t>(m_backdropHeight);
     uint64_t hash = 14695981039346656037ull;
     constexpr size_t stride = 8;
     for (size_t index = 0; index < count; index += stride) {
@@ -2851,8 +2912,8 @@ uint64_t Renderer::HashBackdropPixels() const noexcept {
         hash *= 1099511628211ull;
     }
     hash ^= words[count - 1] & kBackdropRgbMask;
-    hash ^= static_cast<uint64_t>(m_width) << 32;
-    hash ^= m_height;
+    hash ^= static_cast<uint64_t>(m_backdropWidth) << 32;
+    hash ^= m_backdropHeight;
     return hash;
 }
 
@@ -2912,12 +2973,13 @@ bool Renderer::EnsureBackdropProbe(UINT width) {
 bool Renderer::ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept {
     const LONG width = screenRectangle.right - screenRectangle.left;
     const LONG height = screenRectangle.bottom - screenRectangle.top;
-    if (width <= 0 || height <= 0 || !m_backdropProbeValid ||
+    const UINT probeWidth = m_backdropWidth;
+    if (width <= 0 || height <= 0 || probeWidth == 0 || !m_backdropProbeValid ||
         m_backdropProbeReference.size() !=
-            static_cast<size_t>(width) * static_cast<size_t>(kBackdropProbeRows) * 4U) {
+            static_cast<size_t>(probeWidth) * static_cast<size_t>(kBackdropProbeRows) * 4U) {
         return false;
     }
-    if (!EnsureBackdropProbe(static_cast<UINT>(width))) {
+    if (!EnsureBackdropProbe(probeWidth)) {
         return false;
     }
 
@@ -2926,17 +2988,20 @@ bool Renderer::ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept {
         return false;
     }
     BOOL ok = TRUE;
+    const int prevMode = SetStretchBltMode(m_backdropProbeDc, COLORONCOLOR);
     for (UINT row = 0; row < kBackdropProbeRows; ++row) {
         const LONG srcY = screenRectangle.top +
             (height <= 1 ? 0
                          : static_cast<LONG>((static_cast<long long>(height - 1) * row) /
                                static_cast<long long>(kBackdropProbeRows - 1)));
-        if (BitBlt(m_backdropProbeDc, 0, static_cast<int>(row), static_cast<int>(width), 1, screen,
-                screenRectangle.left, srcY, SRCCOPY) == FALSE) {
+        if (StretchBlt(m_backdropProbeDc, 0, static_cast<int>(row), static_cast<int>(probeWidth), 1,
+                screen, screenRectangle.left, srcY, static_cast<int>(width), 1,
+                SRCCOPY) == FALSE) {
             ok = FALSE;
             break;
         }
     }
+    SetStretchBltMode(m_backdropProbeDc, prevMode);
     ReleaseDC(nullptr, screen);
     if (ok == FALSE) {
         return false;
@@ -2945,13 +3010,16 @@ bool Renderer::ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept {
     const uint32_t* cur = reinterpret_cast<const uint32_t*>(m_backdropProbePixels);
     const uint32_t* ref = reinterpret_cast<const uint32_t*>(m_backdropProbeReference.data());
     const size_t count =
-        static_cast<size_t>(width) * static_cast<size_t>(kBackdropProbeRows);
+        static_cast<size_t>(probeWidth) * static_cast<size_t>(kBackdropProbeRows);
     size_t diffs = 0;
     constexpr size_t stride = 4;
+    const size_t noiseBudget = (std::max)(static_cast<size_t>(6),
+        static_cast<size_t>(kBackdropProbeNoisePixels) /
+            (static_cast<size_t>(kBackdropDownsample) * static_cast<size_t>(kBackdropDownsample)));
     for (size_t i = 0; i < count; i += stride) {
         if (BackdropRgbDiffers(cur[i], ref[i])) {
             ++diffs;
-            if (diffs > kBackdropProbeNoisePixels) {
+            if (diffs > noiseBudget) {
                 return false;
             }
         }
@@ -2959,21 +3027,21 @@ bool Renderer::ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept {
     if (BackdropRgbDiffers(cur[count - 1], ref[count - 1])) {
         ++diffs;
     }
-    return diffs <= kBackdropProbeNoisePixels;
+    return diffs <= noiseBudget;
 }
 
 void Renderer::CommitBackdropProbeFromDib() noexcept {
-    if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0) {
+    if (m_backdropDibPixels == nullptr || m_backdropWidth == 0 || m_backdropHeight == 0) {
         m_backdropProbeValid = false;
         m_backdropProbeReference.clear();
         return;
     }
-    const size_t rowBytes = static_cast<size_t>(m_width) * 4U;
+    const size_t rowBytes = static_cast<size_t>(m_backdropWidth) * 4U;
     m_backdropProbeReference.resize(rowBytes * kBackdropProbeRows);
     for (UINT row = 0; row < kBackdropProbeRows; ++row) {
-        const UINT srcRow = (m_height <= 1)
+        const UINT srcRow = (m_backdropHeight <= 1)
             ? 0U
-            : static_cast<UINT>((static_cast<UINT64>(m_height - 1) * row) /
+            : static_cast<UINT>((static_cast<UINT64>(m_backdropHeight - 1) * row) /
                   (kBackdropProbeRows - 1));
         std::memcpy(m_backdropProbeReference.data() + row * rowBytes,
             m_backdropDibPixels + static_cast<size_t>(srcRow) * rowBytes, rowBytes);
@@ -2982,12 +3050,13 @@ void Renderer::CommitBackdropProbeFromDib() noexcept {
 }
 
 size_t Renderer::CountBackdropSampleDiffs() const noexcept {
-    if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0 ||
+    if (m_backdropDibPixels == nullptr || m_backdropWidth == 0 || m_backdropHeight == 0 ||
         m_backdropCommittedSamples.empty()) {
         return SIZE_MAX / 4U;
     }
     const uint32_t* words = reinterpret_cast<const uint32_t*>(m_backdropDibPixels);
-    const size_t count = static_cast<size_t>(m_width) * static_cast<size_t>(m_height);
+    const size_t count =
+        static_cast<size_t>(m_backdropWidth) * static_cast<size_t>(m_backdropHeight);
     constexpr size_t stride = 8;
     size_t sampleCount = (count + stride - 1) / stride;
     if (count > 0) {
@@ -3016,11 +3085,12 @@ size_t Renderer::CountBackdropSampleDiffs() const noexcept {
 
 void Renderer::CommitBackdropSamplesFromDib() noexcept {
     m_backdropCommittedSamples.clear();
-    if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0) {
+    if (m_backdropDibPixels == nullptr || m_backdropWidth == 0 || m_backdropHeight == 0) {
         return;
     }
     const uint32_t* words = reinterpret_cast<const uint32_t*>(m_backdropDibPixels);
-    const size_t count = static_cast<size_t>(m_width) * static_cast<size_t>(m_height);
+    const size_t count =
+        static_cast<size_t>(m_backdropWidth) * static_cast<size_t>(m_backdropHeight);
     constexpr size_t stride = 8;
     m_backdropCommittedSamples.reserve((count / stride) + 2U);
     for (size_t index = 0; index < count; index += stride) {
@@ -3038,7 +3108,7 @@ bool Renderer::UploadBackdropPixels() {
     if (!WaitForBackdropCopy(kCopyWaitMs)) {
         return false;
     }
-    const size_t rowBytes = static_cast<size_t>(m_width) * 4U;
+    const size_t rowBytes = static_cast<size_t>(m_backdropWidth) * 4U;
     for (UINT row = 0; row < m_backdropRowCount; ++row) {
         std::memcpy(m_backdropUploadPixels + m_backdropFootprint.Offset +
                 static_cast<size_t>(row) * m_backdropFootprint.Footprint.RowPitch,
@@ -3253,7 +3323,8 @@ uint64_t Renderer::HashPanelCapturePixels(UINT width, UINT height) const noexcep
 
 void Renderer::StampDockBackdropInto(const RECT& panel, uint8_t* panelPixels) const noexcept {
     if (!m_backdropOriginValid || !m_backdropValid || m_backdropDibPixels == nullptr ||
-        panelPixels == nullptr || m_width == 0 || m_height == 0) {
+        panelPixels == nullptr || m_width == 0 || m_height == 0 || m_backdropWidth == 0 ||
+        m_backdropHeight == 0) {
         return;
     }
     const RECT dock{
@@ -3266,19 +3337,31 @@ void Renderer::StampDockBackdropInto(const RECT& panel, uint8_t* panelPixels) co
         return;
     }
     const int panelWidth = static_cast<int>(panel.right - panel.left);
-    const int byteCount = static_cast<int>(overlap.right - overlap.left) * 4;
-    if (panelWidth <= 0 || byteCount <= 0) {
+    if (panelWidth <= 0) {
         return;
     }
+    // Nearest upsample from the quarter-res dock plate into the full-res panel.
     for (LONG y = overlap.top; y < overlap.bottom; ++y) {
         const int panelRow = static_cast<int>(y - panel.top);
-        const int dockRow = static_cast<int>(y - dock.top);
-        const int panelCol = static_cast<int>(overlap.left - panel.left);
-        const int dockCol = static_cast<int>(overlap.left - dock.left);
-        std::memcpy(
-            panelPixels + (static_cast<size_t>(panelRow) * static_cast<size_t>(panelWidth) + panelCol) * 4U,
-            m_backdropDibPixels + (static_cast<size_t>(dockRow) * m_width + static_cast<size_t>(dockCol)) * 4U,
-            static_cast<size_t>(byteCount));
+        const int dockRowFull = static_cast<int>(y - dock.top);
+        const UINT srcRow = (std::min)(m_backdropHeight - 1U,
+            static_cast<UINT>((static_cast<UINT64>(dockRowFull) * m_backdropHeight) / m_height));
+        uint8_t* dst = panelPixels +
+            (static_cast<size_t>(panelRow) * static_cast<size_t>(panelWidth) +
+                static_cast<size_t>(overlap.left - panel.left)) *
+                4U;
+        for (LONG x = overlap.left; x < overlap.right; ++x) {
+            const int dockColFull = static_cast<int>(x - dock.left);
+            const UINT srcCol = (std::min)(m_backdropWidth - 1U,
+                static_cast<UINT>((static_cast<UINT64>(dockColFull) * m_backdropWidth) / m_width));
+            const uint8_t* src = m_backdropDibPixels +
+                (static_cast<size_t>(srcRow) * m_backdropWidth + srcCol) * 4U;
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+            dst[3] = src[3];
+            dst += 4;
+        }
     }
 }
 
@@ -3771,14 +3854,17 @@ void Renderer::SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const
     r = DOCK_CHROME_INK_R;
     g = DOCK_CHROME_INK_G;
     b = DOCK_CHROME_INK_B;
-    if (!m_backdropValid || m_backdropDibPixels == nullptr || m_width < 2 || m_height < 2) {
+    if (!m_backdropValid || m_backdropDibPixels == nullptr || m_backdropWidth < 2 ||
+        m_backdropHeight < 2) {
         return;
     }
     auto sampleLuma = [this](float u, float v) -> float {
-        const UINT x = (std::min)(m_width - 1U, static_cast<UINT>(u * static_cast<float>(m_width - 1U)));
-        const UINT y = (std::min)(m_height - 1U, static_cast<UINT>(v * static_cast<float>(m_height - 1U)));
+        const UINT x = (std::min)(m_backdropWidth - 1U,
+            static_cast<UINT>(u * static_cast<float>(m_backdropWidth - 1U)));
+        const UINT y = (std::min)(m_backdropHeight - 1U,
+            static_cast<UINT>(v * static_cast<float>(m_backdropHeight - 1U)));
         const uint8_t* p =
-            m_backdropDibPixels + (static_cast<size_t>(y) * m_width + x) * 4U;
+            m_backdropDibPixels + (static_cast<size_t>(y) * m_backdropWidth + x) * 4U;
         // DIB is BGRA; Rec.709 luma matches the shader's rgb dot.
         return (0.0722F * static_cast<float>(p[0]) + 0.7152F * static_cast<float>(p[1]) +
                    0.2126F * static_cast<float>(p[2])) /

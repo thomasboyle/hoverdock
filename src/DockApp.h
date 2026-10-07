@@ -309,16 +309,12 @@ private:
     void PositionOverlayWindows();
     void UpdateHoverLabel();
     void HideHoverLabel() noexcept;
-    // GDI raster of a hover bubble: 32-bit BGRA bits with the displayed alpha
-    // baked in. Pure function of (text, scale); UpdateHoverLabel caches results
-    // so fast cursor waggles blit instead of re-running font/DC churn per icon.
-    [[nodiscard]] bool RasterizeHoverLabel(const std::wstring& text, float scale, SIZE& labelSize,
-        std::vector<uint8_t>& bits);
-    struct HoverLabelBits {
-        SIZE size{};
-        std::vector<uint8_t> pixels;
-    };
-    std::unordered_map<std::wstring, HoverLabelBits> m_hoverLabelCache;
+    // Liquid-glass hover label: BakeGlassPanel plate + flyout ink glyphs.
+    // screenOrigin is the layered-window top-left (label sits above the dock).
+    // Height is uniform for every label; width follows text up to a max with
+    // ellipsis. Not cached — glass samples the live backdrop at that origin.
+    [[nodiscard]] bool RasterizeHoverLabel(const std::wstring& text, float scale,
+        POINT screenOrigin, SIZE& labelSize, std::vector<uint8_t>& bits);
     void DestroyHoverLabelFont() noexcept;
     [[nodiscard]] HFONT HoverLabelFont();
     struct IconLoadRequest {

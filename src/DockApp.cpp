@@ -4175,10 +4175,8 @@ void DockApp::UpdateHoverLabel() {
     }
 
     if (m_hoveredIcon == m_hoverLabelIcon) {
-        // The bubble overlaps the dock window, so any dock move to HWND_TOPMOST
-        // (layout, animation tick) sinks it behind the glass where it stays
-        // visible through the transparency. Re-assert topmost without
-        // re-rasterizing so it never renders from behind.
+        // Label sits above the dock; dock HWND_TOPMOST bumps can still sink it.
+        // Re-assert topmost without re-baking glass.
         if (m_hoverLabelWindow != nullptr && IsWindowVisible(m_hoverLabelWindow) != FALSE) {
             SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, 0, 0, 0, 0,
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_NOREDRAW);
@@ -4207,33 +4205,6 @@ void DockApp::UpdateHoverLabel() {
 
     const UINT dpi = GetDpiForWindow(m_window);
     const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
-    const std::wstring cacheKey =
-        text + L'|' + std::to_wstring(static_cast<int>(std::lround(scale * 100.0F)));
-    const HoverLabelBits* cached = nullptr;
-    {
-        const auto found = m_hoverLabelCache.find(cacheKey);
-        if (found != m_hoverLabelCache.end()) {
-            cached = &found->second;
-        }
-    }
-    SIZE labelSize{};
-    const std::vector<uint8_t>* labelBits = nullptr;
-    std::vector<uint8_t> rasterized;
-    if (cached != nullptr) {
-        labelSize = cached->size;
-        labelBits = &cached->pixels;
-    } else {
-        if (!RasterizeHoverLabel(text, scale, labelSize, rasterized)) {
-            HideHoverLabel();
-            return;
-        }
-        if (m_hoverLabelCache.size() >= 64) {
-            m_hoverLabelCache.clear();
-        }
-        labelBits = &m_hoverLabelCache
-                         .emplace(cacheKey, HoverLabelBits{labelSize, rasterized})
-                         .first->second.pixels;
-    }
 
     POINT iconTopLeft{m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].bounds.left,
         m_iconRenderData[static_cast<size_t>(m_hoveredIcon)].bounds.top};
@@ -4244,10 +4215,64 @@ void DockApp::UpdateHoverLabel() {
         HideHoverLabel();
         return;
     }
-    const LONG gap = GreaterOf(2L, static_cast<LONG>(std::lround(4.0F * scale)));
+    RECT dockScreen{};
+    if (GetWindowRect(m_window, &dockScreen) == FALSE) {
+        HideHoverLabel();
+        return;
+    }
+    // Uniform pill height; gap clears the dock window so the bubble sits above.
+    const LONG gap = GreaterOf(6L, static_cast<LONG>(std::lround(8.0F * scale)));
+    const LONG bubbleHeight = GreaterOf(28L, static_cast<LONG>(std::lround(28.0F * scale)));
+    const LONG horizontalPadding = GreaterOf(10L, static_cast<LONG>(std::lround(14.0F * scale)));
+    const LONG minWidth = GreaterOf(56L, static_cast<LONG>(std::lround(56.0F * scale)));
+    const LONG maxWidth = GreaterOf(220L, static_cast<LONG>(std::lround(240.0F * scale)));
+    LONG textWidth = 0;
+    {
+        HFONT font = HoverLabelFont();
+        HDC measureDc = GetDC(nullptr);
+        if (measureDc != nullptr) {
+            HDC memory = CreateCompatibleDC(measureDc);
+            if (memory != nullptr) {
+                HGDIOBJ prev = SelectObject(memory, font);
+                SIZE textSize{};
+                if (GetTextExtentPoint32W(memory, text.c_str(), static_cast<int>(text.size()),
+                        &textSize) != FALSE) {
+                    textWidth = textSize.cx;
+                }
+                if (prev != nullptr && prev != HGDI_ERROR) {
+                    SelectObject(memory, prev);
+                }
+                DeleteDC(memory);
+            }
+            ReleaseDC(nullptr, measureDc);
+        }
+    }
+    LONG bubbleWidth = textWidth + horizontalPadding * 2L;
+    if (bubbleWidth < minWidth) {
+        bubbleWidth = minWidth;
+    }
+    if (bubbleWidth > maxWidth) {
+        bubbleWidth = maxWidth;
+    }
+    POINT destination{
+        iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L - bubbleWidth / 2L,
+        dockScreen.top - bubbleHeight - gap};
+
+    // Hide before bake so the previous layered bubble is not in the capture.
+    if (m_hoverLabelWindow != nullptr) {
+        ShowWindow(m_hoverLabelWindow, SW_HIDE);
+    }
+
+    SIZE labelSize{};
+    std::vector<uint8_t> rasterized;
+    if (!RasterizeHoverLabel(text, scale, destination, labelSize, rasterized)) {
+        HideHoverLabel();
+        return;
+    }
+
     const size_t byteCount =
         static_cast<size_t>(labelSize.cx) * static_cast<size_t>(labelSize.cy) * 4U;
-    if (labelBits->size() != byteCount || labelSize.cx <= 0 || labelSize.cy <= 0) {
+    if (rasterized.size() != byteCount || labelSize.cx <= 0 || labelSize.cy <= 0) {
         HideHoverLabel();
         return;
     }
@@ -4276,7 +4301,7 @@ void DockApp::UpdateHoverLabel() {
         HideHoverLabel();
         return;
     }
-    std::memcpy(dibBits, labelBits->data(), byteCount);
+    std::memcpy(dibBits, rasterized.data(), byteCount);
     HDC memory = CreateCompatibleDC(screen);
     ReleaseDC(nullptr, screen);
     if (memory == nullptr) {
@@ -4291,10 +4316,6 @@ void DockApp::UpdateHoverLabel() {
         HideHoverLabel();
         return;
     }
-
-    POINT destination{iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L -
-            labelSize.cx / 2L,
-        iconTopLeft.y - labelSize.cy - gap};
     POINT source{0L, 0L};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     const BOOL updated = UpdateLayeredWindow(m_hoverLabelWindow, nullptr, &destination, &labelSize,
@@ -4316,10 +4337,9 @@ void DockApp::UpdateHoverLabel() {
     m_hoverLabelIcon = m_hoveredIcon;
 }
 
-bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, SIZE& labelSize,
-    std::vector<uint8_t>& bits) {
+bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, POINT screenOrigin,
+    SIZE& labelSize, std::vector<uint8_t>& bits) {
     HFONT font = HoverLabelFont();
-    HGDIOBJ fontObject = font;
     HDC screen = GetDC(nullptr);
     if (screen == nullptr) {
         return false;
@@ -4329,7 +4349,7 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, SIZE& l
         ReleaseDC(nullptr, screen);
         return false;
     }
-    HGDIOBJ previousFont = SelectObject(memory, fontObject);
+    HGDIOBJ previousFont = SelectObject(memory, font);
     if (previousFont == nullptr || previousFont == HGDI_ERROR) {
         DeleteDC(memory);
         ReleaseDC(nullptr, screen);
@@ -4344,112 +4364,45 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, SIZE& l
         ReleaseDC(nullptr, screen);
         return false;
     }
-
-    const LONG horizontalPadding = GreaterOf(8L, static_cast<LONG>(std::lround(12.0F * scale)));
-    const LONG verticalPadding = GreaterOf(5L, static_cast<LONG>(std::lround(6.0F * scale)));
-    const LONG triangleWidth = GreaterOf(10L, static_cast<LONG>(std::lround(12.0F * scale)));
-    const LONG triangleHeight = GreaterOf(6L, static_cast<LONG>(std::lround(7.0F * scale)));
-    const LONG cornerRadius = GreaterOf(5L, static_cast<LONG>(std::lround(7.0F * scale)));
-    const LONG bubbleWidth = GreaterOf(60L, textSize.cx + horizontalPadding * 2L);
-    const LONG bubbleHeight = GreaterOf(24L, textSize.cy + verticalPadding * 2L);
-    labelSize = {bubbleWidth, bubbleHeight + triangleHeight};
-
-    BITMAPV5HEADER header{};
-    header.bV5Size = sizeof(header);
-    header.bV5Width = labelSize.cx;
-    header.bV5Height = -labelSize.cy;
-    header.bV5Planes = 1;
-    header.bV5BitCount = 32;
-    header.bV5Compression = BI_BITFIELDS;
-    header.bV5RedMask = 0x00ff0000U;
-    header.bV5GreenMask = 0x0000ff00U;
-    header.bV5BlueMask = 0x000000ffU;
-    header.bV5AlphaMask = 0xff000000U;
-    void* dibBits = nullptr;
-    HBITMAP bitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
-        DIB_RGB_COLORS, &dibBits, nullptr, 0);
-    ReleaseDC(nullptr, screen);
-    if (bitmap == nullptr || dibBits == nullptr) {
-        SelectObject(memory, previousFont);
-        DeleteDC(memory);
-        return false;
-    }
-    HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
-    if (previousBitmap == nullptr || previousBitmap == HGDI_ERROR) {
-        DeleteObject(bitmap);
-        SelectObject(memory, previousFont);
-        DeleteDC(memory);
-        return false;
-    }
-
-    const size_t pixelCount = static_cast<size_t>(labelSize.cx) * static_cast<size_t>(labelSize.cy);
-    std::memset(dibBits, 0, pixelCount * sizeof(DWORD));
-    HBRUSH bubbleBrush = CreateSolidBrush(RGB(42, 42, 46));
-    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(112, 112, 120));
-    if (bubbleBrush == nullptr || borderPen == nullptr) {
-        if (bubbleBrush != nullptr) {
-            DeleteObject(bubbleBrush);
-        }
-        if (borderPen != nullptr) {
-            DeleteObject(borderPen);
-        }
-        SelectObject(memory, previousBitmap);
-        DeleteObject(bitmap);
-        SelectObject(memory, previousFont);
-        DeleteDC(memory);
-        return false;
-    }
-    HGDIOBJ previousBrush = SelectObject(memory, bubbleBrush);
-    HGDIOBJ previousPen = SelectObject(memory, borderPen);
-    if (previousBrush == nullptr || previousBrush == HGDI_ERROR || previousPen == nullptr ||
-        previousPen == HGDI_ERROR) {
-        if (previousBrush != nullptr && previousBrush != HGDI_ERROR) {
-            SelectObject(memory, previousBrush);
-        }
-        if (previousPen != nullptr && previousPen != HGDI_ERROR) {
-            SelectObject(memory, previousPen);
-        }
-        DeleteObject(borderPen);
-        DeleteObject(bubbleBrush);
-        SelectObject(memory, previousBitmap);
-        DeleteObject(bitmap);
-        SelectObject(memory, previousFont);
-        DeleteDC(memory);
-        return false;
-    }
-
-    RoundRect(memory, 0, 0, SaturatedInt(bubbleWidth), SaturatedInt(bubbleHeight),
-        SaturatedInt(cornerRadius * 2L), SaturatedInt(cornerRadius * 2L));
-    const LONG center = bubbleWidth / 2L;
-    POINT triangle[3] = {
-        {center - triangleWidth / 2L, bubbleHeight - 1L},
-        {center + triangleWidth / 2L, bubbleHeight - 1L},
-        {center, bubbleHeight + triangleHeight - 1L},
-    };
-    Polygon(memory, triangle, SaturatedInt(static_cast<LONG>(std::size(triangle))));
-    SetBkMode(memory, TRANSPARENT);
-    SetTextColor(memory, RGB(245, 245, 247));
-    RECT textBounds{horizontalPadding, 0L, bubbleWidth - horizontalPadding, bubbleHeight};
-    DrawTextW(memory, text.c_str(), textLength, &textBounds,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-
-    DWORD* pixels = static_cast<DWORD*>(dibBits);
-    for (size_t index = 0; index < pixelCount; ++index) {
-        if ((pixels[index] & 0x00ffffffU) != 0) {
-            pixels[index] |= 0xff000000U;
-        }
-    }
-    bits.assign(static_cast<const uint8_t*>(dibBits), static_cast<const uint8_t*>(dibBits) +
-        pixelCount * sizeof(DWORD));
-
-    SelectObject(memory, previousPen);
-    SelectObject(memory, previousBrush);
-    DeleteObject(borderPen);
-    DeleteObject(bubbleBrush);
-    SelectObject(memory, previousBitmap);
-    DeleteObject(bitmap);
     SelectObject(memory, previousFont);
     DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+
+    // Uniform height for every label; width tracks text up to a max (ellipsis).
+    const LONG horizontalPadding = GreaterOf(10L, static_cast<LONG>(std::lround(14.0F * scale)));
+    const LONG minWidth = GreaterOf(56L, static_cast<LONG>(std::lround(56.0F * scale)));
+    const LONG maxWidth = GreaterOf(220L, static_cast<LONG>(std::lround(240.0F * scale)));
+    const LONG bubbleHeight = GreaterOf(28L, static_cast<LONG>(std::lround(28.0F * scale)));
+    LONG bubbleWidth = textSize.cx + horizontalPadding * 2L;
+    if (bubbleWidth < minWidth) {
+        bubbleWidth = minWidth;
+    }
+    if (bubbleWidth > maxWidth) {
+        bubbleWidth = maxWidth;
+    }
+    labelSize = {bubbleWidth, bubbleHeight};
+    const size_t byteCount =
+        static_cast<size_t>(labelSize.cx) * static_cast<size_t>(labelSize.cy) * 4U;
+    bits.assign(byteCount, 0);
+
+    // Same liquid-glass stack as dock-face panels (backdrop blur + face tonemap).
+    const bool baked = m_rendererInitialized &&
+        TryBakePopupGlass(screenOrigin, labelSize.cx, labelSize.cy, bits.data(), byteCount, true,
+            false);
+    if (!baked) {
+        // Soft fallback plate if the GPU bake is unavailable.
+        for (size_t i = 0; i + 3 < byteCount; i += 4) {
+            bits[i + 0] = 46;
+            bits[i + 1] = 46;
+            bits[i + 2] = 50;
+            bits[i + 3] = 230;
+        }
+    }
+
+    SetFlyoutChromeInkForGlass(bits.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy));
+    RECT textBounds{horizontalPadding / 2L, 0L, bubbleWidth - horizontalPadding / 2L, bubbleHeight};
+    DrawFlyoutText(bits.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy), textBounds,
+        font, text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
     return true;
 }
 

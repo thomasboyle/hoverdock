@@ -164,6 +164,9 @@ private:
     static constexpr UINT kBackdropTextureDescriptor = 1;
     static constexpr UINT kTempBlurDescriptor = 2;
     static constexpr UINT kTempBlurDescriptor2 = 3;
+    // Dock glass backdrop + frost intermediates: 1/2 width x 1/2 height
+    // (= 1/4 pixels). Chrome (icons/labels) stays full-res on the swap chain.
+    static constexpr UINT kBackdropDownsample = 2;
 
     struct alignas(256) FrameConstants {
         float scene0[4]{};
@@ -193,6 +196,8 @@ private:
     void CreateRenderTargets();
     void CreateBackdropResources();
     void ReleaseBackdropResources() noexcept;
+    [[nodiscard]] UINT BackdropWidth() const noexcept;
+    [[nodiscard]] UINT BackdropHeight() const noexcept;
     [[nodiscard]] bool UploadBackdropPixels();
     [[nodiscard]] uint64_t HashBackdropPixels() const noexcept;
     [[nodiscard]] bool EnsureBackdropProbe(UINT width);
@@ -271,13 +276,16 @@ private:
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_pendingUploads;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_backdropFootprint{};
     UINT m_backdropRowCount = 0;
+    UINT m_backdropWidth = 0;
+    UINT m_backdropHeight = 0;
     uint8_t* m_backdropUploadPixels = nullptr;
     HDC m_backdropDc = nullptr;
     HBITMAP m_backdropBitmap = nullptr;
     HGDIOBJ m_backdropPreviousBitmap = nullptr;
     uint8_t* m_backdropDibPixels = nullptr;
-    // Screen origin of the pixels in m_backdropDibPixels. Menu captures paste
-    // this over the dock so the plate does not sample the dock's swap chain.
+    // Screen origin of the pixels in m_backdropDibPixels (full dock strip).
+    // Menu captures upsample this half-res plate over the dock overlap so the
+    // plate does not sample the dock's swap chain.
     LONG m_backdropOriginX = 0;
     LONG m_backdropOriginY = 0;
     bool m_backdropOriginValid = false;
