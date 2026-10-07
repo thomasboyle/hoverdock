@@ -4220,12 +4220,13 @@ void DockApp::UpdateHoverLabel() {
         HideHoverLabel();
         return;
     }
-    // Uniform pill height; gap clears the dock window so the bubble sits above.
-    const LONG gap = GreaterOf(6L, static_cast<LONG>(std::lround(8.0F * scale)));
+    // Uniform pill + caret; tip sits just above the dock window top.
+    const LONG gap = GreaterOf(4L, static_cast<LONG>(std::lround(5.0F * scale)));
     const LONG bubbleHeight = GreaterOf(28L, static_cast<LONG>(std::lround(28.0F * scale)));
-    const LONG horizontalPadding = GreaterOf(10L, static_cast<LONG>(std::lround(14.0F * scale)));
-    const LONG minWidth = GreaterOf(56L, static_cast<LONG>(std::lround(56.0F * scale)));
-    const LONG maxWidth = GreaterOf(220L, static_cast<LONG>(std::lround(240.0F * scale)));
+    const LONG triangleHeight = GreaterOf(6L, static_cast<LONG>(std::lround(7.0F * scale)));
+    const LONG horizontalPadding = GreaterOf(12L, static_cast<LONG>(std::lround(16.0F * scale)));
+    const LONG minWidth = GreaterOf(64L, static_cast<LONG>(std::lround(64.0F * scale)));
+    const LONG maxWidth = GreaterOf(240L, static_cast<LONG>(std::lround(260.0F * scale)));
     LONG textWidth = 0;
     {
         HFONT font = HoverLabelFont();
@@ -4254,9 +4255,10 @@ void DockApp::UpdateHoverLabel() {
     if (bubbleWidth > maxWidth) {
         bubbleWidth = maxWidth;
     }
+    const LONG totalHeight = bubbleHeight + triangleHeight;
     POINT destination{
         iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L - bubbleWidth / 2L,
-        dockScreen.top - bubbleHeight - gap};
+        dockScreen.top - totalHeight - gap};
 
     // Hide before bake so the previous layered bubble is not in the capture.
     if (m_hoverLabelWindow != nullptr) {
@@ -4368,11 +4370,14 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, POINT s
     DeleteDC(memory);
     ReleaseDC(nullptr, screen);
 
-    // Uniform height for every label; width tracks text up to a max (ellipsis).
-    const LONG horizontalPadding = GreaterOf(10L, static_cast<LONG>(std::lround(14.0F * scale)));
-    const LONG minWidth = GreaterOf(56L, static_cast<LONG>(std::lround(56.0F * scale)));
-    const LONG maxWidth = GreaterOf(220L, static_cast<LONG>(std::lround(240.0F * scale)));
+    // Light frosted pill + speech caret (matches ideal-label-look reference).
+    const LONG horizontalPadding = GreaterOf(12L, static_cast<LONG>(std::lround(16.0F * scale)));
+    const LONG minWidth = GreaterOf(64L, static_cast<LONG>(std::lround(64.0F * scale)));
+    const LONG maxWidth = GreaterOf(240L, static_cast<LONG>(std::lround(260.0F * scale)));
     const LONG bubbleHeight = GreaterOf(28L, static_cast<LONG>(std::lround(28.0F * scale)));
+    const LONG triangleWidth = GreaterOf(10L, static_cast<LONG>(std::lround(12.0F * scale)));
+    const LONG triangleHeight = GreaterOf(6L, static_cast<LONG>(std::lround(7.0F * scale)));
+    const LONG cornerRadius = GreaterOf(10L, static_cast<LONG>(std::lround(12.0F * scale)));
     LONG bubbleWidth = textSize.cx + horizontalPadding * 2L;
     if (bubbleWidth < minWidth) {
         bubbleWidth = minWidth;
@@ -4380,26 +4385,127 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, POINT s
     if (bubbleWidth > maxWidth) {
         bubbleWidth = maxWidth;
     }
-    labelSize = {bubbleWidth, bubbleHeight};
-    const size_t byteCount =
-        static_cast<size_t>(labelSize.cx) * static_cast<size_t>(labelSize.cy) * 4U;
+    labelSize = {bubbleWidth, bubbleHeight + triangleHeight};
+    const size_t pixelCount =
+        static_cast<size_t>(labelSize.cx) * static_cast<size_t>(labelSize.cy);
+    const size_t byteCount = pixelCount * 4U;
     bits.assign(byteCount, 0);
 
-    // Same liquid-glass stack as dock-face panels (backdrop blur + face tonemap).
-    const bool baked = m_rendererInitialized &&
-        TryBakePopupGlass(screenOrigin, labelSize.cx, labelSize.cy, bits.data(), byteCount, true,
-            false);
+    // Always bake a *light* frosted face (even if dock/menus are dark).
+    const RECT screenRect{screenOrigin.x, screenOrigin.y, screenOrigin.x + labelSize.cx,
+        screenOrigin.y + labelSize.cy};
+    const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
+    bool baked = false;
+    if (m_rendererInitialized) {
+        std::vector<uint8_t> glass;
+        baked = m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(labelSize.cx),
+            static_cast<UINT>(labelSize.cy), PackPopupGlassFxFlags(true, false),
+            DOCK_QS_SETTINGS_GLASS_ALPHA, dpiScale, m_settingsWindow, m_overflowWindow,
+            m_hoverLabelWindow, true /* lightPlate */, glass);
+        if (baked && glass.size() == byteCount) {
+            bits = std::move(glass);
+        } else {
+            baked = false;
+        }
+    }
     if (!baked) {
-        // Soft fallback plate if the GPU bake is unavailable.
         for (size_t i = 0; i + 3 < byteCount; i += 4) {
-            bits[i + 0] = 46;
-            bits[i + 1] = 46;
-            bits[i + 2] = 50;
-            bits[i + 3] = 230;
+            bits[i + 0] = 235;
+            bits[i + 1] = 235;
+            bits[i + 2] = 240;
+            bits[i + 3] = 220;
         }
     }
 
-    SetFlyoutChromeInkForGlass(bits.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy));
+    // Supersampled pill + downward caret mask (same AA approach as overflow).
+    constexpr LONG kMaskSupersample = 2;
+    const LONG maskW = labelSize.cx * kMaskSupersample;
+    const LONG maskH = labelSize.cy * kMaskSupersample;
+    HDC maskDc = CreateCompatibleDC(nullptr);
+    void* maskBits = nullptr;
+    HBITMAP maskBitmap = nullptr;
+    BITMAPV5HEADER maskHeader{};
+    maskHeader.bV5Size = sizeof(maskHeader);
+    maskHeader.bV5Width = maskW;
+    maskHeader.bV5Height = -maskH;
+    maskHeader.bV5Planes = 1;
+    maskHeader.bV5BitCount = 32;
+    maskHeader.bV5Compression = BI_BITFIELDS;
+    maskHeader.bV5RedMask = 0x00ff0000U;
+    maskHeader.bV5GreenMask = 0x0000ff00U;
+    maskHeader.bV5BlueMask = 0x000000ffU;
+    maskHeader.bV5AlphaMask = 0xff000000U;
+    if (maskDc != nullptr) {
+        maskBitmap = CreateDIBSection(maskDc, reinterpret_cast<const BITMAPINFO*>(&maskHeader),
+            DIB_RGB_COLORS, &maskBits, nullptr, 0);
+    }
+    if (maskDc != nullptr && maskBitmap != nullptr && maskBits != nullptr) {
+        HGDIOBJ previousMask = SelectObject(maskDc, maskBitmap);
+        RECT all{0, 0, maskW, maskH};
+        FillRect(maskDc, &all, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        HBRUSH whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+        HPEN whitePen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+        HGDIOBJ previousBrush = SelectObject(maskDc, whiteBrush);
+        HGDIOBJ previousPen = SelectObject(maskDc, whitePen);
+        RoundRect(maskDc, 0, 0, SaturatedInt(bubbleWidth * kMaskSupersample),
+            SaturatedInt(bubbleHeight * kMaskSupersample),
+            SaturatedInt(cornerRadius * 2L * kMaskSupersample),
+            SaturatedInt(cornerRadius * 2L * kMaskSupersample));
+        const LONG center = bubbleWidth / 2L;
+        POINT triangle[3] = {
+            {(center - triangleWidth / 2L) * kMaskSupersample,
+                bubbleHeight * kMaskSupersample - kMaskSupersample},
+            {(center + triangleWidth / 2L) * kMaskSupersample,
+                bubbleHeight * kMaskSupersample - kMaskSupersample},
+            {center * kMaskSupersample,
+                (bubbleHeight + triangleHeight) * kMaskSupersample - kMaskSupersample},
+        };
+        Polygon(maskDc, triangle, 3);
+        SelectObject(maskDc, previousPen);
+        SelectObject(maskDc, previousBrush);
+        DeleteObject(whitePen);
+        DeleteObject(whiteBrush);
+
+        auto* mask = static_cast<uint8_t*>(maskBits);
+        const float kMaskSamples = static_cast<float>(kMaskSupersample * kMaskSupersample);
+        for (LONG y = 0; y < labelSize.cy; ++y) {
+            for (LONG x = 0; x < labelSize.cx; ++x) {
+                unsigned covered = 0;
+                for (LONG sampleY = 0; sampleY < kMaskSupersample; ++sampleY) {
+                    const size_t maskRow =
+                        (static_cast<size_t>(y) * kMaskSupersample + static_cast<size_t>(sampleY)) *
+                        static_cast<size_t>(maskW);
+                    for (LONG sampleX = 0; sampleX < kMaskSupersample; ++sampleX) {
+                        covered += mask[(maskRow + static_cast<size_t>(x) * kMaskSupersample +
+                                            static_cast<size_t>(sampleX)) *
+                            4U];
+                    }
+                }
+                const float cov = static_cast<float>(covered) / (255.0F * kMaskSamples);
+                uint8_t* p = bits.data() +
+                    (static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx) +
+                        static_cast<size_t>(x)) *
+                        4U;
+                p[0] = static_cast<uint8_t>(std::lround(static_cast<float>(p[0]) * cov));
+                p[1] = static_cast<uint8_t>(std::lround(static_cast<float>(p[1]) * cov));
+                p[2] = static_cast<uint8_t>(std::lround(static_cast<float>(p[2]) * cov));
+                p[3] = static_cast<uint8_t>(std::lround(static_cast<float>(p[3]) * cov));
+            }
+        }
+        SelectObject(maskDc, previousMask);
+        DeleteObject(maskBitmap);
+        DeleteDC(maskDc);
+    } else {
+        if (maskBitmap != nullptr) {
+            DeleteObject(maskBitmap);
+        }
+        if (maskDc != nullptr) {
+            DeleteDC(maskDc);
+        }
+    }
+
+    // Light face -> dark sans ink (reference uses near-black glyphs).
+    SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
     RECT textBounds{horizontalPadding / 2L, 0L, bubbleWidth - horizontalPadding / 2L, bubbleHeight};
     DrawFlyoutText(bits.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy), textBounds,
         font, text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
