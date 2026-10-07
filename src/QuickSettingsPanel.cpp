@@ -2451,8 +2451,10 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
         !m_bluetoothSnapshot.discovering && !m_bluetooth.IsPairing()) {
         KillTimer(m_window, kBluetoothTimerId);
     }
-    InvalidateOverflowGlass();
-    PaintOverflowPopup();
+    // Page content changed; overflow size/origin/frost usually unchanged, so
+    // keep the warm frosted glass buffer. Sync PaintOverflowPopup on this
+    // thread (LL mouse hook) freezes the cursor - coalesce via the queue.
+    QueueOverflowPaint();
 }
 
 void DockApp::CloseQuickSettingsPage() {
@@ -2476,8 +2478,9 @@ void DockApp::CloseQuickSettingsPage() {
             SetTimer(m_window, kBluetoothTimerId, 4000, nullptr);
         }
     }
-    InvalidateOverflowGlass();
-    PaintOverflowPopup();
+    // Same as OpenQuickSettingsPage: reuse glass; do not sync-paint on the
+    // hook thread.
+    QueueOverflowPaint();
 }
 
 void DockApp::ProjectBrightness(int percent) {
@@ -2998,7 +3001,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         tile({x, y, x + tileWidths[1], y + homeTileH}, L'\uE839', L"Ethernet",
             m_qsCache.ethernetUp ? L"Connected" : L"Off", TrayFlyoutHitKind::Ethernet);
         x += tileWidths[1] + tileGap;
-        tile({x, y, x + tileWidths[2], y + homeTileH}, L'\uE945', L"Performance Boost", m_boostStatus,
+        tile({x, y, x + tileWidths[2], y + homeTileH}, L'\uE945', L"Boost", m_boostStatus,
             TrayFlyoutHitKind::Boost, false);
         x += tileWidths[2] + tileGap;
         tile({x, y, x + tileWidths[3], y + homeTileH}, L'\uE7F4', L"System Tray",
