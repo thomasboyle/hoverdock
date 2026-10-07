@@ -1789,8 +1789,10 @@ void FillHGradientPill(uint8_t* dest, int destWidth, int destHeight, float x0, f
     if (dest == nullptr || alpha <= 0.0F || x1 <= x0 + 0.5F || radius <= 0.5F) {
         return;
     }
-    const int left = std::max(0, static_cast<int>(std::floor(x0 - 1.0F)));
-    const int right = std::min(destWidth, static_cast<int>(std::ceil(x1 + 1.0F)));
+    // Include the full end-cap discs (x0/x1 are stadium segment centers).
+    // Bounding only to x0..x1 clipped the semicircles and left square ends.
+    const int left = std::max(0, static_cast<int>(std::floor(x0 - radius - 2.0F)));
+    const int right = std::min(destWidth, static_cast<int>(std::ceil(x1 + radius + 2.0F)));
     const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 2.0F)));
     const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 2.0F)));
     const float span = std::max(1.0F, x1 - x0);

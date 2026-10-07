@@ -106,6 +106,9 @@
 // Quick Settings carries an explicit transparent margin so the shader can
 // draw the soft outer shadow without tinting square HWND corner wedges.
 #define DOCK_FX_POPUP_SHADOW 0x100u
+// Hover labels: PANEL plate uses the dock bar face tonemap (not charcoal /
+// text-panel crush). scene2.w can milk the plate further for legibility.
+#define DOCK_FX_LABEL_FACE 0x200u
 // With PANEL: use the dock's face tone map, rim and blur instead of the
 // charcoal plate (Quick Settings / Dock Settings).
 #define DOCK_FX_DOCK_FACE 0x8000u

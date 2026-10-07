@@ -109,6 +109,11 @@ float GlassBevelWidth(float2 halfSize, float cornerRadius, float dpi, bool isPan
     {
         return edgeBevel;
     }
+    const float labelFace = FxEnabled(scene1.x, (float)DOCK_FX_LABEL_FACE);
+    if (labelFace > 0.5)
+    {
+        return edgeBevel;
+    }
     const float textPanel = FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE);
     const float textBand = clamp(DOCK_TEXT_PANEL_BEVEL_PT * dpi, 8.0 * dpi, faceBevel);
     return textPanel > 0.5 ? textBand : faceBevel;
@@ -291,10 +296,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
     const float popupShadowOn = FxEnabled(scene1.x, (float)DOCK_FX_POPUP_SHADOW);
     const bool isPanel = panelOn > 0.5;
-    // Charcoal plate only for panels that did not opt into the dock face.
-    // Text panels are Quick Settings and Dock Settings (DOCK_FX_DOCK_FACE).
-    const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE);
-    const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE));
+    // Hover labels share the dock bar face (LABEL_FACE): skip charcoal and
+    // text-panel crush. QS/Settings keep DOCK_FACE text-panel faces.
+    const float labelFace = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_LABEL_FACE);
+    const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE) * (1.0 - labelFace);
+    const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE)) * (1.0 - labelFace);
     const float marginDev = max(1.0 - panelOn, popupShadowOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli). Squircle n=4 gives
@@ -512,6 +518,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     float plateMix = FrostPlateMix(max(frostAmount, textPanel * DOCK_TEXT_PANEL_FROST_FLOOR));
     plateMix = max(plateMix, charcoalOn * DOCK_PANEL_PLATE_MIX_FLOOR);
     plateMix = max(plateMix, textPanel * DOCK_TEXT_PANEL_PLATE_MIX_FLOOR);
+    // Labels: same dock face pipeline, milked toward the plate (~50% via scene2.w).
+    plateMix = lerp(plateMix, 1.0, saturate(scene2.w) * labelFace);
     float3 color = lerp(frostedBackground, toneMapped, plateMix);
 
     // ---- 4. Fresnel reflection + specular ---------------------------------
@@ -626,6 +634,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
     const float popupShadowOn = FxEnabled(scene1.x, (float)DOCK_FX_POPUP_SHADOW);
     const bool isPanel = panelOn > 0.5;
+    const float labelFace = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_LABEL_FACE);
     const float marginDev = max(1.0 - panelOn, popupShadowOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
     const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
@@ -679,8 +688,8 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float frostAmt = saturate(((uint)scene1.x >> 16) / 255.0);
     float micaRim;
     float micaCore;
-    const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE);
-    const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE));
+    const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE) * (1.0 - labelFace);
+    const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE)) * (1.0 - labelFace);
     FrostMicaRadii(max(frostAmt, max(charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR,
         textPanel * DOCK_TEXT_PANEL_FROST_FLOOR)), micaRim, micaCore);
     blurPx = lerp(micaRim, micaCore, height01) * dpi;

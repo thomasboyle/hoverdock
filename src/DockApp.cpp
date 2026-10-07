@@ -4221,7 +4221,8 @@ void DockApp::UpdateHoverLabel() {
         return;
     }
     // Uniform pill + caret; tip sits just above the dock window top.
-    const LONG gap = GreaterOf(4L, static_cast<LONG>(std::lround(5.0F * scale)));
+    // Sit much closer to the dock (~25% of the previous 5px@96dpi gap).
+    const LONG gap = GreaterOf(1L, static_cast<LONG>(std::lround(1.25F * scale)));
     const LONG bubbleHeight = GreaterOf(28L, static_cast<LONG>(std::lround(28.0F * scale)));
     const LONG triangleHeight = GreaterOf(6L, static_cast<LONG>(std::lround(7.0F * scale)));
     const LONG horizontalPadding = GreaterOf(12L, static_cast<LONG>(std::lround(16.0F * scale)));
@@ -4391,17 +4392,41 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, POINT s
     const size_t byteCount = pixelCount * 4U;
     bits.assign(byteCount, 0);
 
-    // Always bake a *light* frosted face (even if dock/menus are dark).
+    // Same GlassPS stack as the dock bar (LABEL_FACE), milked +50% for glyphs.
     const RECT screenRect{screenOrigin.x, screenOrigin.y, screenOrigin.x + labelSize.cx,
         screenOrigin.y + labelSize.cy};
+    const float frostAmount = m_config.FrostAmount();
+    const float glassAlpha = DOCK_GLASS_ALPHA + (1.0F - DOCK_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
+    UINT labelFx = DOCK_FX_PANEL | DOCK_FX_LABEL_FACE | DOCK_FX_TINT | DOCK_FX_BLUR;
+    if (m_config.RimLight()) {
+        labelFx |= DOCK_FX_RIM;
+    }
+    if (m_config.Lensing()) {
+        labelFx |= DOCK_FX_LENS;
+    }
+    if (m_config.Dispersion()) {
+        labelFx |= DOCK_FX_DISPERSION;
+    }
+    if (m_config.Specular()) {
+        labelFx |= DOCK_FX_SPECULAR;
+    }
+    if (m_config.DropShadow()) {
+        labelFx |= DOCK_FX_SHADOW;
+    }
+    if (m_config.DepthShade()) {
+        labelFx |= DOCK_FX_THICKNESS;
+    }
+    const UINT frostByte =
+        static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0F, 1.0F) * 255.0F));
+    labelFx |= (frostByte << 16);
     bool baked = false;
     if (m_rendererInitialized) {
         std::vector<uint8_t> glass;
         baked = m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(labelSize.cx),
-            static_cast<UINT>(labelSize.cy), PackPopupGlassFxFlags(true, false),
-            DOCK_QS_SETTINGS_GLASS_ALPHA, dpiScale, m_settingsWindow, m_overflowWindow,
-            m_hoverLabelWindow, true /* lightPlate */, glass);
+            static_cast<UINT>(labelSize.cy), labelFx, glassAlpha, dpiScale, m_settingsWindow,
+            m_overflowWindow, m_hoverLabelWindow, m_config.LightPanels(), glass,
+            0.5F /* faceMilkBoost */);
         if (baked && glass.size() == byteCount) {
             bits = std::move(glass);
         } else {
@@ -4410,9 +4435,9 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, POINT s
     }
     if (!baked) {
         for (size_t i = 0; i + 3 < byteCount; i += 4) {
-            bits[i + 0] = 235;
-            bits[i + 1] = 235;
-            bits[i + 2] = 240;
+            bits[i + 0] = 48;
+            bits[i + 1] = 48;
+            bits[i + 2] = 52;
             bits[i + 3] = 220;
         }
     }
@@ -4504,8 +4529,8 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, POINT s
         }
     }
 
-    // Light face -> dark sans ink (reference uses near-black glyphs).
-    SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
+    // Ink follows the milky dock face (dark on light plate, chrome on dark).
+    SetFlyoutChromeInkForGlass(bits.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy));
     RECT textBounds{horizontalPadding / 2L, 0L, bubbleWidth - horizontalPadding / 2L, bubbleHeight};
     DrawFlyoutText(bits.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy), textBounds,
         font, text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);

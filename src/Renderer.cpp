@@ -3881,7 +3881,7 @@ void Renderer::SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const
 
 bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, UINT fxFlags,
     float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC,
-    bool lightPlate, std::vector<uint8_t>& outBgra)
+    bool lightPlate, std::vector<uint8_t>& outBgra, float faceMilkBoost)
 {
     outBgra.clear();
     if (m_device == nullptr || m_queue == nullptr || m_panelCommandList == nullptr ||
@@ -3950,6 +3950,8 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         m_panelMappedConstants->scene1[3] = 1.0F;
         std::fill(std::begin(m_panelMappedConstants->scene2),
             std::end(m_panelMappedConstants->scene2), 0.0F);
+        // Labels: scene2.w milks the dock face plate (0 = none, 0.5 = +50%).
+        m_panelMappedConstants->scene2[3] = (std::max)(0.0F, (std::min)(faceMilkBoost, 1.0F));
 
         D3D12_TEXTURE_COPY_LOCATION srcLoc{};
         srcLoc.pResource = m_panelBackdropUpload.Get();
