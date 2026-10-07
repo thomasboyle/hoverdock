@@ -455,6 +455,56 @@ std::optional<std::string> ExtractStringField(const std::string& json, std::stri
     return std::nullopt;
 }
 
+std::optional<double> ExtractDoubleField(const std::string& json, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    size_t pos = 0;
+    while ((pos = json.find(needle, pos)) != std::string::npos) {
+        size_t colon = json.find(':', pos + needle.size());
+        if (colon == std::string::npos) {
+            return std::nullopt;
+        }
+        ++colon;
+        while (colon < json.size() && (json[colon] == ' ' || json[colon] == '\t')) {
+            ++colon;
+        }
+        size_t end = colon;
+        if (end < json.size() && (json[end] == '-' || json[end] == '+')) {
+            ++end;
+        }
+        bool sawDigit = false;
+        while (end < json.size() && std::isdigit(static_cast<unsigned char>(json[end])) != 0) {
+            sawDigit = true;
+            ++end;
+        }
+        if (end < json.size() && json[end] == '.') {
+            ++end;
+            while (end < json.size() && std::isdigit(static_cast<unsigned char>(json[end])) != 0) {
+                sawDigit = true;
+                ++end;
+            }
+        }
+        if (end < json.size() && (json[end] == 'e' || json[end] == 'E')) {
+            ++end;
+            if (end < json.size() && (json[end] == '-' || json[end] == '+')) {
+                ++end;
+            }
+            while (end < json.size() && std::isdigit(static_cast<unsigned char>(json[end])) != 0) {
+                ++end;
+            }
+        }
+        if (!sawDigit) {
+            pos += needle.size();
+            continue;
+        }
+        try {
+            return std::stod(json.substr(colon, end - colon));
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
 // Appends the UTF-8 encoding of a code point.
 void AppendUtf8(std::string& out, uint32_t cp) {
     if (cp < 0x80) {
@@ -2048,6 +2098,7 @@ struct ModelReply {
     bool truncated = false;  // finish_reason "length" (hit max_tokens)
     std::string content;
     std::wstring error;
+    double predictedPerSecond = 0.0;  // timings.predicted_per_second
 };
 
 ModelReply AskModel(const ParsedUrl& url, const std::string& user, int maxTokens, const char* grammar,
@@ -2070,6 +2121,10 @@ ModelReply AskModel(const ParsedUrl& url, const std::string& user, int maxTokens
             reply.truncated = response.find("\"finish_reason\":\"length\"") != std::string::npos;
             if (const auto content = ExtractAssistantContent(response); content.has_value()) {
                 reply.content = *content;
+            }
+            if (const auto tps = ExtractDoubleField(response, "predicted_per_second"); tps.has_value() &&
+                *tps > 0.0 && std::isfinite(*tps)) {
+                reply.predictedPerSecond = *tps;
             }
             return reply;
         }
@@ -2836,6 +2891,401 @@ SearchAgentResult LlamaServerClient::RunAgent(const std::wstring& baseUrl,
     return result;
 }
 
+
+namespace {
+
+// Live web snippets for info / specs answers (no API key).
+// DuckDuckGo Instant Answer JSON first; HTML results when Instant Answer is
+// empty (common for product specs). Bing HTML is a last-resort backup.
+constexpr DWORD kWebConnectTimeoutMs = 4000;
+constexpr DWORD kWebSendTimeoutMs = 6000;
+constexpr DWORD kWebReceiveTimeoutMs = 10000;
+constexpr size_t kWebMaxResponseBytes = 512 * 1024;
+constexpr size_t kWebMaxSnippets = 5;
+constexpr size_t kWebMaxSnippetChars = 220;
+constexpr size_t kWebMaxGroundingChars = 1400;
+
+bool HttpGetExternal(const wchar_t* host, INTERNET_PORT port, bool secure, const std::wstring& path,
+    std::string& body, std::wstring& error) {
+    body.clear();
+    WinHttpHandle session(WinHttpOpen(L"HoverdockSearch/1.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (session.Get() == nullptr) {
+        error = L"WinHttpOpen failed";
+        return false;
+    }
+    WinHttpSetTimeouts(session.Get(), kWebConnectTimeoutMs, kWebConnectTimeoutMs, kWebSendTimeoutMs,
+        kWebReceiveTimeoutMs);
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+    protocols |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#endif
+    WinHttpSetOption(session.Get(), WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+
+    WinHttpHandle connection(WinHttpConnect(session.Get(), host, port, 0));
+    if (connection.Get() == nullptr) {
+        error = L"WinHttpConnect failed";
+        return false;
+    }
+    const DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
+    WinHttpHandle request(WinHttpOpenRequest(connection.Get(), L"GET", path.c_str(), nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
+    if (request.Get() == nullptr) {
+        error = L"WinHttpOpenRequest failed";
+        return false;
+    }
+    const wchar_t* headers =
+        L"Accept: text/html,application/json;q=0.9,*/*;q=0.8\r\n"
+        L"Accept-Language: en-US,en;q=0.8\r\n";
+    if (WinHttpAddRequestHeaders(request.Get(), headers, static_cast<DWORD>(-1L),
+            WINHTTP_ADDREQ_FLAG_ADD) == FALSE) {
+        error = L"WinHttpAddRequestHeaders failed";
+        return false;
+    }
+    if (WinHttpSendRequest(request.Get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0,
+            0, 0) == FALSE) {
+        error = L"WinHttpSendRequest failed";
+        return false;
+    }
+    if (WinHttpReceiveResponse(request.Get(), nullptr) == FALSE) {
+        error = L"WinHttpReceiveResponse failed";
+        return false;
+    }
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (WinHttpQueryHeaders(request.Get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX) == FALSE ||
+        status < 200 || status >= 300) {
+        error = L"HTTP " + std::to_wstring(status);
+        return false;
+    }
+    for (;;) {
+        DWORD available = 0;
+        if (WinHttpQueryDataAvailable(request.Get(), &available) == FALSE) {
+            error = L"WinHttpQueryDataAvailable failed";
+            return false;
+        }
+        if (available == 0) {
+            break;
+        }
+        if (body.size() + available > kWebMaxResponseBytes) {
+            error = L"response too large";
+            body.clear();
+            return false;
+        }
+        const size_t offset = body.size();
+        body.resize(offset + available);
+        DWORD read = 0;
+        if (WinHttpReadData(request.Get(), body.data() + offset, available, &read) == FALSE) {
+            error = L"WinHttpReadData failed";
+            return false;
+        }
+        body.resize(offset + read);
+    }
+    return true;
+}
+
+void DecodeHtmlEntitiesInPlace(std::wstring& text) {
+    struct Pair {
+        std::wstring_view from;
+        wchar_t to;
+    };
+    static constexpr Pair kEntities[] = {
+        {L"&amp;", L'&'},
+        {L"&lt;", L'<'},
+        {L"&gt;", L'>'},
+        {L"&quot;", L'"'},
+        {L"&#39;", L'\''},
+        {L"&apos;", L'\''},
+        {L"&nbsp;", L' '},
+    };
+    for (const Pair& ent : kEntities) {
+        for (;;) {
+            const size_t at = text.find(ent.from);
+            if (at == std::wstring::npos) {
+                break;
+            }
+            text.replace(at, ent.from.size(), 1, ent.to);
+        }
+    }
+    for (;;) {
+        const size_t at = text.find(L"&#");
+        if (at == std::wstring::npos) {
+            break;
+        }
+        const size_t end = text.find(L';', at + 2);
+        if (end == std::wstring::npos || end - at > 10) {
+            break;
+        }
+        const bool hex = text.size() > at + 2 && (text[at + 2] == L'x' || text[at + 2] == L'X');
+        const size_t digStart = at + (hex ? 3 : 2);
+        unsigned long value = 0;
+        try {
+            value = std::stoul(std::wstring(text.substr(digStart, end - digStart)), nullptr, hex ? 16 : 10);
+        } catch (...) {
+            text.erase(at, 2);
+            continue;
+        }
+        if (value == 0 || value > 0x10FFFF) {
+            text.erase(at, end - at + 1);
+            continue;
+        }
+        text.replace(at, end - at + 1, 1, static_cast<wchar_t>(value <= 0xFFFF ? value : 0xFFFD));
+    }
+}
+
+std::wstring StripHtmlTags(std::string_view html) {
+    std::string plain;
+    plain.reserve(html.size());
+    bool inTag = false;
+    for (const char ch : html) {
+        if (ch == '<') {
+            inTag = true;
+            continue;
+        }
+        if (ch == '>') {
+            inTag = false;
+            plain.push_back(' ');
+            continue;
+        }
+        if (!inTag) {
+            plain.push_back(ch == '\n' || ch == '\r' || ch == '\t' ? ' ' : ch);
+        }
+    }
+    std::wstring wide = Utf8ToWide(plain);
+    DecodeHtmlEntitiesInPlace(wide);
+    std::wstring out;
+    out.reserve(wide.size());
+    bool space = false;
+    for (const wchar_t c : wide) {
+        if (std::iswspace(c) != 0) {
+            space = true;
+            continue;
+        }
+        if (space && !out.empty()) {
+            out.push_back(L' ');
+        }
+        space = false;
+        out.push_back(c);
+    }
+    return TrimWide(std::move(out));
+}
+
+struct WebSnippet {
+    std::wstring title;
+    std::wstring text;
+};
+
+void AppendUniqueSnippet(std::vector<WebSnippet>& out, std::wstring title, std::wstring text) {
+    title = TruncateWide(TrimWide(std::move(title)), 100);
+    text = TruncateWide(TrimWide(std::move(text)), kWebMaxSnippetChars);
+    if (text.size() < 24 && title.size() < 8) {
+        return;
+    }
+    const std::wstring key = ToLowerWide(text.empty() ? title : text);
+    for (const WebSnippet& existing : out) {
+        const std::wstring other = ToLowerWide(existing.text.empty() ? existing.title : existing.text);
+        if (!key.empty() && !other.empty() &&
+            (key.find(other) != std::wstring::npos || other.find(key) != std::wstring::npos)) {
+            return;
+        }
+    }
+    out.push_back(WebSnippet{std::move(title), std::move(text)});
+}
+
+void CollectDdgInstantAnswer(const std::string& json, std::vector<WebSnippet>& out) {
+    if (const auto abs = ExtractStringField(json, "AbstractText"); abs.has_value() && abs->size() > 20) {
+        std::wstring heading;
+        if (const auto h = ExtractStringField(json, "Heading"); h.has_value()) {
+            heading = Utf8ToWide(*h);
+        }
+        AppendUniqueSnippet(out, std::move(heading), Utf8ToWide(*abs));
+    }
+    if (const auto answer = ExtractStringField(json, "Answer"); answer.has_value() && answer->size() > 2) {
+        AppendUniqueSnippet(out, L"Answer", Utf8ToWide(*answer));
+    }
+    if (const auto def = ExtractStringField(json, "Definition"); def.has_value() && def->size() > 20) {
+        AppendUniqueSnippet(out, L"Definition", Utf8ToWide(*def));
+    }
+    size_t pos = 0;
+    int related = 0;
+    while (related < 4 && out.size() < kWebMaxSnippets) {
+        pos = json.find("\"Text\"", pos);
+        if (pos == std::string::npos) {
+            break;
+        }
+        if (const auto value = ExtractStringField(json.substr(pos), "Text");
+            value.has_value() && value->size() > 24) {
+            AppendUniqueSnippet(out, {}, Utf8ToWide(*value));
+            ++related;
+        }
+        pos += 6;
+    }
+}
+
+void CollectHtmlResultSnippets(const std::string& html, std::vector<WebSnippet>& out,
+    std::string_view titleClass, std::string_view snipClass) {
+    const std::string titleNeedle = std::string("class=\"") + std::string(titleClass) + "\"";
+    const std::string snipNeedle = std::string("class=\"") + std::string(snipClass) + "\"";
+    size_t pos = 0;
+    while (out.size() < kWebMaxSnippets && (pos = html.find(titleNeedle, pos)) != std::string::npos) {
+        const size_t open = html.find('>', pos + titleNeedle.size());
+        if (open == std::string::npos) {
+            break;
+        }
+        const size_t close = html.find("</a>", open + 1);
+        if (close == std::string::npos) {
+            break;
+        }
+        std::wstring title = StripHtmlTags(std::string_view(html.data() + open + 1, close - open - 1));
+        std::wstring snip;
+        const size_t snipAt = html.find(snipNeedle, close);
+        const size_t nextTitle = html.find(titleNeedle, close + 4);
+        if (snipAt != std::string::npos && (nextTitle == std::string::npos || snipAt < nextTitle)) {
+            const size_t sOpen = html.find('>', snipAt + snipNeedle.size());
+            if (sOpen != std::string::npos) {
+                size_t sClose = html.find("</a>", sOpen + 1);
+                const size_t sCloseDiv = html.find("</div>", sOpen + 1);
+                if (sCloseDiv != std::string::npos && (sClose == std::string::npos || sCloseDiv < sClose)) {
+                    sClose = sCloseDiv;
+                }
+                if (sClose != std::string::npos) {
+                    snip = StripHtmlTags(std::string_view(html.data() + sOpen + 1, sClose - sOpen - 1));
+                }
+            }
+        }
+        AppendUniqueSnippet(out, std::move(title), std::move(snip));
+        pos = close + 4;
+    }
+}
+
+void CollectBingSnippets(const std::string& html, std::vector<WebSnippet>& out) {
+    size_t pos = 0;
+    while (out.size() < kWebMaxSnippets &&
+        (pos = html.find("class=\"b_algo\"", pos)) != std::string::npos) {
+        const size_t blockEnd = html.find("class=\"b_algo\"", pos + 14);
+        const size_t end = blockEnd == std::string::npos ? html.size() : blockEnd;
+        const std::string_view block(html.data() + pos, end - pos);
+        std::wstring title;
+        std::wstring snip;
+        if (const size_t h2 = block.find("<h2"); h2 != std::string_view::npos) {
+            const size_t aOpen = block.find("<a", h2);
+            if (aOpen != std::string_view::npos) {
+                const size_t gt = block.find('>', aOpen);
+                const size_t aClose = block.find("</a>", gt == std::string_view::npos ? 0 : gt);
+                if (gt != std::string_view::npos && aClose != std::string_view::npos) {
+                    title = StripHtmlTags(block.substr(gt + 1, aClose - gt - 1));
+                }
+            }
+        }
+        if (const size_t p = block.find("<p"); p != std::string_view::npos) {
+            const size_t gt = block.find('>', p);
+            const size_t pClose = block.find("</p>", gt == std::string_view::npos ? 0 : gt);
+            if (gt != std::string_view::npos && pClose != std::string_view::npos) {
+                snip = StripHtmlTags(block.substr(gt + 1, pClose - gt - 1));
+            }
+        }
+        AppendUniqueSnippet(out, std::move(title), std::move(snip));
+        pos = end;
+    }
+}
+
+std::wstring FormatWebGrounding(const std::vector<WebSnippet>& snippets) {
+    std::wstring out;
+    int n = 0;
+    for (const WebSnippet& snip : snippets) {
+        if (snip.title.empty() && snip.text.empty()) {
+            continue;
+        }
+        ++n;
+        std::wstring line = L"[" + std::to_wstring(n) + L"] ";
+        if (!snip.title.empty()) {
+            line += snip.title;
+            if (!snip.text.empty()) {
+                line += L" - ";
+            }
+        }
+        line += snip.text;
+        line = TruncateWide(std::move(line), kWebMaxSnippetChars + 40);
+        if (out.size() + line.size() + 1 > kWebMaxGroundingChars) {
+            break;
+        }
+        if (!out.empty()) {
+            out.push_back(L'\n');
+        }
+        out += line;
+    }
+    return out;
+}
+
+std::wstring SearchSummaryFromSnippets(const std::vector<WebSnippet>& snippets) {
+    if (snippets.empty()) {
+        return {};
+    }
+    const WebSnippet* best = &snippets.front();
+    for (const WebSnippet& s : snippets) {
+        if (s.text.size() > best->text.size()) {
+            best = &s;
+        }
+    }
+    std::wstring summary;
+    if (!best->title.empty()) {
+        summary = best->title;
+        if (!best->text.empty()) {
+            summary += L": ";
+            summary += best->text;
+        }
+    } else {
+        summary = best->text;
+    }
+    summary += L" (web)";
+    return AnswerSentence(std::move(summary));
+}
+
+std::vector<WebSnippet> FetchWebSnippets(const std::wstring& query,
+    const LlamaServerClient::CancelCallback& cancelled) {
+    std::vector<WebSnippet> snippets;
+    if (query.empty()) {
+        return snippets;
+    }
+    const std::wstring encoded = UrlEncodeQuery(query);
+    std::string body;
+    std::wstring error;
+
+    if (!(cancelled && cancelled())) {
+        const std::wstring path = L"/?q=" + encoded + L"&format=json&no_html=1&skip_disambig=1";
+        if (HttpGetExternal(L"api.duckduckgo.com", INTERNET_DEFAULT_HTTPS_PORT, true, path, body, error)) {
+            CollectDdgInstantAnswer(body, snippets);
+        }
+    }
+
+    if (snippets.size() < 2 && !(cancelled && cancelled())) {
+        body.clear();
+        error.clear();
+        const std::wstring path = L"/html/?q=" + encoded;
+        if (HttpGetExternal(L"html.duckduckgo.com", INTERNET_DEFAULT_HTTPS_PORT, true, path, body,
+                error)) {
+            CollectHtmlResultSnippets(body, snippets, "result__a", "result__snippet");
+        }
+    }
+
+    if (snippets.size() < 2 && !(cancelled && cancelled())) {
+        body.clear();
+        error.clear();
+        const std::wstring path = L"/search?q=" + encoded + L"&setlang=en-US";
+        if (HttpGetExternal(L"www.bing.com", INTERNET_DEFAULT_HTTPS_PORT, true, path, body, error)) {
+            CollectBingSnippets(body, snippets);
+        }
+    }
+
+    if (snippets.size() > kWebMaxSnippets) {
+        snippets.resize(kWebMaxSnippets);
+    }
+    return snippets;
+}
+
+}  // namespace
+
 SearchAgentResult LlamaServerClient::RunAnswerAgent(const std::wstring& baseUrl,
     const std::wstring& request, const StatusCallback& status, const CancelCallback& cancelled) {
     SearchAgentResult result;
@@ -2853,13 +3303,37 @@ SearchAgentResult LlamaServerClient::RunAnswerAgent(const std::wstring& baseUrl,
         return result;
     }
     result.steps = 1;
+
+    // Live web first so the local model can ground recent facts (specs, news).
+    notify(L"Searching web...");
+    const std::vector<WebSnippet> snippets = FetchWebSnippets(goal, cancelled);
+    if (cancelled && cancelled()) {
+        return result;
+    }
+    const std::wstring grounding = FormatWebGrounding(snippets);
+
     notify(L"Answering...");
     const ParsedUrl url = ParseBaseUrl(baseUrl);
     std::string user = "question: ";
     user += WideToUtf8(goal);
-    user += "\nReply with A <short factual answer>. Do not launch apps or open URLs.";
+    if (!grounding.empty()) {
+        user += "\nLive web snippets (prefer these over training memory for recent facts):\n";
+        user += WideToUtf8(grounding);
+        user += "\nReply with A <short factual answer grounded in the snippets>. "
+                "Do not launch apps or open URLs.";
+    } else {
+        user += "\n(No live web results available.) Reply with A <short factual answer>. "
+                "Note uncertainty for very recent facts. Do not launch apps or open URLs.";
+    }
     ModelReply reply = AskModel(url, user, kAnswerMaxTokens, kAnswerGrammar, kAgentReceiveTimeoutMs);
+    result.predictedPerSecond = reply.predictedPerSecond;
     if (!reply.reached) {
+        // Model offline: still show a search-based summary when web worked.
+        if (!snippets.empty()) {
+            result.reply = SearchSummaryFromSnippets(snippets);
+            result.serverUnavailable = false;
+            return result;
+        }
         result.serverUnavailable = true;
         return result;
     }
@@ -2881,7 +3355,11 @@ SearchAgentResult LlamaServerClient::RunAnswerAgent(const std::wstring& baseUrl,
         text = TrimWide(text.substr(2));
     }
     if (text.empty()) {
-        result.reply = L"No answer from the local model.";
+        if (!snippets.empty()) {
+            result.reply = SearchSummaryFromSnippets(snippets);
+        } else {
+            result.reply = L"No answer from the local model.";
+        }
     } else {
         result.reply = AnswerSentence(std::move(text));
     }

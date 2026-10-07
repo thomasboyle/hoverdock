@@ -45,6 +45,8 @@ struct SearchAgentResult {
     // Short reply from the model ("done.say") or a status/error line.
     std::wstring reply;
     int steps = 0;
+    // From llama-server timings.predicted_per_second (0 = unknown / not a model round).
+    double predictedPerSecond = 0.0;
 };
 
 // Model-free resolution of a Search query (first-time goals included).
@@ -125,8 +127,11 @@ public:
         const StatusCallback& status, const CancelCallback& cancelled,
         const std::wstring& codeLanguageHint = {});
 
-    // Factual / specs Q&A only: grammar forces A <answer>, never L/W/Y/... .
-    // result.actions stays empty; result.reply is shown above the Search box.
+    // Factual / specs Q&A: WinHTTP fetches DuckDuckGo/Bing snippets, then the
+    // local model answers with grammar A <answer> grounded in that context
+    // (search summary alone if llama-server is down). No L/W/Y/... tools.
+    // result.actions stays empty; result.reply is shown above the Search box;
+    // result.predictedPerSecond comes from llama timings when available.
     [[nodiscard]] static SearchAgentResult RunAnswerAgent(const std::wstring& baseUrl,
         const std::wstring& request, const StatusCallback& status,
         const CancelCallback& cancelled);

@@ -10505,9 +10505,17 @@ void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result)
     }
     if (failure.empty() && !result.reply.empty()) {
         // Q&A / specs: keep Search open and show the answer above the textbox.
-        Log(L"Search agent answer shown chars=" + std::to_wstring(result.reply.size()));
+        // Footer shows generation speed from llama-server timings when available.
+        Log(L"Search agent answer shown chars=" + std::to_wstring(result.reply.size()) +
+            L" tok_s=" + std::to_wstring(result.predictedPerSecond));
         SetLaunchPromptAnswer(result.reply);
-        SetLaunchPromptStatus(L"Answer above — ask another question or open an app");
+        if (result.predictedPerSecond > 0.05) {
+            wchar_t speed[64];
+            swprintf_s(speed, L"%.1f tok/s", result.predictedPerSecond);
+            SetLaunchPromptStatus(speed);
+        } else {
+            SetLaunchPromptStatus(L"-");
+        }
         return;
     }
     SetLaunchPromptStatus(!failure.empty() ? failure
