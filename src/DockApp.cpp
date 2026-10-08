@@ -1279,7 +1279,7 @@ void FillRectColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT boun
 }
 
 // Concept D Minimal Sage - panel toggles/slider (#98A869).
-// Dock running-indicator dot stays amber in Shaders.hlsl. DIB order: B, G, R.
+// Dock running-indicator dot is black in Shaders.hlsl. DIB order: B, G, R.
 constexpr uint8_t kAmberB = DOCK_PANEL_TOGGLE_B;
 constexpr uint8_t kAmberG = DOCK_PANEL_TOGGLE_G;
 constexpr uint8_t kAmberR = DOCK_PANEL_TOGGLE_R;
@@ -3841,15 +3841,15 @@ HFONT DockApp::HoverLabelFont() {
     const UINT dpi = m_window != nullptr ? GetDpiForWindow(m_window) : 96U;
     const float scale =
         static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F * std::max(0.75F, m_dockScale);
-    // Match the dock clock date face: Segoe UI / FW_NORMAL / ~17px at 96 DPI.
-    const int pixelHeight = std::max(15, static_cast<int>(std::lround(17.0F * scale)));
+    // macOS dock labels are a small semibold system face (~16px at 96 DPI).
+    const int pixelHeight = std::max(14, static_cast<int>(std::lround(16.0F * scale)));
     if (m_hoverLabelFont != nullptr && dpi == m_hoverLabelFontDpi &&
         pixelHeight == m_hoverLabelFontPx) {
         return m_hoverLabelFont;
     }
 
     DestroyHoverLabelFont();
-    m_hoverLabelFont = CreateFontW(-pixelHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    m_hoverLabelFont = CreateFontW(-pixelHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, DockTextFontFace());
     m_hoverLabelFontDpi = dpi;
@@ -3878,14 +3878,15 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     const float scale = static_cast<float>(dpi) / 96.0F;
     const float layoutScale = scale * m_dockScale;
     const LONG iconSize = std::lround(56.0F * layoutScale);
-    const LONG dotSize = std::max(2L, std::lround(5.0F * layoutScale));
-    const LONG dotGap = std::max(1L, std::lround(2.0F * layoutScale));
+    const LONG dotSize = std::max(3L, std::lround(6.0F * layoutScale));
+    const LONG dotGap = std::max(3L, std::lround(6.0F * layoutScale));
     const LONG iconSlotHeight = iconSize + dotGap + dotSize;
-    // Padding sets icon breathing room. The full-span bevel means the whole
-    // face refracts gently, but glyphs are drawn undisplaced on top and the
-    // icon-calm halos still the glass around them: only background warps.
-    const LONG padding = std::lround(24.0F * layoutScale);
-    const LONG gap = std::lround(10.0F * layoutScale);
+    // Horizontal inset stays roomy. The glyph is centered: the margin above it
+    // equals the dot gap, the activity dot, and the floor under it.
+    const LONG padding = std::lround(18.0F * layoutScale);
+    const LONG padBottom = std::lround(6.0F * layoutScale);
+    const LONG padTop = dotGap + dotSize + padBottom;
+    const LONG gap = std::lround(8.0F * layoutScale);
     const LONG dividerSlotWidth = std::lround(10.0F * layoutScale);
     const LONG margin = std::lround(10.0F * scale);
     const LONG trayGlyph = std::max(22L, std::lround(28.0F * layoutScale));
@@ -3945,7 +3946,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     // drop shade into the margin ring.
     const LONG shadowMargin = DockShadowMarginPx(scale);
     m_dockWidth = static_cast<UINT>(padding * 2 + contentWidth + shadowMargin * 2);
-    m_dockHeight = static_cast<UINT>(padding * 2 + iconSlotHeight + shadowMargin * 2);
+    m_dockHeight = static_cast<UINT>(padTop + padBottom + iconSlotHeight + shadowMargin * 2);
     // The window carries a shadow ring around the pill; anchoring the window
     // bottom to the screen bottom would leave the pill floating a full
     // shadowMargin above the edge. Sink the window so only a small breathing
@@ -3970,7 +3971,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     m_iconRenderData.clear();
     m_trashIndex = -1;
     m_iconRenderData.reserve(displayCount + 8U);
-    const LONG top = (static_cast<LONG>(m_dockHeight) - iconSlotHeight) / 2;
+    const LONG top = shadowMargin + padTop;
     LONG left = padding + shadowMargin;
     for (size_t index = 0; index < displayCount; ++index) {
         DockIconRenderData data;
@@ -4189,6 +4190,62 @@ void DockApp::PositionOverlayWindows() {
     PositionContextMenu();
 }
 
+struct HoverBubbleLayout {
+    LONG width = 0;
+    LONG body = 0;
+    LONG tail = 0;
+    LONG tailBase = 0;
+    LONG height = 0;
+    LONG shadow = 0;
+    LONG padX = 0;
+};
+
+HoverBubbleLayout LayoutHoverBubble(LONG textWidth, float scale) {
+    const LONG padX = GreaterOf(8L, static_cast<LONG>(std::lround(8.0F * scale)));
+    const LONG maxWidth = GreaterOf(260L, static_cast<LONG>(std::lround(300.0F * scale)));
+    HoverBubbleLayout layout;
+    // Shorter than a circle, with a flat top and bottom, and a small sharp tail.
+    layout.body = GreaterOf(28L, static_cast<LONG>(std::lround(32.0F * scale)));
+    layout.tail = GreaterOf(6L, static_cast<LONG>(std::lround(8.0F * scale)));
+    layout.tailBase = GreaterOf(12L, static_cast<LONG>(std::lround(16.0F * scale)));
+    layout.shadow = GreaterOf(6L, static_cast<LONG>(std::lround(8.0F * scale)));
+    layout.padX = padX;
+    // Short names stay a pill. Wider than this, the side gap is padX.
+    const LONG minWidth = layout.body * 2L;
+    LONG width = textWidth + padX * 2L;
+    if (width < minWidth) {
+        width = minWidth;
+    }
+    if (width > maxWidth) {
+        width = maxWidth;
+    }
+    layout.width = width;
+    layout.height = layout.body + layout.tail;
+    return layout;
+}
+
+// Coverage of a rounded bar with a small downward triangle on its flat floor.
+float HoverBubbleCoverage(float x, float y, float width, float bodyH, float tailH, float tailBase) {
+    const float cx = width * 0.5F;
+    const float radius = std::min(bodyH * 0.42F, width * 0.5F);
+    const float dx = std::fabs(x - cx) - std::max(0.0F, width * 0.5F - radius);
+    const float dy = std::fabs(y - bodyH * 0.5F) - std::max(0.0F, bodyH * 0.5F - radius);
+    const float ax = std::max(dx, 0.0F);
+    const float ay = std::max(dy, 0.0F);
+    const float pill = std::sqrt(ax * ax + ay * ay) + std::min(std::max(dx, dy), 0.0F) - radius;
+
+    float tail = 1.0e6F;
+    const float baseY = bodyH - 1.5F;
+    const float tipY = bodyH + tailH;
+    if (y >= baseY && y <= tipY && tipY > baseY) {
+        const float v = (y - baseY) / (tipY - baseY);
+        tail = std::fabs(x - cx) - tailBase * 0.5F * (1.0F - v);
+    } else if (y > tipY) {
+        tail = y - tipY;
+    }
+    return std::clamp(0.5F - std::min(pill, tail), 0.0F, 1.0F);
+}
+
 void DockApp::UpdateHoverLabel(bool forceGlassRefresh) {
     if (IsDragActive() || m_draggedIcon >= 0 || m_hoveredDivider >= 0 || IsOverflowOpen() ||
         IsContextMenuOpen()) {
@@ -4248,18 +4305,11 @@ void DockApp::UpdateHoverLabel(bool forceGlassRefresh) {
         HideHoverLabel();
         return;
     }
-    // Uniform pill + caret. Position against the *glass* top (window top +
-    // shadow margin), not the HWND top — otherwise labels float in the
-    // 18pt shadow band and look far above the dock face.
-    // gap = 0: caret tip flush with the glass top edge.
-    const LONG gap = 0;
+    // Speech bubble against the glass top (window top + shadow margin), not the
+    // HWND top — otherwise labels float in the shadow band.
+    const LONG gap = GreaterOf(4L, static_cast<LONG>(std::lround(8.0F * scale)));
     const LONG shadowMargin = DockShadowMarginPx(scale);
     const LONG glassTop = dockScreen.top + shadowMargin;
-    const LONG bubbleHeight = GreaterOf(28L, static_cast<LONG>(std::lround(28.0F * scale)));
-    const LONG triangleHeight = GreaterOf(6L, static_cast<LONG>(std::lround(7.0F * scale)));
-    const LONG horizontalPadding = GreaterOf(12L, static_cast<LONG>(std::lround(16.0F * scale)));
-    const LONG minWidth = GreaterOf(64L, static_cast<LONG>(std::lround(64.0F * scale)));
-    const LONG maxWidth = GreaterOf(240L, static_cast<LONG>(std::lround(260.0F * scale)));
     LONG textWidth = 0;
     {
         HFONT font = HoverLabelFont();
@@ -4281,17 +4331,12 @@ void DockApp::UpdateHoverLabel(bool forceGlassRefresh) {
             ReleaseDC(nullptr, measureDc);
         }
     }
-    LONG bubbleWidth = textWidth + horizontalPadding * 2L;
-    if (bubbleWidth < minWidth) {
-        bubbleWidth = minWidth;
-    }
-    if (bubbleWidth > maxWidth) {
-        bubbleWidth = maxWidth;
-    }
-    const LONG totalHeight = bubbleHeight + triangleHeight;
+    const HoverBubbleLayout bubble = LayoutHoverBubble(textWidth, scale);
+    const LONG outerWidth = bubble.width + bubble.shadow * 2L;
+    const LONG outerHeight = bubble.height + bubble.shadow * 2L;
     POINT destination{
-        iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L - bubbleWidth / 2L,
-        glassTop - totalHeight - gap};
+        iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L - outerWidth / 2L,
+        glassTop - outerHeight + bubble.shadow - gap};
 
     // Hide before bake on icon change so the previous bubble is not captured.
     // Glint refresh keeps the window up to avoid flicker.
@@ -4404,22 +4449,8 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, POINT s
     DeleteDC(memory);
     ReleaseDC(nullptr, screen);
 
-    // Light frosted pill + speech caret (matches ideal-label-look reference).
-    const LONG horizontalPadding = GreaterOf(12L, static_cast<LONG>(std::lround(16.0F * scale)));
-    const LONG minWidth = GreaterOf(64L, static_cast<LONG>(std::lround(64.0F * scale)));
-    const LONG maxWidth = GreaterOf(240L, static_cast<LONG>(std::lround(260.0F * scale)));
-    const LONG bubbleHeight = GreaterOf(28L, static_cast<LONG>(std::lround(28.0F * scale)));
-    const LONG triangleWidth = GreaterOf(10L, static_cast<LONG>(std::lround(12.0F * scale)));
-    const LONG triangleHeight = GreaterOf(6L, static_cast<LONG>(std::lround(7.0F * scale)));
-    const LONG cornerRadius = GreaterOf(10L, static_cast<LONG>(std::lround(12.0F * scale)));
-    LONG bubbleWidth = textSize.cx + horizontalPadding * 2L;
-    if (bubbleWidth < minWidth) {
-        bubbleWidth = minWidth;
-    }
-    if (bubbleWidth > maxWidth) {
-        bubbleWidth = maxWidth;
-    }
-    labelSize = {bubbleWidth, bubbleHeight + triangleHeight};
+    const HoverBubbleLayout bubble = LayoutHoverBubble(textSize.cx, scale);
+    labelSize = {bubble.width + bubble.shadow * 2L, bubble.height + bubble.shadow * 2L};
     const size_t pixelCount =
         static_cast<size_t>(labelSize.cx) * static_cast<size_t>(labelSize.cy);
     const size_t byteCount = pixelCount * 4U;
@@ -4472,104 +4503,98 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, float scale, POINT s
         }
     }
     if (!baked) {
+        constexpr uint8_t kFallbackA = 204;
+        constexpr uint8_t kFallbackC = static_cast<uint8_t>(247U * kFallbackA / 255U);
         for (size_t i = 0; i + 3 < byteCount; i += 4) {
-            bits[i + 0] = 48;
-            bits[i + 1] = 48;
-            bits[i + 2] = 52;
-            bits[i + 3] = 220;
+            bits[i + 0] = kFallbackC;
+            bits[i + 1] = kFallbackC;
+            bits[i + 2] = kFallbackC;
+            bits[i + 3] = kFallbackA;
         }
     }
 
-    // Supersampled pill + downward caret mask (same AA approach as overflow).
-    constexpr LONG kMaskSupersample = 2;
-    const LONG maskW = labelSize.cx * kMaskSupersample;
-    const LONG maskH = labelSize.cy * kMaskSupersample;
-    HDC maskDc = CreateCompatibleDC(nullptr);
-    void* maskBits = nullptr;
-    HBITMAP maskBitmap = nullptr;
-    BITMAPV5HEADER maskHeader{};
-    maskHeader.bV5Size = sizeof(maskHeader);
-    maskHeader.bV5Width = maskW;
-    maskHeader.bV5Height = -maskH;
-    maskHeader.bV5Planes = 1;
-    maskHeader.bV5BitCount = 32;
-    maskHeader.bV5Compression = BI_BITFIELDS;
-    maskHeader.bV5RedMask = 0x00ff0000U;
-    maskHeader.bV5GreenMask = 0x0000ff00U;
-    maskHeader.bV5BlueMask = 0x000000ffU;
-    maskHeader.bV5AlphaMask = 0xff000000U;
-    if (maskDc != nullptr) {
-        maskBitmap = CreateDIBSection(maskDc, reinterpret_cast<const BITMAPINFO*>(&maskHeader),
-            DIB_RGB_COLORS, &maskBits, nullptr, 0);
+    // Capsule + tail coverage, then a soft drop shadow under it.
+    std::vector<float> coverage(pixelCount, 0.0F);
+    const float originX = static_cast<float>(bubble.shadow);
+    const float originY = static_cast<float>(bubble.shadow);
+    const float shapeW = static_cast<float>(bubble.width);
+    const float bodyH = static_cast<float>(bubble.body);
+    const float tailH = static_cast<float>(bubble.tail);
+    const float tailBase = static_cast<float>(bubble.tailBase);
+    for (LONG y = 0; y < labelSize.cy; ++y) {
+        for (LONG x = 0; x < labelSize.cx; ++x) {
+            const float localX = static_cast<float>(x) + 0.5F - originX;
+            const float localY = static_cast<float>(y) + 0.5F - originY;
+            coverage[static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx) +
+                static_cast<size_t>(x)] =
+                HoverBubbleCoverage(localX, localY, shapeW, bodyH, tailH, tailBase);
+        }
     }
-    if (maskDc != nullptr && maskBitmap != nullptr && maskBits != nullptr) {
-        HGDIOBJ previousMask = SelectObject(maskDc, maskBitmap);
-        RECT all{0, 0, maskW, maskH};
-        FillRect(maskDc, &all, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-        HBRUSH whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
-        HPEN whitePen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
-        HGDIOBJ previousBrush = SelectObject(maskDc, whiteBrush);
-        HGDIOBJ previousPen = SelectObject(maskDc, whitePen);
-        RoundRect(maskDc, 0, 0, SaturatedInt(bubbleWidth * kMaskSupersample),
-            SaturatedInt(bubbleHeight * kMaskSupersample),
-            SaturatedInt(cornerRadius * 2L * kMaskSupersample),
-            SaturatedInt(cornerRadius * 2L * kMaskSupersample));
-        const LONG center = bubbleWidth / 2L;
-        POINT triangle[3] = {
-            {(center - triangleWidth / 2L) * kMaskSupersample,
-                bubbleHeight * kMaskSupersample - kMaskSupersample},
-            {(center + triangleWidth / 2L) * kMaskSupersample,
-                bubbleHeight * kMaskSupersample - kMaskSupersample},
-            {center * kMaskSupersample,
-                (bubbleHeight + triangleHeight) * kMaskSupersample - kMaskSupersample},
-        };
-        Polygon(maskDc, triangle, 3);
-        SelectObject(maskDc, previousPen);
-        SelectObject(maskDc, previousBrush);
-        DeleteObject(whitePen);
-        DeleteObject(whiteBrush);
 
-        auto* mask = static_cast<uint8_t*>(maskBits);
-        const float kMaskSamples = static_cast<float>(kMaskSupersample * kMaskSupersample);
+    std::vector<float> shadow = coverage;
+    const int blurRadius = std::max(3, static_cast<int>(std::lround(5.0F * scale)));
+    std::vector<float> blurTemp(pixelCount, 0.0F);
+    for (int pass = 0; pass < 2; ++pass) {
         for (LONG y = 0; y < labelSize.cy; ++y) {
             for (LONG x = 0; x < labelSize.cx; ++x) {
-                unsigned covered = 0;
-                for (LONG sampleY = 0; sampleY < kMaskSupersample; ++sampleY) {
-                    const size_t maskRow =
-                        (static_cast<size_t>(y) * kMaskSupersample + static_cast<size_t>(sampleY)) *
-                        static_cast<size_t>(maskW);
-                    for (LONG sampleX = 0; sampleX < kMaskSupersample; ++sampleX) {
-                        covered += mask[(maskRow + static_cast<size_t>(x) * kMaskSupersample +
-                                            static_cast<size_t>(sampleX)) *
-                            4U];
-                    }
+                float sum = 0.0F;
+                int count = 0;
+                const int x0 = std::max(0L, x - blurRadius);
+                const int x1 = std::min(labelSize.cx - 1L, x + blurRadius);
+                for (int sx = x0; sx <= x1; ++sx) {
+                    sum += shadow[static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx) +
+                        static_cast<size_t>(sx)];
+                    ++count;
                 }
-                const float cov = static_cast<float>(covered) / (255.0F * kMaskSamples);
-                uint8_t* p = bits.data() +
-                    (static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx) +
-                        static_cast<size_t>(x)) *
-                        4U;
-                p[0] = static_cast<uint8_t>(std::lround(static_cast<float>(p[0]) * cov));
-                p[1] = static_cast<uint8_t>(std::lround(static_cast<float>(p[1]) * cov));
-                p[2] = static_cast<uint8_t>(std::lround(static_cast<float>(p[2]) * cov));
-                p[3] = static_cast<uint8_t>(std::lround(static_cast<float>(p[3]) * cov));
+                blurTemp[static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx) +
+                    static_cast<size_t>(x)] = count > 0 ? sum / static_cast<float>(count) : 0.0F;
             }
         }
-        SelectObject(maskDc, previousMask);
-        DeleteObject(maskBitmap);
-        DeleteDC(maskDc);
-    } else {
-        if (maskBitmap != nullptr) {
-            DeleteObject(maskBitmap);
-        }
-        if (maskDc != nullptr) {
-            DeleteDC(maskDc);
+        for (LONG y = 0; y < labelSize.cy; ++y) {
+            for (LONG x = 0; x < labelSize.cx; ++x) {
+                float sum = 0.0F;
+                int count = 0;
+                const int y0 = std::max(0L, y - blurRadius);
+                const int y1 = std::min(labelSize.cy - 1L, y + blurRadius);
+                for (int sy = y0; sy <= y1; ++sy) {
+                    sum += blurTemp[static_cast<size_t>(sy) * static_cast<size_t>(labelSize.cx) +
+                        static_cast<size_t>(x)];
+                    ++count;
+                }
+                shadow[static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx) +
+                    static_cast<size_t>(x)] = count > 0 ? sum / static_cast<float>(count) : 0.0F;
+            }
         }
     }
 
-    // Ink follows the milky dock face (dark on light plate, chrome on dark).
-    SetFlyoutChromeInkForGlass(bits.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy));
-    RECT textBounds{horizontalPadding / 2L, 0L, bubbleWidth - horizontalPadding / 2L, bubbleHeight};
+    constexpr float kShadowAlpha = 0.28F;
+    const LONG shadowDrop = std::max(1L, static_cast<LONG>(std::lround(2.0F * scale)));
+    for (LONG y = 0; y < labelSize.cy; ++y) {
+        for (LONG x = 0; x < labelSize.cx; ++x) {
+            const size_t index =
+                static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx) + static_cast<size_t>(x);
+            const float cov = coverage[index];
+            const LONG shadowY = y - shadowDrop;
+            const float shade = shadowY >= 0
+                ? shadow[static_cast<size_t>(shadowY) * static_cast<size_t>(labelSize.cx) +
+                      static_cast<size_t>(x)]
+                : 0.0F;
+            uint8_t* p = bits.data() + index * 4U;
+            const float glassA = (static_cast<float>(p[3]) / 255.0F) * cov;
+            const float shadowA = shade * kShadowAlpha * (1.0F - glassA);
+            const float outA = glassA + shadowA;
+            p[0] = static_cast<uint8_t>(std::lround(static_cast<float>(p[0]) * cov));
+            p[1] = static_cast<uint8_t>(std::lround(static_cast<float>(p[1]) * cov));
+            p[2] = static_cast<uint8_t>(std::lround(static_cast<float>(p[2]) * cov));
+            p[3] = static_cast<uint8_t>(std::lround(std::clamp(outA, 0.0F, 1.0F) * 255.0F));
+        }
+    }
+
+    // Hover labels stay dark on the light speech bubble, on every wallpaper.
+    SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
+    const LONG textBottom = bubble.shadow + bubble.body;
+    RECT textBounds{bubble.shadow + bubble.padX / 2L, bubble.shadow,
+        bubble.shadow + bubble.width - bubble.padX / 2L, textBottom};
     DrawFlyoutText(bits.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy), textBounds,
         font, text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
     return true;

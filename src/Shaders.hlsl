@@ -402,8 +402,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
     float frostCore;
     // Panels keep a minimum mica dissolve so busy wallpaper detail cannot
     // fight glyphs even when the user parks Frost near clear.
-    const float panelFrost = max(frostAmount, max(charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR,
-        textPanel * DOCK_TEXT_PANEL_FROST_FLOOR));
+    const float panelFrost = max(frostAmount,
+        max(charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR,
+            textPanel * DOCK_TEXT_PANEL_FROST_FLOOR));
     FrostMicaRadii(panelFrost, frostRim, frostCore);
 
     float3 frostedBackground;
@@ -497,7 +498,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     }
 
     // ---- 1. Face plate (Frost slider) -----------------------------------
-    // Dock: vibrancy (saturation boost) then a light #28..#f2 veil (clear
+    // Dock: vibrancy (saturation boost) then a #4b..#e1 veil (clear
     // Apple mix -> milky glass) so the backdrop keeps its color and contrast.
     // Panels (DOCK_FX_PANEL): neutral charcoal plate (pre-sage Concept A+D)
     // with milk floor — live capture+blur, no sage wash on the dock bar.
@@ -518,9 +519,12 @@ float4 GlassPS(VertexOutput input) : SV_Target
     float plateMix = FrostPlateMix(max(frostAmount, textPanel * DOCK_TEXT_PANEL_FROST_FLOOR));
     plateMix = max(plateMix, charcoalOn * DOCK_PANEL_PLATE_MIX_FLOOR);
     plateMix = max(plateMix, textPanel * DOCK_TEXT_PANEL_PLATE_MIX_FLOOR);
-    // Labels: same dock face pipeline, milked toward the plate (~50% via scene2.w).
-    plateMix = lerp(plateMix, 1.0, saturate(scene2.w) * labelFace);
     float3 color = lerp(frostedBackground, toneMapped, plateMix);
+
+    if (labelFace > 0.5)
+    {
+        color = (247.0 / 255.0).xxx;
+    }
 
     // ---- 4. Soft edge + pointer-reactive glint (no corner speculars) ------
     // Removed the sharp top-left key specular (pow(ndl, 110)) and NdotL-boosted
@@ -529,21 +533,23 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float3 surfN = normalize(float3(outward * slopeMag, 1.0));
     const float cosTheta = saturate(surfN.z);
     const float fresnel = 0.04 + 0.96 * pow(1.0 - cosTheta, 5.0);
+    // Labels stay a flat speech bubble; the dock keeps the soft rim.
+    const float edgeGain = rimGain * (1.0 - labelFace);
     // Cool, low Fresnel veil — no white hotspot.
-    color += fresnel * float3(0.88, 0.92, 0.98) * 0.12 * pow(rim, 2.8) * rimGain * rimLightDamp;
+    color += fresnel * float3(0.88, 0.92, 0.98) * 0.12 * pow(rim, 2.8) * edgeGain * rimLightDamp;
 
     const float thicknessShade = 1.0 - 0.07 * saturate(1.0 - insideDistance / max(bevelWidth * 0.6, 1e-3));
-    color *= lerp(1.0, thicknessShade, thickOn);
-    color += glassTint * rim * 0.02 * rimGain * rimLightDamp;
+    color *= lerp(1.0, thicknessShade, thickOn * (1.0 - labelFace));
+    color += glassTint * rim * 0.02 * edgeGain * rimLightDamp;
 
     // Uniform soft rim (no NdotL / dual-corner lobes).
     float rimStrength = lerp(0.28, 0.22, charcoalOn);
     rimStrength = lerp(rimStrength, 0.34, textPanel);
     const float3 rimEdge = lerp(float3(0.78, 0.82, 0.88), float3(0.70, 0.72, 0.76), charcoalOn);
-    color += rimEdge * pow(rim, 8.0) * rimStrength * rimGain * rimLightDamp;
+    color += rimEdge * pow(rim, 8.0) * rimStrength * edgeGain * rimLightDamp;
 
-    // Pointer glint (dock + LABEL_FACE): local flare near cursor only.
-    const float glintStrength = ((isPanel && labelFace < 0.5) ? 0.0 : 1.0) * saturate(scene2.z) * specOn;
+    // Pointer glint on the dock bar only. Labels are a flat tooltip.
+    const float glintStrength = (isPanel ? 0.0 : 1.0) * saturate(scene2.z) * specOn;
     if (glintStrength > 0.0)
     {
         const float2 glintPos = scene2.xy;
@@ -575,7 +581,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
     }
 
     color = saturate(color);
-    const float alpha = saturate(mask * scene0.z * (hasBackdrop ? scene1.w : 1.0));
+    float alpha = saturate(mask * scene0.z * (hasBackdrop ? scene1.w : 1.0));
+    if (labelFace > 0.5)
+    {
+        alpha = mask * 0.8;
+    }
     return float4(color * alpha, alpha);
 }
 
@@ -791,15 +801,17 @@ float4 IconPS(VertexOutput input) : SV_Target
 
     if (icon.iconMeta.x > 0.5 && contentHeightRatio < 0.98 && input.uv.y > contentHeightRatio) {
         const float stripHeightPx = icon.iconRect.w * (1.0 - contentHeightRatio);
-        const float dotCenterY = contentHeightRatio + (1.0 - contentHeightRatio) * 0.8;
-        const float dotRadiusPx = max(min(stripHeightPx * 0.294, icon.iconRect.z * 0.042), 2.25);
+        // Sit in the lower part of the strip, under the icon, clear of the slot edge.
+        const float dotCenterY = contentHeightRatio + (1.0 - contentHeightRatio) * 0.72;
+        const float dotRadiusPx = 0.75 * max(min(stripHeightPx * 0.42, icon.iconRect.z * 0.055), 2.8);
         float2 dotOffset;
         dotOffset.x = (input.uv.x - 0.5) * icon.iconRect.z;
         dotOffset.y = (input.uv.y - dotCenterY) * icon.iconRect.w;
         const float dist = length(dotOffset);
-        const float edgeSoftness = max(0.6, dotRadiusPx * 0.22);
+        const float edgeSoftness = max(0.28, dotRadiusPx * 0.2);
         const float dotAlpha = 1.0 - smoothstep(dotRadiusPx, dotRadiusPx + edgeSoftness, dist);
-        const float3 runningDot = float3(1.0, 191.0 / 255.0, 0.0);
+        // macOS running indicator: small black circle on dark, light, and photo bars.
+        const float3 runningDot = float3(0.0, 0.0, 0.0);
         color = color * (1.0 - dotAlpha) + runningDot * dotAlpha;
         alpha = dotAlpha + alpha * (1.0 - dotAlpha);
     }

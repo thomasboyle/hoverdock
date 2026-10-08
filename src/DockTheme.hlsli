@@ -20,14 +20,13 @@
 #define DOCK_CHROME_INK_G 245
 #define DOCK_CHROME_INK_B 247
 
-// Dock face tone map (linear lift), Apple-style light veil that keeps most of
-// the backdrop contrast instead of flattening it to a grey slab:
-//   backdrop #000000 -> face #282828
-//   backdrop #ffffff -> face #f2f2f2
+// Dock face tone map (linear lift). Matched to the macOS dock bar:
+//   backdrop #000000 -> face #4b4b4b
+//   backdrop #ffffff -> face #e1e1e1
 // face = lerp(OVER_BLACK, OVER_WHITE, vibrantBackdrop). Dock only (GlassPS);
 // panels use DOCK_PANEL_FACE_* and the CPU popup baker.
-#define DOCK_FACE_OVER_BLACK (40.0f / 255.0f)
-#define DOCK_FACE_OVER_WHITE (242.0f / 255.0f)
+#define DOCK_FACE_OVER_BLACK (75.0f / 255.0f)
+#define DOCK_FACE_OVER_WHITE (225.0f / 255.0f)
 // Glass body color for rim/specular accents (dock and panels).
 #define DOCK_FROST_OVER_WHITE (225.0f / 255.0f)
 // Backdrop saturation boost under the dock face (Apple vibrancy).
