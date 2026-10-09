@@ -21,7 +21,10 @@
 #include <wrl/wrappers/corewrappers.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cwchar>
+#include <map>
+#include <string>
 #include <cwctype>
 #include <mutex>
 #include <utility>
@@ -746,6 +749,13 @@ struct BluetoothService::Impl {
     std::vector<ComPtr<ABI::Windows::Devices::Radios::IRadio>> radios;
     std::vector<RadioDevice> paired;
     std::vector<RadioDevice> discovered;
+    // HOVERDOCK_BT_DRYRUN state: simulated results layered over real
+    // enumeration so later refreshes do not undo a simulated action.
+    const bool dryRun = BluetoothService::DryRun();
+    bool dryRadioSet = false;
+    bool dryRadioOn = false;
+    std::map<std::wstring, bool> dryConnected;
+    std::vector<RadioDevice> dryPaired;
     ComPtr<ABI::Windows::Devices::Enumeration::IDeviceWatcher> watcher;
     EventRegistrationToken addedToken{};
     EventRegistrationToken updatedToken{};
@@ -949,6 +959,25 @@ struct BluetoothService::Impl {
         next.hint = hint;
 
         std::vector<RadioDevice> pairedRanked = paired;
+        if (dryRun) {
+            if (dryRadioSet && radioPresent) {
+                next.radioOn = dryRadioOn;
+            }
+            for (const RadioDevice& simulated : dryPaired) {
+                bool present = false;
+                for (const RadioDevice& device : pairedRanked) {
+                    present = present || device.id == simulated.id;
+                }
+                if (!present) {
+                    pairedRanked.push_back(simulated);
+                }
+            }
+            for (RadioDevice& device : pairedRanked) {
+                if (const auto it = dryConnected.find(device.id); it != dryConnected.end()) {
+                    device.connected = it->second;
+                }
+            }
+        }
         std::sort(pairedRanked.begin(), pairedRanked.end(), [](const RadioDevice& left, const RadioDevice& right) {
             if (left.connected != right.connected) {
                 return left.connected;
@@ -1681,7 +1710,103 @@ struct BluetoothService::Impl {
         }
     }
 
+    static const char* JobName(JobKind kind) noexcept {
+        switch (kind) {
+        case JobKind::Refresh:
+            return "Bluetooth::Job Refresh";
+        case JobKind::SetRadio:
+            return "Bluetooth::Job SetRadio";
+        case JobKind::Connect:
+            return "Bluetooth::Job Connect";
+        case JobKind::Disconnect:
+            return "Bluetooth::Job Disconnect";
+        case JobKind::StartDiscovery:
+            return "Bluetooth::Job StartDiscovery";
+        case JobKind::StopDiscovery:
+            return "Bluetooth::Job StopDiscovery";
+        case JobKind::Pair:
+            return "Bluetooth::Job Pair";
+        case JobKind::Quit:
+            return "Bluetooth::Job Quit";
+        }
+        return "Bluetooth::Job ?";
+    }
+
+    // Simulated mutating job (HOVERDOCK_BT_DRYRUN=1). Same busy/publish
+    // sequence as the real path so the UI is exercised end-to-end; no WinRT
+    // Radio / pairing / IOCTL calls are made.
+    void HandleDryRun(const Job& job) {
+        ProfileScope::Mark((std::string("Bluetooth::DryRun ") + JobName(job.kind)).c_str());
+        switch (job.kind) {
+        case JobKind::SetRadio:
+            dryRadioSet = true;
+            dryRadioOn = job.enableRadio;
+            radioOn = radioPresent && job.enableRadio;
+            if (!job.enableRadio) {
+                StopWatcher();
+                discovering = false;
+                discovered.clear();
+                enumerationCompleted = false;
+                hint.clear();
+            }
+            Sleep(400);
+            break;
+        case JobKind::Connect:
+        case JobKind::Disconnect: {
+            const bool connect = job.kind == JobKind::Connect;
+            busyId = job.id;
+            busyText = connect ? L"Connecting..." : L"Disconnecting...";
+            errorId.clear();
+            Publish();
+            Sleep(900);
+            dryConnected[job.id] = connect;
+            busyId.clear();
+            busyText.clear();
+            break;
+        }
+        case JobKind::Pair: {
+            // Copy up front: watcher callbacks may reshuffle `discovered`.
+            const RadioDevice* found = FindMutable(job.id);
+            const bool known = found != nullptr;
+            RadioDevice simulated = known ? *found : RadioDevice{};
+            busyId = job.id;
+            busyText = L"Pairing...";
+            hint = L"Confirm the pairing prompt";
+            Publish();
+            Sleep(1200);
+            if (known) {
+                simulated.canPair = false;
+                busyText = L"Connecting...";
+                Publish();
+                Sleep(700);
+                simulated.connected = true;
+                dryConnected[simulated.id] = true;
+                dryPaired.push_back(simulated);
+                RemoveId(job.id);
+            }
+            busyId.clear();
+            busyText.clear();
+            hint.clear();
+            pairing.store(false);
+            break;
+        }
+        default:
+            break;
+        }
+        ready = true;
+        Publish();
+    }
+
     void Handle(const Job& job) {
+        // Call-path audit (HOVERDOCK_PROFILE): every job logs the worker tid
+        // so it can be compared with the UI thread tid marked on click.
+        ProfileScope::Mark(BluetoothService::ThreadTag(JobName(job.kind)).c_str());
+        ProfileScope jobScope(JobName(job.kind));
+        if (dryRun && (job.kind == JobKind::SetRadio || job.kind == JobKind::Connect ||
+                          job.kind == JobKind::Disconnect || job.kind == JobKind::Pair)) {
+            HandleDryRun(job);
+            return;
+        }
         switch (job.kind) {
         case JobKind::Refresh: {
             ProfileScope profileScope("Bluetooth::HandleRefresh");
@@ -1783,6 +1908,16 @@ struct BluetoothService::Impl {
                 discovering = false;
                 hint = L"Couldn't search for devices";
             }
+            if (dryRun && discovering) {
+                // Dry-run harness: one simulated nearby device so the pair +
+                // connect UI path can be exercised without real hardware.
+                RadioDevice fake;
+                fake.id = L"dryrun#BluetoothTestSpeaker";
+                fake.name = L"HoverDock Dry-Run Speaker With A Very Long Device Name";
+                fake.canPair = true;
+                fake.signal = -40;
+                Upsert(discovered, std::move(fake));
+            }
             Publish();
             break;
         case JobKind::StopDiscovery:
@@ -1843,16 +1978,47 @@ struct BluetoothService::Impl {
                     }
                 }
             }
-            busyId.clear();
-            busyText.clear();
-            pairing.store(false);
             if (pairedOk) {
                 errorId.clear();
                 errorText.clear();
                 hint.clear();
+                uint64_t address = 0;
+                if (const RadioDevice* found = FindMutable(job.id); found != nullptr) {
+                    address = found->address;
+                }
+                if (address == 0) {
+                    address = AddressFromTaggedId(job.id);
+                }
                 RemoveId(job.id);
                 RefreshPaired();
-            } else if (running.load()) {
+                // Pair + connect: many headsets link on their own after
+                // pairing; if not, connect once (still on this worker).
+                RadioDevice* added = nullptr;
+                for (RadioDevice& device : paired) {
+                    if (device.id == job.id || (address != 0 && device.address == address)) {
+                        added = &device;
+                        break;
+                    }
+                }
+                if (added != nullptr && !added->connected && running.load()) {
+                    const RadioDevice copy = *added;
+                    busyId = copy.id;
+                    busyText = L"Connecting...";
+                    Publish();
+                    const bool linked = ConnectDevice(copy);
+                    if (RadioDevice* current = FindMutable(copy.id); current != nullptr) {
+                        if (linked) {
+                            current->connected = true;
+                        } else {
+                            RememberError(copy.id, L"Paired \u00B7 couldn't connect", false);
+                        }
+                    }
+                }
+            }
+            busyId.clear();
+            busyText.clear();
+            pairing.store(false);
+            if (!pairedOk && running.load()) {
                 RememberError(job.id, failure, true);
             }
             Publish();
@@ -2026,6 +2192,22 @@ BluetoothSnapshot BluetoothService::GetSnapshot() const {
         return {};
     }
     return m_impl->CopySnapshot();
+}
+
+bool BluetoothService::DryRun() noexcept {
+    static const bool enabled = []() {
+        wchar_t value[8]{};
+        return GetEnvironmentVariableW(L"HOVERDOCK_BT_DRYRUN", value, static_cast<DWORD>(std::size(value))) != 0 &&
+            value[0] != L'0';
+    }();
+    return enabled;
+}
+
+std::string BluetoothService::ThreadTag(const char* label) {
+    char buffer[160]{};
+    std::snprintf(buffer, sizeof(buffer), "%s tid=%lu", label == nullptr ? "" : label,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    return buffer;
 }
 
 bool BluetoothService::IsPairing() const noexcept {

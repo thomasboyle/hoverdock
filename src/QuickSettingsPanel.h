@@ -11,7 +11,6 @@
 enum class QuickSettingsPage : uint8_t {
     Home = 0,
     Wifi,
-    Ethernet,
     Vpn,
     Sound,
     Microphone,
@@ -58,11 +57,6 @@ struct QuickSettingsCache {
     bool haveWifiInterface = false;
     GUID wifiInterface{};
     std::vector<QsWifiNetwork> wifi;
-    bool ethernetUp = false;
-    std::wstring ethernetStatus;
-    std::wstring ethernetSpeed;
-    std::wstring ethernetIpv4;
-    std::wstring ethernetAdapter;
     std::vector<QsVpnEntry> vpn;
     std::wstring outputName;
     std::wstring inputName;
