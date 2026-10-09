@@ -215,7 +215,8 @@ private:
         BluetoothSettings,
         NotifyIcon,
         Back,
-        Ethernet,
+        // Chevron on the Home Bluetooth tile (replaced Ethernet).
+        BluetoothPage,
         Vpn,
         Microphone,
         Display,
@@ -432,7 +433,7 @@ private:
     // Meter/scrub-only present from underlay via UpdateLayeredWindowIndirect.
     void PaintOverflowLiveFast();
     void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
-        bool includeTemps = true, bool includeBoost = true) const;
+        bool includeTemps = true, bool includeBoost = true, bool includeBluetooth = true) const;
     void ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
         const TrayFlyoutHit& hit) const;
     void DestroyOverflowPopup() noexcept;
@@ -667,6 +668,14 @@ private:
     // Agent/perf: PostMessage RegisterWindowMessage(L"Hoverdock.OpenPerfMenus").
     UINT m_openPerfMenusMessage = 0;
     UINT m_closePerfMenusMessage = 0;
+    // Agent hooks (no synthetic input): RegisterWindowMessage
+    // "Hoverdock.OpenQsPage" (wParam 0 = Home, 1 = Bluetooth) and
+    // "Hoverdock.BluetoothTest" (only honored with HOVERDOCK_BT_DRYRUN=1;
+    // wParam 1 = radio toggle, 2 = connect/disconnect paired[lParam],
+    // 3 = scan start/stop, 4 = pair discovered[lParam]).
+    UINT m_openQsPageMessage = 0;
+    UINT m_bluetoothTestMessage = 0;
+    void RepaintBluetoothStatus();
     HPOWERNOTIFY m_suspendNotify = nullptr;
     HPOWERNOTIFY m_monitorNotify = nullptr;
     bool m_sessionNotifyRegistered = false;
@@ -941,6 +950,15 @@ private:
     uint8_t m_qsBoostStatusInkR = 0;
     uint8_t m_qsBoostStatusInkG = 0;
     uint8_t m_qsBoostStatusInkB = 0;
+    // Home Bluetooth tile status ("Off" / "On" / "Connected to X"): live
+    // overlay like Boost so BT worker snapshots and the tile toggle present
+    // one rect via PaintOverflowLiveFast instead of a full PaintQuickSettings.
+    RECT m_qsBtStatusRect{};
+    bool m_qsBtStatusValid = false;
+    bool m_qsBtStatusDirty = false;
+    uint8_t m_qsBtStatusInkR = 0;
+    uint8_t m_qsBtStatusInkG = 0;
+    uint8_t m_qsBtStatusInkB = 0;
     // When true, LayoutQuickSettings paints meter/scrub tracks at empty levels and
     // records their rects for PaintOverflowLiveFast.
     bool m_qsPaintUnderlayPass = false;

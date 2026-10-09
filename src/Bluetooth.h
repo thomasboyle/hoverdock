@@ -49,6 +49,13 @@ public:
     void Pair(const std::wstring& id);
 
     [[nodiscard]] BluetoothSnapshot GetSnapshot() const;
+    // HOVERDOCK_BT_DRYRUN=1: radio / connect / disconnect / pair jobs are
+    // simulated on the worker (logged, state updated in-memory only) so the
+    // UI paths can be exercised without touching real devices. Enumeration
+    // and discovery stay real (read-only).
+    [[nodiscard]] static bool DryRun() noexcept;
+    // "<label> tid=<GetCurrentThreadId()>" for HOVERDOCK_PROFILE call-path audits.
+    [[nodiscard]] static std::string ThreadTag(const char* label);
     [[nodiscard]] bool IsPairing() const noexcept;
     // Lets the next state change post another paint. Call before reading the snapshot.
     void AllowNextNotify() noexcept;

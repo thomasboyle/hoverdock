@@ -2318,6 +2318,8 @@ int DockApp::Run() {
     m_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     m_openPerfMenusMessage = RegisterWindowMessageW(L"Hoverdock.OpenPerfMenus");
     m_closePerfMenusMessage = RegisterWindowMessageW(L"Hoverdock.ClosePerfMenus");
+    m_openQsPageMessage = RegisterWindowMessageW(L"Hoverdock.OpenQsPage");
+    m_bluetoothTestMessage = RegisterWindowMessageW(L"Hoverdock.BluetoothTest");
     RegisterSystemResumeNotifications();
     HideTaskbar();
     // Profiles first: enrichment (AppUserModelId coverage) depends on knowing
@@ -3012,6 +3014,56 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         if (IsOverflowOpen()) {
             BeginOverflowHide(false);
         }
+        return 0;
+    }
+    if (m_openQsPageMessage != 0 && message == m_openQsPageMessage) {
+        // Hidden agent hook: open Quick Settings (and optionally a drill-in)
+        // without synthetic mouse input, for screenshots / profile runs.
+        if (m_visibility != VisibilityState::Visible) {
+            BeginShow();
+        }
+        if (!IsOverflowOpen()) {
+            BeginOverflowShow();
+        }
+        if (IsOverflowOpen()) {
+            if (wParam == 1) {
+                OpenQuickSettingsPage(QuickSettingsPage::Bluetooth);
+            } else if (wParam == 0 && m_qsPage != QuickSettingsPage::Home) {
+                m_qsReturn = QuickSettingsPage::Home;
+                CloseQuickSettingsPage();
+            }
+        }
+        return 0;
+    }
+    if (m_bluetoothTestMessage != 0 && message == m_bluetoothTestMessage) {
+        // Dry-run harness only: drives the same HandleOverflowClick path a
+        // real click takes, but BluetoothService simulates every mutating
+        // job (radio / connect / disconnect / pair) instead of touching
+        // hardware. Ignored entirely unless HOVERDOCK_BT_DRYRUN=1.
+        if (!BluetoothService::DryRun() || !IsOverflowOpen()) {
+            return 0;
+        }
+        TrayFlyoutHit hit;
+        hit.index = static_cast<int>(lParam);
+        switch (wParam) {
+        case 1:
+            hit.kind = TrayFlyoutHitKind::BluetoothRadio;
+            break;
+        case 2:
+            hit.kind = TrayFlyoutHitKind::BluetoothConnect;
+            break;
+        case 3:
+            hit.kind = TrayFlyoutHitKind::BluetoothDiscover;
+            break;
+        case 4:
+            hit.kind = TrayFlyoutHitKind::BluetoothPair;
+            break;
+        default:
+            return 0;
+        }
+        Log(L"BluetoothTest hook kind=" + std::to_wstring(wParam) + L" index=" +
+            std::to_wstring(static_cast<long long>(lParam)));
+        HandleOverflowClick(hit, WM_LBUTTONUP);
         return 0;
     }
 
@@ -5673,6 +5725,9 @@ void DockApp::FinishOverflowHide() noexcept {
         m_qsTempsDirty = false;
         m_qsBoostStatusValid = false;
         m_qsBoostStatusDirty = false;
+        m_qsBtStatusValid = false;
+        m_qsBtStatusDirty = false;
+        m_qsBtStatusRect = {};
         m_qsMeterRect = {};
         m_qsScrubRect = {};
         m_qsTempCpuRect = {};
@@ -5915,6 +5970,13 @@ void DockApp::BeginOverflowShow() {
         if (presented) {
             ArmOverflowLiveWorkers();
             qsOpenMark(L"ArmOverflowLiveWorkers");
+            // The kept Home frame may show a stale Bluetooth status (snapshots
+            // that land while QS is hidden are not painted). One rect present.
+            if (m_qsBtStatusValid) {
+                m_qsBtStatusDirty = true;
+                PaintOverflowLiveFast();
+                qsOpenMark(L"BluetoothStatusLiveFast");
+            }
         }
     } else {
         RebuildOverflowPopup();
@@ -7793,8 +7855,32 @@ void DockApp::ApplyBluetoothSnapshot() {
     if (!IsOverflowOpen() || unchanged) {
         return;
     }
-    m_overflowHover = -1;
-    QueueOverflowPaint();
+    RepaintBluetoothStatus();
+}
+
+void DockApp::RepaintBluetoothStatus() {
+    // Called on the UI thread (which also owns WH_MOUSE_LL) after a BT
+    // snapshot or an optimistic toggle. Home only shows the tile status, so
+    // present that one rect from the underlay; pages that list BT state
+    // (Bluetooth, Airplane) coalesce a full repaint through the queue.
+    if (!IsOverflowOpen()) {
+        return;
+    }
+    switch (m_qsPage) {
+    case QuickSettingsPage::Home:
+        if (m_qsBtStatusValid) {
+            m_qsBtStatusDirty = true;
+            PaintOverflowLiveFast();
+        }
+        break;
+    case QuickSettingsPage::Bluetooth:
+    case QuickSettingsPage::Airplane:
+        m_overflowHover = -1;
+        QueueOverflowPaint();
+        break;
+    default:
+        break;
+    }
 }
 
 int DockApp::AppSlotCount() const noexcept {
@@ -7902,7 +7988,15 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         RunPerformanceBoost();
         break;
     case TrayFlyoutHitKind::BluetoothRadio:
+        // Home tile body or drill-in header switch. Optimistic flip, then the
+        // WinRT Radio.SetStateAsync runs on the BT worker (never here).
+        ProfileScope::Mark(BluetoothService::ThreadTag("UI BluetoothRadio click").c_str());
         m_lastBluetoothUiAt = QpcSeconds();
+        if (message == WM_RBUTTONUP && m_qsPage == QuickSettingsPage::Home) {
+            // Right-click on the tile mirrors Wi-Fi: open the system page.
+            OpenSettingsPage(L"ms-settings:bluetooth");
+            break;
+        }
         if (!m_bluetoothSnapshot.ready || !m_bluetoothSnapshot.radioPresent) {
             break;
         }
@@ -7913,9 +8007,13 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
             m_bluetoothSnapshot.hint.clear();
         }
         m_bluetooth.SetRadioEnabled(m_bluetoothSnapshot.radioOn);
-        QueueOverflowPaint();
+        RepaintBluetoothStatus();
+        break;
+    case TrayFlyoutHitKind::BluetoothPage:
+        ApplyQuickSettingsCommand(hit, message);
         break;
     case TrayFlyoutHitKind::BluetoothConnect:
+        ProfileScope::Mark(BluetoothService::ThreadTag("UI BluetoothConnect click").c_str());
         m_lastBluetoothUiAt = QpcSeconds();
         if (hit.index < 0 ||
             static_cast<size_t>(hit.index) >= m_bluetoothSnapshot.paired.size()) {
@@ -7934,6 +8032,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         }
         break;
     case TrayFlyoutHitKind::BluetoothPair:
+        ProfileScope::Mark(BluetoothService::ThreadTag("UI BluetoothPair click").c_str());
         m_lastBluetoothUiAt = QpcSeconds();
         if (m_bluetooth.IsPairing() || hit.index < 0 ||
             static_cast<size_t>(hit.index) >= m_bluetoothSnapshot.discovered.size()) {
@@ -7943,13 +8042,22 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
             const BluetoothDeviceInfo& device =
                 m_bluetoothSnapshot.discovered[static_cast<size_t>(hit.index)];
             if (!device.busy && !device.id.empty()) {
-                SetForegroundWindow(m_window);
+                // Real pairing may raise a Windows confirm/PIN prompt that
+                // needs a foreground owner; the dry-run harness never steals focus.
+                if (!BluetoothService::DryRun()) {
+                    SetForegroundWindow(m_window);
+                }
                 m_bluetooth.Pair(device.id);
             }
         }
         break;
     case TrayFlyoutHitKind::BluetoothDiscover:
+        ProfileScope::Mark(BluetoothService::ThreadTag("UI BluetoothDiscover click").c_str());
         m_lastBluetoothUiAt = QpcSeconds();
+        if (m_window != nullptr) {
+            // Keep the 4 s refresh timer alive while a scan runs.
+            SetTimer(m_window, kBluetoothTimerId, 4000, nullptr);
+        }
         if (m_bluetoothSnapshot.discovering) {
             m_bluetoothSnapshot.discovering = false;
             m_bluetoothSnapshot.discovered.clear();
@@ -7968,7 +8076,6 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         ShellExecuteW(nullptr, L"open", L"ms-settings:bluetooth", nullptr, nullptr, SW_SHOWNORMAL);
         break;
     case TrayFlyoutHitKind::Back:
-    case TrayFlyoutHitKind::Ethernet:
     case TrayFlyoutHitKind::Vpn:
     case TrayFlyoutHitKind::Microphone:
     case TrayFlyoutHitKind::Display:
@@ -8103,6 +8210,12 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         // tile underneath.
         break;
     case TrayFlyoutHitKind::BluetoothRadio:
+        // Home tile body: no plate (matches Wi-Fi / VPN tiles). The drill-in
+        // header switch keeps its subtle plate.
+        if (m_qsPage == QuickSettingsPage::Home) {
+            break;
+        }
+        [[fallthrough]];
     case TrayFlyoutHitKind::BluetoothSettings: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
@@ -8130,7 +8243,7 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::Boost:
     case TrayFlyoutHitKind::Brightness:
     case TrayFlyoutHitKind::Back:
-    case TrayFlyoutHitKind::Ethernet:
+    case TrayFlyoutHitKind::BluetoothPage:
     case TrayFlyoutHitKind::Vpn:
     case TrayFlyoutHitKind::Microphone:
     case TrayFlyoutHitKind::Display:
@@ -8272,7 +8385,7 @@ void DockApp::PaintOverflowLiveFast() {
         m_overflowPresentSize.cx != m_overflowSize.cx ||
         m_overflowPresentSize.cy != m_overflowSize.cy ||
         (!m_qsMeterValid && !m_qsScrubValid && !m_qsTempsValid &&
-            !m_qsBoostStatusValid) ||
+            !m_qsBoostStatusValid && !m_qsBtStatusValid) ||
         m_overflowUnderlayBits.size() != m_overflowPresentBits.size() ||
         !OverflowScreenOrigin(origin, caret)) {
         PaintOverflowPopup();
@@ -8347,13 +8460,19 @@ void DockApp::PaintOverflowLiveFast() {
     if (boost) {
         addDirty(m_qsBoostStatusRect);
     }
+    const bool bluetooth = m_qsBtStatusValid && m_qsBtStatusDirty;
+    m_qsBtStatusDirty = false;
+    if (bluetooth) {
+        addDirty(m_qsBtStatusRect);
+    }
     if (!haveDirty) {
         return;
     }
 
-    // includeBoost only when its rect was restored; otherwise meter ticks
-    // would DrawFlyoutText over existing glyphs (fake-bold regression).
-    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps, boost);
+    // includeBoost / includeBluetooth only when their rect was restored;
+    // otherwise meter ticks would DrawFlyoutText over existing glyphs
+    // (fake-bold regression from PR #26).
+    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps, boost, bluetooth);
     if (m_overflowBaseBits.size() == m_overflowPresentBits.size()) {
         // Keep base in sync so hover-fast restores still show live meters.
         const LONG left = dirty.left;
