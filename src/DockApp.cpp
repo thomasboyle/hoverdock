@@ -4075,7 +4075,9 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         left += trayGlyph + trayGap;
     }
     left += trayClockGap - trayGap;
-    const LONG clockTop = top + (iconSlotHeight - clockHeight) / 2;
+    // The icon glyph is the pill's vertical center; the strip under it is the
+    // running dot. Centering the clock in the full slot drops the time/date.
+    const LONG clockTop = top + (iconSize - clockHeight) / 2;
     {
         // Always reserve the slot so the clock does not jump when the first
         // Open-Meteo fetch lands; RasterizeIcon falls back to cloudy.

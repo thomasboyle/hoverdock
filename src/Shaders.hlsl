@@ -337,10 +337,24 @@ float4 GlassPS(VertexOutput input) : SV_Target
         {
             return float4(0.0, 0.0, 0.0, 0.0);
         }
-        // Soft outer contact shadow: the pill SDF re-evaluated with a small
-        // downward offset, falloff over a 16px band. Premultiplied black over
-        // the desktop = drop shade via the DComp blend. Fits inside the layout
-        // margin (18px). Dock: lighter, centered ambient float (Apple glass).
+        // Dock: overhead light. The shade is the pill dropped a few pixels,
+        // with a short penumbra, and only on the downward-facing edge. A ring
+        // on the top and sides is not a cast shadow. Premultiplied black over
+        // the desktop = drop shade via the DComp blend.
+        if (!isPanel)
+        {
+            const float2 dockShadowCenter = outputSize * 0.5 + float2(0.0, 3.5) * dpi;
+            const float dockShadowSdf = SdSquircleBox(pixel - dockShadowCenter, halfSize, cornerRadius);
+            const float penumbra = 4.0 * dpi;
+            const float2 dockOutward = gradient / max(length(gradient), 0.0001);
+            // Only the downward face. 0.55 keeps the shade under the bar
+            // instead of climbing the side corners.
+            const float facingDown = smoothstep(0.55, 0.98, dockOutward.y);
+            const float s = 1.0 - saturate(max(dockShadowSdf, 0.0) / penumbra);
+            const float shadowAlpha = s * s * (3.0 - 2.0 * s) * 0.14 * facingDown;
+            return float4(0.0, 0.0, 0.0, shadowAlpha);
+        }
+        // Panels keep a soft surround in their own margin.
         const float2 shadowOffset = float2(0.0, 4.0);
         const float2 shadowCenter = outputSize * 0.5 + shadowOffset * dpi;
         const float shadowSdf = SdSquircleBox(pixel - shadowCenter, halfSize, cornerRadius);
