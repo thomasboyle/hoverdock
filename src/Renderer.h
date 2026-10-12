@@ -287,24 +287,12 @@ private:
     bool m_backdropValid = false;
     uint64_t m_backdropHash = 0;
     uint64_t m_backdropChangeSerial = 0;
-    // Last DWM composed-frame count seen by CaptureBackdrop. Used for the idle
-    // fast path: when DWM hasn't composed since the last capture, the backdrop
-    // pixels cannot have changed and the BitBlt is skipped (timer still fires).
+    // Last DWM composed-frame count sampled into the backdrop. A new cFrame
+    // is sampled; an unchanged cFrame skips the read. Dirty rects are not a
+    // gate: the strip is the dock HWND, so they cannot see wallpaper under it.
     uint64_t m_backdropDwmFrame = 0;
     bool m_backdropDwmFrameValid = false;
     bool m_backdropRefreshRequested = false;
-    // Last BitBlt of a "dirty" frame did not change pixels. Further dirty-rect
-    // spam must not BitBlt again until a quiet frame or an explicit refresh.
-    bool m_stripConfirmedClean = false;
-    bool m_stripDirtyPending = false;
-    ULONGLONG m_lastStripReadMs = 0;
-    // While the backdrop timer is on the 120 Hz cadence, re-read a dirty strip
-    // on the next tick instead of holding a stale plate for 200 ms.
-    static constexpr ULONGLONG kStripRecheckMs = 8;
-    uint8_t m_stripRechecksLeft = 0;
-    static constexpr uint8_t kStripRechecks = 3;
-    uint8_t m_stripPendingTicks = 0;
-    static constexpr uint8_t kStripPendingMaxTicks = 4;
     // Sparse probe DIB (width x kBackdropProbeRows) + reference from last commit.
     HDC m_backdropProbeDc = nullptr;
     HBITMAP m_backdropProbeBitmap = nullptr;

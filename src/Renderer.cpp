@@ -1219,8 +1219,6 @@ void Renderer::InvalidateBackdrop() noexcept {
     m_backdropDwmFrameValid = false;
     m_backdropDwmFrame = 0;
     m_backdropRefreshRequested = false;
-    m_stripConfirmedClean = false;
-    m_stripDirtyPending = false;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();
@@ -1402,8 +1400,7 @@ bool EnsureMagnifierSampler() noexcept {
     }
 
     g_magnifier.host = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST |
-            WS_EX_NOREDIRECTIONBITMAP,
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         windowClass.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, windowClass.hInstance,
         nullptr);
     if (g_magnifier.host == nullptr ||
@@ -1464,9 +1461,13 @@ bool SampleWithMagnifier(const RECT& screen, uint8_t* destBits, const HWND* excl
         // screen origin is (0, 0): host at -origin, child at +origin. The host
         // stays hidden, so that child is not visible and does not take clicks,
         // while the exclude list still omits the dock from the sample.
+        // The host must stay shown. A hidden magnifier keeps returning the first
+        // frame from MagSetWindowSource, which is the frozen plate under the dock.
+        // Alpha 0 + WS_EX_TRANSPARENT keeps it from drawing or taking clicks; the
+        // child is placed so its screen origin is (0, 0), which the callback requires.
         if (SetWindowPos(g_magnifier.host, HWND_TOPMOST, -static_cast<int>(screen.left),
                 -static_cast<int>(screen.top), static_cast<int>(width), static_cast<int>(height),
-                SWP_NOACTIVATE | SWP_HIDEWINDOW) == FALSE) {
+                SWP_NOACTIVATE | SWP_SHOWWINDOW) == FALSE) {
             return false;
         }
         if (SetWindowPos(g_magnifier.magnifier, nullptr, static_cast<int>(screen.left),
@@ -1476,6 +1477,9 @@ bool SampleWithMagnifier(const RECT& screen, uint8_t* destBits, const HWND* excl
         }
         g_magnifier.source = screen;
         g_magnifier.placed = true;
+    }
+    if (IsWindowVisible(g_magnifier.host) == FALSE) {
+        ShowWindow(g_magnifier.host, SW_SHOWNOACTIVATE);
     }
 
     HWND filters[8]{};
@@ -1958,28 +1962,10 @@ StripDirt DirtForRegion(const RECT& region, const RECT* selfExclude = nullptr,
     return StripDirt::Clean;
 }
 
-// Desktop duplication metadata only: no Map, no BitBlt. A static strip returns
-// Clean and must not touch GDI (BitBlt demand-zeros a fresh mirror every call).
-// Uses the tick's shared poll when one is active so the menu plates see the
-// same frame as the dock strip.
-StripDirt QueryStripDirt(const RECT& strip, const RECT* selfExclude = nullptr,
-    UINT selfExcludeCount = 0) {
-    const bool shared = g_desktopDirt.valid;
-    if (!shared) {
-        PollDesktopDirt(MonitorFromRect(&strip, MONITOR_DEFAULTTONEAREST));
-    }
-    const StripDirt dirt = DirtForRegion(strip, selfExclude, selfExcludeCount);
-    if (!shared) {
-        g_desktopDirt.valid = false;
-    }
-    return dirt;
-}
-
 }  // namespace
 
 void Renderer::RequestBackdropRefresh() noexcept {
     m_backdropRefreshRequested = true;
-    m_stripConfirmedClean = false;
 }
 
 void Renderer::PollDesktopChanges() noexcept {
@@ -2006,93 +1992,42 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         return false;
     }
 
-    // Resting path must not BitBlt. A screen read demand-zeros a fresh GDI
-    // mirror on every call, which is a soft page fault per page even when the
-    // destination DIB is reused. DWM cFrame also advances for cursor motion and
-    // unrelated presents, so probing on that signal faulted at the timer rate.
-    // Dirty rects come from duplication metadata (no map). A clean strip
-    // returns here. Focus changes request one real read.
-    // Dock Present / pointer glint mark DXGI dirty rects over the strip even when
-    // wallpaper under glass is unchanged; ignore dirt wholly inside the dock HWND
-    // (same window CaptureScreenExcluding omits from the sample).
-    RECT selfExclude[1]{};
-    UINT selfExcludeCount = 0;
-    if (m_window != nullptr && GetWindowRect(m_window, &selfExclude[0]) != FALSE) {
-        selfExcludeCount = 1;
-    }
+    // Sample whenever DWM composes a new frame for this monitor. Dirty-rect
+    // gating froze the plate: the strip is the dock HWND, so every change under
+    // the glass is "inside" that window and was discarded. The timer runs at
+    // the monitor refresh; the RGB hash below still skips the GPU upload when
+    // the pixels behind the glass did not change. cFrame is consumed only after
+    // a successful read so a failed sample is retried on the next tick.
+    uint64_t composedFrame = 0;
+    bool haveComposedFrame = false;
     if (m_backdropValid && !m_backdropRefreshRequested) {
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
-        if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
-            if (changed != nullptr) {
-                *changed = false;
-            }
-            return true;
-        }
-        const bool frameAdvanced =
-            !m_backdropDwmFrameValid || timing.cFrame != m_backdropDwmFrame;
-        if (!frameAdvanced && !m_stripDirtyPending) {
-            // A shared poll can see new dirty rects before our cached cFrame
-            // moves. Fall through and BitBlt only then; cursor motion advances
-            // cFrame without dirty rects and stays on this early return.
-            if (!g_desktopDirt.valid ||
-                DirtForRegion(screenRectangle, selfExclude, selfExcludeCount) !=
-                    StripDirt::Dirty) {
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(m_window, &timing))) {
+            if (m_backdropDwmFrameValid && timing.cFrame == m_backdropDwmFrame) {
                 if (changed != nullptr) {
                     *changed = false;
                 }
                 return true;
             }
+            composedFrame = timing.cFrame;
+            haveComposedFrame = true;
         }
-        // Duplication frames trail DWM frames: a timeout means the change is not
-        // delivered yet, so keep the DWM frame unconsumed and ask again.
-        StripDirt dirt = QueryStripDirt(screenRectangle, selfExclude, selfExcludeCount);
-        if (dirt == StripDirt::Pending) {
-            if (m_stripDirtyPending) {
-                dirt = StripDirt::Dirty;
-            } else if (++m_stripPendingTicks < kStripPendingMaxTicks) {
-                if (changed != nullptr) {
-                    *changed = false;
-                }
-                return true;
-            } else {
-                dirt = StripDirt::Clean;
-            }
-        }
-        m_stripPendingTicks = 0;
-        m_backdropDwmFrame = timing.cFrame;
-        m_backdropDwmFrameValid = true;
-        if (dirt == StripDirt::Dirty) {
-            m_stripRechecksLeft = kStripRechecks;
-        }
-        if (dirt != StripDirt::Dirty && !m_stripDirtyPending) {
-            m_stripConfirmedClean = false;
-            if (changed != nullptr) {
-                *changed = false;
-            }
-            return true;
-        }
-        // A read that found nothing meaningful may have caught the first frame of
-        // a fade or move, so dirty frames are re-read at a bounded rate instead
-        // of being ignored until a clean frame.
-        if (m_stripConfirmedClean && GetTickCount64() - m_lastStripReadMs < kStripRecheckMs) {
-            m_stripDirtyPending = true;
-            if (changed != nullptr) {
-                *changed = false;
-            }
-            return true;
-        }
-        m_stripDirtyPending = false;
     } else {
         m_backdropRefreshRequested = false;
-        m_stripDirtyPending = false;
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
-        if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
-            m_backdropDwmFrame = timing.cFrame;
-            m_backdropDwmFrameValid = true;
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(m_window, &timing))) {
+            composedFrame = timing.cFrame;
+            haveComposedFrame = true;
         }
     }
+    const auto commitComposedFrame = [&]() noexcept {
+        if (haveComposedFrame) {
+            m_backdropDwmFrame = composedFrame;
+            m_backdropDwmFrameValid = true;
+        }
+    };
 
     // SRCCOPY-equivalent sample of the composed desktop. The render window is
     // omitted here so its swapchain does not refract back through the glass.
@@ -2106,7 +2041,6 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     m_backdropOriginX = screenRectangle.left;
     m_backdropOriginY = screenRectangle.top;
     m_backdropOriginValid = true;
-    m_lastStripReadMs = GetTickCount64();
 
     // Noise-tolerant change check (preferred over raw FNV hash): a few flapping
     // pixels must not upload or advance BackdropChangeSerial.
@@ -2114,11 +2048,7 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     const bool meaningfullyChanged =
         !m_backdropValid || sampleDiffs > kBackdropChangeMinSamples;
     if (!meaningfullyChanged) {
-        m_stripConfirmedClean = true;
-        if (m_stripRechecksLeft > 0) {
-            --m_stripRechecksLeft;
-            m_stripDirtyPending = true;
-        }
+        commitComposedFrame();
         CommitBackdropProbeFromDib();
         m_backdropHash = HashBackdropPixels();
         if (changed != nullptr) {
@@ -2126,17 +2056,17 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         }
         return true;
     }
-    m_stripConfirmedClean = false;
-
     {
         ProfileScope uploadScope("Renderer::UploadBackdropPixels");
         if (!UploadBackdropPixels()) {
             // GPU saturated: keep the previous backdrop; the next capture tick
-            // retries instead of stalling the UI thread.
+            // retries instead of stalling the UI thread. Leave cFrame
+            // unconsumed so that retry is not skipped.
             ProfileScope::Mark("Renderer::SkipBackdropUpload");
             return false;
         }
     }
+    commitComposedFrame();
     m_backdropHash = HashBackdropPixels();
     m_backdropValid = true;
     CommitBackdropSamplesFromDib();
@@ -2860,8 +2790,6 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropDwmFrame = 0;
     m_backdropDwmFrameValid = false;
     m_backdropRefreshRequested = false;
-    m_stripConfirmedClean = false;
-    m_stripDirtyPending = false;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();

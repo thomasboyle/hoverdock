@@ -62,6 +62,10 @@ private:
         std::vector<std::vector<uint8_t>> missingIconPixels;
         bool layoutChanged = false;
         bool runningChanged = false;
+        // Catalog-event epoch observed by the worker. Apply clears the hidden
+        // dirty flag only when no newer show/hide arrived during the enum.
+        UINT catalogEpoch = 0;
+        UINT refreshGeneration = 0;
     };
 
     struct LaunchTarget {
@@ -162,15 +166,11 @@ private:
     // 0 = no timer while Hidden with a healthy LL hook (event-driven via hook + FG WinEvent).
     static constexpr UINT kCursorWatchHiddenIntervalMs = 0;
     static constexpr UINT kDeferredRefreshDelayMs = 400;
+    // Used only when the host refresh rate cannot be read. While the dock is
+    // visible the backdrop timer tracks that monitor (BackdropFrameIntervalMs).
     static constexpr UINT kBackdropIntervalMs = 8;
-    // Idle DWM / unchanged-capture backoff. Moving wallpaper under the dock,
-    // Quick Settings, or Dock Settings holds the 8 ms (~120 Hz) cadence.
     static constexpr UINT kBackdropIdleIntervalMs = 250;
-    // Static desktop: duplication poll only, no BitBlt. Short enough that motion
-    // is picked up and the fast cadence resumes within a frame or two.
     static constexpr UINT kBackdropRestingIntervalMs = 100;
-    // Clean ticks required before leaving 120 Hz. One unchanged frame must not
-    // drop a moving wallpaper to the resting poll.
     static constexpr UINT kBackdropIdleHysteresisTicks = 15;
     static constexpr UINT kBackdropRestingHysteresisTicks = 15;
     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
@@ -200,6 +200,7 @@ private:
     static constexpr UINT kQsTempsResultMessage = WM_APP + 26;
     static constexpr UINT kQsCacheResultMessage = WM_APP + 27;
     static constexpr UINT kOpenDockSettingsMessage = WM_APP + 29;
+    static constexpr UINT kHiddenCatalogMessage = WM_APP + 30;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -448,7 +449,12 @@ private:
     void UpdatePrimaryMonitor();
     [[nodiscard]] bool AdoptMonitorForCursor(POINT cursor);
     [[nodiscard]] UINT HostDpi() const noexcept;
+    void NoteHostRefreshHz() noexcept;
+    [[nodiscard]] UINT BackdropFrameIntervalMs() const noexcept;
     void BeginShow();
+    void CatchUpHiddenCatalog();
+    void PumpCatalogMessages();
+    void FlushPendingLayout();
     [[nodiscard]] bool CaptureLiveBackdrop();
     // Returns true when a live bake was submitted or a completed bake was applied.
     [[nodiscard]] bool TickLivePopupGlass();
@@ -581,6 +587,8 @@ private:
     void RegisterForegroundWatch() noexcept;
     void UnregisterForegroundWatch() noexcept;
     static void CALLBACK ForegroundWinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+        LONG idObject, LONG idChild, DWORD idEventThread, DWORD dwmsEventTime);
+    static void CALLBACK CatalogWinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
         LONG idObject, LONG idChild, DWORD idEventThread, DWORD dwmsEventTime);
     [[nodiscard]] bool IsElevatedForeground() const noexcept;
     void ApplyPinUnpinLayoutChange();
@@ -746,6 +754,12 @@ private:
     UINT m_cursorWatchAppliedMs = 0;
     UINT m_cursorWatchStationaryPumps = 0;
     HWINEVENTHOOK m_foregroundHook = nullptr;
+    HWINEVENTHOOK m_catalogHook = nullptr;
+    bool m_inBeginShow = false;
+    std::atomic<bool> m_hiddenCatalogDirty{false};
+    std::atomic<UINT> m_hiddenCatalogEpoch{0};
+    UINT m_hostRefreshHz = 60;
+    UINT m_backdropFastPeriodMs = 0;
     bool m_taskbarStateSaved = false;
     UINT m_savedTaskbarState = 0;
     RECT m_savedWorkArea{};
@@ -810,9 +824,9 @@ private:
     bool m_shellFlyoutSeen = false;
     double m_suppressBackdropUntil = 0.0;
     UINT m_backdropTimerAppliedMs = 0;
-    // High-resolution waitable timer for the 8 ms backdrop cadence. SetTimer
-    // cannot fire faster than USER_TIMER_MINIMUM (10 ms), so it never reaches
-    // 120 Hz. Armed only while the dock or an open plate is tracking motion.
+    // High-resolution waitable timer paced to the host monitor refresh.
+    // SetTimer cannot fire faster than USER_TIMER_MINIMUM (10 ms). Armed while
+    // the dock is visible so the glass tracks that panel's refresh rate.
     HANDLE m_backdropWaitable = nullptr;
     bool m_backdropFastArmed = false;
     UINT m_backdropIdleStreak = 0;

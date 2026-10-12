@@ -109,6 +109,9 @@ constexpr float kMinDockScale = 0.75F;
 constexpr float kMaxDockScale = 1.5F;
 constexpr int kBottomHotZonePixels = 8;
 constexpr UINT kRefreshIntervalMs = 15000;
+// While the dock is hidden, rebuild the icon row often enough that a reveal
+// already has the apps opened in the meantime. The visible cadence stays 15 s.
+constexpr UINT kHiddenRefreshIntervalMs = 400;
 constexpr BYTE kInputWindowAlpha = 1;
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
@@ -1602,12 +1605,64 @@ INPUT KeyboardInput(WORD key, DWORD flags) {
 }
 
 bool SendWinKey() {
-    const std::array inputs = {
-        KeyboardInput(VK_LWIN, KEYEVENTF_EXTENDEDKEY),
-        KeyboardInput(VK_LWIN, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
-    };
-    return SendInput(static_cast<UINT>(inputs.size()), const_cast<INPUT*>(inputs.data()),
-        sizeof(INPUT)) == static_cast<UINT>(inputs.size());
+    // Scan code 0x5B plus EXTENDEDKEY. wVk alone is dropped on some builds when
+    // the dock's click did not move foreground (the input window is NOACTIVATE).
+    INPUT inputs[2]{};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wScan = 0x5B;
+    inputs[0].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY;
+    inputs[1] = inputs[0];
+    inputs[1].ki.dwFlags |= KEYEVENTF_KEYUP;
+    return SendInput(static_cast<UINT>(std::size(inputs)), inputs, sizeof(INPUT)) ==
+        static_cast<UINT>(std::size(inputs));
+}
+
+bool SendCtrlEsc() {
+    INPUT inputs[4]{};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+    inputs[0].ki.wScan = 0x1D;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_ESCAPE;
+    inputs[1].ki.wScan = 0x01;
+    inputs[2] = inputs[1];
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3] = inputs[0];
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    return SendInput(static_cast<UINT>(std::size(inputs)), inputs, sizeof(INPUT)) ==
+        static_cast<UINT>(std::size(inputs));
+}
+
+bool GrantExplorerForeground();
+
+bool InjectStartHotkey() {
+    // A NOACTIVATE dock click leaves the previous app in front. SendInput is
+    // then ignored when that app holds the foreground lock or is elevated.
+    // Join its thread, hand foreground to Explorer, then inject the hotkey.
+    HWND foreground = GetForegroundWindow();
+    DWORD foregroundThread = 0;
+    if (foreground != nullptr) {
+        foregroundThread = GetWindowThreadProcessId(foreground, nullptr);
+    }
+    const DWORD thisThread = GetCurrentThreadId();
+    const bool attached = foregroundThread != 0 && foregroundThread != thisThread &&
+        AttachThreadInput(thisThread, foregroundThread, TRUE) != FALSE;
+
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    static_cast<void>(GrantExplorerForeground());
+    if (tray != nullptr) {
+        SetForegroundWindow(tray);
+    }
+
+    bool opened = SendWinKey();
+    if (!opened) {
+        opened = SendCtrlEsc();
+    }
+
+    if (attached) {
+        AttachThreadInput(thisThread, foregroundThread, FALSE);
+    }
+    return opened;
 }
 
 
@@ -2364,6 +2419,9 @@ int DockApp::Run() {
     GetCursorPos(&m_lastCursor);
     m_lastPointerSampleAt = QpcSeconds();
     HandlePointer(m_lastCursor);
+    if (m_visibility == VisibilityState::Hidden) {
+        StartRefreshTimer();
+    }
     Log(L"Dock initialized.");
     // Startup transient allocations (icon extraction temps, shell queries) stay
     // committed in the CRT heap; hand fully-free pages back to the OS once.
@@ -3280,6 +3338,12 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         ApplyBackgroundRefresh(static_cast<UINT>(wParam));
         return 0;
 
+    case kHiddenCatalogMessage:
+        if (m_visibility == VisibilityState::Hidden) {
+            ScheduleDeferredRefresh();
+        }
+        return 0;
+
     case kPinIconMessage:
         ApplyPinIcons(static_cast<UINT>(wParam));
         return 0;
@@ -3506,8 +3570,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 }
             }
         }
-        static_cast<void>(GrantExplorerForeground());
-        if (!SendWinKey()) {
+        if (!InjectStartHotkey()) {
             ReleaseShellFlyoutHold();
             Log(L"Start menu did not accept input.");
         }
@@ -8833,6 +8896,41 @@ void DockApp::UpdatePrimaryMonitor() {
     }
 }
 
+void DockApp::NoteHostRefreshHz() noexcept {
+    UINT hz = 0;
+    if (m_hostMonitor != nullptr) {
+        MONITORINFOEXW information{};
+        information.cbSize = sizeof(information);
+        if (GetMonitorInfoW(m_hostMonitor, &information) != FALSE) {
+            DEVMODEW mode{};
+            mode.dmSize = sizeof(mode);
+            if (EnumDisplaySettingsW(information.szDevice, ENUM_CURRENT_SETTINGS, &mode) != FALSE &&
+                mode.dmDisplayFrequency >= 30 && mode.dmDisplayFrequency <= 500) {
+                hz = mode.dmDisplayFrequency;
+            }
+        }
+    }
+    if (hz == 0) {
+        DWM_TIMING_INFO timing{};
+        timing.cbSize = sizeof(timing);
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(m_window, &timing)) &&
+            timing.rateRefresh.uiDenominator != 0) {
+            hz = static_cast<UINT>((timing.rateRefresh.uiNumerator +
+                                       timing.rateRefresh.uiDenominator / 2) /
+                timing.rateRefresh.uiDenominator);
+        }
+    }
+    if (hz < 30 || hz > 500) {
+        hz = 60;
+    }
+    m_hostRefreshHz = hz;
+}
+
+UINT DockApp::BackdropFrameIntervalMs() const noexcept {
+    const UINT hz = m_hostRefreshHz >= 30 ? m_hostRefreshHz : 60;
+    return std::max(1u, 1000u / hz);
+}
+
 UINT DockApp::HostDpi() const noexcept {
     if (m_hostMonitor != nullptr) {
         UINT dpiX = 96;
@@ -8860,6 +8958,7 @@ bool DockApp::AdoptMonitorForCursor(POINT cursor) {
     const UINT previousDpi = HostDpi();
     m_hostMonitor = monitor;
     m_hostBounds = bounds;
+    NoteHostRefreshHz();
     RebuildLayout(previousDpi != HostDpi());
     PositionOverlayWindows();
     if (m_visibility == VisibilityState::Visible) {
@@ -8899,6 +8998,79 @@ bool DockApp::CaptureLiveBackdrop() {
     return captured && changed;
 }
 
+void DockApp::PumpCatalogMessages() {
+    static_cast<void>(MsgWaitForMultipleObjectsEx(0, nullptr, 15,
+        QS_SENDMESSAGE | QS_POSTMESSAGE, MWMO_INPUTAVAILABLE));
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE | PM_QS_SENDMESSAGE) != FALSE) {
+        DispatchMessageW(&message);
+    }
+    const UINT messages[] = {kRefreshApplyMessage, kLayoutApplyMessage, kPinIconMessage};
+    for (const UINT messageId : messages) {
+        while (PeekMessageW(&message, m_window, messageId, messageId, PM_REMOVE) != FALSE) {
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+void DockApp::FlushPendingLayout() {
+    const bool layout = m_layoutApplyPending;
+    const bool tray = m_trayIconsApplyPending;
+    if (!layout && !tray) {
+        return;
+    }
+    m_layoutApplyPending = false;
+    m_trayIconsApplyPending = false;
+    if (layout) {
+        UpdateInputRegion();
+        PositionOverlayWindows();
+        if (m_rendererInitialized) {
+            m_renderer.Resize(m_dockWidth, m_dockHeight);
+        }
+    }
+    if (tray) {
+        EnsureTrayIcons();
+        QueueRenderFrame();
+    }
+}
+
+void DockApp::CatchUpHiddenCatalog() {
+    const double deadline = QpcSeconds() + 0.28;
+    if (m_hiddenCatalogDirty.load(std::memory_order_relaxed)) {
+        ++m_refreshGeneration;
+        m_lastWindowRefresh = 0.0;
+        while (m_refreshInFlight.load(std::memory_order_relaxed) && QpcSeconds() < deadline) {
+            PumpCatalogMessages();
+        }
+        if (!m_refreshInFlight.load(std::memory_order_relaxed)) {
+            RefreshRunningWindows(true);
+        }
+        while (m_refreshInFlight.load(std::memory_order_relaxed) && QpcSeconds() < deadline) {
+            PumpCatalogMessages();
+        }
+    } else if (m_refreshInFlight.load(std::memory_order_relaxed)) {
+        while (m_refreshInFlight.load(std::memory_order_relaxed) && QpcSeconds() < deadline) {
+            PumpCatalogMessages();
+        }
+    }
+
+    PumpCatalogMessages();
+    UINT pendingGeneration = 0;
+    bool havePending = false;
+    {
+        const std::lock_guard lock(m_refreshSnapshotMutex);
+        if (m_refreshSnapshot.has_value() &&
+            m_refreshSnapshot->refreshGeneration == m_refreshGeneration.load()) {
+            pendingGeneration = m_refreshSnapshot->refreshGeneration;
+            havePending = true;
+        }
+    }
+    if (havePending) {
+        ApplyBackgroundRefresh(pendingGeneration);
+    }
+    FlushPendingLayout();
+}
+
 void DockApp::BeginShow() {
     ProfileScope scope("BeginShow");
     if (m_shellFlyoutHold || m_visibility == VisibilityState::Showing ||
@@ -8908,19 +9080,17 @@ void DockApp::BeginShow() {
 
     HideHoverLabel();
     ++m_showSessionId;
-
-    // Drain a catalog refresh that finished while Hidden so the first revealed
-    // frame already matches the current app set (avoids a mid-slide width jump).
-    {
-        bool havePending = false;
-        {
-            const std::lock_guard lock(m_refreshSnapshotMutex);
-            havePending = m_refreshSnapshot.has_value();
-        }
-        if (havePending) {
-            ApplyBackgroundRefresh(m_refreshGeneration.load());
-        }
+    m_inBeginShow = true;
+    struct BeginShowGuard {
+        DockApp* app;
+        ~BeginShowGuard() { app->m_inBeginShow = false; }
+    } beginShowGuard{this};
+    if (m_visibility == VisibilityState::Hiding) {
+        // Catch-up rebuilds layout. Doing that while Hiding retargets the slide
+        // downward; this reveal owns the animation from here.
+        m_visibility = VisibilityState::Hidden;
     }
+    CatchUpHiddenCatalog();
 
     // Fresh desktop under the dock before the first painted frame. The prior
     // hot-path diet started the slide on the cached backdrop and let the timer
@@ -9020,8 +9190,8 @@ void DockApp::AdvanceAnimation() {
     m_currentY = m_hiddenY;
     StopBackdropTimer();
     StopGlint();
-    // Keep the 15 s catalog timer while Hidden so new apps still reshape the
-    // dock off-screen. Tray/backdrop stay stopped (nothing is painted).
+    // Keep cataloging while Hidden so apps opened off-screen are already in
+    // the row when the dock comes back. Tray/backdrop stay stopped.
     StartRefreshTimer();
     StopTrayTimer();
     BeginOverflowHide(false);
@@ -9128,34 +9298,25 @@ void DockApp::OnBackdropTick() {
     if (m_rendererInitialized) {
         m_renderer.PollDesktopChanges();
     }
-    bool wantFast = false;
     if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
         QpcSeconds() >= m_suppressBackdropUntil) {
         if (CaptureLiveBackdrop()) {
             QueueRenderFrame(false);
-            wantFast = true;
-            m_backdropIdleStreak = 0;
-        } else if (m_backdropCaptureWasIdle) {
-            ++m_backdropIdleStreak;
-        } else {
-            wantFast = true;
-            m_backdropIdleStreak = 0;
         }
     }
-    if (TickLivePopupGlass()) {
-        wantFast = true;
-        m_backdropIdleStreak = 0;
-    }
+    static_cast<void>(TickLivePopupGlass());
     if (m_rendererInitialized) {
         m_renderer.FinishDesktopChangePoll();
     }
-    const bool holdFast = wantFast || m_backdropIdleStreak < kBackdropIdleHysteresisTicks;
-    SyncBackdropTimerInterval(holdFast, !holdFast);
+    // Stay on the monitor refresh while visible. Backing off to 100-250 ms
+    // left moving wallpaper under the glass as a still frame.
+    SyncBackdropTimerInterval(true);
 }
 
 void DockApp::StartBackdropTimer() noexcept {
     m_backdropIdleStreak = 0;
     m_backdropTimerAppliedMs = 0;
+    NoteHostRefreshHz();
     if (m_backdropFastArmed) {
         DisarmBackdropFastTimer();
     }
@@ -9175,6 +9336,7 @@ bool DockApp::ArmBackdropFastTimer() noexcept {
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
+    const UINT period = BackdropFrameIntervalMs();
     if (m_backdropWaitable == nullptr) {
         m_backdropWaitable = CreateWaitableTimerExW(nullptr, nullptr,
             CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -9183,10 +9345,14 @@ bool DockApp::ArmBackdropFastTimer() noexcept {
         return false;
     }
     LARGE_INTEGER due{};
-    due.QuadPart = -80000LL;
-    if (SetWaitableTimer(m_backdropWaitable, &due, 8, nullptr, nullptr, FALSE) == FALSE) {
+    due.QuadPart = -static_cast<LONGLONG>(period) * 10000LL;
+    if (SetWaitableTimer(m_backdropWaitable, &due, period, nullptr, nullptr, FALSE) == FALSE) {
         return false;
     }
+    if (m_backdropFastPeriodMs != period) {
+        Log(L"Backdrop cadence " + std::to_wstring(m_hostRefreshHz) + L" Hz.");
+    }
+    m_backdropFastPeriodMs = period;
     m_backdropFastArmed = true;
     return true;
 }
@@ -9203,14 +9369,16 @@ void DockApp::SyncBackdropTimerInterval(bool wantFast, bool wantResting) noexcep
         return;
     }
     if (wantFast) {
-        if (m_backdropFastArmed) {
+        const UINT period = BackdropFrameIntervalMs();
+        if (m_backdropFastArmed && m_backdropFastPeriodMs == period) {
             return;
         }
         KillTimer(m_window, kBackdropTimerId);
-        m_backdropTimerAppliedMs = kBackdropIntervalMs;
+        m_backdropTimerAppliedMs = period;
         if (!ArmBackdropFastTimer()) {
             m_backdropFastArmed = false;
-            SetTimer(m_window, kBackdropTimerId, kBackdropIntervalMs, nullptr);
+            const UINT timerPeriod = std::max(period, 1u);
+            SetTimer(m_window, kBackdropTimerId, timerPeriod, nullptr);
         }
         return;
     }
@@ -11518,9 +11686,13 @@ void DockApp::ClearPressState() noexcept {
 }
 
 void DockApp::StartRefreshTimer() noexcept {
-    if (m_window != nullptr) {
-        SetTimer(m_window, kRefreshTimerId, kRefreshIntervalMs, nullptr);
+    if (m_window == nullptr) {
+        return;
     }
+    const UINT interval = m_visibility == VisibilityState::Hidden
+        ? kHiddenRefreshIntervalMs
+        : kRefreshIntervalMs;
+    SetTimer(m_window, kRefreshTimerId, interval, nullptr);
 }
 
 void DockApp::ScheduleDeferredRefresh() noexcept {
@@ -11633,7 +11805,10 @@ void DockApp::RemapInteractionAfterLayoutChange(const std::wstring& pressedTarge
 
     if (!pressedTarget.empty() || m_pressedIcon >= 0) {
         const int remapped = indexOfTarget(pressedTarget);
-        if (remapped < 0 || !IsPersistentDisplayIcon(remapped)) {
+        const bool keepSpecial = remapped >= 0 &&
+            static_cast<size_t>(remapped) < m_displayApps.size() &&
+            IsSpecialDockTarget(m_displayApps[static_cast<size_t>(remapped)].app.target);
+        if (remapped < 0 || (!IsPersistentDisplayIcon(remapped) && !keepSpecial)) {
             if (GetCapture() == m_inputWindow) {
                 ReleaseCapture();
             }
@@ -11811,7 +11986,11 @@ void DockApp::BeginBackgroundRefresh(bool force) {
     }
 
     const double now = QpcSeconds();
-    if (!force && now - m_lastWindowRefresh < static_cast<double>(kRefreshIntervalMs) / 1000.0) {
+    const UINT minimumMs = m_visibility == VisibilityState::Hidden
+        ? kHiddenRefreshIntervalMs
+        : kRefreshIntervalMs;
+    // 50 ms of slack so a timer that fires slightly early still runs.
+    if (!force && now - m_lastWindowRefresh + 0.05 < static_cast<double>(minimumMs) / 1000.0) {
         return;
     }
 
@@ -11857,9 +12036,15 @@ void DockApp::BeginBackgroundRefresh(bool force) {
             return;
         }
 
+        const UINT catalogEpoch = m_hiddenCatalogEpoch.load(std::memory_order_relaxed);
         RefreshSnapshot snapshot = DockApp::BuildDisplayAppsSnapshot(windows, pins, currentApps);
         snapshot.windows = std::move(windows);
+        snapshot.catalogEpoch = catalogEpoch;
+        snapshot.refreshGeneration = generation;
         if (!snapshot.layoutChanged && !snapshot.runningChanged) {
+            if (m_hiddenCatalogEpoch.load(std::memory_order_relaxed) == catalogEpoch) {
+                m_hiddenCatalogDirty.store(false, std::memory_order_relaxed);
+            }
             return;
         }
 
@@ -11926,6 +12111,10 @@ void DockApp::ApplyBackgroundRefresh(UINT generation) {
         m_refreshSnapshot.reset();
     }
 
+    if (m_hiddenCatalogEpoch.load(std::memory_order_relaxed) == snapshot.catalogEpoch) {
+        m_hiddenCatalogDirty.store(false, std::memory_order_relaxed);
+    }
+
     m_lastWindowRefresh = QpcSeconds();
     m_windows = std::move(snapshot.windows);
     m_displayApps = std::move(snapshot.displayApps);
@@ -11938,6 +12127,18 @@ void DockApp::ApplyBackgroundRefresh(UINT generation) {
         const std::wstring draggedTarget = m_draggedTarget;
         RemapInteractionAfterLayoutChange(pressedTarget, draggedTarget);
         RebuildLayout(false);
+        if (m_visibility == VisibilityState::Hidden && !m_inBeginShow) {
+            FlushPendingLayout();
+            Log(L"Hidden catalog updated dock layout.");
+            // Resize blocks this thread, so a hot-zone move during the flush
+            // never posts. Sample the cursor now or the dock stays hidden.
+            POINT cursor{};
+            if (GetCursorPos(&cursor) != FALSE) {
+                HandlePointer(cursor);
+            }
+        } else if (m_visibility == VisibilityState::Hidden) {
+            FlushPendingLayout();
+        }
     }
 
     if (!snapshot.missingIconTargets.empty()) {
@@ -12644,12 +12845,22 @@ void DockApp::RegisterForegroundWatch() noexcept {
     if (m_foregroundHook == nullptr) {
         Log(L"Foreground WinEvent hook unavailable; elevated FG uses timer/taskbar sync only.");
     }
+    m_catalogHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, nullptr,
+        &DockApp::CatalogWinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (m_catalogHook == nullptr) {
+        Log(L"Window show/hide hook unavailable; hidden layout uses the catalog timer only.");
+    }
 }
 
 void DockApp::UnregisterForegroundWatch() noexcept {
     if (m_foregroundHook != nullptr) {
         UnhookWinEvent(m_foregroundHook);
         m_foregroundHook = nullptr;
+    }
+    if (m_catalogHook != nullptr) {
+        UnhookWinEvent(m_catalogHook);
+        m_catalogHook = nullptr;
     }
 }
 
@@ -12658,7 +12869,35 @@ void CALLBACK DockApp::ForegroundWinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG, 
         return;
     }
     s_instance->m_renderer.RequestBackdropRefresh();
+    if (s_instance->m_visibility == VisibilityState::Hidden ||
+        s_instance->m_visibility == VisibilityState::Hiding) {
+        s_instance->m_hiddenCatalogEpoch.fetch_add(1, std::memory_order_relaxed);
+        s_instance->m_hiddenCatalogDirty.store(true, std::memory_order_relaxed);
+    }
     PostMessageW(s_instance->m_window, kCursorWatchSyncMessage, 0, 0);
+}
+
+void CALLBACK DockApp::CatalogWinEventProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG idObject,
+    LONG idChild, DWORD, DWORD) {
+    if (s_instance == nullptr || s_instance->m_window == nullptr || hwnd == nullptr) {
+        return;
+    }
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
+        return;
+    }
+    const VisibilityState visibility = s_instance->m_visibility;
+    if (visibility != VisibilityState::Hidden && visibility != VisibilityState::Hiding) {
+        return;
+    }
+    const LONG extended = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    if ((extended & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0) {
+        return;
+    }
+    s_instance->m_hiddenCatalogEpoch.fetch_add(1, std::memory_order_relaxed);
+    s_instance->m_hiddenCatalogDirty.store(true, std::memory_order_relaxed);
+    if (visibility == VisibilityState::Hidden) {
+        PostMessageW(s_instance->m_window, kHiddenCatalogMessage, 0, 0);
+    }
 }
 
 bool DockApp::IsElevatedForeground() const noexcept {
@@ -12791,8 +13030,7 @@ bool DockApp::OpenStartMenuFromDock() {
         ReleaseCapture();
     }
     UnmarkFullscreenClaims();
-    static_cast<void>(GrantExplorerForeground());
-    if (!SendWinKey()) {
+    if (!InjectStartHotkey()) {
         Log(L"Start menu did not accept input.");
         return false;
     }
