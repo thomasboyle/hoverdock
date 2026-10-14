@@ -44,6 +44,10 @@ public:
     void SetRadioEnabled(bool enabled);
     void Connect(const std::wstring& id);
     void Disconnect(const std::wstring& id);
+    // Hands-Free (HFP) policy. Call with userChange=false after Start to
+    // seed it from settings; userChange=true also queues ONE 111E enable /
+    // disable for paired audio devices on the worker (never blocks).
+    void SetHandsFree(bool enabled, bool userChange);
     void StartDiscovery();
     void StopDiscovery();
     void Pair(const std::wstring& id);

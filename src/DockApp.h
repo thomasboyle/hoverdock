@@ -256,6 +256,7 @@ private:
         Specular,
         DropShadow,
         DepthShade,
+        HandsFree,
         LightPanels,
         CheckNow,
         PerfProfile,

@@ -52,6 +52,11 @@ public:
     // Quick Settings and Dock Settings. Off is the dark plate.
     [[nodiscard]] bool LightPanels() const noexcept;
     void SetLightPanels(bool enabled) noexcept;
+    // When true (default), PostConnect restores Hands-Free (HFP/mic) if
+    // missing. When false, connect never enables 111E/1108; flipping the
+    // setting queues ONE disable/enable of 111E on the Bluetooth worker.
+    [[nodiscard]] bool HandsFree() const noexcept;
+    void SetHandsFree(bool enabled) noexcept;
     // Remembers the last version whose installer/mover was actually launched,
     // with the wall-clock time of the attempt (unix seconds, 0 = none). Used
     // to break reinstall loops: if the install did not take effect (wrong
@@ -88,6 +93,7 @@ private:
     bool m_dropShadow = true;
     bool m_depthShade = true;
     bool m_lightPanels = false;
+    bool m_handsFree = true;
     std::wstring m_lastInstalledVersion;
     long long m_lastInstalledTime = 0;
     int m_lastInstalledAttempts = 0;

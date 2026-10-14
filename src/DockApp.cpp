@@ -3,6 +3,9 @@
 #include "DockTheme.hlsli"
 #include "PerfBoost.h"
 #include "Profile.h"
+#include <cstdio>
+#include <share.h>
+#include <string>
 #include "RecycleBin.h"
 #include "Startup.h"
 #include "Updater.h"
@@ -2384,6 +2387,7 @@ int DockApp::Run() {
     static_cast<void>(m_tray.Refresh());
     m_weather.Start(m_window, kWeatherMessage);
     m_bluetooth.Start(m_window, kBluetoothMessage);
+    m_bluetooth.SetHandsFree(m_config.HandsFree(), false);
     SetTimer(m_window, kWeatherTimerId, WeatherService::kRefreshIntervalMs, nullptr);
     RebuildDisplayApps();
     RebuildLayout(false);
@@ -3092,6 +3096,55 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             }
         }
         return 0;
+    }
+    {
+        // TEST-ONLY phase-2 timing harness. Inert unless HOVERDOCK_BT_TESTHOOK=1.
+        // Drives the same BluetoothService jobs a click enqueues, without cursor input.
+        static const UINT kBtTestLive = RegisterWindowMessageW(L"Hoverdock.BtTestLive");
+        static const bool kBtTestLiveOn = []() {
+            wchar_t v[8]{};
+            return GetEnvironmentVariableW(L"HOVERDOCK_BT_TESTHOOK", v, 8) != 0 && v[0] != L'0';
+        }();
+        if (kBtTestLiveOn && kBtTestLive != 0 && message == kBtTestLive) {
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            char mark[160]{};
+            std::snprintf(mark, sizeof(mark), "BtTest trigger kind=%d arg=%lld qpc=%lld", static_cast<int>(wParam),
+                static_cast<long long>(lParam), static_cast<long long>(qpc.QuadPart));
+            ProfileScope::Mark(mark);
+            std::wstring airpods;
+            const BluetoothSnapshot btNow = m_bluetooth.GetSnapshot();
+            for (const BluetoothDeviceInfo& d : btNow.paired) {
+                if (d.name.find(L"AirPods") != std::wstring::npos) {
+                    airpods = d.id;
+                    break;
+                }
+            }
+            switch (wParam) {
+            case 1:
+            case 2:
+                if (airpods.empty()) {
+                    ProfileScope::Mark("BtTest no-airpods");
+                } else if (wParam == 1) {
+                    m_bluetooth.Connect(airpods);
+                } else {
+                    m_bluetooth.Disconnect(airpods);
+                }
+                break;
+            case 3:
+                m_bluetooth.SetRadioEnabled(lParam != 0);
+                break;
+            case 4:
+                m_bluetooth.RequestRefresh(true);
+                break;
+            case 5:
+                ProfileScope::Mark("BtTest monitor n/a (A)");
+                break;
+            default:
+                break;
+            }
+            return 0;
+        }
     }
     if (m_bluetoothTestMessage != 0 && message == m_bluetoothTestMessage) {
         // Dry-run harness only: drives the same HandleOverflowClick path a
@@ -6731,6 +6784,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     case SettingsHitKind::Specular:
     case SettingsHitKind::DropShadow:
     case SettingsHitKind::DepthShade:
+    case SettingsHitKind::HandsFree:
     case SettingsHitKind::LightPanels: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         const float wash = (hit.kind == SettingsHitKind::CheckNow ||
@@ -7240,6 +7294,15 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         QueueRenderFrame();
         break;
     }
+    case SettingsHitKind::HandsFree: {
+        const bool enabled = !m_config.HandsFree();
+        m_config.SetHandsFree(enabled);
+        ScheduleConfigSave();
+        // Non-blocking: only queues a worker job for the 111E change.
+        m_bluetooth.SetHandsFree(enabled, true);
+        QueueSettingsPaint();
+        break;
+    }
     case SettingsHitKind::LightPanels: {
         m_config.SetLightPanels(!m_config.LightPanels());
         ScheduleConfigSave();
@@ -7425,6 +7488,8 @@ void DockApp::PaintSettingsPopup() {
             m_config.DropShadow(), 0.0F},
         {SettingsHitKind::DepthShade, L"Depth shade", L"Inner shading at the glass edge", false,
             m_config.DepthShade(), 0.0F},
+        {SettingsHitKind::HandsFree, L"Hands-free (mic) for headsets",
+            L"Restore Hands-Free after Bluetooth connect", false, m_config.HandsFree(), 0.0F},
     };
     const LONG switchRowCount = static_cast<LONG>(sizeof(rows) / sizeof(rows[0]));
 
@@ -7893,6 +7958,49 @@ void DockApp::OnWeatherUpdated() {
 void DockApp::ApplyBluetoothSnapshot() {
     m_bluetooth.AllowNextNotify();
     BluetoothSnapshot next = m_bluetooth.GetSnapshot();
+    {
+        // TEST-ONLY phase-2 timing harness: log the state the tile would show.
+        static const bool kBtSnapLog = []() {
+            wchar_t v[8]{};
+            return GetEnvironmentVariableW(L"HOVERDOCK_BT_TESTHOOK", v, 8) != 0 && v[0] != L'0';
+        }();
+        if (kBtSnapLog) {
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            bool found = false;
+            for (const BluetoothDeviceInfo& d : next.paired) {
+                if (d.name.find(L"AirPods") == std::wstring::npos) {
+                    continue;
+                }
+                found = true;
+                std::string status;
+                for (wchar_t c : d.status) {
+                    status.push_back(c < 128 ? static_cast<char>(c) : '?');
+                }
+                char mark[224]{};
+                std::snprintf(mark, sizeof(mark), "BtTest snap connected=%d busy=%d radio=%d status=%s qpc=%lld",
+                    d.connected ? 1 : 0, d.busy ? 1 : 0, next.radioOn ? 1 : 0, status.c_str(),
+                    static_cast<long long>(qpc.QuadPart));
+                ProfileScope::Mark(mark);
+                // TEST-ONLY: mirror the tile state to %TEMP%\hoverdock-bt-phase2\tile.txt for the harness.
+                wchar_t tmp[MAX_PATH]{};
+                if (GetTempPathW(MAX_PATH, tmp) != 0) {
+                    std::wstring path = std::wstring(tmp) + L"hoverdock-bt-phase2\\tile.txt";
+                    if (FILE* tf = _wfsopen(path.c_str(), L"w", _SH_DENYNO)) {
+                        std::fprintf(tf, "%d %d %d %lld\n", d.connected ? 1 : 0, d.busy ? 1 : 0, next.radioOn ? 1 : 0,
+                            static_cast<long long>(qpc.QuadPart));
+                        std::fclose(tf);
+                    }
+                }
+            }
+            if (!found) {
+                char mark[128]{};
+                std::snprintf(mark, sizeof(mark), "BtTest snap noairpods radio=%d qpc=%lld", next.radioOn ? 1 : 0,
+                    static_cast<long long>(qpc.QuadPart));
+                ProfileScope::Mark(mark);
+            }
+        }
+    }
     auto deviceEqual = [](const BluetoothDeviceInfo& a, const BluetoothDeviceInfo& b) {
         return a.id == b.id && a.name == b.name && a.status == b.status && a.connected == b.connected &&
             a.busy == b.busy;
