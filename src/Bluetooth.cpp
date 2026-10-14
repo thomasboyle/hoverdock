@@ -15,6 +15,12 @@
 #include <windows.devices.radios.h>
 #pragma warning(pop)
 
+#pragma warning(push)
+#pragma warning(disable : 4061 4100 4265 4365 4371 4458 4464 4619 4668 4986 5026 5027 5204 5220 5246)
+#include <mmdeviceapi.h>
+#include <devicetopology.h>
+#pragma warning(pop)
+
 #include <wrl/client.h>
 #include <wrl/event.h>
 #include <wrl/implements.h>
@@ -44,7 +50,14 @@ constexpr DWORD kLinkPollMs = 50;
 constexpr DWORD kDisconnectWaitMs = 3000;   // measured ACL down 150 ms median (IOCTL only)
 constexpr DWORD kPageLinkWaitMs = 5000;     // measured link-up 1.6 s median, 4.1 s max
 constexpr DWORD kPageErrorGraceMs = 1500;   // link may still come up after an L2CAP error
-constexpr DWORD kToggleLinkWaitMs = 5000;
+constexpr DWORD kToggleLinkWaitMs = 5000;   // after the toggle has returned
+constexpr DWORD kToggleTotalWaitMs = 12000; // round 2: toggle median 6.13 s, link up inside it
+constexpr DWORD kTaskJoinMs = 7000;         // bounded wait for a previous service task
+constexpr DWORD kTaskChainWaitMs = 15000;   // helper thread waits for its predecessor
+// KSPROPSETID_BtAudio (shared/ksmedia.h, 7FA06C40-B8F6-4C7E-8556-E8C33A12E54D).
+constexpr GUID kKsPropSetBtAudio = {0x7fa06c40, 0xb8f6, 0x4c7e, {0x85, 0x56, 0xe8, 0xc3, 0x3a, 0x12, 0xe5, 0x4d}};
+constexpr ULONG kKsPropOneShotReconnect = 0; // KSPROPERTY_ONESHOT_RECONNECT
+constexpr ULONG kKsPropertyTypeGet = 0x00000001; // KSPROPERTY_TYPE_GET
 constexpr int kMaxRefreshRetries = 3;
 constexpr DWORD kRefreshRetryMs = 1500;
 constexpr size_t kMaxPaired = 6;
@@ -579,7 +592,10 @@ void SetService(HANDLE radio, BLUETOOTH_DEVICE_INFO& info, unsigned short id, DW
 std::vector<GUID> InstalledServices(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
     std::vector<GUID> services;
     DWORD count = 0;
-    if (BluetoothEnumerateInstalledServices(radio, &info, &count, nullptr) != ERROR_SUCCESS || count == 0) {
+    // The sizing call reports ERROR_MORE_DATA (documented as success with the
+    // needed count). Treating that as failure made this always return empty.
+    const DWORD sized = BluetoothEnumerateInstalledServices(radio, &info, &count, nullptr);
+    if ((sized != ERROR_SUCCESS && sized != ERROR_MORE_DATA) || count == 0) {
         return services;
     }
     services.resize(count);
@@ -632,6 +648,166 @@ bool RememberedClassic(uint64_t address) {
     });
 }
 
+// Round 3: blocking BluetoothSetServiceState calls run on a helper thread
+// owned by a ServiceTask so the worker can publish link-up / run a
+// disconnect while a toggle is still inside the driver. The thread only
+// touches the task (shared_ptr), never BluetoothService::Impl.
+struct ServiceStep {
+    unsigned short id = 0;
+    DWORD state = BLUETOOTH_SERVICE_ENABLE;
+};
+
+struct ServiceTask {
+    uint64_t address = 0;
+    const char* scopeName = nullptr;
+    std::vector<ServiceStep> steps;
+    std::shared_ptr<ServiceTask> previous;
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> leftDisabled{false}; // cancelled between a disable and its enable
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ServiceTask() = default;
+    ServiceTask(const ServiceTask&) = delete;
+    ServiceTask& operator=(const ServiceTask&) = delete;
+    ~ServiceTask() {
+        if (done != nullptr) {
+            CloseHandle(done);
+        }
+    }
+    [[nodiscard]] bool Done() const noexcept {
+        return done == nullptr || WaitForSingleObject(done, 0) == WAIT_OBJECT_0;
+    }
+};
+
+void MarkServiceResult(unsigned short id, DWORD state, DWORD rc) {
+    char text[112]{};
+    std::snprintf(text, sizeof(text), "Bluetooth::SetServiceState %04X %s rc=%lu", static_cast<unsigned>(id),
+        state == BLUETOOTH_SERVICE_ENABLE ? "enable" : "disable", static_cast<unsigned long>(rc));
+    ProfileScope::Mark(text);
+}
+
+void RunServiceTask(ServiceTask& task) {
+    if (task.previous != nullptr) {
+        if (task.previous->done != nullptr &&
+            WaitForSingleObject(task.previous->done, kTaskChainWaitMs) != WAIT_OBJECT_0) {
+            ProfileScope::Mark("Bluetooth::ServiceTask predecessor still running");
+        }
+        task.previous.reset();
+    }
+    ProfileScope taskScope(task.scopeName != nullptr ? task.scopeName : "Bluetooth::ServiceTask");
+    bool pendingEnable = false;
+    for (const ServiceStep& step : task.steps) {
+        if (task.cancel.load()) {
+            ProfileScope::Mark("Bluetooth::ServiceTask cancelled before step");
+            if (pendingEnable) {
+                task.leftDisabled.store(true);
+                ProfileScope::Mark("Bluetooth::A2dpToggle cancelled between disable and enable");
+            }
+            break;
+        }
+        ForEachRadio([&](HANDLE radio) {
+            BLUETOOTH_DEVICE_INFO info{};
+            if (LoadDeviceInfo(radio, task.address, info)) {
+                const GUID service = ServiceUuid(step.id);
+                MarkServiceResult(step.id, step.state, SetServiceScoped(radio, info, service, step.state));
+            }
+            return false;
+        });
+        pendingEnable = step.state == BLUETOOTH_SERVICE_DISABLE;
+    }
+    if (task.done != nullptr) {
+        SetEvent(task.done);
+    }
+}
+
+DWORD WINAPI ServiceTaskThread(LPVOID param) {
+    std::unique_ptr<std::shared_ptr<ServiceTask>> holder(static_cast<std::shared_ptr<ServiceTask>*>(param));
+    if (holder != nullptr && *holder != nullptr) {
+        RunServiceTask(**holder);
+    }
+    return 0;
+}
+
+// Round 3 (1): ask the Bluetooth audio KS filter to reconnect. This is the
+// documented KSPROPSETID_BtAudio / KSPROPERTY_ONESHOT_RECONNECT path the
+// Windows audio stack uses for A2DP/HFP endpoints; it pages the device and
+// brings up the profile without changing any service state. The filter is
+// found via the render endpoint whose connector points at a BTHENUM filter
+// interface containing this device address. Worker thread (COM MTA via
+// RoInitialize) only.
+HRESULT KsReconnect(uint64_t address) {
+    ProfileScope profileScope("Bluetooth::KsReconnect");
+    wchar_t addressText[16]{};
+    std::swprintf(addressText, std::size(addressText), L"%012llX", static_cast<unsigned long long>(address));
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+    if (FAILED(hr)) {
+        ProfileScope::Mark("Bluetooth::KsReconnect no MMDeviceEnumerator");
+        return hr;
+    }
+    ComPtr<IMMDeviceCollection> endpoints;
+    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATEMASK_ALL, &endpoints);
+    if (FAILED(hr) || endpoints == nullptr) {
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    UINT endpointCount = 0;
+    endpoints->GetCount(&endpointCount);
+    HRESULT last = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    int filtersTried = 0;
+    for (UINT index = 0; index < endpointCount; ++index) {
+        ComPtr<IMMDevice> endpoint;
+        ComPtr<IDeviceTopology> topology;
+        if (FAILED(endpoints->Item(index, &endpoint)) || endpoint == nullptr ||
+            FAILED(endpoint->Activate(__uuidof(IDeviceTopology), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(topology.GetAddressOf()))) ||
+            topology == nullptr) {
+            continue;
+        }
+        UINT connectors = 0;
+        topology->GetConnectorCount(&connectors);
+        for (UINT c = 0; c < connectors; ++c) {
+            ComPtr<IConnector> connector;
+            if (FAILED(topology->GetConnector(c, &connector)) || connector == nullptr) {
+                continue;
+            }
+            LPWSTR filterId = nullptr;
+            if (FAILED(connector->GetDeviceIdConnectedTo(&filterId)) || filterId == nullptr) {
+                continue;
+            }
+            const std::wstring filter(filterId);
+            CoTaskMemFree(filterId);
+            if (!ContainsInsensitive(filter, addressText) || !ContainsInsensitive(filter, L"BTH")) {
+                continue;
+            }
+            ComPtr<IMMDevice> filterDevice;
+            ComPtr<IKsControl> control;
+            if (FAILED(enumerator->GetDevice(filter.c_str(), &filterDevice)) || filterDevice == nullptr ||
+                FAILED(filterDevice->Activate(__uuidof(IKsControl), CLSCTX_ALL, nullptr,
+                    reinterpret_cast<void**>(control.GetAddressOf()))) ||
+                control == nullptr) {
+                ProfileScope::Mark("Bluetooth::KsReconnect filter not activatable");
+                continue;
+            }
+            ++filtersTried;
+            KSPROPERTY property{};
+            property.Set = kKsPropSetBtAudio;
+            property.Id = kKsPropOneShotReconnect;
+            property.Flags = kKsPropertyTypeGet;
+            ULONG returned = 0;
+            last = control->KsProperty(&property, sizeof(property), nullptr, 0, &returned);
+            char text[96]{};
+            std::snprintf(text, sizeof(text), "Bluetooth::KsReconnect hr=0x%08lX", static_cast<unsigned long>(last));
+            ProfileScope::Mark(text);
+            if (SUCCEEDED(last)) {
+                return last;
+            }
+        }
+    }
+    if (filtersTried == 0) {
+        ProfileScope::Mark("Bluetooth::KsReconnect no BT audio filter for device");
+    }
+    return last;
+}
+
 const wchar_t* PairFailureText(
     ABI::Windows::Devices::Enumeration::DevicePairingResultStatus status) noexcept {
     using ABI::Windows::Devices::Enumeration::DevicePairingResultStatus_AlreadyPaired;
@@ -674,6 +850,10 @@ struct BluetoothService::Impl {
     bool inflightActive = false;
     JobKind inflightKind = JobKind::Refresh;
     std::wstring inflightId;
+    // Worker-only (round 3): background SetServiceState tasks.
+    std::shared_ptr<ServiceTask> lastTask;
+    std::shared_ptr<ServiceTask> toggleTask; // last A2DP toggle / re-enable
+    std::vector<HANDLE> taskThreads;
     // Worker-only (P4 bounded refresh retry).
     bool refreshSuspect = false;
     int refreshRetries = 0;
@@ -753,7 +933,7 @@ struct BluetoothService::Impl {
         Track(info.Get());
         const ULONGLONG deadline = GetTickCount64() + timeoutMs;
         for (;;) {
-            if (!running.load()) {
+            if (JobCancelled()) {
                 info->Cancel();
                 hr = E_ABORT;
                 break;
@@ -801,7 +981,7 @@ struct BluetoothService::Impl {
         Track(info.Get());
         const ULONGLONG deadline = GetTickCount64() + timeoutMs;
         for (;;) {
-            if (!running.load()) {
+            if (JobCancelled()) {
                 info->Cancel();
                 hr = E_ABORT;
                 break;
@@ -858,6 +1038,14 @@ struct BluetoothService::Impl {
                 if (queue.size() != before) {
                     ProfileScope::Mark("Bluetooth::Supersede queued");
                 }
+                // Round 3 (4): user jobs never wait behind a refresh. Abort an
+                // in-flight refresh (its WinRT waits observe cancelJob; it keeps
+                // last-good state and retries) and queue ahead of refresh /
+                // PostConnect / discovery jobs.
+                if (inflightActive && inflightKind == JobKind::Refresh && cancelJob != nullptr) {
+                    SetEvent(cancelJob);
+                    ProfileScope::Mark("Bluetooth::Supersede preempt refresh");
+                }
                 if (inflightActive && inflightId == job.id && cancelJob != nullptr) {
                     const bool opposite =
                         (inflightKind == JobKind::Connect && job.kind == JobKind::Disconnect) ||
@@ -868,6 +1056,19 @@ struct BluetoothService::Impl {
                         ProfileScope::Mark("Bluetooth::Supersede cancel in-flight");
                     }
                 }
+            }
+            if (job.kind == JobKind::Connect || job.kind == JobKind::Disconnect) {
+                const auto at = std::find_if(queue.begin(), queue.end(), [](const Job& pending) {
+                    return pending.kind != JobKind::Connect && pending.kind != JobKind::Disconnect &&
+                        pending.kind != JobKind::Pair && pending.kind != JobKind::SetRadio &&
+                        pending.kind != JobKind::Quit;
+                });
+                if (at != queue.end()) {
+                    ProfileScope::Mark("Bluetooth::Enqueue user job ahead of refresh");
+                }
+                queue.insert(at, std::move(job));
+                SetEvent(wake);
+                return true;
             }
             if (job.kind == JobKind::Refresh) {
                 for (Job& pending : queue) {
@@ -1446,8 +1647,7 @@ struct BluetoothService::Impl {
         }
     }
 
-    bool CollectPaired(bool lowEnergy, std::vector<RadioDevice>& dest) {
-    ProfileScope profileScope("Bluetooth::CollectPaired");
+    ComPtr<DeviceListAsync> StartCollect(bool lowEnergy) {
         HSTRING selector = nullptr;
         if (lowEnergy) {
             ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothLEDeviceStatics2> statics;
@@ -1455,7 +1655,7 @@ struct BluetoothService::Impl {
                 RuntimeClass_Windows_Devices_Bluetooth_BluetoothLEDevice);
             if (FAILED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics))) || statics == nullptr ||
                 FAILED(statics->GetDeviceSelectorFromPairingState(TRUE, &selector))) {
-                return false;
+                return nullptr;
             }
         } else {
             ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothDeviceStatics2> statics;
@@ -1463,11 +1663,11 @@ struct BluetoothService::Impl {
                 RuntimeClass_Windows_Devices_Bluetooth_BluetoothDevice);
             if (FAILED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics))) || statics == nullptr ||
                 FAILED(statics->GetDeviceSelectorFromPairingState(TRUE, &selector))) {
-                return false;
+                return nullptr;
             }
         }
         if (selector == nullptr) {
-            return false;
+            return nullptr;
         }
         ComPtr<ABI::Windows::Devices::Enumeration::IDeviceInformationStatics> enumeration;
         Microsoft::WRL::Wrappers::HStringReference deviceClass(
@@ -1476,7 +1676,7 @@ struct BluetoothService::Impl {
         if (FAILED(RoGetActivationFactory(deviceClass.Get(), IID_PPV_ARGS(&enumeration))) ||
             enumeration == nullptr || properties == nullptr) {
             WindowsDeleteString(selector);
-            return false;
+            return nullptr;
         }
         // PairingState(true) includes IssueInquiry:=False. IsPaired alone returns nothing.
         ComPtr<DeviceListAsync> operation;
@@ -1484,10 +1684,28 @@ struct BluetoothService::Impl {
             selector, properties.Get(), operation.GetAddressOf());
         WindowsDeleteString(selector);
         if (FAILED(queried) || operation == nullptr) {
+            return nullptr;
+        }
+        return operation;
+    }
+
+    // Waits for a query started by StartCollect, until the shared deadline.
+    bool CollectPaired(bool lowEnergy, DeviceListAsync* operation, ULONGLONG deadline, std::vector<RadioDevice>& dest) {
+    ProfileScope profileScope("Bluetooth::CollectPaired");
+        if (operation == nullptr) {
+            ProfileScope::Mark(lowEnergy ? "Bluetooth::CollectPaired LE start failed"
+                                         : "Bluetooth::CollectPaired classic start failed");
             return false;
         }
+        const ULONGLONG now = GetTickCount64();
+        const DWORD remaining = now >= deadline ? 1 : static_cast<DWORD>(deadline - now);
         ComPtr<DeviceList> list;
-        if (FAILED(WaitResult(operation.Get(), list.GetAddressOf(), kStatusTimeoutMs)) || list == nullptr) {
+        const HRESULT waited = WaitResult(operation, list.GetAddressOf(), remaining);
+        if (FAILED(waited) || list == nullptr) {
+            char text[128]{};
+            std::snprintf(text, sizeof(text), "Bluetooth::CollectPaired %s hr=0x%08lX",
+                lowEnergy ? "LE" : "classic", static_cast<unsigned long>(waited));
+            ProfileScope::Mark(text);
             ProfileScope::Mark(lowEnergy ? "Bluetooth::CollectPaired LE timeout/error"
                                          : "Bluetooth::CollectPaired classic timeout/error");
             return false;
@@ -1551,8 +1769,21 @@ struct BluetoothService::Impl {
     void RefreshPaired() {
     ProfileScope profileScope("Bluetooth::RefreshPaired");
         std::vector<RadioDevice> next;
-        const bool classicOk = CollectPaired(false, next);
-        const bool leOk = CollectPaired(true, next);
+        // Round 3 (4): classic and LE queries run in parallel under ONE
+        // kStatusTimeoutMs bound (was two serial 2.5 s timeouts = 5.0 s).
+        ComPtr<DeviceListAsync> classicOp;
+        ComPtr<DeviceListAsync> leOp;
+        {
+            ProfileScope startScope("Bluetooth::RefreshPaired start queries");
+            classicOp = StartCollect(false);
+            leOp = StartCollect(true);
+        }
+        const ULONGLONG deadline = GetTickCount64() + kStatusTimeoutMs;
+        const bool classicOk = CollectPaired(false, classicOp.Get(), deadline, next);
+        const bool leOk = CollectPaired(true, leOp.Get(), deadline, next);
+        if (JobCancelled()) {
+            ProfileScope::Mark("Bluetooth::Refresh preempted by user job");
+        }
         if (!classicOk && !leOk) {
             // P4: both queries failed / timed out: keep the last good list.
             ProfileScope::Mark("Bluetooth::RefreshPaired keep-last (both queries failed)");
@@ -1860,57 +2091,132 @@ struct BluetoothService::Impl {
         return result;
     }
 
-    // P2: page A2DP directly (L2CAP PSM 0x19, non-blocking) and return as
-    // soon as the ACL is up. No SetServiceState here. The socket is closed
-    // before returning, so no disable can ever overlap an in-flight page.
-    LinkWait PageAudio(uint64_t address) {
-        ProfileScope profileScope("Bluetooth::PageAudio");
+    // Starts steps on a helper thread, chained after the previous task.
+    std::shared_ptr<ServiceTask> StartServiceTask(uint64_t address, const char* scopeName,
+        std::vector<ServiceStep> steps) {
+        for (auto it = taskThreads.begin(); it != taskThreads.end();) {
+            if (WaitForSingleObject(*it, 0) == WAIT_OBJECT_0) {
+                CloseHandle(*it);
+                it = taskThreads.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        auto task = std::make_shared<ServiceTask>();
+        task->address = address;
+        task->scopeName = scopeName;
+        task->steps = std::move(steps);
+        if (lastTask != nullptr && !lastTask->Done()) {
+            task->previous = lastTask;
+        }
+        if (task->done == nullptr) {
+            return nullptr;
+        }
+        auto* holder = new std::shared_ptr<ServiceTask>(task);
+        HANDLE helper = CreateThread(nullptr, 0, ServiceTaskThread, holder, 0, nullptr);
+        if (helper == nullptr) {
+            delete holder;
+            ProfileScope::Mark("Bluetooth::ServiceTask thread failed");
+            return nullptr;
+        }
+        taskThreads.push_back(helper);
+        lastTask = task;
+        return task;
+    }
+
+    // Bounded, cancellable wait for the previous service task (worker).
+    bool WaitTaskIdle(DWORD timeoutMs) {
+        if (lastTask == nullptr || lastTask->Done()) {
+            return true;
+        }
+        ProfileScope profileScope("Bluetooth::WaitServiceTask");
+        HANDLE handles[2]{lastTask->done, cancelJob};
+        const DWORD count = cancelJob != nullptr ? 2u : 1u;
+        return WaitForMultipleObjects(count, handles, FALSE, timeoutMs) == WAIT_OBJECT_0;
+    }
+
+    // Watches the link while a service task runs; returns at link-up even if
+    // the task is still inside SetServiceState (round 3, item 2).
+    LinkWait WaitLinkDuringTask(uint64_t address, const std::shared_ptr<ServiceTask>& task) {
+        const ULONGLONG deadline = GetTickCount64() + kToggleTotalWaitMs;
+        HANDLE extra = task != nullptr ? task->done : nullptr;
+        ULONGLONG tailDeadline = deadline;
+        for (;;) {
+            const ULONGLONG now = GetTickCount64();
+            const ULONGLONG until = std::min(deadline, tailDeadline);
+            const DWORD remaining = now >= until ? 0 : static_cast<DWORD>(until - now);
+            const LinkWait waited = WaitLink(address, true, remaining, extra);
+            if (waited != LinkWait::Extra) {
+                if (waited == LinkWait::Reached && task != nullptr && !task->Done()) {
+                    ProfileScope::Mark("Bluetooth::Connect link-up during service task");
+                }
+                if (waited == LinkWait::Cancelled && task != nullptr) {
+                    task->cancel.store(true);
+                }
+                return waited;
+            }
+            ProfileScope::Mark("Bluetooth::ServiceTask done before link");
+            extra = nullptr;
+            tailDeadline = GetTickCount64() + kToggleLinkWaitMs;
+        }
+    }
+
+    // Diagnostic / secondary page: L2CAP PSM 0x19 via Winsock. Round 2 saw
+    // an immediate connect error in 17/19 jobs; the code is now logged and
+    // an immediate error returns at once (no 1.5 s grace).
+    LinkWait L2capPage(uint64_t address) {
+        ProfileScope profileScope("Bluetooth::L2capPage");
         WSADATA wsa{};
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
             return LinkWait::Timeout;
         }
+        char text[112]{};
         LinkWait result = LinkWait::Timeout;
         const SOCKET sock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_L2CAP);
-        const WSAEVENT pageReady = sock != INVALID_SOCKET ? WSACreateEvent() : WSA_INVALID_EVENT;
-        if (sock != INVALID_SOCKET && pageReady != WSA_INVALID_EVENT &&
-            WSAEventSelect(sock, pageReady, FD_CONNECT) == 0) { // also makes the socket non-blocking
+        if (sock == INVALID_SOCKET) {
+            std::snprintf(text, sizeof(text), "Bluetooth::PageAudio socket error wsa=%d", WSAGetLastError());
+            ProfileScope::Mark(text);
+            WSACleanup();
+            return result;
+        }
+        const WSAEVENT pageReady = WSACreateEvent();
+        if (pageReady != WSA_INVALID_EVENT && WSAEventSelect(sock, pageReady, FD_CONNECT) == 0) {
             SOCKADDR_BTH remote{};
             remote.addressFamily = AF_BTH;
             remote.btAddr = address;
             remote.serviceClassId = ServiceUuid(0x110B);
             remote.port = 0x0019;
-            bool watchSocket = true;
-            if (connect(sock, reinterpret_cast<SOCKADDR*>(&remote), sizeof(remote)) != 0 &&
-                WSAGetLastError() != WSAEWOULDBLOCK) {
-                ProfileScope::Mark("Bluetooth::PageAudio connect error");
-                watchSocket = false;
-            }
-            ULONGLONG deadline = GetTickCount64() + (watchSocket ? kPageLinkWaitMs : kPageErrorGraceMs);
-            for (;;) {
-                const ULONGLONG now = GetTickCount64();
-                const DWORD remaining = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
-                result = WaitLink(address, true, remaining, watchSocket ? pageReady : nullptr);
-                if (result != LinkWait::Extra) {
-                    break;
-                }
-                watchSocket = false;
-                WSANETWORKEVENTS network{};
-                if (WSAEnumNetworkEvents(sock, pageReady, &network) == 0 && (network.lNetworkEvents & FD_CONNECT) != 0 &&
-                    network.iErrorCode[FD_CONNECT_BIT] == 0) {
-                    ProfileScope::Mark("Bluetooth::PageAudio l2cap connected");
+            if (connect(sock, reinterpret_cast<SOCKADDR*>(&remote), sizeof(remote)) != 0) {
+                const int error = WSAGetLastError();
+                if (error != WSAEWOULDBLOCK) {
+                    std::snprintf(text, sizeof(text), "Bluetooth::PageAudio connect error wsa=%d", error);
+                    ProfileScope::Mark("Bluetooth::PageAudio connect error");
+                    ProfileScope::Mark(text);
                 } else {
-                    // The ACL may still come up (A2DP driver owns the PSM);
-                    // give it a short grace, then let the caller fall back.
-                    ProfileScope::Mark("Bluetooth::PageAudio l2cap error");
-                    deadline = std::min<ULONGLONG>(deadline, GetTickCount64() + kPageErrorGraceMs);
+                    ProfileScope::Mark("Bluetooth::PageAudio l2cap pending");
+                    result = WaitLink(address, true, kPageLinkWaitMs, pageReady);
+                    if (result == LinkWait::Extra) {
+                        WSANETWORKEVENTS network{};
+                        int code = -1;
+                        if (WSAEnumNetworkEvents(sock, pageReady, &network) == 0 &&
+                            (network.lNetworkEvents & FD_CONNECT) != 0) {
+                            code = network.iErrorCode[FD_CONNECT_BIT];
+                        }
+                        std::snprintf(text, sizeof(text), "Bluetooth::PageAudio l2cap result wsa=%d", code);
+                        ProfileScope::Mark(text);
+                        ProfileScope::Mark(code == 0 ? "Bluetooth::PageAudio l2cap connected"
+                                                     : "Bluetooth::PageAudio l2cap error");
+                        result = WaitLink(address, true, code == 0 ? kPageLinkWaitMs : kPageErrorGraceMs);
+                    }
                 }
+            } else {
+                ProfileScope::Mark("Bluetooth::PageAudio l2cap connected");
+                result = WaitLink(address, true, kPageLinkWaitMs);
             }
         } else {
             ProfileScope::Mark("Bluetooth::PageAudio socket setup failed");
         }
-        if (sock != INVALID_SOCKET) {
-            closesocket(sock);
-        }
+        closesocket(sock);
         if (pageReady != WSA_INVALID_EVENT) {
             WSACloseEvent(pageReady);
         }
@@ -1918,9 +2224,28 @@ struct BluetoothService::Impl {
         return result;
     }
 
-    // P2 connect. Audio: page directly; only if that does not bring the link
-    // up, ONE A2DP (110B) disable/enable toggle (after the page socket is
-    // closed). Returns at link-up. AVRCP/HFP are handled by PostConnect.
+    // P2 page. 1) KS one-shot reconnect on the device's BT audio filter;
+    // 2) L2CAP PSM 0x19 (diagnostic, fails fast). No SetServiceState here.
+    LinkWait PageAudio(uint64_t address) {
+        ProfileScope profileScope("Bluetooth::PageAudio");
+        const HRESULT ks = KsReconnect(address);
+        if (SUCCEEDED(ks)) {
+            ProfileScope::Mark("Bluetooth::PageAudio branch=ks");
+            const LinkWait waited = WaitLink(address, true, kPageLinkWaitMs);
+            if (waited != LinkWait::Timeout) {
+                return waited;
+            }
+            ProfileScope::Mark("Bluetooth::PageAudio ks no link");
+        }
+        if (JobCancelled()) {
+            return LinkWait::Cancelled;
+        }
+        ProfileScope::Mark("Bluetooth::PageAudio branch=l2cap");
+        return L2capPage(address);
+    }
+
+    // P2 connect. Audio: KS reconnect page, then (only if no link) ONE A2DP
+    // toggle on a helper thread, publishing at link-up even mid-toggle.
     LinkWait ConnectClassic(uint64_t address, bool& audio) {
         ProfileScope profileScope("Bluetooth::ConnectClassic");
         audio = false;
@@ -1956,6 +2281,28 @@ struct BluetoothService::Impl {
             ForEachRadio(nudge);
             return WaitLink(address, true, 2000);
         }
+        // A superseded toggle may still be inside the driver: never stack a
+        // page on top of it (bounded, cancellable).
+        if (!WaitTaskIdle(kTaskJoinMs)) {
+            if (JobCancelled()) {
+                return LinkWait::Cancelled;
+            }
+            ProfileScope::Mark("Bluetooth::Connect previous service task still running");
+        }
+        if (toggleTask != nullptr && toggleTask->address == address && toggleTask->Done() &&
+            toggleTask->leftDisabled.load()) {
+            // A cancelled toggle left 110B disabled: enable-only is the page
+            // (round 1: enabling a disabled 110B paged, link-up 1.6 s median).
+            ProfileScope::Mark("Bluetooth::Connect branch=reenable-a2dp");
+            toggleTask = StartServiceTask(address, "Bluetooth::A2dpReenable",
+                {ServiceStep{0x110B, BLUETOOTH_SERVICE_ENABLE}});
+            if (toggleTask != nullptr) {
+                const LinkWait waited = WaitLinkDuringTask(address, toggleTask);
+                if (waited != LinkWait::Timeout) {
+                    return waited;
+                }
+            }
+        }
         const LinkWait paged = PageAudio(address);
         if (paged != LinkWait::Timeout) {
             return paged; // Reached or Cancelled
@@ -1964,26 +2311,27 @@ struct BluetoothService::Impl {
             return LinkWait::Cancelled;
         }
         ProfileScope::Mark("Bluetooth::Connect page failed, A2DP toggle");
-        {
-            ProfileScope toggleScope("Bluetooth::A2dpToggle");
-            ForEachRadio([&](HANDLE radio) {
-                BLUETOOTH_DEVICE_INFO info{};
-                if (LoadDeviceInfo(radio, address, info)) {
-                    SetService(radio, info, 0x110B, BLUETOOTH_SERVICE_DISABLE);
-                    SetService(radio, info, 0x110B, BLUETOOTH_SERVICE_ENABLE);
-                }
-                return false;
-            });
+        ProfileScope::Mark("Bluetooth::Connect branch=toggle");
+        toggleTask = StartServiceTask(address, "Bluetooth::A2dpToggle",
+            {ServiceStep{0x110B, BLUETOOTH_SERVICE_DISABLE}, ServiceStep{0x110B, BLUETOOTH_SERVICE_ENABLE}});
+        if (toggleTask == nullptr) {
+            return LinkWait::Timeout;
         }
-        return WaitLink(address, true, kToggleLinkWaitMs);
+        return WaitLinkDuringTask(address, toggleTask);
     }
 
     // P1: IOCTL_BTH_DISCONNECT_DEVICE only (no BluetoothSetServiceState
-    // disables), then an event wait for the link to go down.
+    // disables), then an event wait for the link to go down. Runs at once
+    // even if a superseded toggle is still in SetServiceState; that task is
+    // told to stop before its next step.
     LinkWait DisconnectClassic(uint64_t address) {
         ProfileScope profileScope("Bluetooth::DisconnectClassic");
         if (address == 0) {
             return LinkWait::Timeout;
+        }
+        if (lastTask != nullptr && !lastTask->Done() && lastTask->address == address) {
+            lastTask->cancel.store(true);
+            ProfileScope::Mark("Bluetooth::Disconnect cancel running service task");
         }
         bool issued = false;
         ForEachRadio([&](HANDLE radio) {
@@ -2003,6 +2351,22 @@ struct BluetoothService::Impl {
             return LinkWait::Reached;
         }
         return waited;
+    }
+
+    // After a disconnect was published: if a superseded service task was
+    // still running, wait for it (bounded, cancellable by a newer Connect)
+    // and drop the link again if its enable re-paged the device.
+    void ReapTaskAfterDisconnect(uint64_t address) {
+        if (lastTask == nullptr || lastTask->Done() || lastTask->address != address) {
+            return;
+        }
+        if (!WaitTaskIdle(kTaskJoinMs) || JobCancelled()) {
+            return;
+        }
+        if (AnyRadioConnected(address)) {
+            ProfileScope::Mark("Bluetooth::Disconnect re-drop after service task");
+            DisconnectClassic(address);
+        }
     }
 
     LinkWait ConnectDevice(const RadioDevice& device, bool& audio) {
@@ -2039,12 +2403,26 @@ struct BluetoothService::Impl {
         if (address == 0 || JobCancelled() || !AnyRadioConnected(address)) {
             return;
         }
+        std::vector<ServiceStep> steps;
         ForEachRadio([&](HANDLE radio) {
             BLUETOOTH_DEVICE_INFO info{};
             if (!LoadDeviceInfo(radio, address, info) || !UsesAudio(radio, info)) {
                 return false;
             }
             const std::vector<GUID> installed = InstalledServices(radio, info);
+            // Diagnostic: which services Windows has enabled for the device.
+            std::string list = "Bluetooth::PostConnect services:";
+            for (const GUID& service : installed) {
+                char item[16]{};
+                const unsigned short id = ShortServiceId(service);
+                if (id != 0) {
+                    std::snprintf(item, sizeof(item), " %04X", static_cast<unsigned>(id));
+                } else {
+                    std::snprintf(item, sizeof(item), " other");
+                }
+                list += item;
+            }
+            ProfileScope::Mark(list.c_str());
             if (installed.empty()) {
                 ProfileScope::Mark("Bluetooth::PostConnect services unknown");
                 return true;
@@ -2054,15 +2432,20 @@ struct BluetoothService::Impl {
                 return std::any_of(installed.begin(), installed.end(),
                     [&](const GUID& service) { return IsEqualGUID(service, wanted) != FALSE; });
             };
-            if (!has(0x110E) && !JobCancelled()) {
-                SetService(radio, info, 0x110E, BLUETOOTH_SERVICE_ENABLE);
+            if (!has(0x110E)) {
+                steps.push_back(ServiceStep{0x110E, BLUETOOTH_SERVICE_ENABLE});
             }
-            if (!has(0x111E) && !JobCancelled()) {
+            if (!has(0x111E)) {
                 ProfileScope::Mark("Bluetooth::RestoreVoice HFP missing");
-                SetService(radio, info, 0x111E, BLUETOOTH_SERVICE_ENABLE);
+                steps.push_back(ServiceStep{0x111E, BLUETOOTH_SERVICE_ENABLE});
             }
             return true;
         });
+        if (!steps.empty() && !JobCancelled()) {
+            // Enable-only, on the helper thread (chained after any toggle) so
+            // a Disconnect never waits behind it.
+            StartServiceTask(address, "Bluetooth::PostConnectEnable", std::move(steps));
+        }
     }
 
     void RememberError(const std::wstring& id, const wchar_t* text, bool sectionHint) {
@@ -2271,6 +2654,15 @@ struct BluetoothService::Impl {
                 RememberError(job.id, connect ? L"Couldn't connect" : L"Couldn't disconnect", false);
             }
             Publish();
+            if (!connect && ok && running.load()) {
+                ReapTaskAfterDisconnect(address);
+                if (address != 0 && AnyRadioConnected(address)) {
+                    if (RadioDevice* current = FindMutable(job.id); current != nullptr) {
+                        current->connected = true;
+                    }
+                    Publish();
+                }
+            }
             // Reconcile with the radio shortly after; do not block this job.
             if (ok && running.load()) {
                 Job refresh{JobKind::Refresh, false, {}};
@@ -2516,6 +2908,22 @@ struct BluetoothService::Impl {
             }
             CloseHandle(thread);
             thread = nullptr;
+            // Worker has exited: helper threads only touch their own task.
+            // Ask any in-flight toggle to stop between steps, then join
+            // finished ones. A thread still inside SetServiceState is
+            // detached (its task lives via the thread's own shared_ptr);
+            // its HANDLE is left open so CloseHandle is not raced.
+            if (lastTask != nullptr) {
+                lastTask->cancel.store(true);
+            }
+            for (HANDLE helper : taskThreads) {
+                if (WaitForSingleObject(helper, 50) == WAIT_OBJECT_0) {
+                    CloseHandle(helper);
+                }
+            }
+            taskThreads.clear();
+            lastTask.reset();
+            toggleTask.reset();
             if (wake != nullptr) {
                 CloseHandle(wake);
                 wake = nullptr;
