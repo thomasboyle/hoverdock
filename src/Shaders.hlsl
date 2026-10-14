@@ -57,6 +57,89 @@ float SdSquircleBox(float2 position, float2 halfSize, float cornerRadius)
     return outside + inside - cornerRadius;
 }
 
+
+// ---------------------------------------------------------------------------
+// macOS 27 dock silhouette (measured spec, ratios of the icon body S):
+// height 1.752 S, superellipse corners n = 2.78 with extent r = 0.738 S
+// (not a pill, not a circular arc). The dock window is the pill plus the
+// rounded shadow margin on every side (DockApp::RebuildLayout), so S falls
+// out of the pill height and no extra constant has to be plumbed.
+// ---------------------------------------------------------------------------
+static const float kDock27HeightS = 1.752;
+static const float kDock27CornerS = 0.738;
+static const float kDock27CornerN = 2.78;
+static const float kDock27RefS = 40.5; // spec px are measured at S = 40.5 px
+
+float Dock27MarginPx(float dpi)
+{
+    // Same rounding as DockShadowMarginPx (std::lround) on the C++ side.
+    return floor(DOCK_SHADOW_MARGIN_PT * dpi + 0.5);
+}
+
+// Superellipse rounded-rect SDF. Exact on the straight runs; in the corner
+// the superellipse level is divided by its gradient length so the value is
+// a first-order Euclidean distance near the boundary (needed for the 1 px
+// rim core). nrm is the unit outward normal (y down, like pixels).
+float SdSquircleRectN(float2 p, float2 halfSize, float r, float n, out float2 nrm)
+{
+    const float2 q = abs(p) - (halfSize - r);
+    if (q.x > 0.0 && q.y > 0.0)
+    {
+        const float2 a = max(q, 1e-5);
+        const float m = max(a.x, a.y);
+        const float2 u = a / m;
+        const float2 un = pow(u, n);
+        const float sum = un.x + un.y;
+        const float k = m * pow(sum, 1.0 / n);
+        const float2 g = pow(u, n - 1.0) * pow(sum, 1.0 / n - 1.0);
+        const float gl = max(length(g), 1e-4);
+        nrm = sign(p) * g / gl;
+        return (k - r) / gl;
+    }
+    nrm = (q.x > q.y) ? float2(sign(p.x), 0.0) : float2(0.0, sign(p.y));
+    return max(q.x, q.y) - r;
+}
+
+void Dock27Shape(float2 pixel, float2 outputSize, float dpi,
+    out float2 halfSize, out float iconS, out float cornerRadius, out float distance, out float2 nrm)
+{
+    halfSize = max(outputSize * 0.5 - Dock27MarginPx(dpi), float2(1.0, 1.0));
+    iconS = 2.0 * halfSize.y / kDock27HeightS;
+    cornerRadius = max(min(kDock27CornerS * iconS, halfSize.y), 1.0);
+    distance = SdSquircleRectN(pixel - outputSize * 0.5, halfSize, cornerRadius, kDock27CornerN, nrm);
+}
+
+// Gaussian of width w integrated over a 1 px box footprint (approximated by
+// widening to sqrt(w^2 + 1/12) at constant area) so the 0.4 px core cannot
+// alias.
+float PixelGauss(float x, float w)
+{
+    const float we = sqrt(w * w + 1.0 / 12.0);
+    const float t = x / we;
+    return (w / we) * exp(-0.5 * t * t);
+}
+
+// Rim light R(s, n) from the spec: s = depth inside the edge (px).
+float Dock27Rim(float s, float2 nrm, float iconS)
+{
+    const float k = iconS / kDock27RefS;
+    const float A = 0.0685 + 0.850 * nrm.y * nrm.y;
+    const float core = 0.258 * PixelGauss(s - 1.29 * k, 0.404 * k);
+    const float glow = 0.153 * exp(-max(s, 0.0) / (2.55 * k));
+    return saturate(A * (core + glow));
+}
+
+// Faint dark hairline just outside the edge (alpha of black, premultiplied).
+float Dock27OuterLine(float distance, float iconS)
+{
+    const float k = iconS / kDock27RefS;
+    return 0.036 * PixelGauss(distance - 0.87 * k, 0.34 * k);
+}
+
+// Cool white tint composited over the (lightly blurred) backdrop.
+static const float3 kDock27Tint = float3(165.0, 162.0, 193.0) / 255.0;
+static const float kDock27TintAlpha = 0.29;
+
 // Convex slab height vs. normalized edge distance x in [0,1] (0 = outer rim,
 // 1 = flat interior). Superellipse n=4 profile: f(x) = (1-(1-x)^4)^(1/4).
 // Thickness is highest in the center and tapers toward the rim; the slope is
@@ -302,18 +385,24 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE) * (1.0 - labelFace);
     const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE)) * (1.0 - labelFace);
     const float marginDev = max(1.0 - panelOn, popupShadowOn) * DOCK_SHADOW_MARGIN_PT * dpi;
-    const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
-    // Shared DOCK_CORNER_RADIUS_PT (see DockTheme.hlsli). Squircle n=4 gives
-    // Apple-like continuous curvature (slightly fuller corners than the true
-    // circular arcs of GDI RoundRect used for the input region; the few-px
-    // corner difference is outside the interactive icon area).
-    const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
-    const float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
+    // Panels: shared DOCK_CORNER_RADIUS_PT squircle (n=4). Dock: macOS 27
+    // silhouette (Dock27Shape) with an analytic outward normal.
+    float2 halfSize = max(outputSize * 0.5 - marginDev, float2(1.0, 1.0));
+    float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
+    float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
+    float dockS = 1.0;
+    float2 dockNrm = float2(0.0, 1.0);
+    if (!isPanel)
+    {
+        Dock27Shape(pixel, outputSize, dpi, halfSize, dockS, cornerRadius, distance, dockNrm);
+    }
     const float aa = 1.35 * dpi;
-    const float mask = 1.0 - smoothstep(-aa, aa, distance);
+    // Dock: crisp 1 px coverage (the spec edge is a 0.5-coverage crossing).
+    const float mask = isPanel ? 1.0 - smoothstep(-aa, aa, distance) : saturate(0.5 - distance);
     // SDF gradient = 2D surface direction (CASDFLayer-style). ddx/ddy gives
     // screen-space analytic derivatives of the SDF field.
-    const float2 gradient = float2(ddx(distance), ddy(distance));
+    const float2 screenGradient = float2(ddx(distance), ddy(distance));
+    const float2 gradient = isPanel ? screenGradient : dockNrm;
     // Per-effect master switches (dock settings, default all on). Decoded
     // from the scene1.x bitmask; each gates exactly one pipeline stage.
     // Declared before the shadow early-out so every branch can use them.
@@ -331,6 +420,25 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float thickOn = FxEnabled(fxBits, 128.0);
     if (mask <= 0.0)
     {
+        if (!isPanel)
+        {
+            // Dock: faint dark hairline just outside the edge, combined with
+            // the downward contact shade when that effect is on.
+            const float outerLine = Dock27OuterLine(distance, dockS) * rimGain;
+            float shadowAlpha = 0.0;
+            if (shadowOn > 0.5)
+            {
+                const float2 dockShadowCenter = outputSize * 0.5 + float2(0.0, 3.5) * dpi;
+                float2 shadowNrm;
+                const float dockShadowSdf = SdSquircleRectN(pixel - dockShadowCenter, halfSize,
+                    cornerRadius, kDock27CornerN, shadowNrm);
+                const float penumbra = 4.0 * dpi;
+                const float facingDown = smoothstep(0.55, 0.98, dockNrm.y);
+                const float s = 1.0 - saturate(max(dockShadowSdf, 0.0) / penumbra);
+                shadowAlpha = s * s * (3.0 - 2.0 * s) * 0.14 * facingDown;
+            }
+            return float4(0.0, 0.0, 0.0, 1.0 - (1.0 - shadowAlpha) * (1.0 - outerLine));
+        }
         // Only Quick Settings opts into a transparent popup margin. Other
         // panels retain their old no-shadow contract.
         if ((isPanel && popupShadowOn < 0.5) || shadowOn < 0.5)
@@ -511,6 +619,50 @@ float4 GlassPS(VertexOutput input) : SV_Target
         }
     }
 
+    // ---- macOS 27 dock material -------------------------------------------
+    // fill = cool white tint (165,162,193) at ~29% over the backdrop; rim is a
+    // white additive overlay out = fill + R (1 - fill) with the spec's n_y^2
+    // band light (crisp core + soft inner glow); faint dark line outside.
+    if (!isPanel)
+    {
+        const float rimR = Dock27Rim(-distance, dockNrm, dockS) * rimGain;
+        const float tintA = kDock27TintAlpha * tintOn;
+        float3 inside;
+        float insideAlpha;
+        if (hasBackdrop)
+        {
+            const float3 fill = lerp(frostedBackground, kDock27Tint, tintA);
+            inside = fill + rimR * (1.0 - fill);
+            insideAlpha = 1.0;
+        }
+        else
+        {
+            // No live capture: composite the same two layers over the
+            // desktop directly (tint at tintA, then white at R).
+            insideAlpha = rimR + (1.0 - rimR) * tintA;
+            inside = (rimR + (1.0 - rimR) * tintA * kDock27Tint) / max(insideAlpha, 1e-4);
+        }
+        const float glint = saturate(scene2.z) * specOn;
+        if (glint > 0.0)
+        {
+            const float2 toGlint = pixel - scene2.xy;
+            const float rimSigma = 48.0 * dpi;
+            const float nearRim = exp(-dot(toGlint, toGlint) / (2.0 * rimSigma * rimSigma));
+            inside += float3(0.85, 0.90, 1.0) * Dock27Rim(-distance, float2(0.0, 1.0), dockS) * 0.6 *
+                nearRim * glint * rimGain;
+        }
+        if (scene1.z > 0.5)
+        {
+            const float outline = 1.0 - smoothstep(0.0, 1.0, abs(distance));
+            inside = lerp(inside, float3(1.0, 0.18, 0.58), outline);
+        }
+        inside = saturate(inside);
+        const float cov = saturate(mask * scene0.z * (hasBackdrop ? scene1.w : 1.0)) * insideAlpha;
+        const float outerLine = Dock27OuterLine(distance, dockS) * rimGain;
+        const float outA = cov + (1.0 - cov) * outerLine;
+        return float4(inside * cov, outA);
+    }
+
     // ---- 1. Face plate (Frost slider) -----------------------------------
     // Dock: vibrancy (saturation boost) then a #4b..#e1 veil (clear
     // Apple mix -> milky glass) so the backdrop keeps its color and contrast.
@@ -626,10 +778,17 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const bool isPanel = panelOn > 0.5;
     const float labelFace = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_LABEL_FACE);
     const float marginDev = max(1.0 - panelOn, popupShadowOn) * DOCK_SHADOW_MARGIN_PT * dpi;
-    const float2 halfSize = max(outputSize * 0.5 - marginDev - 1.5 * dpi * (1.0 - panelOn), float2(1.0, 1.0));
-    const float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
-    const float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
-    const float2 gradient = float2(ddx(distance), ddy(distance));
+    float2 halfSize = max(outputSize * 0.5 - marginDev, float2(1.0, 1.0));
+    float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
+    float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
+    float dockS = 1.0;
+    float2 dockNrm = float2(0.0, 1.0);
+    if (!isPanel)
+    {
+        Dock27Shape(pixel, outputSize, dpi, halfSize, dockS, cornerRadius, distance, dockNrm);
+    }
+    const float2 screenGradient = float2(ddx(distance), ddy(distance));
+    const float2 gradient = isPanel ? screenGradient : dockNrm;
     const float2 texel = 1.0 / outputSize;
     const float2 uv = pixel * texel;
     const float2 outward = gradient / max(length(gradient), 0.0001);
@@ -764,13 +923,14 @@ float4 IconPS(VertexOutput input) : SV_Target
     {
         const float2 size = max(icon.iconRect.zw, 1.0);
         const float2 offset = abs(input.uv - 0.5) * size;
-        const float halfThickness = 0.75;
-        const float cap = 2.0;
-        const float lineAlpha = smoothstep(halfThickness + 0.75, halfThickness, offset.x) *
-            smoothstep(size.y * 0.5, max(size.y * 0.5 - cap, 0.0), offset.y) * 0.80;
-        const float3 ink = adaptiveInk ? AdaptiveChromeInk(outputSize)
-                                       : float3(0.32, 0.32, 0.34);
-        return float4(ink * lineAlpha, lineAlpha);
+        // macOS 27 separator: neutral black at ~21% alpha, 1.28 S tall
+        // (the slot height), ~0.049 S wide (2 px at 2x), ends fade over ~1 px.
+        const float iconS = size.y / 1.28;
+        const float halfWidth = max(0.0247 * iconS, 0.5);
+        const float across = saturate(halfWidth + 0.5 - offset.x) - saturate(-halfWidth + 0.5 - offset.x);
+        const float along = saturate(size.y * 0.5 - offset.y + 0.5);
+        const float lineAlpha = saturate(across) * along * 0.21;
+        return float4(0.0, 0.0, 0.0, lineAlpha);
     }
 
     if (icon.iconMeta.y > 3.5)
@@ -814,16 +974,15 @@ float4 IconPS(VertexOutput input) : SV_Target
     }
 
     if (icon.iconMeta.x > 0.5 && contentHeightRatio < 0.98 && input.uv.y > contentHeightRatio) {
-        const float stripHeightPx = icon.iconRect.w * (1.0 - contentHeightRatio);
-        // Sit in the lower part of the strip, under the icon, clear of the slot edge.
-        const float dotCenterY = contentHeightRatio + (1.0 - contentHeightRatio) * 0.72;
-        const float dotRadiusPx = 0.75 * max(min(stripHeightPx * 0.42, icon.iconRect.z * 0.055), 2.8);
+        // macOS 27 running dot: diameter 0.091 S, centre 0.21 S below the
+        // icon body (S = icon width), opaque near-black, 1 px AA.
+        const float iconS = icon.iconRect.z;
+        const float dotRadiusPx = max(0.0455 * iconS, 1.0);
         float2 dotOffset;
         dotOffset.x = (input.uv.x - 0.5) * icon.iconRect.z;
-        dotOffset.y = (input.uv.y - dotCenterY) * icon.iconRect.w;
+        dotOffset.y = input.uv.y * icon.iconRect.w - (iconS + 0.21 * iconS);
         const float dist = length(dotOffset);
-        const float edgeSoftness = max(0.28, dotRadiusPx * 0.2);
-        const float dotAlpha = 1.0 - smoothstep(dotRadiusPx, dotRadiusPx + edgeSoftness, dist);
+        const float dotAlpha = saturate(dotRadiusPx + 0.5 - dist);
         // macOS running indicator: small black circle on dark, light, and photo bars.
         const float3 runningDot = float3(0.0, 0.0, 0.0);
         color = color * (1.0 - dotAlpha) + runningDot * dotAlpha;

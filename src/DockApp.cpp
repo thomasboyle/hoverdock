@@ -4046,16 +4046,19 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     const float scale = static_cast<float>(dpi) / 96.0F;
     const float layoutScale = scale * m_dockScale;
     const LONG iconSize = std::lround(56.0F * layoutScale);
-    const LONG dotSize = std::max(3L, std::lround(6.0F * layoutScale));
-    const LONG dotGap = std::max(3L, std::lround(6.0F * layoutScale));
-    const LONG iconSlotHeight = iconSize + dotGap + dotSize;
-    // Horizontal inset stays roomy. The glyph is centered: the margin above it
-    // equals the dot gap, the activity dot, and the floor under it.
-    const LONG padding = std::lround(18.0F * layoutScale);
-    const LONG padBottom = std::lround(6.0F * layoutScale);
-    const LONG padTop = dotGap + dotSize + padBottom;
-    const LONG gap = std::lround(8.0F * layoutScale);
-    const LONG dividerSlotWidth = std::lround(10.0F * layoutScale);
+    // macOS 27 dock geometry, in units of the icon body S (measured spec):
+    // bar height 1.752 S with the icon centred, side padding 0.373 S, icon
+    // pitch 1.321 S (gap 0.321 S), a divider section 0.605 S wider than a
+    // pitch (slot 0.284 S between two gaps) holding a 1.28 S line, and the
+    // running dot 0.21 S below the body (drawn in the slot strip by IconPS).
+    const float iconS = static_cast<float>(iconSize);
+    const LONG iconSlotHeight = iconSize + static_cast<LONG>(std::ceil(0.26F * iconS)) + 1L;
+    const LONG pillHeight = std::lround(1.752F * iconS);
+    const LONG padding = std::lround(0.373F * iconS);
+    const LONG padTop = (pillHeight - iconSize) / 2L;
+    const LONG gap = std::lround(0.321F * iconS);
+    const LONG dividerSlotWidth = std::lround(0.284F * iconS);
+    const LONG dividerHeight = std::lround(1.28F * iconS);
     const LONG margin = std::lround(10.0F * scale);
     const LONG trayGlyph = std::max(22L, std::lround(28.0F * layoutScale));
     const LONG trayGap = std::lround(10.0F * layoutScale);
@@ -4114,7 +4117,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     // drop shade into the margin ring.
     const LONG shadowMargin = DockShadowMarginPx(scale);
     m_dockWidth = static_cast<UINT>(padding * 2 + contentWidth + shadowMargin * 2);
-    m_dockHeight = static_cast<UINT>(padTop + padBottom + iconSlotHeight + shadowMargin * 2);
+    m_dockHeight = static_cast<UINT>(pillHeight + shadowMargin * 2);
     // The window carries a shadow ring around the pill; anchoring the window
     // bottom to the screen bottom would leave the pill floating a full
     // shadowMargin above the edge. Sink the window so only a small breathing
@@ -4140,11 +4143,12 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     m_trashIndex = -1;
     m_iconRenderData.reserve(displayCount + 8U);
     const LONG top = shadowMargin + padTop;
+    const LONG dividerTop = shadowMargin + (pillHeight - dividerHeight) / 2L;
     LONG left = padding + shadowMargin;
     for (size_t index = 0; index < displayCount; ++index) {
         DockIconRenderData data;
         if (IsLayoutOnlyTarget(m_displayApps[index].app.target)) {
-            data.bounds = {left, top, left + dividerSlotWidth, top + iconSize};
+            data.bounds = {left, dividerTop, left + dividerSlotWidth, dividerTop + dividerHeight};
             data.kind = DockIconKind::Divider;
             data.adaptiveInk = true;
             left += dividerSlotWidth + gap;
@@ -4163,7 +4167,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     DockIconRenderData trayDivider;
     trayDivider.kind = DockIconKind::TrayDivider;
     trayDivider.adaptiveInk = true;
-    trayDivider.bounds = {left, top, left + trayDividerWidth, top + iconSize};
+    trayDivider.bounds = {left, dividerTop, left + trayDividerWidth, dividerTop + dividerHeight};
     m_iconRenderData.push_back(trayDivider);
     left += trayDividerWidth + trayLeadGap;
 
@@ -4264,8 +4268,11 @@ void DockApp::UpdateInputRegion() {
     // fall through the drop shade to the desktop.
     const float scale = static_cast<float>(HostDpi()) / 96.0F;
     const int shadowMargin = static_cast<int>(DockShadowMarginPx(scale));
+    // macOS 27 squircle corner (extent 0.738 S, S = pill height / 1.752); the
+    // closest circular arc is ~0.68 S, which GDI RoundRect approximates.
+    const float pillS = static_cast<float>(height - shadowMargin * 2) / 1.752F;
     HRGN region = CreateDockInputRegion(width - shadowMargin * 2, height - shadowMargin * 2,
-        static_cast<int>(std::lround(2.0F * DOCK_CORNER_RADIUS_PT * scale)));
+        static_cast<int>(std::lround(2.0F * 0.68F * pillS)));
     if (region == nullptr) {
         Log(L"Could not create the dock input region.");
         return;
