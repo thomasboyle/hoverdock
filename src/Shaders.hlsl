@@ -626,7 +626,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     if (!isPanel)
     {
         const float rimR = Dock27Rim(-distance, dockNrm, dockS) * rimGain;
-        const float tintA = kDock27TintAlpha * tintOn;
+        // Always on: the Tint toggle never fed the old dock face either.
+        const float tintA = kDock27TintAlpha;
         float3 inside;
         float insideAlpha;
         if (hasBackdrop)
