@@ -39,6 +39,14 @@ namespace {
 constexpr DWORD kOpTimeoutMs = 20000;
 constexpr DWORD kStatusTimeoutMs = 2500;
 constexpr DWORD kPairTimeoutMs = 180000;
+// Round 1: event-driven link waits (fallback poll quantum + bounds).
+constexpr DWORD kLinkPollMs = 50;
+constexpr DWORD kDisconnectWaitMs = 3000;   // measured ACL down 150 ms median (IOCTL only)
+constexpr DWORD kPageLinkWaitMs = 5000;     // measured link-up 1.6 s median, 4.1 s max
+constexpr DWORD kPageErrorGraceMs = 1500;   // link may still come up after an L2CAP error
+constexpr DWORD kToggleLinkWaitMs = 5000;
+constexpr int kMaxRefreshRetries = 3;
+constexpr DWORD kRefreshRetryMs = 1500;
 constexpr size_t kMaxPaired = 6;
 constexpr size_t kMaxDiscovered = 4;
 constexpr size_t kMaxTracked = 32;
@@ -78,6 +86,7 @@ enum class JobKind : uint8_t {
     StartDiscovery,
     StopDiscovery,
     Pair,
+    PostConnect, // Round 1: AVRCP / HFP enable after link-up, off the critical path
     Quit,
 };
 
@@ -458,19 +467,71 @@ bool AnyRadioConnected(uint64_t address) {
     return ForEachRadio([&](HANDLE radio) { return RadioConnected(radio, address); });
 }
 
-bool WaitForLink(uint64_t address, DWORD timeoutMs, const std::atomic<bool>& running, bool wantConnected) {
-    ProfileScope profileScope("Bluetooth::WaitForLink");
-    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
-    for (;;) {
-        if (AnyRadioConnected(address) == wantConnected) {
-            return true;
+// Radio handles opened once per wait instead of per poll.
+class RadioHandles {
+public:
+    RadioHandles() {
+        BLUETOOTH_FIND_RADIO_PARAMS params{};
+        params.dwSize = sizeof(params);
+        HANDLE radio = nullptr;
+        const HBLUETOOTH_RADIO_FIND find = BluetoothFindFirstRadio(&params, &radio);
+        if (find == nullptr) {
+            return;
         }
-        if (!running.load() || GetTickCount64() >= deadline) {
-            return false;
+        do {
+            if (radio != nullptr) {
+                m_handles.push_back(radio);
+                radio = nullptr;
+            }
+        } while (BluetoothFindNextRadio(find, &radio) != FALSE);
+        BluetoothFindRadioClose(find);
+        if (radio != nullptr) {
+            CloseHandle(radio);
         }
-        Sleep(200);
     }
-}
+    ~RadioHandles() {
+        for (HANDLE handle : m_handles) {
+            CloseHandle(handle);
+        }
+    }
+    RadioHandles(const RadioHandles&) = delete;
+    RadioHandles& operator=(const RadioHandles&) = delete;
+
+    [[nodiscard]] bool Any() const noexcept { return !m_handles.empty(); }
+    [[nodiscard]] bool Connected(uint64_t address) const {
+        for (HANDLE handle : m_handles) {
+            if (RadioConnected(handle, address)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    std::vector<HANDLE> m_handles;
+};
+
+enum class LinkWait : uint8_t {
+    Reached,
+    Timeout,
+    Cancelled,
+    Extra, // caller-supplied handle (e.g. L2CAP page socket event) signalled
+};
+
+// Signal shared with a WinRT ConnectionStatusChanged callback. Held by
+// shared_ptr so a late callback on a thread-pool thread never touches a
+// closed handle.
+struct LinkSignal {
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    LinkSignal() = default;
+    LinkSignal(const LinkSignal&) = delete;
+    LinkSignal& operator=(const LinkSignal&) = delete;
+    ~LinkSignal() {
+        if (event != nullptr) {
+            CloseHandle(event);
+        }
+    }
+};
 
 // Timing-only instrumentation (phase 2): same scope names as 9d0c953.
 const char* ServiceScopeName(unsigned short id, DWORD state) noexcept {
@@ -549,14 +610,6 @@ bool UsesAudio(HANDLE radio, const BLUETOOTH_DEVICE_INFO& info) {
     return false;
 }
 
-void EnableAudio(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
-    // Enable A2DP/AVRCP only. Do not DisableVoice/HFP here: flipping SCO
-    // profiles forces Windows to rebuild the audio graph and can glitch
-    // browser WASAPI playback even when the user is mid-video.
-    SetService(radio, info, 0x110B, BLUETOOTH_SERVICE_ENABLE);
-    SetService(radio, info, 0x110E, BLUETOOTH_SERVICE_ENABLE);
-}
-
 void EnableGeneral(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
     bool enabled = false;
     for (const GUID& service : InstalledServices(radio, info)) {
@@ -572,156 +625,11 @@ void EnableGeneral(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
     }
 }
 
-void DisableProfiles(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
-    ProfileScope profileScope("Bluetooth::DisableProfiles");
-    const unsigned short ids[] = {0x110B, 0x110E, 0x1108, 0x111E, 0x1124, 0x110A};
-    for (unsigned short id : ids) {
-        SetService(radio, info, id, BLUETOOTH_SERVICE_DISABLE);
-    }
-    for (const GUID& service : InstalledServices(radio, info)) {
-        SetServiceScoped(radio, info, service, BLUETOOTH_SERVICE_DISABLE);
-    }
-}
-
 bool RememberedClassic(uint64_t address) {
     return ForEachRadio([&](HANDLE radio) {
         BLUETOOTH_DEVICE_INFO info{};
         return LoadDeviceInfo(radio, address, info) && info.fRemembered != FALSE;
     });
-}
-
-bool PageAudio(uint64_t address) {
-    ProfileScope profileScope("Bluetooth::PageAudio");
-    WSADATA wsa{};
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        return false;
-    }
-    bool paged = false;
-    const SOCKET sock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_L2CAP);
-    if (sock != INVALID_SOCKET) {
-        u_long nonblocking = 1;
-        ioctlsocket(sock, FIONBIO, &nonblocking);
-        SOCKADDR_BTH remote{};
-        remote.addressFamily = AF_BTH;
-        remote.btAddr = address;
-        remote.serviceClassId = ServiceUuid(0x110B);
-        remote.port = 0x0019;
-        const int started = connect(sock, reinterpret_cast<SOCKADDR*>(&remote), sizeof(remote));
-        if (started == 0) {
-            paged = true;
-        } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
-            const WSAEVENT ready = WSACreateEvent();
-            if (ready != WSA_INVALID_EVENT && WSAEventSelect(sock, ready, FD_CONNECT) == 0) {
-                const DWORD waited = WSAWaitForMultipleEvents(1, &ready, FALSE, 3000, FALSE);
-                WSANETWORKEVENTS network{};
-                if (waited == WSA_WAIT_EVENT_0 &&
-                    WSAEnumNetworkEvents(sock, ready, &network) == 0 &&
-                    (network.lNetworkEvents & FD_CONNECT) != 0 &&
-                    network.iErrorCode[FD_CONNECT_BIT] == 0) {
-                    paged = true;
-                }
-            }
-            if (ready != WSA_INVALID_EVENT) {
-                WSACloseEvent(ready);
-            }
-        }
-        if (paged) {
-            ForEachRadio([&](HANDLE radio) {
-                BLUETOOTH_DEVICE_INFO info{};
-                if (!LoadDeviceInfo(radio, address, info)) {
-                    return false;
-                }
-                EnableAudio(radio, info);
-                return RadioConnected(radio, address);
-            });
-        }
-        closesocket(sock);
-    }
-    WSACleanup();
-    return paged;
-}
-
-bool ConnectClassic(uint64_t address, const std::atomic<bool>& running) {
-    ProfileScope profileScope("Bluetooth::ConnectClassic");
-    if (address == 0 || !running.load()) {
-        return false;
-    }
-    // Fast path: enable the right profiles once. Never CM_Disable Bluetooth
-    // device nodes - that tears down audio endpoints and breaks browser
-    // WASAPI render while a video is playing.
-    bool audio = false;
-    const auto applyProfile = [&](HANDLE radio) {
-        BLUETOOTH_DEVICE_INFO info{};
-        if (!LoadDeviceInfo(radio, address, info)) {
-            return false;
-        }
-        if (UsesAudio(radio, info)) {
-            audio = true;
-            EnableAudio(radio, info);
-        } else {
-            EnableGeneral(radio, info);
-        }
-        return RadioConnected(radio, address);
-    };
-    if (ForEachRadio(applyProfile) || AnyRadioConnected(address)) {
-        return true;
-    }
-    if (!running.load()) {
-        return false;
-    }
-    // Audio devices often need an L2CAP page to bring the ACL up; keep it brief.
-    if (audio) {
-        PageAudio(address);
-        if (!running.load()) {
-            return false;
-        }
-        ForEachRadio(applyProfile);
-        if (AnyRadioConnected(address)) {
-            return true;
-        }
-    }
-    // One short confirmation wait, then a single profile re-nudge. Total budget
-    // stays well under the old multi-stage ~15s path so Connect feels responsive.
-    if (WaitForLink(address, 3500, running, true)) {
-        return true;
-    }
-    if (!running.load()) {
-        return false;
-    }
-    ForEachRadio(applyProfile);
-    return WaitForLink(address, 2000, running, true) || AnyRadioConnected(address);
-}
-
-bool DisconnectClassic(uint64_t address, const std::atomic<bool>& running) {
-    ProfileScope profileScope("Bluetooth::DisconnectClassic");
-    if (address == 0) {
-        return false;
-    }
-    // Issue the radio disconnect IOCTL first so the link drops immediately,
-    // then disable profiles on the same radio pass. Avoid long WaitForLink
-    // polls that made Disconnect feel stuck for multiple seconds.
-    ForEachRadio([&](HANDLE radio) {
-        DWORD returned = 0;
-        {
-            ProfileScope ioctlScope("Bluetooth::DisconnectIoctl");
-            DeviceIoControl(radio, kDisconnectIoctl, &address, sizeof(address), nullptr, 0, &returned,
-                nullptr);
-        }
-        BLUETOOTH_DEVICE_INFO info{};
-        if (LoadDeviceInfo(radio, address, info)) {
-            DisableProfiles(radio, info);
-        }
-        return false; // IOCTL + disable on every radio (same coverage as prior two passes)
-    });
-    if (!running.load()) {
-        return !AnyRadioConnected(address);
-    }
-    // Brief confirmation only. If the stack is still settling, treat the force
-    // attempt as success â€” Windows finishes the drop asynchronously.
-    if (WaitForLink(address, 700, running, false)) {
-        return true;
-    }
-    return !AnyRadioConnected(address);
 }
 
 const wchar_t* PairFailureText(
@@ -759,6 +667,17 @@ struct BluetoothService::Impl {
     UINT notifyMessage = 0;
     HANDLE wake = nullptr;
     HANDLE thread = nullptr;
+    // Manual-reset. Set when a newer opposite Connect/Disconnect (or Stop)
+    // supersedes the in-flight job; reset under queueMutex on every pop.
+    HANDLE cancelJob = nullptr;
+    // Guarded by queueMutex.
+    bool inflightActive = false;
+    JobKind inflightKind = JobKind::Refresh;
+    std::wstring inflightId;
+    // Worker-only (P4 bounded refresh retry).
+    bool refreshSuspect = false;
+    int refreshRetries = 0;
+    ULONGLONG retryDueMs = 0;
     std::atomic<bool> running{false};
     std::atomic<bool> pairing{false};
     std::atomic<bool> notifyQueued{false};
@@ -925,6 +844,30 @@ struct BluetoothService::Impl {
             std::lock_guard<std::mutex> lock(queueMutex);
             if (!running.load() && job.kind != JobKind::Quit) {
                 return false;
+            }
+            if (job.kind == JobKind::Connect || job.kind == JobKind::Disconnect) {
+                // P3: newest intent per device wins. Drop queued Connect /
+                // Disconnect / PostConnect for the same id, and cancel an
+                // in-flight opposite job (its waits observe cancelJob).
+                const size_t before = queue.size();
+                std::erase_if(queue, [&](const Job& pending) {
+                    return pending.id == job.id &&
+                        (pending.kind == JobKind::Connect || pending.kind == JobKind::Disconnect ||
+                            pending.kind == JobKind::PostConnect);
+                });
+                if (queue.size() != before) {
+                    ProfileScope::Mark("Bluetooth::Supersede queued");
+                }
+                if (inflightActive && inflightId == job.id && cancelJob != nullptr) {
+                    const bool opposite =
+                        (inflightKind == JobKind::Connect && job.kind == JobKind::Disconnect) ||
+                        (inflightKind == JobKind::Disconnect && job.kind == JobKind::Connect) ||
+                        (inflightKind == JobKind::PostConnect && job.kind == JobKind::Disconnect);
+                    if (opposite) {
+                        SetEvent(cancelJob);
+                        ProfileScope::Mark("Bluetooth::Supersede cancel in-flight");
+                    }
+                }
             }
             if (job.kind == JobKind::Refresh) {
                 for (Job& pending : queue) {
@@ -1125,64 +1068,85 @@ struct BluetoothService::Impl {
         }
         ABI::Windows::Devices::Radios::RadioAccessStatus status =
             ABI::Windows::Devices::Radios::RadioAccessStatus_Unspecified;
-        if (FAILED(WaitResult(operation.Get(), &status, kOpTimeoutMs))) {
+        if (FAILED(WaitResult(operation.Get(), &status, kStatusTimeoutMs))) {
+            // Transient (timeout / stack busy): retry on a later refresh.
+            ProfileScope::Mark("Bluetooth::EnsureAccess failed");
+            accessKnown = false;
             return false;
         }
         accessAllowed = status == ABI::Windows::Devices::Radios::RadioAccessStatus_Allowed;
         return accessAllowed;
     }
 
-    void RefreshRadio(bool force = false) {
+    // P5: IRadio objects are cached indefinitely; each refresh reads
+    // get_State (~0.1 ms). Re-enumerate (GetRadiosAsync) only when the cache
+    // is empty, a get_State fails, or reenumerate is requested.
+    // P4: a failed / timed-out enumeration keeps the last good radio state
+    // and flags refreshSuspect so the worker retries (bounded).
+    void RefreshRadio(bool reenumerate = false) {
     ProfileScope profileScope("Bluetooth::RefreshRadio");
         if (!EnsureAccess()) {
+            if (!accessKnown) {
+                refreshSuspect = true; // transient; keep last good radio state
+                return;
+            }
             radioPresent = false;
             radioOn = false;
             radios.clear();
             hint = L"Bluetooth access was denied";
             return;
         }
-        // Soft path: poll cached IRadio::get_State when a full GetRadiosAsync
-        // ran recently. Avoids ~20-30ms WinRT enum on every 4s QS timer tick.
-        constexpr ULONGLONG kRadioCacheMs = 3000;
-        const ULONGLONG now = GetTickCount64();
-        if (!force && !radios.empty() && lastRadioRefreshMs != 0 &&
-            now - lastRadioRefreshMs < kRadioCacheMs) {
-            radioPresent = true;
-            radioOn = false;
+        if (!reenumerate && !radios.empty()) {
+            ProfileScope cachedScope("Bluetooth::RefreshRadio cached");
+            bool stateOk = true;
+            bool anyOn = false;
             for (const ComPtr<ABI::Windows::Devices::Radios::IRadio>& radio : radios) {
-                if (radio == nullptr) {
-                    continue;
-                }
                 ABI::Windows::Devices::Radios::RadioState state =
                     ABI::Windows::Devices::Radios::RadioState_Unknown;
-                if (SUCCEEDED(radio->get_State(&state)) &&
-                    state == ABI::Windows::Devices::Radios::RadioState_On) {
-                    radioOn = true;
+                if (radio == nullptr || FAILED(radio->get_State(&state))) {
+                    stateOk = false;
+                    break;
+                }
+                if (state == ABI::Windows::Devices::Radios::RadioState_On) {
+                    anyOn = true;
                 }
             }
-            return;
+            if (stateOk) {
+                radioPresent = true;
+                radioOn = anyOn;
+                return;
+            }
+            ProfileScope::Mark("Bluetooth::RefreshRadio cached state failed, re-enumerating");
         }
-        radioPresent = false;
-        radioOn = false;
-        radios.clear();
+        ProfileScope enumScope("Bluetooth::RefreshRadio enum");
+        const auto keepLast = [&](const char* why) {
+            ProfileScope::Mark(why);
+            refreshSuspect = true;
+        };
         ComPtr<ABI::Windows::Devices::Radios::IRadioStatics> statics;
         Microsoft::WRL::Wrappers::HStringReference className(
             RuntimeClass_Windows_Devices_Radios_Radio);
         if (FAILED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics)))) {
+            keepLast("Bluetooth::RefreshRadio keep-last (activation failed)");
             return;
         }
         ComPtr<RadioListAsync> operation;
         if (FAILED(statics->GetRadiosAsync(&operation))) {
+            keepLast("Bluetooth::RefreshRadio keep-last (GetRadiosAsync failed)");
             return;
         }
         ComPtr<RadioList> list;
-        if (FAILED(WaitResult(operation.Get(), list.GetAddressOf(), kOpTimeoutMs)) || list == nullptr) {
+        if (FAILED(WaitResult(operation.Get(), list.GetAddressOf(), kStatusTimeoutMs)) || list == nullptr) {
+            keepLast("Bluetooth::RefreshRadio keep-last (GetRadiosAsync timeout/error)");
             return;
         }
         unsigned count = 0;
         if (FAILED(list->get_Size(&count))) {
+            keepLast("Bluetooth::RefreshRadio keep-last (list size failed)");
             return;
         }
+        std::vector<ComPtr<ABI::Windows::Devices::Radios::IRadio>> found;
+        bool foundOn = false;
         for (unsigned index = 0; index < count; ++index) {
             ComPtr<ABI::Windows::Devices::Radios::IRadio> radio;
             if (FAILED(list->GetAt(index, radio.GetAddressOf())) || radio == nullptr) {
@@ -1194,15 +1158,23 @@ struct BluetoothService::Impl {
                 kind != ABI::Windows::Devices::Radios::RadioKind_Bluetooth) {
                 continue;
             }
-            radioPresent = true;
             ABI::Windows::Devices::Radios::RadioState state =
                 ABI::Windows::Devices::Radios::RadioState_Unknown;
             if (SUCCEEDED(radio->get_State(&state)) &&
                 state == ABI::Windows::Devices::Radios::RadioState_On) {
-                radioOn = true;
+                foundOn = true;
             }
-            radios.push_back(std::move(radio));
+            found.push_back(std::move(radio));
         }
+        if (found.empty() && radioPresent && RadioHandles().Any()) {
+            // WinRT lists no Bluetooth radio but the Win32 stack still has one
+            // (seen during the profile-disable tail): don't publish radio=0.
+            keepLast("Bluetooth::RefreshRadio keep-last (WinRT no radio, Win32 radio present)");
+            return;
+        }
+        radios = std::move(found);
+        radioPresent = !radios.empty();
+        radioOn = foundOn;
         lastRadioRefreshMs = GetTickCount64();
         if (radioOn && hint == L"Bluetooth access was denied") {
             hint.clear();
@@ -1232,7 +1204,9 @@ struct BluetoothService::Impl {
                 changed = true;
             }
         }
-        RefreshRadio(true);
+        // P5: read the cached IRadio state; RefreshRadio re-enumerates only if
+        // get_State fails (avoids the measured 4.9 s cold GetRadiosAsync).
+        RefreshRadio(false);
         return changed || radioOn == enabled;
     }
 
@@ -1513,7 +1487,9 @@ struct BluetoothService::Impl {
             return false;
         }
         ComPtr<DeviceList> list;
-        if (FAILED(WaitResult(operation.Get(), list.GetAddressOf(), kOpTimeoutMs)) || list == nullptr) {
+        if (FAILED(WaitResult(operation.Get(), list.GetAddressOf(), kStatusTimeoutMs)) || list == nullptr) {
+            ProfileScope::Mark(lowEnergy ? "Bluetooth::CollectPaired LE timeout/error"
+                                         : "Bluetooth::CollectPaired classic timeout/error");
             return false;
         }
         unsigned count = 0;
@@ -1543,6 +1519,7 @@ struct BluetoothService::Impl {
     // One radio enumeration updates classic fConnected for all remembered addresses.
     // Preserves connect/disconnect UI accuracy without N WinRT Async round-trips.
     void ReconcileClassicLinks(std::vector<RadioDevice>& devices) {
+        ProfileScope profileScope("Bluetooth::ReconcileClassicLinks");
         bool anyClassic = false;
         for (const RadioDevice& device : devices) {
             if (device.address != 0 && !device.lowEnergy) {
@@ -1576,11 +1553,34 @@ struct BluetoothService::Impl {
         std::vector<RadioDevice> next;
         const bool classicOk = CollectPaired(false, next);
         const bool leOk = CollectPaired(true, next);
-        if (classicOk || leOk) {
-            ReconcileClassicLinks(next);
-            paired = std::move(next);
-            lastPairedRefreshMs = GetTickCount64();
+        if (!classicOk && !leOk) {
+            // P4: both queries failed / timed out: keep the last good list.
+            ProfileScope::Mark("Bluetooth::RefreshPaired keep-last (both queries failed)");
+            refreshSuspect = true;
+            return;
         }
+        // P4: a classic device that the Win32 stack still remembers (paired)
+        // but that this enumeration dropped is a transient AEP gap (seen
+        // after the old profile-disable tail). Keep the last good entry and
+        // retry instead of publishing an empty list.
+        if (radioOn) {
+            for (const RadioDevice& previous : paired) {
+                if (previous.address == 0 || previous.lowEnergy) {
+                    continue;
+                }
+                const bool present = std::any_of(next.begin(), next.end(), [&](const RadioDevice& device) {
+                    return device.id == previous.id || (device.address != 0 && device.address == previous.address);
+                });
+                if (!present && RememberedClassic(previous.address)) {
+                    ProfileScope::Mark("Bluetooth::RefreshPaired keep-last (paired device missing from AEP)");
+                    refreshSuspect = true;
+                    next.push_back(previous);
+                }
+            }
+        }
+        ReconcileClassicLinks(next);
+        paired = std::move(next);
+        lastPairedRefreshMs = GetTickCount64();
     }
 
     void StopWatcher() {
@@ -1728,7 +1728,285 @@ struct BluetoothService::Impl {
         return SUCCEEDED(WaitDone(services.Get(), kLeConnectTimeoutMs));
     }
 
-    bool ConnectDevice(const RadioDevice& device) {
+    [[nodiscard]] bool JobCancelled() const noexcept {
+        return !running.load() ||
+            (cancelJob != nullptr && WaitForSingleObject(cancelJob, 0) == WAIT_OBJECT_0);
+    }
+
+    // Event-driven link wait. Wakes on: the job cancel event, the classic
+    // BluetoothDevice.ConnectionStatusChanged notification, an optional
+    // caller handle, or a kLinkPollMs fallback that reads ACL fConnected on
+    // radio handles opened once. Bounded by timeoutMs. Never runs on the UI
+    // thread (worker only).
+    LinkWait WaitLink(uint64_t address, bool wantConnected, DWORD timeoutMs, HANDLE extra = nullptr) {
+        ProfileScope profileScope("Bluetooth::WaitForLink");
+        const RadioHandles radiosForWait;
+        const auto signal = std::make_shared<LinkSignal>();
+        ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothDevice> device;
+        ComPtr<ClassicDeviceAsync> opening;
+        EventRegistrationToken token{};
+        bool registered = false;
+        {
+            ComPtr<ABI::Windows::Devices::Bluetooth::IBluetoothDeviceStatics> statics;
+            Microsoft::WRL::Wrappers::HStringReference className(
+                RuntimeClass_Windows_Devices_Bluetooth_BluetoothDevice);
+            if (SUCCEEDED(RoGetActivationFactory(className.Get(), IID_PPV_ARGS(&statics))) && statics != nullptr) {
+                // Started, not awaited: polled below so it never delays the wait.
+                statics->FromBluetoothAddressAsync(address, opening.GetAddressOf());
+            }
+        }
+        const auto tryRegister = [&]() {
+            if (registered || opening == nullptr || signal->event == nullptr) {
+                return;
+            }
+            ComPtr<IAsyncInfo> info;
+            AsyncStatus status = AsyncStatus::Started;
+            if (FAILED(opening.As(&info)) || FAILED(info->get_Status(&status))) {
+                opening.Reset();
+                return;
+            }
+            if (status == AsyncStatus::Started) {
+                return;
+            }
+            if (status == AsyncStatus::Completed && SUCCEEDED(opening->GetResults(device.GetAddressOf())) &&
+                device != nullptr) {
+                auto handler = Microsoft::WRL::Callback<
+                    __FITypedEventHandler_2_Windows__CDevices__CBluetooth__CBluetoothDevice_IInspectable>(
+                    [signal](ABI::Windows::Devices::Bluetooth::IBluetoothDevice*, IInspectable*) -> HRESULT {
+                        SetEvent(signal->event);
+                        return S_OK;
+                    });
+                if (handler != nullptr && SUCCEEDED(device->add_ConnectionStatusChanged(handler.Get(), &token))) {
+                    registered = true;
+                }
+            }
+            opening.Reset();
+        };
+        const auto deviceSays = [&]() {
+            if (!registered || device == nullptr) {
+                return false;
+            }
+            ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus status =
+                ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Disconnected;
+            return SUCCEEDED(device->get_ConnectionStatus(&status)) &&
+                (status == ABI::Windows::Devices::Bluetooth::BluetoothConnectionStatus_Connected) == wantConnected;
+        };
+        constexpr DWORD kNone = MAXDWORD;
+        HANDLE handles[3]{};
+        DWORD count = 0;
+        if (cancelJob != nullptr) {
+            handles[count++] = cancelJob;
+        }
+        DWORD linkIndex = kNone;
+        if (signal->event != nullptr) {
+            linkIndex = count;
+            handles[count++] = signal->event;
+        }
+        DWORD extraIndex = kNone;
+        if (extra != nullptr) {
+            extraIndex = count;
+            handles[count++] = extra;
+        }
+        LinkWait result = LinkWait::Timeout;
+        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+        for (;;) {
+            if (radiosForWait.Connected(address) == wantConnected || deviceSays()) {
+                ProfileScope::Mark(wantConnected ? "Bluetooth::WaitForLink up" : "Bluetooth::WaitForLink down");
+                result = LinkWait::Reached;
+                break;
+            }
+            if (JobCancelled()) {
+                ProfileScope::Mark("Bluetooth::WaitForLink cancelled");
+                result = LinkWait::Cancelled;
+                break;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline) {
+                ProfileScope::Mark("Bluetooth::WaitForLink timeout");
+                break;
+            }
+            const DWORD slice = static_cast<DWORD>(std::min<ULONGLONG>(kLinkPollMs, deadline - now));
+            DWORD waited = WAIT_TIMEOUT;
+            if (count == 0) {
+                Sleep(slice);
+            } else {
+                waited = WaitForMultipleObjects(count, handles, FALSE, slice);
+            }
+            if (linkIndex != kNone && waited == WAIT_OBJECT_0 + linkIndex) {
+                ProfileScope::Mark("Bluetooth::WaitForLink event");
+            } else if (extraIndex != kNone && waited == WAIT_OBJECT_0 + extraIndex) {
+                result = LinkWait::Extra;
+                break;
+            } else if (waited == WAIT_FAILED) {
+                Sleep(slice);
+            }
+            tryRegister();
+        }
+        if (registered && device != nullptr) {
+            device->remove_ConnectionStatusChanged(token);
+        }
+        if (opening != nullptr) {
+            ComPtr<IAsyncInfo> info;
+            if (SUCCEEDED(opening.As(&info))) {
+                info->Cancel();
+            }
+        }
+        if (device != nullptr) {
+            ComPtr<ABI::Windows::Foundation::IClosable> closable;
+            if (SUCCEEDED(device.As(&closable))) {
+                closable->Close();
+            }
+        }
+        return result;
+    }
+
+    // P2: page A2DP directly (L2CAP PSM 0x19, non-blocking) and return as
+    // soon as the ACL is up. No SetServiceState here. The socket is closed
+    // before returning, so no disable can ever overlap an in-flight page.
+    LinkWait PageAudio(uint64_t address) {
+        ProfileScope profileScope("Bluetooth::PageAudio");
+        WSADATA wsa{};
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            return LinkWait::Timeout;
+        }
+        LinkWait result = LinkWait::Timeout;
+        const SOCKET sock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_L2CAP);
+        const WSAEVENT pageReady = sock != INVALID_SOCKET ? WSACreateEvent() : WSA_INVALID_EVENT;
+        if (sock != INVALID_SOCKET && pageReady != WSA_INVALID_EVENT &&
+            WSAEventSelect(sock, pageReady, FD_CONNECT) == 0) { // also makes the socket non-blocking
+            SOCKADDR_BTH remote{};
+            remote.addressFamily = AF_BTH;
+            remote.btAddr = address;
+            remote.serviceClassId = ServiceUuid(0x110B);
+            remote.port = 0x0019;
+            bool watchSocket = true;
+            if (connect(sock, reinterpret_cast<SOCKADDR*>(&remote), sizeof(remote)) != 0 &&
+                WSAGetLastError() != WSAEWOULDBLOCK) {
+                ProfileScope::Mark("Bluetooth::PageAudio connect error");
+                watchSocket = false;
+            }
+            ULONGLONG deadline = GetTickCount64() + (watchSocket ? kPageLinkWaitMs : kPageErrorGraceMs);
+            for (;;) {
+                const ULONGLONG now = GetTickCount64();
+                const DWORD remaining = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+                result = WaitLink(address, true, remaining, watchSocket ? pageReady : nullptr);
+                if (result != LinkWait::Extra) {
+                    break;
+                }
+                watchSocket = false;
+                WSANETWORKEVENTS network{};
+                if (WSAEnumNetworkEvents(sock, pageReady, &network) == 0 && (network.lNetworkEvents & FD_CONNECT) != 0 &&
+                    network.iErrorCode[FD_CONNECT_BIT] == 0) {
+                    ProfileScope::Mark("Bluetooth::PageAudio l2cap connected");
+                } else {
+                    // The ACL may still come up (A2DP driver owns the PSM);
+                    // give it a short grace, then let the caller fall back.
+                    ProfileScope::Mark("Bluetooth::PageAudio l2cap error");
+                    deadline = std::min<ULONGLONG>(deadline, GetTickCount64() + kPageErrorGraceMs);
+                }
+            }
+        } else {
+            ProfileScope::Mark("Bluetooth::PageAudio socket setup failed");
+        }
+        if (sock != INVALID_SOCKET) {
+            closesocket(sock);
+        }
+        if (pageReady != WSA_INVALID_EVENT) {
+            WSACloseEvent(pageReady);
+        }
+        WSACleanup();
+        return result;
+    }
+
+    // P2 connect. Audio: page directly; only if that does not bring the link
+    // up, ONE A2DP (110B) disable/enable toggle (after the page socket is
+    // closed). Returns at link-up. AVRCP/HFP are handled by PostConnect.
+    LinkWait ConnectClassic(uint64_t address, bool& audio) {
+        ProfileScope profileScope("Bluetooth::ConnectClassic");
+        audio = false;
+        if (address == 0 || !running.load()) {
+            return LinkWait::Timeout;
+        }
+        ForEachRadio([&](HANDLE radio) {
+            BLUETOOTH_DEVICE_INFO info{};
+            if (!LoadDeviceInfo(radio, address, info)) {
+                return false;
+            }
+            audio = UsesAudio(radio, info);
+            return true;
+        });
+        if (AnyRadioConnected(address)) {
+            ProfileScope::Mark("Bluetooth::Connect already up");
+            return LinkWait::Reached;
+        }
+        if (!audio) {
+            // Non-audio devices: unchanged profile nudge, event-driven waits.
+            const auto nudge = [&](HANDLE radio) {
+                BLUETOOTH_DEVICE_INFO info{};
+                if (LoadDeviceInfo(radio, address, info)) {
+                    EnableGeneral(radio, info);
+                }
+                return false;
+            };
+            ForEachRadio(nudge);
+            LinkWait waited = WaitLink(address, true, 3500);
+            if (waited != LinkWait::Timeout) {
+                return waited;
+            }
+            ForEachRadio(nudge);
+            return WaitLink(address, true, 2000);
+        }
+        const LinkWait paged = PageAudio(address);
+        if (paged != LinkWait::Timeout) {
+            return paged; // Reached or Cancelled
+        }
+        if (JobCancelled()) {
+            return LinkWait::Cancelled;
+        }
+        ProfileScope::Mark("Bluetooth::Connect page failed, A2DP toggle");
+        {
+            ProfileScope toggleScope("Bluetooth::A2dpToggle");
+            ForEachRadio([&](HANDLE radio) {
+                BLUETOOTH_DEVICE_INFO info{};
+                if (LoadDeviceInfo(radio, address, info)) {
+                    SetService(radio, info, 0x110B, BLUETOOTH_SERVICE_DISABLE);
+                    SetService(radio, info, 0x110B, BLUETOOTH_SERVICE_ENABLE);
+                }
+                return false;
+            });
+        }
+        return WaitLink(address, true, kToggleLinkWaitMs);
+    }
+
+    // P1: IOCTL_BTH_DISCONNECT_DEVICE only (no BluetoothSetServiceState
+    // disables), then an event wait for the link to go down.
+    LinkWait DisconnectClassic(uint64_t address) {
+        ProfileScope profileScope("Bluetooth::DisconnectClassic");
+        if (address == 0) {
+            return LinkWait::Timeout;
+        }
+        bool issued = false;
+        ForEachRadio([&](HANDLE radio) {
+            DWORD returned = 0;
+            ProfileScope ioctlScope("Bluetooth::DisconnectIoctl");
+            if (DeviceIoControl(radio, kDisconnectIoctl, &address, sizeof(address), nullptr, 0, &returned,
+                    nullptr) != FALSE) {
+                issued = true;
+            }
+            return false; // every radio
+        });
+        if (!issued) {
+            ProfileScope::Mark("Bluetooth::DisconnectIoctl failed");
+        }
+        const LinkWait waited = WaitLink(address, false, kDisconnectWaitMs);
+        if (waited == LinkWait::Timeout && !AnyRadioConnected(address)) {
+            return LinkWait::Reached;
+        }
+        return waited;
+    }
+
+    LinkWait ConnectDevice(const RadioDevice& device, bool& audio) {
+        audio = false;
         uint64_t address = device.address;
         if (address == 0) {
             address = AddressFromTaggedId(device.id);
@@ -1736,13 +2014,55 @@ struct BluetoothService::Impl {
         if (address == 0) {
             address = ParseBluetoothAddress(device.id);
         }
-        if (ConnectClassic(address, running)) {
-            return true;
+        const LinkWait classic = ConnectClassic(address, audio);
+        if (classic == LinkWait::Reached || classic == LinkWait::Cancelled) {
+            return classic;
         }
         if (device.lowEnergy && !RememberedClassic(address)) {
-            return ConnectLe(address);
+            return ConnectLe(address) ? LinkWait::Reached : LinkWait::Timeout;
         }
-        return false;
+        return classic;
+    }
+
+    // Runs as its own worker job after the connect result is published.
+    // Enable-only and only for services that are missing; cancelled by a
+    // newer Disconnect between steps.
+    void PostConnect(const Job& job) {
+        const RadioDevice* device = FindMutable(job.id);
+        if (device == nullptr) {
+            return;
+        }
+        uint64_t address = device->address;
+        if (address == 0) {
+            address = AddressFromTaggedId(device->id);
+        }
+        if (address == 0 || JobCancelled() || !AnyRadioConnected(address)) {
+            return;
+        }
+        ForEachRadio([&](HANDLE radio) {
+            BLUETOOTH_DEVICE_INFO info{};
+            if (!LoadDeviceInfo(radio, address, info) || !UsesAudio(radio, info)) {
+                return false;
+            }
+            const std::vector<GUID> installed = InstalledServices(radio, info);
+            if (installed.empty()) {
+                ProfileScope::Mark("Bluetooth::PostConnect services unknown");
+                return true;
+            }
+            const auto has = [&](unsigned short id) {
+                const GUID wanted = ServiceUuid(id);
+                return std::any_of(installed.begin(), installed.end(),
+                    [&](const GUID& service) { return IsEqualGUID(service, wanted) != FALSE; });
+            };
+            if (!has(0x110E) && !JobCancelled()) {
+                SetService(radio, info, 0x110E, BLUETOOTH_SERVICE_ENABLE);
+            }
+            if (!has(0x111E) && !JobCancelled()) {
+                ProfileScope::Mark("Bluetooth::RestoreVoice HFP missing");
+                SetService(radio, info, 0x111E, BLUETOOTH_SERVICE_ENABLE);
+            }
+            return true;
+        });
     }
 
     void RememberError(const std::wstring& id, const wchar_t* text, bool sectionHint) {
@@ -1769,6 +2089,8 @@ struct BluetoothService::Impl {
             return "Bluetooth::Job StopDiscovery";
         case JobKind::Pair:
             return "Bluetooth::Job Pair";
+        case JobKind::PostConnect:
+            return "Bluetooth::Job PostConnect";
         case JobKind::Quit:
             return "Bluetooth::Job Quit";
         }
@@ -1863,6 +2185,19 @@ struct BluetoothService::Impl {
                     RefreshPaired();
                 }
             }
+            // P4: bounded retry when this refresh kept last-good state.
+            if (refreshSuspect && refreshRetries < kMaxRefreshRetries) {
+                ++refreshRetries;
+                retryDueMs = GetTickCount64() + kRefreshRetryMs;
+                ProfileScope::Mark("Bluetooth::Refresh retry scheduled");
+            } else if (!refreshSuspect) {
+                refreshRetries = 0;
+                retryDueMs = 0;
+            } else {
+                ProfileScope::Mark("Bluetooth::Refresh retries exhausted");
+                retryDueMs = 0;
+            }
+            refreshSuspect = false;
             ready = true;
             Publish();
             break;
@@ -1905,8 +2240,13 @@ struct BluetoothService::Impl {
             if (address == 0) {
                 address = ParseBluetoothAddress(copy.id);
             }
-            const bool ok =
-                connect ? ConnectDevice(copy) : DisconnectClassic(address, running);
+            bool audio = false;
+            const LinkWait outcome = connect ? ConnectDevice(copy, audio) : DisconnectClassic(address);
+            const bool ok = outcome == LinkWait::Reached;
+            const bool cancelled = outcome == LinkWait::Cancelled;
+            if (connect && ok) {
+                ProfileScope::Mark("Bluetooth::Connect marked connected at link-up");
+            }
             busyId.clear();
             busyText.clear();
             if (RadioDevice* current = FindMutable(job.id); current != nullptr) {
@@ -1917,21 +2257,37 @@ struct BluetoothService::Impl {
                     if (hint == L"Couldn't connect" || hint == L"Couldn't disconnect") {
                         hint.clear();
                     }
+                } else if (cancelled) {
+                    // Superseded by a newer opposite request: no error row;
+                    // reflect the real link, the queued job decides the rest.
+                    ProfileScope::Mark("Bluetooth::Job superseded");
+                    if (address != 0) {
+                        current->connected = AnyRadioConnected(address);
+                    }
                 } else {
                     RememberError(job.id, connect ? L"Couldn't connect" : L"Couldn't disconnect", false);
                 }
-            } else if (!ok) {
+            } else if (!ok && !cancelled) {
                 RememberError(job.id, connect ? L"Couldn't connect" : L"Couldn't disconnect", false);
             }
             Publish();
-            // Reconcile with the radio shortly after â€” do not block this job.
+            // Reconcile with the radio shortly after; do not block this job.
             if (ok && running.load()) {
                 Job refresh{JobKind::Refresh, false, {}};
                 refresh.forcePaired = true;
                 Enqueue(std::move(refresh));
+                if (connect && audio) {
+                    // AVRCP / HFP restore off the critical path (after link-up,
+                    // after the result is published).
+                    Job post{JobKind::PostConnect, false, job.id};
+                    Enqueue(std::move(post));
+                }
             }
             break;
         }
+        case JobKind::PostConnect:
+            PostConnect(job);
+            break;
         case JobKind::StartDiscovery:
             if (!radioOn) {
                 RefreshRadio();
@@ -2048,7 +2404,11 @@ struct BluetoothService::Impl {
                     busyId = copy.id;
                     busyText = L"Connecting...";
                     Publish();
-                    const bool linked = ConnectDevice(copy);
+                    bool pairAudio = false;
+                    const bool linked = ConnectDevice(copy, pairAudio) == LinkWait::Reached;
+                    if (linked && pairAudio && running.load()) {
+                        Enqueue(Job{JobKind::PostConnect, false, copy.id});
+                    }
                     if (RadioDevice* current = FindMutable(copy.id); current != nullptr) {
                         if (linked) {
                             current->connected = true;
@@ -2081,24 +2441,51 @@ struct BluetoothService::Impl {
             Publish();
         }
         while (running.load()) {
-            WaitForSingleObject(wake, INFINITE);
-            std::vector<Job> jobs;
+            // One job at a time so a newer Connect/Disconnect can still
+            // supersede queued jobs (P3) and cancel the in-flight one.
+            Job job;
+            bool have = false;
             {
                 std::lock_guard<std::mutex> lock(queueMutex);
-                jobs.swap(queue);
-            }
-            for (const Job& job : jobs) {
-                if (job.kind == JobKind::Quit || !running.load()) {
-                    StopWatcher();
-                    discovering = false;
-                    if (ro != RPC_E_CHANGED_MODE && SUCCEEDED(ro)) {
-                        RoUninitialize();
+                if (!queue.empty()) {
+                    job = std::move(queue.front());
+                    queue.erase(queue.begin());
+                    have = true;
+                    inflightActive = true;
+                    inflightKind = job.kind;
+                    inflightId = job.id;
+                    if (cancelJob != nullptr && running.load()) {
+                        ResetEvent(cancelJob);
                     }
-                    return;
+                } else {
+                    inflightActive = false;
+                    inflightId.clear();
                 }
-                if (winrtReady) {
-                    Handle(job);
+            }
+            if (!have) {
+                DWORD timeout = INFINITE;
+                if (retryDueMs != 0) {
+                    const ULONGLONG now = GetTickCount64();
+                    timeout = now >= retryDueMs ? 0 : static_cast<DWORD>(retryDueMs - now);
                 }
+                if (WaitForSingleObject(wake, timeout) == WAIT_TIMEOUT && retryDueMs != 0) {
+                    retryDueMs = 0;
+                    Job retry{JobKind::Refresh, false, {}};
+                    retry.forcePaired = true;
+                    Enqueue(std::move(retry));
+                }
+                continue;
+            }
+            if (job.kind == JobKind::Quit || !running.load()) {
+                StopWatcher();
+                discovering = false;
+                if (ro != RPC_E_CHANGED_MODE && SUCCEEDED(ro)) {
+                    RoUninitialize();
+                }
+                return;
+            }
+            if (winrtReady) {
+                Handle(job);
             }
         }
         StopWatcher();
@@ -2110,6 +2497,9 @@ struct BluetoothService::Impl {
     bool Stop() noexcept {
         running.store(false);
         pairing.store(false);
+        if (cancelJob != nullptr) {
+            SetEvent(cancelJob);
+        }
         CancelOutstanding();
         if (wake != nullptr) {
             Job quit;
@@ -2130,9 +2520,19 @@ struct BluetoothService::Impl {
                 CloseHandle(wake);
                 wake = nullptr;
             }
-        } else if (wake != nullptr) {
-            CloseHandle(wake);
-            wake = nullptr;
+            if (cancelJob != nullptr) {
+                CloseHandle(cancelJob);
+                cancelJob = nullptr;
+            }
+        } else {
+            if (wake != nullptr) {
+                CloseHandle(wake);
+                wake = nullptr;
+            }
+            if (cancelJob != nullptr) {
+                CloseHandle(cancelJob);
+                cancelJob = nullptr;
+            }
         }
         {
             std::lock_guard<std::mutex> lock(stateMutex);
@@ -2158,6 +2558,7 @@ void BluetoothService::Start(HWND notifyWindow, UINT notifyMessage) {
     if (m_impl->wake == nullptr) {
         return;
     }
+    m_impl->cancelJob = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     m_impl->running.store(true);
     m_impl->thread = CreateThread(nullptr, 0,
         [](LPVOID param) -> DWORD {
@@ -2169,6 +2570,10 @@ void BluetoothService::Start(HWND notifyWindow, UINT notifyMessage) {
         m_impl->running.store(false);
         CloseHandle(m_impl->wake);
         m_impl->wake = nullptr;
+        if (m_impl->cancelJob != nullptr) {
+            CloseHandle(m_impl->cancelJob);
+            m_impl->cancelJob = nullptr;
+        }
         return;
     }
     m_impl->Enqueue(Job{JobKind::Refresh, false, {}});
