@@ -4,6 +4,7 @@
 #include "PerfBoost.h"
 #include "Profile.h"
 #include <cstdio>
+#include <share.h>
 #include <string>
 #include "RecycleBin.h"
 #include "Startup.h"
@@ -7903,6 +7904,16 @@ void DockApp::ApplyBluetoothSnapshot() {
                     d.connected ? 1 : 0, d.busy ? 1 : 0, next.radioOn ? 1 : 0, status.c_str(),
                     static_cast<long long>(qpc.QuadPart));
                 ProfileScope::Mark(mark);
+                // TEST-ONLY: mirror the tile state to %TEMP%\hoverdock-bt-phase2\tile.txt for the harness.
+                wchar_t tmp[MAX_PATH]{};
+                if (GetTempPathW(MAX_PATH, tmp) != 0) {
+                    std::wstring path = std::wstring(tmp) + L"hoverdock-bt-phase2\\tile.txt";
+                    if (FILE* tf = _wfsopen(path.c_str(), L"w", _SH_DENYNO)) {
+                        std::fprintf(tf, "%d %d %d %lld\n", d.connected ? 1 : 0, d.busy ? 1 : 0, next.radioOn ? 1 : 0,
+                            static_cast<long long>(qpc.QuadPart));
+                        std::fclose(tf);
+                    }
+                }
             }
             if (!found) {
                 char mark[128]{};
