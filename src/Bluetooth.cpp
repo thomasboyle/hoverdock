@@ -1,4 +1,4 @@
-﻿#include <winsock2.h>
+#include <winsock2.h>
 #include <ws2bth.h>
 
 #include "Bluetooth.h"
@@ -52,6 +52,7 @@ constexpr DWORD kPageLinkWaitMs = 5000;     // measured link-up 1.6 s median, 4.
 constexpr DWORD kPageErrorGraceMs = 1500;   // link may still come up after an L2CAP error
 constexpr DWORD kToggleLinkWaitMs = 5000;   // after the toggle has returned
 constexpr DWORD kToggleTotalWaitMs = 12000; // round 2: toggle median 6.13 s, link up inside it
+constexpr DWORD kDisconnectGuardMs = 2000;  // round 3: late KS / HFP re-pages at 0.45-1.7 s
 constexpr DWORD kTaskJoinMs = 7000;         // bounded wait for a previous service task
 constexpr DWORD kTaskChainWaitMs = 15000;   // helper thread waits for its predecessor
 // KSPROPSETID_BtAudio (shared/ksmedia.h, 7FA06C40-B8F6-4C7E-8556-E8C33A12E54D).
@@ -100,6 +101,7 @@ enum class JobKind : uint8_t {
     StopDiscovery,
     Pair,
     PostConnect, // Round 1: AVRCP / HFP enable after link-up, off the critical path
+    HfpPolicy,   // Round 4: user toggled Hands-free (mic) for headsets
     Quit,
 };
 
@@ -660,6 +662,7 @@ struct ServiceStep {
 struct ServiceTask {
     uint64_t address = 0;
     const char* scopeName = nullptr;
+    const char* resultMark = nullptr; // optional "<prefix><rc>" mark per step
     std::vector<ServiceStep> steps;
     std::shared_ptr<ServiceTask> previous;
     std::atomic<bool> cancel{false};
@@ -708,7 +711,13 @@ void RunServiceTask(ServiceTask& task) {
             BLUETOOTH_DEVICE_INFO info{};
             if (LoadDeviceInfo(radio, task.address, info)) {
                 const GUID service = ServiceUuid(step.id);
-                MarkServiceResult(step.id, step.state, SetServiceScoped(radio, info, service, step.state));
+                const DWORD rc = SetServiceScoped(radio, info, service, step.state);
+                MarkServiceResult(step.id, step.state, rc);
+                if (task.resultMark != nullptr) {
+                    char text[112]{};
+                    std::snprintf(text, sizeof(text), "%s%lu", task.resultMark, static_cast<unsigned long>(rc));
+                    ProfileScope::Mark(text);
+                }
             }
             return false;
         });
@@ -850,6 +859,10 @@ struct BluetoothService::Impl {
     bool inflightActive = false;
     JobKind inflightKind = JobKind::Refresh;
     std::wstring inflightId;
+    // Round 4: HFP policy (UI writes, worker reads) and disconnect guard.
+    std::atomic<bool> handsFree{true};
+    std::atomic<bool> guardActive{false};
+    std::atomic<uint64_t> userConnectSeq{0};
     // Worker-only (round 3): background SetServiceState tasks.
     std::shared_ptr<ServiceTask> lastTask;
     std::shared_ptr<ServiceTask> toggleTask; // last A2DP toggle / re-enable
@@ -1042,6 +1055,14 @@ struct BluetoothService::Impl {
                 // in-flight refresh (its WinRT waits observe cancelJob; it keeps
                 // last-good state and retries) and queue ahead of refresh /
                 // PostConnect / discovery jobs.
+                if (job.kind == JobKind::Connect) {
+                    userConnectSeq.fetch_add(1);
+                }
+                // A disconnect guard never holds up another user job.
+                if (inflightActive && guardActive.load() && cancelJob != nullptr) {
+                    SetEvent(cancelJob);
+                    ProfileScope::Mark("Bluetooth::Supersede end disconnect guard");
+                }
                 if (inflightActive && inflightKind == JobKind::Refresh && cancelJob != nullptr) {
                     SetEvent(cancelJob);
                     ProfileScope::Mark("Bluetooth::Supersede preempt refresh");
@@ -2093,7 +2114,7 @@ struct BluetoothService::Impl {
 
     // Starts steps on a helper thread, chained after the previous task.
     std::shared_ptr<ServiceTask> StartServiceTask(uint64_t address, const char* scopeName,
-        std::vector<ServiceStep> steps) {
+        std::vector<ServiceStep> steps, const char* resultMark = nullptr) {
         for (auto it = taskThreads.begin(); it != taskThreads.end();) {
             if (WaitForSingleObject(*it, 0) == WAIT_OBJECT_0) {
                 CloseHandle(*it);
@@ -2105,6 +2126,7 @@ struct BluetoothService::Impl {
         auto task = std::make_shared<ServiceTask>();
         task->address = address;
         task->scopeName = scopeName;
+        task->resultMark = resultMark;
         task->steps = std::move(steps);
         if (lastTask != nullptr && !lastTask->Done()) {
             task->previous = lastTask;
@@ -2232,6 +2254,11 @@ struct BluetoothService::Impl {
         if (SUCCEEDED(ks)) {
             ProfileScope::Mark("Bluetooth::PageAudio branch=ks");
             const LinkWait waited = WaitLink(address, true, kPageLinkWaitMs);
+            if (waited == LinkWait::Cancelled) {
+                // The reconnect request is already in the driver and still
+                // completes; the superseding Disconnect's guard re-drops it.
+                ProfileScope::Mark("Bluetooth::Connect cancelled after KS reconnect");
+            }
             if (waited != LinkWait::Timeout) {
                 return waited;
             }
@@ -2369,6 +2396,70 @@ struct BluetoothService::Impl {
         }
     }
 
+    // Round 4 (a)/(b): after a disconnect, watch ~2 s for the link to come
+    // back (a KS reconnect from a superseded connect, or a profile driver
+    // reconnecting after a fresh HFP enable) and drop it again. Ends early,
+    // without re-dropping, if any newer user Connect/Disconnect arrives.
+    void GuardAfterDisconnect(uint64_t address) {
+        if (address == 0 || !running.load()) {
+            return;
+        }
+        ProfileScope profileScope("Bluetooth::DisconnectGuard");
+        const uint64_t connectSeq = userConnectSeq.load();
+        guardActive.store(true);
+        const LinkWait waited = JobCancelled() ? LinkWait::Cancelled : WaitLink(address, true, kDisconnectGuardMs);
+        guardActive.store(false);
+        if (waited == LinkWait::Reached && !JobCancelled() && userConnectSeq.load() == connectSeq) {
+            ProfileScope::Mark("Bluetooth::Disconnect guard re-drop");
+            DisconnectClassic(address);
+        } else if (waited == LinkWait::Reached || waited == LinkWait::Cancelled) {
+            ProfileScope::Mark("Bluetooth::Disconnect guard cancelled");
+        } else {
+            ProfileScope::Mark("Bluetooth::Disconnect guard quiet");
+        }
+    }
+
+    // Round 4: explicit user change of the HFP policy. ONE 111E disable (off)
+    // or enable (on) per paired audio device, on a helper task chained after
+    // any running toggle so the worker is never blocked by the ~3 s call.
+    void ApplyHfpPolicy(bool enabled) {
+        if (dryRun) {
+            ProfileScope::Mark("Bluetooth::HfpPolicy dry-run skip");
+            return;
+        }
+        for (const RadioDevice& device : paired) {
+            uint64_t address = device.address;
+            if (address == 0) {
+                address = AddressFromTaggedId(device.id);
+            }
+            if (address == 0 || device.lowEnergy) {
+                continue;
+            }
+            bool act = false;
+            ForEachRadio([&](HANDLE radio) {
+                BLUETOOTH_DEVICE_INFO info{};
+                if (!LoadDeviceInfo(radio, address, info) || info.fRemembered == FALSE || !UsesAudio(radio, info)) {
+                    return false;
+                }
+                const std::vector<GUID> installed = InstalledServices(radio, info);
+                const bool hasHfp = std::any_of(installed.begin(), installed.end(),
+                    [](const GUID& service) { return IsEqualGUID(service, ServiceUuid(0x111E)) != FALSE; });
+                // Off: disable only if enabled. On: enable only if missing
+                // (an empty list means unknown: enabling is non-destructive).
+                act = enabled ? !hasHfp : hasHfp;
+                return true;
+            });
+            if (!act) {
+                ProfileScope::Mark(enabled ? "Bluetooth::HfpPolicy set on nothing to do"
+                                           : "Bluetooth::HfpPolicy set off nothing to do");
+                continue;
+            }
+            StartServiceTask(address, enabled ? "Bluetooth::HfpPolicyEnable" : "Bluetooth::HfpPolicyDisable",
+                {ServiceStep{0x111E, enabled ? static_cast<DWORD>(BLUETOOTH_SERVICE_ENABLE) : static_cast<DWORD>(BLUETOOTH_SERVICE_DISABLE)}},
+                enabled ? "Bluetooth::HfpPolicy set on enable rc=" : "Bluetooth::HfpPolicy set off disable rc=");
+        }
+    }
+
     LinkWait ConnectDevice(const RadioDevice& device, bool& audio) {
         audio = false;
         uint64_t address = device.address;
@@ -2436,8 +2527,13 @@ struct BluetoothService::Impl {
                 steps.push_back(ServiceStep{0x110E, BLUETOOTH_SERVICE_ENABLE});
             }
             if (!has(0x111E)) {
-                ProfileScope::Mark("Bluetooth::RestoreVoice HFP missing");
-                steps.push_back(ServiceStep{0x111E, BLUETOOTH_SERVICE_ENABLE});
+                if (!handsFree.load()) {
+                    // User keeps Hands-Free off: never enable 111E / 1108.
+                    ProfileScope::Mark("Bluetooth::HfpPolicy off skip restore");
+                } else {
+                    ProfileScope::Mark("Bluetooth::RestoreVoice HFP missing");
+                    steps.push_back(ServiceStep{0x111E, BLUETOOTH_SERVICE_ENABLE});
+                }
             }
             return true;
         });
@@ -2474,6 +2570,8 @@ struct BluetoothService::Impl {
             return "Bluetooth::Job Pair";
         case JobKind::PostConnect:
             return "Bluetooth::Job PostConnect";
+        case JobKind::HfpPolicy:
+            return "Bluetooth::Job HfpPolicy";
         case JobKind::Quit:
             return "Bluetooth::Job Quit";
         }
@@ -2656,6 +2754,7 @@ struct BluetoothService::Impl {
             Publish();
             if (!connect && ok && running.load()) {
                 ReapTaskAfterDisconnect(address);
+                GuardAfterDisconnect(address);
                 if (address != 0 && AnyRadioConnected(address)) {
                     if (RadioDevice* current = FindMutable(job.id); current != nullptr) {
                         current->connected = true;
@@ -2679,6 +2778,9 @@ struct BluetoothService::Impl {
         }
         case JobKind::PostConnect:
             PostConnect(job);
+            break;
+        case JobKind::HfpPolicy:
+            ApplyHfpPolicy(job.enableRadio);
             break;
         case JobKind::StartDiscovery:
             if (!radioOn) {
@@ -3018,6 +3120,17 @@ void BluetoothService::Connect(const std::wstring& id) {
 void BluetoothService::Disconnect(const std::wstring& id) {
     if (m_impl != nullptr && !id.empty()) {
         m_impl->Enqueue(Job{JobKind::Disconnect, false, id});
+    }
+}
+
+void BluetoothService::SetHandsFree(bool enabled, bool userChange) {
+    if (m_impl == nullptr) {
+        return;
+    }
+    m_impl->handsFree.store(enabled);
+    if (userChange) {
+        // Only queues work; the 111E change runs off the UI thread.
+        m_impl->Enqueue(Job{JobKind::HfpPolicy, enabled, {}});
     }
 }
 

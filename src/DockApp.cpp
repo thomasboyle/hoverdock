@@ -2332,6 +2332,7 @@ int DockApp::Run() {
     static_cast<void>(m_tray.Refresh());
     m_weather.Start(m_window, kWeatherMessage);
     m_bluetooth.Start(m_window, kBluetoothMessage);
+    m_bluetooth.SetHandsFree(m_config.HandsFree(), false);
     SetTimer(m_window, kWeatherTimerId, WeatherService::kRefreshIntervalMs, nullptr);
     RebuildDisplayApps();
     RebuildLayout(false);
@@ -6718,6 +6719,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     case SettingsHitKind::Specular:
     case SettingsHitKind::DropShadow:
     case SettingsHitKind::DepthShade:
+    case SettingsHitKind::HandsFree:
     case SettingsHitKind::LightPanels: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         const float wash = (hit.kind == SettingsHitKind::CheckNow ||
@@ -7227,6 +7229,15 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         QueueRenderFrame();
         break;
     }
+    case SettingsHitKind::HandsFree: {
+        const bool enabled = !m_config.HandsFree();
+        m_config.SetHandsFree(enabled);
+        ScheduleConfigSave();
+        // Non-blocking: only queues a worker job for the 111E change.
+        m_bluetooth.SetHandsFree(enabled, true);
+        QueueSettingsPaint();
+        break;
+    }
     case SettingsHitKind::LightPanels: {
         m_config.SetLightPanels(!m_config.LightPanels());
         ScheduleConfigSave();
@@ -7412,6 +7423,8 @@ void DockApp::PaintSettingsPopup() {
             m_config.DropShadow(), 0.0F},
         {SettingsHitKind::DepthShade, L"Depth shade", L"Inner shading at the glass edge", false,
             m_config.DepthShade(), 0.0F},
+        {SettingsHitKind::HandsFree, L"Hands-free (mic) for headsets",
+            L"Restore Hands-Free after Bluetooth connect", false, m_config.HandsFree(), 0.0F},
     };
     const LONG switchRowCount = static_cast<LONG>(sizeof(rows) / sizeof(rows[0]));
 

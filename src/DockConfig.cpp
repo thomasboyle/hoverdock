@@ -952,6 +952,7 @@ bool DockConfig::Load() {
     m_dropShadow = true;
     m_depthShade = true;
     m_lightPanels = false;
+    m_handsFree = true;
     m_lastInstalledVersion.clear();
     m_lastInstalledTime = 0;
     m_lastInstalledAttempts = 0;
@@ -1030,6 +1031,10 @@ bool DockConfig::Load() {
         if (lightPanels != dockSection->second.end()) {
             m_lightPanels = ParseBoolean(lightPanels->second);
         }
+        const auto handsFree = dockSection->second.find(L"handsfree");
+        if (handsFree != dockSection->second.end()) {
+            m_handsFree = ParseBoolean(handsFree->second);
+        }
         const auto lastInstalledVersion =
             dockSection->second.find(L"lastinstalledversion");
         if (lastInstalledVersion != dockSection->second.end()) {
@@ -1106,6 +1111,7 @@ bool DockConfig::Save() const {
     contents << L"DropShadow=" << (m_dropShadow ? L"1" : L"0") << L"\n";
     contents << L"DepthShade=" << (m_depthShade ? L"1" : L"0") << L"\n";
     contents << L"LightPanels=" << (m_lightPanels ? L"1" : L"0") << L"\n";
+    contents << L"HandsFree=" << (m_handsFree ? L"1" : L"0") << L"\n";
     if (!m_lastInstalledVersion.empty()) {
         contents << L"LastInstalledVersion=" << m_lastInstalledVersion << L"\n";
         contents << L"LastInstalledTime=" << m_lastInstalledTime << L"\n";
@@ -1258,6 +1264,14 @@ void DockConfig::SetLightPanels(bool enabled) noexcept {
     m_lightPanels = enabled;
 }
 
+bool DockConfig::HandsFree() const noexcept {
+    return m_handsFree;
+}
+
+void DockConfig::SetHandsFree(bool enabled) noexcept {
+    m_handsFree = enabled;
+}
+
 std::wstring DockConfig::LastInstalledVersion() const {
     return m_lastInstalledVersion;
 }
@@ -1321,5 +1335,6 @@ void DockConfig::SetDefaults() {
     m_dropShadow = true;
     m_depthShade = true;
     m_lightPanels = false;
+    m_handsFree = true;
     m_frostAmount = 0.0F;
 }
