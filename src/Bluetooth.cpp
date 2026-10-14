@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cwchar>
+#include <cstring>
 #include <map>
 #include <string>
 #include <cwctype>
@@ -471,9 +472,47 @@ bool WaitForLink(uint64_t address, DWORD timeoutMs, const std::atomic<bool>& run
     }
 }
 
+// Timing-only instrumentation (phase 2): same scope names as 9d0c953.
+const char* ServiceScopeName(unsigned short id, DWORD state) noexcept {
+    const bool enable = state == BLUETOOTH_SERVICE_ENABLE;
+    switch (id) {
+    case 0x110B:
+        return enable ? "Bluetooth::SetServiceState 110B(A2DP sink) enable"
+                      : "Bluetooth::SetServiceState 110B(A2DP sink) disable";
+    case 0x110E:
+        return enable ? "Bluetooth::SetServiceState 110E(AVRCP) enable"
+                      : "Bluetooth::SetServiceState 110E(AVRCP) disable";
+    case 0x111E:
+        return enable ? "Bluetooth::SetServiceState 111E(HFP) enable"
+                      : "Bluetooth::SetServiceState 111E(HFP) disable";
+    case 0x1108:
+        return enable ? "Bluetooth::SetServiceState 1108(HSP) enable"
+                      : "Bluetooth::SetServiceState 1108(HSP) disable";
+    case 0x1124:
+        return enable ? "Bluetooth::SetServiceState 1124(HID) enable"
+                      : "Bluetooth::SetServiceState 1124(HID) disable";
+    default:
+        return enable ? "Bluetooth::SetServiceState other enable" : "Bluetooth::SetServiceState other disable";
+    }
+}
+
+unsigned short ShortServiceId(const GUID& service) noexcept {
+    const GUID base = ServiceUuid(0);
+    if (service.Data2 == base.Data2 && service.Data3 == base.Data3 &&
+        memcmp(service.Data4, base.Data4, sizeof(base.Data4)) == 0 && (service.Data1 >> 16) == 0) {
+        return static_cast<unsigned short>(service.Data1 & 0xFFFFu);
+    }
+    return 0;
+}
+
+DWORD SetServiceScoped(HANDLE radio, BLUETOOTH_DEVICE_INFO& info, const GUID& service, DWORD state) {
+    ProfileScope profileScope(ServiceScopeName(ShortServiceId(service), state));
+    return BluetoothSetServiceState(radio, &info, &service, state);
+}
+
 void SetService(HANDLE radio, BLUETOOTH_DEVICE_INFO& info, unsigned short id, DWORD state) {
     const GUID service = ServiceUuid(id);
-    BluetoothSetServiceState(radio, &info, &service, state);
+    SetServiceScoped(radio, info, service, state);
 }
 
 std::vector<GUID> InstalledServices(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
@@ -525,7 +564,7 @@ void EnableGeneral(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
             IsEqualGUID(service, ServiceUuid(0x110A)) != FALSE) {
             continue;
         }
-        BluetoothSetServiceState(radio, &info, &service, BLUETOOTH_SERVICE_ENABLE);
+        SetServiceScoped(radio, info, service, BLUETOOTH_SERVICE_ENABLE);
         enabled = true;
     }
     if (!enabled) {
@@ -534,12 +573,13 @@ void EnableGeneral(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
 }
 
 void DisableProfiles(HANDLE radio, BLUETOOTH_DEVICE_INFO& info) {
+    ProfileScope profileScope("Bluetooth::DisableProfiles");
     const unsigned short ids[] = {0x110B, 0x110E, 0x1108, 0x111E, 0x1124, 0x110A};
     for (unsigned short id : ids) {
         SetService(radio, info, id, BLUETOOTH_SERVICE_DISABLE);
     }
     for (const GUID& service : InstalledServices(radio, info)) {
-        BluetoothSetServiceState(radio, &info, &service, BLUETOOTH_SERVICE_DISABLE);
+        SetServiceScoped(radio, info, service, BLUETOOTH_SERVICE_DISABLE);
     }
 }
 
@@ -662,8 +702,11 @@ bool DisconnectClassic(uint64_t address, const std::atomic<bool>& running) {
     // polls that made Disconnect feel stuck for multiple seconds.
     ForEachRadio([&](HANDLE radio) {
         DWORD returned = 0;
-        DeviceIoControl(radio, kDisconnectIoctl, &address, sizeof(address), nullptr, 0, &returned,
-            nullptr);
+        {
+            ProfileScope ioctlScope("Bluetooth::DisconnectIoctl");
+            DeviceIoControl(radio, kDisconnectIoctl, &address, sizeof(address), nullptr, 0, &returned,
+                nullptr);
+        }
         BLUETOOTH_DEVICE_INFO info{};
         if (LoadDeviceInfo(radio, address, info)) {
             DisableProfiles(radio, info);
