@@ -2699,7 +2699,7 @@ void Renderer::CreateBackdropResources() {
             Check(m_panelConstants2->Map(0, nullptr, reinterpret_cast<void**>(&m_panelMappedConstants2)),
                 "Map second panel constant buffer");
             const D3D12_RESOURCE_DESC instanceBuffer =
-                BufferDescription(sizeof(IconInstanceConstants) * 1U);
+                BufferDescription(sizeof(IconInstanceConstants) * 128U);
             Check(m_device->CreateCommittedResource(&panelUploadHeap, D3D12_HEAP_FLAG_NONE, &instanceBuffer,
                       D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_panelIconInstances)),
                 "Create panel icon instance stub");
@@ -3780,6 +3780,70 @@ void Renderer::SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const
     }
 }
 
+// Control Centre shapes -> panel instance buffer (two slots per shape) and the
+// per-shape adaptive face (macOS 26 Regular style tables, measured).
+void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
+{
+    static_cast<void>(width);
+    static_cast<void>(height);
+    m_ccFaceLuma.clear();
+    if (m_panelMappedConstants == nullptr) {
+        return;
+    }
+    if (m_ccShapes.empty() || m_panelIconInstances == nullptr) {
+        m_panelMappedConstants->scene1[2] = 0.0F;
+        return;
+    }
+    const size_t count = (std::min)(m_ccShapes.size(), static_cast<size_t>(48));
+    IconInstanceConstants* slots = nullptr;
+    if (FAILED(m_panelIconInstances->Map(0, nullptr, reinterpret_cast<void**>(&slots))) ||
+        slots == nullptr) {
+        m_panelMappedConstants->scene1[2] = 0.0F;
+        return;
+    }
+    const float dpi = (std::max)(dpiScale, 1.0F);
+    for (size_t i = 0; i < count; ++i) {
+        const CcShapeDesc& sh = m_ccShapes[i];
+        const float sPt = 2.0F * (std::min)(sh.hw, sh.hh) / dpi;
+        // One fixed frosted-light face for every shape, independent of the
+        // backdrop (no luma adaptation): W == B makes the face colour constant,
+        // then a white fill lifts it. Same on dark and bright backdrops.
+        const float x = 0.5F;
+        const float W = 0.90F;
+        const float B = 0.90F;
+        const float fillA = 0.35F;
+        // gain: fixed face + refraction signature (see CcGlass).
+        const float gain = 0.6F;
+        const bool black = false;
+        // Regular style scaling laws: A = -min(0.8 s, 60), h = min(0.25 s, 20),
+        // blur r = clamp(2 + (s-48)/56, 2, 4), sigma = 2 r (pt).
+        const float amountPt = (std::min)(0.8F * sPt, 60.0F);
+        const float heightPt = (std::min)(0.25F * sPt, 20.0F);
+        const float blurR = std::clamp(2.0F + (sPt - 48.0F) / 56.0F, 2.0F, 4.0F);
+        const float sigmaPx = 2.0F * blurR * dpi;
+        IconInstanceConstants& a = slots[2 * i];
+        IconInstanceConstants& b = slots[2 * i + 1];
+        a.iconRect[0] = sh.cx;
+        a.iconRect[1] = sh.cy;
+        a.iconRect[2] = sh.hw;
+        a.iconRect[3] = sh.hh;
+        a.iconMeta[0] = sh.radius;
+        a.iconMeta[1] = amountPt * dpi;
+        a.iconMeta[2] = heightPt * dpi;
+        a.iconMeta[3] = 2.0F * sigmaPx;
+        b.iconRect[0] = W;
+        b.iconRect[1] = B;
+        b.iconRect[2] = fillA;
+        b.iconRect[3] = black ? 1.0F : 0.0F;
+        b.iconMeta[0] = gain;
+        b.iconMeta[1] = b.iconMeta[2] = b.iconMeta[3] = 0.0F;
+        const float base = B + (W - B) * x;
+        const float fill = black ? 0.0F : 1.0F;
+        m_ccFaceLuma.push_back(base + (fill - base) * fillA);
+    }
+    m_panelIconInstances->Unmap(0, nullptr);
+    m_panelMappedConstants->scene1[2] = 100.0F + static_cast<float>(count);
+}
 bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, UINT fxFlags,
     float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC,
     bool lightPlate, std::vector<uint8_t>& outBgra, float faceMilkBoost, float glintX,
@@ -3855,6 +3919,9 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         m_panelMappedConstants->scene2[1] = glintY;
         m_panelMappedConstants->scene2[2] = (std::max)(0.0F, (std::min)(glintStrength, 1.0F));
         m_panelMappedConstants->scene2[3] = (std::max)(0.0F, (std::min)(faceMilkBoost, 1.0F));
+        if ((fxFlags & DOCK_FX_CC) != 0) {
+            UploadCcShapes(width, height, dpiScale);
+        }
 
         D3D12_TEXTURE_COPY_LOCATION srcLoc{};
         srcLoc.pResource = m_panelBackdropUpload.Get();
@@ -4302,6 +4369,9 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         m_panelMappedConstants->scene1[3] = 1.0F;
         std::fill(std::begin(m_panelMappedConstants->scene2),
             std::end(m_panelMappedConstants->scene2), 0.0F);
+        if ((fxFlags & DOCK_FX_CC) != 0) {
+            UploadCcShapes(width, height, dpiScale);
+        }
 
         D3D12_TEXTURE_COPY_LOCATION srcLoc{};
         srcLoc.pResource = m_panelBackdropUpload.Get();

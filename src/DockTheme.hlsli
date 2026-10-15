@@ -111,3 +111,7 @@
 // With PANEL: use the dock's face tone map, rim and blur instead of the
 // charcoal plate (Quick Settings / Dock Settings).
 #define DOCK_FX_DOCK_FACE 0x8000u
+// macOS 26 Control Centre material for Quick Settings (panel + per-tile glass
+// shapes read from the panel instance buffer; see CcGlass in Shaders.hlsl).
+// Halo bits 8-13 are unused for panels, so bit 10 is free.
+#define DOCK_FX_CC 0x400u

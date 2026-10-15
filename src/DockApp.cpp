@@ -7007,8 +7007,13 @@ UINT DockApp::PackPopupGlassFxFlags(bool dockFace, bool popupShadow) const noexc
         glassFx |= DOCK_FX_POPUP_SHADOW;
     }
     constexpr UINT haloSlots = 0u;
-    const UINT frostByte =
+    UINT frostByte =
         static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0f, 1.0f) * 255.0f));
+    if (popupShadow && !m_qsCcShapes.empty()) {
+        // Quick Settings: macOS 26 Control Centre material (own blur/lens stack).
+        glassFx |= DOCK_FX_CC;
+        frostByte = 0;
+    }
     return (frostByte << 16) | (haloSlots << 8) | glassFx;
 }
 
@@ -8746,6 +8751,27 @@ void DockApp::PaintOverflowPopup() {
     // panel layout remains the same size; only its layered HWND grows.
     m_overflowSize.cx = panelWidth + shadowMargin * 2L;
     m_overflowSize.cy = contentHeight + caretHeight + shadowMargin * 2L;
+    // Hand the layout's glass shapes (window px) to the renderer.
+    uint64_t ccHash = 1469598103934665603ULL;
+    {
+        std::vector<Renderer::CcShapeDesc> ccShapes;
+        ccShapes.reserve(m_qsCcShapes.size());
+        for (const QsCcShape& shape : m_qsCcShapes) {
+            Renderer::CcShapeDesc desc;
+            desc.cx = 0.5F * static_cast<float>(shape.bounds.left + shape.bounds.right) +
+                static_cast<float>(shadowMargin);
+            desc.cy = 0.5F * static_cast<float>(shape.bounds.top + shape.bounds.bottom) +
+                static_cast<float>(shadowMargin);
+            desc.hw = 0.5F * static_cast<float>(shape.bounds.right - shape.bounds.left);
+            desc.hh = 0.5F * static_cast<float>(shape.bounds.bottom - shape.bounds.top);
+            desc.radius = shape.radius;
+            for (const float value : {desc.cx, desc.cy, desc.hw, desc.hh, desc.radius}) {
+                ccHash = (ccHash ^ static_cast<uint64_t>(std::lround(value * 4.0F))) * 1099511628211ULL;
+            }
+            ccShapes.push_back(desc);
+        }
+        m_renderer.SetCcShapes(ccShapes);
+    }
 
     if (m_overflowWindow == nullptr) {
         const wchar_t className[] = L"LiquidGlassDockOverflow";
@@ -8810,6 +8836,9 @@ void DockApp::PaintOverflowPopup() {
         static_cast<size_t>(m_overflowSize.cx) * static_cast<size_t>(m_overflowSize.cy);
     ReleaseDC(nullptr, screen);
     bool glassCacheHit = false;
+    if (m_overflowGlassCcHash != ccHash) {
+        m_overflowGlass.clear();
+    }
     if (OverflowGlassValid(origin)) {
         ProfileScope scopeGlassHit("OverflowGlass-cache-hit");
         std::memcpy(pixels, m_overflowGlass.data(), m_overflowGlass.size());
@@ -8935,6 +8964,7 @@ void DockApp::PaintOverflowPopup() {
         m_overflowGlassOrigin = origin;
         m_overflowGlassCaretX = m_overflowCaretX;
         m_overflowGlassFrost = m_config.FrostAmount();
+        m_overflowGlassCcHash = ccHash;
     }
     const int width = SaturatedInt(m_overflowSize.cx);
     const int height = SaturatedInt(m_overflowSize.cy);

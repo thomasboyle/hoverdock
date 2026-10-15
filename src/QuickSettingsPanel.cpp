@@ -65,9 +65,10 @@ using namespace dock_detail;
 
 namespace {
 
-constexpr uint8_t kBlueB = 255;
-constexpr uint8_t kBlueG = 132;
-constexpr uint8_t kBlueR = 47;
+// QS accent (#98A869) for active toggles, slider fills and meters.
+constexpr uint8_t kBlueB = 105;
+constexpr uint8_t kBlueG = 168;
+constexpr uint8_t kBlueR = 152;
 constexpr uint8_t kInkDarkR = 33;
 constexpr uint8_t kInkDarkG = 34;
 constexpr uint8_t kInkDarkB = 36;
@@ -2644,10 +2645,9 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
-    const bool light = m_config.LightPanels();
-    const uint8_t inkR = light ? kInkDarkR : kInkLightR;
-    const uint8_t inkG = light ? kInkDarkG : kInkLightG;
-    const uint8_t inkB = light ? kInkDarkB : kInkLightB;
+    const uint8_t inkR = m_qsMeterInkR;
+    const uint8_t inkG = m_qsMeterInkG;
+    const uint8_t inkB = m_qsMeterInkB;
     if (m_qsMeterValid) {
         const RECT& meter = m_qsMeterRect;
         if (m_qsPage == QuickSettingsPage::Microphone) {
@@ -2685,7 +2685,7 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
                         1.0F, kBlueB, kBlueG, kBlueR, kBlueB, kBlueG, kBlueR);
                 } else {
                     FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
-                        1.0F, 198, 198, 202, 188, 188, 192);
+                        0.28F, inkB, inkG, inkR, inkB, inkG, inkR);
                 }
             }
         }
@@ -2698,22 +2698,15 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
         const float left = static_cast<float>(track.left) + radius;
         const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
         const float fill = left + (right - left) * level;
-        const float shadeY = cy + std::max(1.5F, 2.0F * scale);
-        FillHGradientPill(pixels, width, height, left, right, shadeY, radius, light ? 0.16F : 0.22F,
-            180, 170, 190, 170, 160, 184);
-        FillHGradientPill(pixels, width, height, left, right, cy, radius, light ? 0.40F : 0.34F,
-            228, 220, 236, 210, 204, 226);
+        FillPillColorPremul(pixels, width, height, left, right, cy, radius, 0.26F, m_qsScrubInkB,
+            m_qsScrubInkG, m_qsScrubInkR);
         if (level > 0.01F) {
-            FillHGradientPill(pixels, width, height, left, std::max(left + radius, fill), cy, radius,
-                1.0F, 250, 140, 64, 245, 90, 176);
+            FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
+                kBlueB, kBlueG, kBlueR);
         }
-        const float thumb = radius + std::max(3.5F, 5.0F * scale);
-        FillSoftDisc(pixels, width, height, fill, cy, thumb + std::max(4.0F, 5.5F * scale), 0.55F,
-            255, 150, 210);
-        FillSoftDisc(pixels, width, height, fill, cy, thumb, 1.0F, 245, 120, 210);
-        FillSoftDisc(pixels, width, height, fill, cy, thumb * 0.62F, 1.0F, 255, 236, 252);
-    }
-    if (includeTemps && m_qsTempsValid && m_qsPage == QuickSettingsPage::Home &&
+        FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(1.0F, 1.5F * scale), 0.99F,
+            false);
+    }    if (includeTemps && m_qsTempsValid && m_qsPage == QuickSettingsPage::Home &&
         m_overflowLabelFont != nullptr) {
         // Values live outside the underlay so a new reading presents only
         // these two rects (PaintOverflowLiveFast) instead of a full rebuild.
@@ -2797,14 +2790,22 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     }
     const bool home = m_qsPage == QuickSettingsPage::Home;
     panelWidth = std::max(320L, std::lround((home ? 600.0F : 380.0F) * scale));
+    m_qsCcShapes.clear();
+    m_qsCcShapes.push_back({RECT{0, 0, 0, 0}, 34.0F * scale});
+    if (home) {
+        // Control Centre grid: 4 x 63pt cells, 13pt gutters = 291pt of content.
+        padding = std::max(12L, std::lround(20.0F * scale));
+        panelWidth = padding * 2L + std::lround(291.0F * scale);
+    }
     const LONG gap = std::max(8L, std::lround(10.0F * scale));
     const LONG sliderH = std::max(22L, std::lround(28.0F * scale));
     const LONG listRow = std::max(52L, std::lround(58.0F * scale));
     const LONG sectionH = std::max(22L, std::lround(26.0F * scale));
-    const bool light = m_config.LightPanels();
-    const uint8_t inkR = light ? kInkDarkR : kInkLightR;
-    const uint8_t inkG = light ? kInkDarkG : kInkLightG;
-    const uint8_t inkB = light ? kInkDarkB : kInkLightB;
+    // The CC panel face is always light (spec W/B tables), so panel ink is dark.
+    const bool light = true;
+    const uint8_t inkR = kInkDarkR;
+    const uint8_t inkG = kInkDarkG;
+    const uint8_t inkB = kInkDarkB;
     LONG y = padding;
 
     auto push = [&](TrayFlyoutHitKind kind, RECT bounds, int index = -1) {
@@ -2944,7 +2945,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             rightLimit = toggle.left - 4;
         }
         const LONG titleLeft = m_qsPage == QuickSettingsPage::Home ? padding : padding + headerHeight;
-        dock_detail::g_flyoutTextHalo = gear;  // Home title sits on bare glass
+        dock_detail::g_flyoutTextHalo = false;  // title sits on the CC glass face
         text({titleLeft, y, rightLimit, y + headerHeight}, titleFont, title,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
         dock_detail::g_flyoutTextHalo = false;
@@ -2958,7 +2959,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     auto footer = [&](const wchar_t* label, int link) {
         const RECT row{padding, y, panelWidth - padding, y + listRow};
         if (draw) {
-            SetFlyoutChromeInk(kBlueR, kBlueG, kBlueB);
+            SetFlyoutChromeInk(84, 104, 44);
             text(row, labelFont, std::wstring(label) + L"    \u203A",
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
             restoreInk();
@@ -2978,415 +2979,371 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
 
     if (home) {
         beginHeader(L"Quick Settings", true, -1, false);
-        const LONG homeGap = std::max(8L, std::lround(12.0F * scale));
-        y += homeGap;
-        const LONG inner = panelWidth - padding * 2L;
-        const LONG tileGap = homeGap;
-        const LONG homeTileH = std::max(96L, std::lround(110.0F * scale));
-        const LONG homeCardH = std::max(112L, std::lround(124.0F * scale));
-        const LONG homeSmallH = std::max(74L, std::lround(86.0F * scale));
-        const LONG homeMediaH = std::max(78L, std::lround(90.0F * scale));
-        const LONG tileCount = 5L;
-        const LONG tileGaps = tileGap * (tileCount - 1L);
-        const LONG tileBase = (inner - tileGaps) / tileCount;
-        const LONG tileExtra = (inner - tileGaps) - tileBase * tileCount;
-        LONG tileWidths[5] = {};
-        for (LONG tileIndex = 0; tileIndex < tileCount; ++tileIndex) {
-            tileWidths[tileIndex] = tileBase + (tileIndex < tileExtra ? 1L : 0L);
-        }
-        const UINT tileIcon = static_cast<UINT>(std::max(16L, std::lround(18.0F * scale)));
-        const LONG inset = std::max(10L, std::lround(14.0F * scale));
-        auto homeCard = [&](RECT bounds) {
+        // ---- macOS 26 Control Centre grid (pt scaled by DPI) ---------------
+        // Cell 63, gutter 13 (pitch 76), 4 columns = 291 wide. Every module is a
+        // separate glass shape baked by the renderer (DOCK_FX_CC); this pass
+        // only lays out shapes, glyphs, text and live controls on top.
+        auto P = [&](float pt) { return static_cast<LONG>(std::lround(pt * scale)); };
+        const LONG gridTop = y + P(10.0F);
+        auto cellRect = [&](int col, int row, int w, int h) {
+            const float x0 = static_cast<float>(col) * 76.0F;
+            const float x1 = x0 + static_cast<float>(w) * 76.0F - 13.0F;
+            const float y0 = static_cast<float>(row) * 76.0F;
+            const float y1 = y0 + static_cast<float>(h) * 76.0F - 13.0F;
+            return RECT{padding + static_cast<LONG>(std::lround(x0 * scale)),
+                gridTop + static_cast<LONG>(std::lround(y0 * scale)),
+                padding + static_cast<LONG>(std::lround(x1 * scale)),
+                gridTop + static_cast<LONG>(std::lround(y1 * scale))};
+        };
+        uint64_t inkSigNew = 0;
+        struct CcInk {
+            uint8_t r, g, b;
+            bool dark;
+        };
+        auto addShape = [&](RECT bounds, float radius) {
+            m_qsCcShapes.push_back({bounds, radius});
+            return m_qsCcShapes.size() - 1U;
+        };
+        // Glyph/text ink follows the adaptive face luminance with hysteresis.
+        auto ccInk = [&](size_t idx) {
+            const std::vector<float>& faces = m_renderer.CcFaceLuma();
+            const float face = idx < faces.size() ? faces[idx] : 0.80F;
+            const bool prev = idx < 64U && ((m_qsCcInkSig >> idx) & 1ULL) != 0ULL;
+            const bool dark = face > (prev ? 0.52F : 0.62F);
+            if (dark && idx < 64U) {
+                inkSigNew |= 1ULL << idx;
+            }
+            return dark ? CcInk{kInkDarkR, kInkDarkG, kInkDarkB, true}
+                        : CcInk{kInkLightR, kInkLightG, kInkLightB, false};
+        };
+        constexpr uint8_t kOnAccentR = 30;
+        constexpr uint8_t kOnAccentG = 33;
+        constexpr uint8_t kOnAccentB = 24;
+        auto glyphDisc = [&](float cx, float cy, float radius, bool active, const CcInk& ink,
+                             wchar_t symbol, UINT extent) {
             if (!draw) {
                 return;
             }
-            // Mock tiles (1072px export of a ~600px panel) use ~8pt corners,
-            // a hairline cool rim, a 2px top inset, and a ~8pt soft drop.
-            const float shortest = static_cast<float>(std::min(bounds.right - bounds.left,
-                bounds.bottom - bounds.top));
-            const float radius = std::min(shortest * 0.22F, std::max(7.0F, 8.0F * scale));
-            const int blur = std::max(4, static_cast<int>(std::lround(7.0F * scale)));
-            for (int layer = blur; layer >= 1; --layer) {
-                const float t = static_cast<float>(layer) / static_cast<float>(blur);
-                RECT shadow = bounds;
-                const LONG expand = std::max(0L, std::lround(2.4F * scale * t));
-                InflateRect(&shadow, expand, 0);
-                const LONG drop = std::max(1L, std::lround((0.6F + 6.5F * t) * scale));
-                shadow.top += std::max(1L, drop / 5L);
-                shadow.bottom += drop;
-                const float falloff = (1.0F - t) * (1.0F - t);
-                const float alpha = (light ? 0.085F : 0.18F) * falloff;
-                if (alpha < 0.012F) {
-                    continue;
-                }
-                FillSquircleColorPremul(pixels, width, height, shadow,
-                    radius + static_cast<float>(expand), alpha, light ? 132 : 0, light ? 136 : 0,
-                    light ? 146 : 0);
+            if (active) {
+                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, kBlueB, kBlueG,
+                    kBlueR);
+            } else {
+                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.16F, ink.b, ink.g,
+                    ink.r);
             }
-            FillSquircleColorPremul(pixels, width, height, bounds, radius, light ? 0.92F : 0.72F,
-                light ? 226 : 40, light ? 228 : 42, light ? 234 : 48);
-            RECT face = bounds;
-            const LONG border = std::max(1L, std::lround(1.0F * scale));
-            InflateRect(&face, -border, -border);
-            face.top += border;
-            if (face.right > face.left + 4 && face.bottom > face.top + 4) {
-                FillSquircleColorPremul(pixels, width, height, face,
-                    std::max(6.0F, radius - static_cast<float>(border)), light ? 0.985F : 0.94F,
-                    light ? 250 : 30, light ? 250 : 32, light ? 252 : 36);
+            const LONG left = static_cast<LONG>(std::lround(cx - static_cast<float>(extent) * 0.5F));
+            const LONG top = static_cast<LONG>(std::lround(cy - static_cast<float>(extent) * 0.5F));
+            if (active) {
+                icon(left, top, symbol, extent, kOnAccentR, kOnAccentG, kOnAccentB);
+            } else {
+                icon(left, top, symbol, extent, ink.r, ink.g, ink.b);
             }
         };
-        auto tile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
-                        TrayFlyoutHitKind kind, bool chevron = true) {
-            homeCard(bounds);
-            icon(bounds.left + inset, bounds.top + inset, symbol, tileIcon, inkR, inkG, inkB);
-            const LONG titleTop = bounds.top + inset + static_cast<LONG>(tileIcon) +
-                std::max(2L, std::lround(3.0F * scale));
-            const LONG statusBand = std::max(18L, std::lround(22.0F * scale));
-            text({bounds.left + inset, titleTop, bounds.right - std::max(8L, inset - 2),
-                     bounds.bottom - statusBand},
-                labelFont, title, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 255);
-            const LONG chevW = chevron ? std::max(12L, std::lround(14.0F * scale)) : 0L;
-            const LONG statusBottom = bounds.bottom - std::max(8L, std::lround(10.0F * scale));
-            const LONG statusTop = statusBottom - std::max(16L, std::lround(18.0F * scale));
-            const RECT statusBounds{bounds.left + inset, statusTop,
-                bounds.right - inset - chevW, statusBottom};
-            // Boost status is a live overlay (PaintQsLiveOverlays) so worker
-            // status posts never force a full PaintOverflowPopup.
-            if (kind == TrayFlyoutHitKind::Boost) {
+        // 2x1 capsule: O36 glyph disc at 14pt inset, title + status to its right.
+        auto capsule = [&](RECT b, wchar_t symbol, const wchar_t* title, const std::wstring& sub,
+                           TrayFlyoutHitKind kind, bool active, int live, bool splitChevron) {
+            const float h = static_cast<float>(b.bottom - b.top);
+            const size_t idx = addShape(b, h * 0.5F);
+            const CcInk ink = ccInk(idx);
+            const LONG cy = (b.top + b.bottom) / 2L;
+            const float disc = static_cast<float>(P(36.0F));
+            const float cx = static_cast<float>(b.left + P(14.0F)) + disc * 0.5F;
+            glyphDisc(cx, static_cast<float>(cy), disc * 0.5F, active, ink, symbol,
+                static_cast<UINT>(std::max(14L, P(19.0F))));
+            if (draw) {
+                SetFlyoutChromeInk(ink.r, ink.g, ink.b);
+            }
+            const LONG textL = static_cast<LONG>(std::lround(cx + disc * 0.5F)) + P(9.0F);
+            const LONG textR = b.right - P(12.0F);
+            text({textL, cy - P(21.0F), textR, cy + P(1.0F)}, labelFont, title,
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            const RECT statusRect{textL, cy + P(1.0F), textR, cy + P(21.0F)};
+            if (live == 1) {
                 if (draw) {
-                    m_qsBoostStatusRect = statusBounds;
+                    m_qsBoostStatusRect = statusRect;
                     m_qsBoostStatusValid = true;
-                    m_qsBoostStatusInkR = inkR;
-                    m_qsBoostStatusInkG = inkG;
-                    m_qsBoostStatusInkB = inkB;
+                    m_qsBoostStatusInkR = ink.r;
+                    m_qsBoostStatusInkG = ink.g;
+                    m_qsBoostStatusInkB = ink.b;
                 }
-            } else if (kind == TrayFlyoutHitKind::BluetoothRadio) {
-                // Bluetooth status is also a live overlay: snapshots from the
-                // BT worker and the tile toggle never force a full repaint.
+            } else if (live == 2) {
                 if (draw) {
-                    m_qsBtStatusRect = statusBounds;
+                    m_qsBtStatusRect = statusRect;
                     m_qsBtStatusValid = true;
-                    m_qsBtStatusInkR = inkR;
-                    m_qsBtStatusInkG = inkG;
-                    m_qsBtStatusInkB = inkB;
+                    m_qsBtStatusInkR = ink.r;
+                    m_qsBtStatusInkG = ink.g;
+                    m_qsBtStatusInkB = ink.b;
                 }
             } else {
-                text(statusBounds, statusFont, subtitle,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 196);
+                text(statusRect, statusFont, sub, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
             }
-            if (chevron) {
-                text({bounds.right - inset - chevW, statusTop, bounds.right - std::max(6L, std::lround(8.0F * scale)),
-                         statusBottom},
-                    statusFont, L"\u203A", DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 168);
-            }
-            if (kind == TrayFlyoutHitKind::BluetoothRadio) {
-                // Split tile: the chevron column opens the drill-in, the rest
-                // toggles the radio. Pushed first so OverflowHitIndex prefers it.
-                const LONG chevHit = std::max(34L, std::lround(38.0F * scale));
+            if (splitChevron) {
+                // Right edge opens the drill-in page, the body toggles the radio.
                 push(TrayFlyoutHitKind::BluetoothPage,
-                    {std::max(bounds.left, bounds.right - chevHit), bounds.top, bounds.right, bounds.bottom});
+                    {std::max(b.left, b.right - P(36.0F)), b.top, b.right, b.bottom});
             }
-            push(kind, bounds);
+            push(kind, b);
         };
-        auto gradientSlider = [&](RECT track, float level, bool media) {
+        auto circle = [&](RECT b, wchar_t symbol, TrayFlyoutHitKind kind, bool active) {
+            const float w = static_cast<float>(b.right - b.left);
+            const size_t idx = addShape(b, w * 0.5F);
+            const CcInk ink = ccInk(idx);
+            const float cx = 0.5F * static_cast<float>(b.left + b.right);
+            const float cy = 0.5F * static_cast<float>(b.top + b.bottom);
+            if (draw) {
+                if (active) {
+                    // Accent fill inset 2pt so the glass rim highlight stays visible.
+                    FillPillColorPremul(pixels, width, height, cx, cx, cy,
+                        w * 0.5F - static_cast<float>(P(2.0F)), 0.98F, kBlueB, kBlueG, kBlueR);
+                }
+                const UINT extent = static_cast<UINT>(std::max(16L, P(25.0F)));
+                const LONG left = static_cast<LONG>(std::lround(cx - static_cast<float>(extent) * 0.5F));
+                const LONG top = static_cast<LONG>(std::lround(cy - static_cast<float>(extent) * 0.5F));
+                if (active) {
+                    icon(left, top, symbol, extent, kOnAccentR, kOnAccentG, kOnAccentB);
+                } else {
+                    icon(left, top, symbol, extent, ink.r, ink.g, ink.b);
+                }
+            }
+            push(kind, b);
+        };
+        auto accentSlider = [&](RECT track, float level, const CcInk& ink) {
             if (!draw) {
                 return;
             }
             level = std::clamp(level, 0.0F, 1.0F);
-            const float radius = std::max(4.0F, static_cast<float>(track.bottom - track.top) * 0.5F);
+            const float radius = static_cast<float>(track.bottom - track.top) * 0.5F;
             const float cy = 0.5F * static_cast<float>(track.top + track.bottom);
             const float left = static_cast<float>(track.left) + radius;
             const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
             const float fill = left + (right - left) * level;
-            const float shadeY = cy + std::max(1.5F, 2.0F * scale);
-            if (media) {
-                FillHGradientPill(pixels, width, height, left, right, shadeY, radius, light ? 0.16F : 0.22F,
-                    180, 170, 190, 170, 160, 184);
-                FillHGradientPill(pixels, width, height, left, right, cy, radius, light ? 0.40F : 0.34F,
-                    228, 220, 236, 210, 204, 226);
-            } else {
-                FillHGradientPill(pixels, width, height, left, right, shadeY, radius, light ? 0.14F : 0.22F,
-                    176, 180, 190, 168, 172, 182);
-                FillHGradientPill(pixels, width, height, left, right, cy, radius, 1.0F, 236, 236, 238,
-                    226, 226, 230);
-            }
+            FillPillColorPremul(pixels, width, height, left, right, cy, radius, 0.26F, ink.b, ink.g, ink.r);
             if (level > 0.01F) {
-                if (media) {
-                    FillHGradientPill(pixels, width, height, left, std::max(left + radius, fill), cy, radius,
-                        1.0F, 250, 140, 64, 245, 90, 176);
-                } else {
-                    FillHGradientPill(pixels, width, height, left, std::max(left + radius, fill), cy, radius,
-                        1.0F, 255, 168, 72, 255, 118, 36);
-                }
+                FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
+                    kBlueB, kBlueG, kBlueR);
             }
-            // Mock volume thumb is a hair larger than the track, with a soft
-            // contact shade. The media thumb is a larger saturated orb.
-            const float thumb = radius + (media ? std::max(3.5F, 5.0F * scale)
-                                                : std::max(2.0F, 2.5F * scale));
-            if (media) {
-                FillSoftDisc(pixels, width, height, fill, cy, thumb + std::max(4.0F, 5.5F * scale), 0.55F,
-                    255, 150, 210);
-                FillSoftDisc(pixels, width, height, fill, cy, thumb, 1.0F, 245, 120, 210);
-                FillSoftDisc(pixels, width, height, fill, cy, thumb * 0.62F, 1.0F, 255, 236, 252);
-            } else {
-                FillSoftDisc(pixels, width, height, fill, cy + std::max(1.0F, 1.6F * scale),
-                    thumb + std::max(1.5F, 2.0F * scale), 0.22F, 186, 196, 210);
-                FillCirclePremul(pixels, width, height, fill, cy, thumb, 0.99F, false);
-                FillSoftDisc(pixels, width, height, fill - thumb * 0.18F, cy, thumb * 0.72F, 0.35F,
-                    255, 255, 255);
+            FillSoftDisc(pixels, width, height, fill, cy + std::max(1.0F, 1.5F * scale),
+                radius + std::max(1.5F, 2.0F * scale), 0.20F, 60, 60, 66);
+            FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(1.0F, 1.5F * scale), 0.99F,
+                false);
+        };
+        auto sliderCapsule = [&](RECT b, wchar_t symbol, const wchar_t* title, const std::wstring& value,
+                                 float level, TrayFlyoutHitKind sliderKind, bool sliderEnabled,
+                                 TrayFlyoutHitKind drillKind) {
+            const float h = static_cast<float>(b.bottom - b.top);
+            const size_t idx = addShape(b, h * 0.5F);
+            const CcInk ink = ccInk(idx);
+            const LONG padX = P(22.0F);
+            const UINT extent = static_cast<UINT>(std::max(14L, P(18.0F)));
+            if (draw) {
+                SetFlyoutChromeInk(ink.r, ink.g, ink.b);
+                icon(b.left + padX, b.top + P(10.0F), symbol, extent, ink.r, ink.g, ink.b);
             }
+            const LONG rowTop = b.top + P(8.0F);
+            const LONG rowBottom = rowTop + P(22.0F);
+            text({b.left + padX + static_cast<LONG>(extent) + P(8.0F), rowTop, b.right - padX - P(56.0F), rowBottom},
+                labelFont, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            text({b.right - padX - P(56.0F), rowTop, b.right - padX, rowBottom}, statusFont, value,
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 190);
+            const RECT track{b.left + padX, b.top + P(36.0F), b.right - padX, b.top + P(54.0F)};
+            accentSlider(track, level, ink);
+            if (sliderEnabled) {
+                push(sliderKind, track);
+            }
+            push(drillKind, b);
         };
 
-        LONG x = padding;
         const bool wifiOn = tray.network == TrayNetworkKind::Wifi;
         std::wstring wifiLabel = L"Off";
         if (wifiOn) {
             wifiLabel = tray.networkName.empty() ? L"Connected" : tray.networkName;
         } else if (m_qsCache.wifiRadioOn) {
-            // Radio on, no network. "Not connected" does not fit the ~60px
-            // status band (it rendered as a bare "Not"); "On" matches the
-            // Bluetooth tile's radio-on-but-idle wording.
             wifiLabel = L"On";
         }
-        tile({x, y, x + tileWidths[0], y + homeTileH}, L'\uE701', L"Wi-Fi", wifiLabel,
-            TrayFlyoutHitKind::Wifi);
-        x += tileWidths[0] + tileGap;
-        // Bluetooth replaced Ethernet. Status text is a live overlay (see
-        // PaintQsLiveOverlays); body toggles the radio, chevron drills in.
-        tile({x, y, x + tileWidths[1], y + homeTileH}, L'\uE702', L"Bluetooth", std::wstring{},
-            TrayFlyoutHitKind::BluetoothRadio);
-        x += tileWidths[1] + tileGap;
-        tile({x, y, x + tileWidths[2], y + homeTileH}, L'\uE945', L"Boost", m_boostStatus,
-            TrayFlyoutHitKind::Boost, false);
-        x += tileWidths[2] + tileGap;
-        tile({x, y, x + tileWidths[3], y + homeTileH}, L'\uE7F4', L"System Tray",
-            (m_overflowIconsLoaded && m_overflowIcons.empty()) ? L"No icons" : L"Hidden",
-            TrayFlyoutHitKind::SystemTrayPage);
-        x += tileWidths[3] + tileGap;
-        std::wstring vpnLabel = L"Off";
+        const bool btOn = m_bluetoothSnapshot.radioOn;
+        // Row 0: Wi-Fi + Bluetooth capsules.
+        capsule(cellRect(0, 0, 2, 1), L'\uE701', L"Wi-Fi", wifiLabel, TrayFlyoutHitKind::Wifi,
+            wifiOn || m_qsCache.wifiRadioOn, 0, false);
+        capsule(cellRect(2, 0, 2, 1), L'\uE702', L"Bluetooth", std::wstring{},
+            TrayFlyoutHitKind::BluetoothRadio, btOn, 2, true);
+        // Row 1: Boost + Power capsules.
+        capsule(cellRect(0, 1, 2, 1), L'\uE945', L"Boost", m_boostStatus, TrayFlyoutHitKind::Boost, false, 1,
+            false);
+        capsule(cellRect(2, 1, 2, 1), L'\uE708', L"Power", EnergyModeLabel(m_qsCache.powerMode),
+            TrayFlyoutHitKind::Power, false, 0, false);
+        // Row 2: System Tray + VPN circles, Microphone capsule (live meter).
+        bool vpnOn = false;
         for (const QsVpnEntry& entry : m_qsCache.vpn) {
             if (entry.connected) {
-                vpnLabel = entry.name.empty() ? L"Connected" : entry.name;
+                vpnOn = true;
                 break;
             }
         }
-        tile({x, y, x + tileWidths[4], y + homeTileH}, L'\uE72E', L"VPN", vpnLabel, TrayFlyoutHitKind::Vpn);
-        y += homeTileH + homeGap;
-
-        // Mock measures about 58/42, not a literal 2:1. Sound is the wide card.
-        const LONG soundW = (inner - homeGap) * 58L / 100L;
-        const RECT sound{padding, y, padding + soundW, y + homeCardH};
-        const RECT mic{sound.right + homeGap, y, panelWidth - padding, y + homeCardH};
-        const LONG percentW = std::max(36L, std::lround(44.0F * scale));
-        const LONG sliderTrackH = std::max(20L, std::lround(28.0F * scale));
-        const RECT volumeTrack{sound.left + inset, sound.bottom - inset - sliderTrackH,
-            sound.right - inset - percentW, sound.bottom - inset};
-        push(TrayFlyoutHitKind::VolumeSlider, volumeTrack);
-        homeCard(sound);
-        icon(sound.left + inset, sound.top + inset, tray.volumeMuted ? L'\uE74F' : L'\uE767', tileIcon,
-            inkR, inkG, inkB);
-        const LONG titleLeft = sound.left + inset + static_cast<LONG>(tileIcon) + std::max(6L, std::lround(8.0F * scale));
-        text({titleLeft, sound.top + inset - 2, sound.right - 28, sound.top + inset + static_cast<LONG>(tileIcon)},
-            labelFont, L"Sound", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-        text({titleLeft, sound.top + inset + static_cast<LONG>(tileIcon) - 2, sound.right - inset,
-                 volumeTrack.top - 4},
-            statusFont, outputName, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
-        text({sound.right - 26, sound.top + inset - 2, sound.right - 8, sound.top + inset + static_cast<LONG>(tileIcon)},
-            statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 168);
-        gradientSlider(volumeTrack, volume, false);
-        text({volumeTrack.right + 4, volumeTrack.top, sound.right - 8, volumeTrack.bottom}, statusFont,
-            std::to_wstring(static_cast<int>(std::lround(volume * 100.0F))) + L"%",
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 170);
-        push(TrayFlyoutHitKind::Sound, sound);
-
-        homeCard(mic);
-        icon(mic.left + inset, mic.top + inset, L'\uE720', tileIcon, inkR, inkG, inkB);
-        const LONG micTitleLeft = mic.left + inset + static_cast<LONG>(tileIcon) + std::max(6L, std::lround(8.0F * scale));
-        text({micTitleLeft, mic.top + inset - 2, mic.right - 28, mic.top + inset + static_cast<LONG>(tileIcon)},
-            labelFont, L"Microphone", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-        const std::wstring micStatus = m_qsCache.inputNote.empty() ? inputName : m_qsCache.inputNote;
-        text({micTitleLeft, mic.top + inset + static_cast<LONG>(tileIcon) - 2, mic.right - inset, mic.bottom - 36},
-            statusFont, micStatus, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
-        text({mic.right - 26, mic.top + inset - 2, mic.right - 8, mic.top + inset + static_cast<LONG>(tileIcon)},
-            statusFont, L"\u203A", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 168);
-        const LONG barH = std::max(6L, std::lround(8.0F * scale));
-        const RECT meter{mic.left + inset, mic.bottom - inset - barH, mic.right - inset, mic.bottom - inset};
-        if (draw) {
-            m_qsMeterRect = meter;
-            m_qsMeterValid = true;
-            constexpr int segments = 12;
-            const float peak = m_qsPaintUnderlayPass ? 0.0F : m_qsCache.inputPeak;
-            const int lit = m_qsCache.inputMuted || m_qsPaintUnderlayPass
-                ? 0
-                : static_cast<int>(std::lround(std::pow(std::clamp(peak, 0.0F, 1.0F), 0.45F) *
-                      static_cast<float>(segments)));
-            const LONG segGap = std::max(2L, std::lround(3.0F * scale));
-            const LONG segW = std::max(4L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
-            const float segRadius = static_cast<float>(barH) * 0.5F;
-            for (int index = 0; index < segments; ++index) {
-                const LONG left = meter.left + index * (segW + segGap);
-                const float cxL = static_cast<float>(left) + segRadius;
-                const float cxR = static_cast<float>(left + segW) - segRadius;
-                const float cy = 0.5F * static_cast<float>(meter.top + meter.bottom);
-                if (index < lit) {
-                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
-                        1.0F, kBlueB, kBlueG, kBlueR, kBlueB, kBlueG, kBlueR);
-                } else {
-                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
-                        1.0F, 198, 198, 202, 188, 188, 192);
+        circle(cellRect(0, 2, 1, 1), L'\uE7F4', TrayFlyoutHitKind::SystemTrayPage, false);
+        circle(cellRect(1, 2, 1, 1), L'\uE72E', TrayFlyoutHitKind::Vpn, vpnOn);
+        {
+            const RECT b = cellRect(2, 2, 2, 1);
+            const float h = static_cast<float>(b.bottom - b.top);
+            const size_t idx = addShape(b, h * 0.5F);
+            const CcInk ink = ccInk(idx);
+            const LONG cy = (b.top + b.bottom) / 2L;
+            const float disc = static_cast<float>(P(36.0F));
+            const float cx = static_cast<float>(b.left + P(14.0F)) + disc * 0.5F;
+            glyphDisc(cx, static_cast<float>(cy), disc * 0.5F, !m_qsCache.inputMuted, ink, L'\uE720',
+                static_cast<UINT>(std::max(14L, P(19.0F))));
+            if (draw) {
+                SetFlyoutChromeInk(ink.r, ink.g, ink.b);
+            }
+            const LONG textL = static_cast<LONG>(std::lround(cx + disc * 0.5F)) + P(9.0F);
+            const LONG textR = b.right - P(14.0F);
+            text({textL, cy - P(22.0F), textR, cy - P(2.0F)}, labelFont, L"Mic",
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            const LONG barH = std::max(5L, P(6.0F));
+            const RECT meter{textL, cy + P(6.0F), textR, cy + P(6.0F) + barH};
+            if (draw) {
+                m_qsMeterRect = meter;
+                m_qsMeterValid = true;
+                m_qsMeterInkR = ink.r;
+                m_qsMeterInkG = ink.g;
+                m_qsMeterInkB = ink.b;
+                constexpr int segments = 12;
+                const LONG segGap = std::max(2L, P(2.5F));
+                const LONG segW = std::max(3L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
+                const float segRadius = static_cast<float>(barH) * 0.5F;
+                for (int index = 0; index < segments; ++index) {
+                    const LONG left = meter.left + index * (segW + segGap);
+                    const float cxL = static_cast<float>(left) + segRadius;
+                    const float cxR = static_cast<float>(left + segW) - segRadius;
+                    const float cyM = 0.5F * static_cast<float>(meter.top + meter.bottom);
+                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cyM, segRadius,
+                        0.28F, ink.b, ink.g, ink.r, ink.b, ink.g, ink.r);
                 }
             }
+            push(TrayFlyoutHitKind::Microphone, b);
         }
-        push(TrayFlyoutHitKind::Microphone, mic);
-        y += homeCardH + homeGap;
-
-        const LONG cell = (inner - homeGap * 2L) / 3L;
-        auto smallTile = [&](RECT bounds, wchar_t symbol, const wchar_t* title, const std::wstring& subtitle,
-                             TrayFlyoutHitKind kind) {
-            homeCard(bounds);
-            icon(bounds.left + inset, bounds.top + std::max(8L, std::lround(10.0F * scale)), symbol, tileIcon,
-                inkR, inkG, inkB);
-            const LONG titleTop = bounds.top + std::max(8L, std::lround(10.0F * scale)) +
-                static_cast<LONG>(tileIcon) + 2;
-            text({bounds.left + inset, titleTop, bounds.right - 8, titleTop + std::max(16L, std::lround(20.0F * scale))},
-                labelFont, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            const LONG statusBottom = bounds.bottom - std::max(8L, std::lround(10.0F * scale));
-            const LONG statusTop = statusBottom - std::max(16L, std::lround(18.0F * scale));
-            const LONG chevW = std::max(12L, std::lround(14.0F * scale));
-            text({bounds.left + inset, statusTop, bounds.right - inset - chevW, statusBottom}, statusFont,
-                subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 196);
-            text({bounds.right - inset - chevW, statusTop, bounds.right - std::max(6L, std::lround(8.0F * scale)),
-                     statusBottom},
-                statusFont, L"\u203A", DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 168);
-            push(kind, bounds);
-        };
-        std::wstring displayStatus = L"On";
-        if (m_qsCache.nightKnown && m_qsCache.nightLight) {
-            displayStatus = L"Night light";
-        }
-        x = padding;
-        // Temp tile needs more than 1/3 width so two-line values fit; Display
-        // and Power shrink slightly to fund it.
+        // Row 3: Sound slider capsule (4x1).
+        sliderCapsule(cellRect(0, 3, 4, 1), tray.volumeMuted ? L'\uE74F' : L'\uE767', L"Sound",
+            std::to_wstring(static_cast<int>(std::lround(volume * 100.0F))) + L"%", volume,
+            TrayFlyoutHitKind::VolumeSlider, true, TrayFlyoutHitKind::Sound);
+        // Row 4: Display slider capsule (4x1, brightness).
+        const bool brightnessUsable = tray.brightnessAvailable || projected >= 0;
+        sliderCapsule(cellRect(0, 4, 4, 1), L'\uE706', L"Display",
+            brightnessUsable
+                ? std::to_wstring(static_cast<int>(std::lround(brightness * 100.0F))) + L"%"
+                : ((m_qsCache.nightKnown && m_qsCache.nightLight) ? std::wstring(L"Night light")
+                                                                    : std::wstring(L"On")),
+            brightness, TrayFlyoutHitKind::BrightnessSlider, brightnessUsable, TrayFlyoutHitKind::Display);
+        // Rows 5-6: CPU/GPU (2x2) and Now Playing (2x2).
         {
-            const LONG tempsW = std::max(cell + std::max(8L, homeGap / 2L), (inner * 40L) / 100L);
-            const LONG sideW = std::max(1L, (inner - tempsW - homeGap * 2L) / 2L);
-            smallTile({x, y, x + sideW, y + homeSmallH}, L'\uE706', L"Display", displayStatus,
-                TrayFlyoutHitKind::Display);
-            x += sideW + homeGap;
-            smallTile({x, y, x + sideW, y + homeSmallH}, L'\uE708', L"Power", EnergyModeLabel(m_qsCache.powerMode),
-                TrayFlyoutHitKind::Power);
-            x += sideW + homeGap;
-        }
-        {
-            // Thermometer + CPU / GPU label-over-value columns. Values are two
-            // lines (temp then watts) in the smaller status font so neither
-            // column clips. Read-only, no hit/hover/chevron.
-            const RECT temps{x, y, panelWidth - padding, y + homeSmallH};
-            homeCard(temps);
-            const float glyphH = static_cast<float>(tileIcon) * 1.15F;
-            const float glyphCx = static_cast<float>(temps.left + inset) + static_cast<float>(tileIcon) * 0.45F;
-            const float glyphTop = static_cast<float>(temps.top + temps.bottom) * 0.5F - glyphH * 0.5F;
+            const RECT b = cellRect(0, 5, 2, 2);
+            const size_t idx = addShape(b, static_cast<float>(P(30.0F)));
+            const CcInk ink = ccInk(idx);
             if (draw) {
-                FillThermometerPremul(pixels, width, height, glyphCx, glyphTop, glyphH,
-                    std::max(1.0F, 1.05F * scale), inkR, inkG, inkB);
+                SetFlyoutChromeInk(ink.r, ink.g, ink.b);
             }
-            const LONG columnsLeft = temps.left + inset + static_cast<LONG>(tileIcon) +
-                std::max(6L, std::lround(8.0F * scale));
-            const LONG columnsRight = temps.right - std::max(4L, inset / 2L);
-            const LONG columnW = std::max(1L, (columnsRight - columnsLeft) / 2L);
-            const LONG labelH = std::max(16L, std::lround(18.0F * scale));
-            const LONG valueH = std::max(30L, std::lround(34.0F * scale));
-            const LONG blockTop = (temps.top + temps.bottom) / 2L - (labelH + valueH) / 2L;
-            const RECT cpuLabel{columnsLeft, blockTop, columnsLeft + columnW, blockTop + labelH};
-            const RECT gpuLabel{columnsLeft + columnW, blockTop, columnsRight, blockTop + labelH};
+            const LONG inset = P(16.0F);
+            const float glyphH = static_cast<float>(P(24.0F));
+            if (draw) {
+                FillThermometerPremul(pixels, width, height, static_cast<float>(b.left + inset) + glyphH * 0.25F,
+                    static_cast<float>(b.top + inset), glyphH, std::max(1.0F, 1.1F * scale), ink.r, ink.g,
+                    ink.b);
+            }
+            const LONG colW = (b.right - b.left - inset * 2L) / 2L;
+            const LONG labelTop = b.top + P(50.0F);
+            const LONG labelH = P(20.0F);
+            const LONG valueH = P(38.0F);
+            const RECT cpuLabel{b.left + inset, labelTop, b.left + inset + colW, labelTop + labelH};
+            const RECT gpuLabel{b.left + inset + colW, labelTop, b.right - inset, labelTop + labelH};
             const RECT cpuValue{cpuLabel.left, cpuLabel.bottom, cpuLabel.right, cpuLabel.bottom + valueH};
             const RECT gpuValue{gpuLabel.left, gpuLabel.bottom, gpuLabel.right, gpuLabel.bottom + valueH};
-            constexpr UINT labelFormat = DT_LEFT | DT_VCENTER | DT_SINGLELINE;
-            // Wrap/newline so temp and watts paint as two lines inside the value rect.
-            constexpr UINT valueFormat = DT_LEFT | DT_TOP | DT_WORDBREAK;
-            text(cpuLabel, labelFont, L"CPU", labelFormat, 255);
-            text(gpuLabel, labelFont, L"GPU", labelFormat, 255);
+            text(cpuLabel, labelFont, L"CPU", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+            text(gpuLabel, labelFont, L"GPU", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
             if (draw) {
                 m_qsTempCpuRect = cpuValue;
                 m_qsTempGpuRect = gpuValue;
                 m_qsTempsValid = true;
-                m_qsTempsInkR = g_flyoutInkR;
-                m_qsTempsInkG = g_flyoutInkG;
-                m_qsTempsInkB = g_flyoutInkB;
+                m_qsTempsInkR = ink.r;
+                m_qsTempsInkG = ink.g;
+                m_qsTempsInkB = ink.b;
             }
-            // Values are a live overlay (see PaintQsLiveOverlays); only an
-            // overlay-less paint draws them into the plate. Prefer the smaller
-            // status font so two lines fit the column width.
             HFONT valueFont = statusFont != nullptr ? statusFont : labelFont;
+            constexpr UINT valueFormat = DT_LEFT | DT_TOP | DT_WORDBREAK;
             if (!m_qsPaintUnderlayPass) {
                 text(cpuValue, valueFont, TempPowerText(m_qsCache.cpuTempC, m_qsCache.cpuWatts), valueFormat, 255);
                 text(gpuValue, valueFont, TempPowerText(m_qsCache.gpuTempC, m_qsCache.gpuWatts), valueFormat, 255);
             }
         }
-        y += homeSmallH + homeGap;
-
-        const RECT media{padding, y, panelWidth - padding, y + homeMediaH};
-        homeCard(media);
-        const LONG art = std::max(44L, std::min(homeMediaH - std::max(16L, std::lround(20.0F * scale)),
-                          std::lround(56.0F * scale)));
-        const LONG artLeft = media.left + std::max(12L, std::lround(14.0F * scale));
-        const LONG artTop = media.top + (homeMediaH - art) / 2L;
-        if (draw) {
-            FillAlbumDisc(pixels, width, height, static_cast<float>(artLeft) + static_cast<float>(art) * 0.5F,
-                static_cast<float>(artTop) + static_cast<float>(art) * 0.5F,
-                static_cast<float>(art) * 0.5F);
+        {
+            const RECT b = cellRect(2, 5, 2, 2);
+            const size_t idx = addShape(b, static_cast<float>(P(30.0F)));
+            const CcInk ink = ccInk(idx);
+            if (draw) {
+                SetFlyoutChromeInk(ink.r, ink.g, ink.b);
+            }
+            const LONG inset = P(14.0F);
+            const LONG art = P(42.0F);
+            const LONG artLeft = b.left + inset;
+            const LONG artTop = b.top + inset;
+            if (draw) {
+                FillAlbumDisc(pixels, width, height, static_cast<float>(artLeft) + static_cast<float>(art) * 0.5F,
+                    static_cast<float>(artTop) + static_cast<float>(art) * 0.5F, static_cast<float>(art) * 0.5F);
+            }
+            const std::wstring mediaTitle = m_qsCache.mediaHave && !m_qsCache.mediaTitle.empty()
+                ? m_qsCache.mediaTitle
+                : (m_qsCache.mediaHave ? L"Now playing" : L"Nothing playing");
+            const std::wstring mediaArtist = m_qsCache.mediaHave
+                ? (m_qsCache.mediaArtist.empty() ? (m_qsCache.mediaPlaying ? L"Playing" : L"Paused")
+                                                 : m_qsCache.mediaArtist)
+                : L"System media";
+            const LONG textL = artLeft + art + P(8.0F);
+            const LONG textR = b.right - inset;
+            text({textL, artTop, textR, artTop + art / 2L + P(2.0F)}, labelFont, mediaTitle,
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            text({textL, artTop + art / 2L + P(2.0F), textR, artTop + art + P(2.0F)}, statusFont, mediaArtist,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 185);
+            const LONG scrubH = std::max(6L, P(7.0F));
+            const LONG scrubTop = artTop + art + P(12.0F);
+            const RECT scrub{b.left + inset, scrubTop, b.right - inset, scrubTop + scrubH};
+            if (draw) {
+                m_qsScrubRect = scrub;
+                m_qsScrubValid = true;
+                m_qsScrubInkR = ink.r;
+                m_qsScrubInkG = ink.g;
+                m_qsScrubInkB = ink.b;
+            }
+            push(TrayFlyoutHitKind::MediaSeek, scrub);
+            const LONG transport = P(32.0F);
+            const LONG transportGap = P(10.0F);
+            const LONG rowTop = scrub.bottom + P(10.0F);
+            const LONG rowW = transport * 3L + transportGap * 2L;
+            const LONG rowLeft = (b.left + b.right - rowW) / 2L;
+            const RECT prev{rowLeft, rowTop, rowLeft + transport, rowTop + transport};
+            const RECT play{prev.right + transportGap, rowTop, prev.right + transportGap + transport, rowTop + transport};
+            const RECT next{play.right + transportGap, rowTop, play.right + transportGap + transport, rowTop + transport};
+            push(TrayFlyoutHitKind::MediaTransport, prev, 0);
+            push(TrayFlyoutHitKind::MediaTransport, play, 1);
+            push(TrayFlyoutHitKind::MediaTransport, next, 2);
+            const UINT transportIcon = static_cast<UINT>(std::max(14L, P(17.0F)));
+            auto center = [&](const RECT& r) {
+                return std::pair<LONG, LONG>{r.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
+                    r.top + (transport - static_cast<LONG>(transportIcon)) / 2L};
+            };
+            icon(center(prev).first, center(prev).second, L'\uE892', transportIcon, ink.r, ink.g, ink.b);
+            icon(center(play).first, center(play).second, m_qsCache.mediaPlaying ? L'\uE769' : L'\uE768',
+                transportIcon, ink.r, ink.g, ink.b);
+            icon(center(next).first, center(next).second, L'\uE893', transportIcon, ink.r, ink.g, ink.b);
+            const float scrubLevel = (!m_qsPaintUnderlayPass && m_qsCache.mediaHave) ? m_qsCache.mediaProgress : 0.0F;
+            accentSlider(scrub, scrubLevel, ink);
         }
-        const LONG scrubW = std::max(108L, std::lround(132.0F * scale));
-        const LONG scrubH = std::max(7L, std::lround(9.0F * scale));
-        const LONG scrubRight = media.right - std::max(16L, std::lround(18.0F * scale));
-        const LONG scrubLeft = scrubRight - scrubW;
-        const LONG midY = media.top + homeMediaH / 2L;
-        const RECT scrub{scrubLeft, midY - scrubH / 2L, scrubRight, midY + (scrubH - scrubH / 2L)};
-        const LONG transport = std::max(28L, std::lround(32.0F * scale));
-        const LONG transportGap = std::max(2L, std::lround(4.0F * scale));
-        const LONG nextRight = scrubLeft - std::max(12L, std::lround(16.0F * scale));
-        const RECT next{nextRight - transport, midY - transport / 2L, nextRight, midY + transport / 2L};
-        const RECT play{next.left - transportGap - transport, next.top, next.left - transportGap, next.bottom};
-        const RECT prev{play.left - transportGap - transport, next.top, play.left - transportGap, next.bottom};
-        push(TrayFlyoutHitKind::MediaSeek, scrub);
-        push(TrayFlyoutHitKind::MediaTransport, prev, 0);
-        push(TrayFlyoutHitKind::MediaTransport, play, 1);
-        push(TrayFlyoutHitKind::MediaTransport, next, 2);
-        const LONG textLeft = artLeft + art + std::max(10L, std::lround(12.0F * scale));
-        const std::wstring mediaTitle = m_qsCache.mediaHave && !m_qsCache.mediaTitle.empty()
-            ? m_qsCache.mediaTitle
-            : (m_qsCache.mediaHave ? L"Now playing" : L"Nothing playing");
-        const std::wstring mediaArtist = m_qsCache.mediaHave
-            ? (m_qsCache.mediaArtist.empty() ? (m_qsCache.mediaPlaying ? L"Playing" : L"Paused")
-                                             : m_qsCache.mediaArtist)
-            : L"System media";
-        text({textLeft, media.top + homeMediaH / 2L - std::max(20L, std::lround(22.0F * scale)), prev.left - 8,
-                 media.top + homeMediaH / 2L},
-            titleFont, mediaTitle, DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-        text({textLeft, media.top + homeMediaH / 2L, prev.left - 8,
-                 media.top + homeMediaH / 2L + std::max(18L, std::lround(20.0F * scale))},
-            statusFont, mediaArtist, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
-        const UINT transportIcon = static_cast<UINT>(std::max(14L, std::lround(16.0F * scale)));
-        icon(prev.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
-            prev.top + (transport - static_cast<LONG>(transportIcon)) / 2L, L'\uE892', transportIcon, inkR, inkG,
-            inkB);
-        icon(play.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
-            play.top + (transport - static_cast<LONG>(transportIcon)) / 2L,
-            m_qsCache.mediaPlaying ? L'\uE769' : L'\uE768', transportIcon, inkR, inkG, inkB);
-        icon(next.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
-            next.top + (transport - static_cast<LONG>(transportIcon)) / 2L, L'\uE893', transportIcon, inkR, inkG,
-            inkB);
         if (draw) {
-            m_qsScrubRect = scrub;
-            m_qsScrubValid = true;
+            m_qsCcInkSig = inkSigNew;
         }
-        const float scrubLevel = (!m_qsPaintUnderlayPass && m_qsCache.mediaHave) ? m_qsCache.mediaProgress : 0.0F;
-        gradientSlider(scrub, scrubLevel, true);
-        y += homeMediaH + padding;
+        y = cellRect(0, 5, 2, 2).bottom + padding;
         contentBottom = y;
+    m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
+        m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
         return;
     }
-
     auto infoRow = [&](RECT row, const wchar_t* title, const std::wstring& value) {
         text({row.left + 14, row.top + 6, row.right - 14, row.top + 26}, labelFont, title,
             DT_LEFT | DT_BOTTOM | DT_SINGLELINE, 255);
@@ -3821,6 +3778,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     }
     y += padding;
     contentBottom = y;
+    m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
 }
 
 void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) {
