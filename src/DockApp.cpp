@@ -6947,9 +6947,11 @@ UINT DockApp::PackPopupGlassFxFlags(bool dockFace, bool popupShadow) const noexc
     if (m_config.Dispersion()) {
         glassFx |= DOCK_FX_DISPERSION;
     }
-    // Panels always run the mica stack (Concept A strong backdrop blur) so
-    // busy wallpaper detail dissolves under glyphs even at clear Frost.
-    glassFx |= DOCK_FX_BLUR;
+    // Dock-face popups gate blur exactly like the dock (Frost > 0); context
+    // menus keep the always-on mica stack.
+    if (!dockFace || frostAmount > 0.001f) {
+        glassFx |= DOCK_FX_BLUR;
+    }
     if (m_config.Specular()) {
         glassFx |= DOCK_FX_SPECULAR;
     }
@@ -7077,7 +7079,8 @@ bool DockApp::TickLivePopupGlass()
     }
 
     const float frostAmount = m_config.FrostAmount();
-    const float settingsAlpha = DOCK_QS_SETTINGS_GLASS_ALPHA;
+    // Dock-face popups use the dock's glass alpha curve (same Frost slider).
+    const float settingsAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
     const float contextAlpha =
         DOCK_PANEL_GLASS_ALPHA + (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
@@ -7153,7 +7156,7 @@ bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* 
     }
     const RECT screenRect{origin.x, origin.y, origin.x + width, origin.y + height};
     const float frostAmount = m_config.FrostAmount();
-    const float glassAlpha = dockFace ? DOCK_QS_SETTINGS_GLASS_ALPHA
+    const float glassAlpha = dockFace ? DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount
                                       : DOCK_PANEL_GLASS_ALPHA +
             (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
