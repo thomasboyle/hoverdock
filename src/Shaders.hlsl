@@ -242,32 +242,8 @@ float GlassBevelWidth(float2 halfSize, float cornerRadius, float dpi, bool isPan
     return textPanel > 0.5 ? textBand : faceBevel;
 }
 
-// Icon-calm halos: 1 on/near an icon rect, 0 beyond a 10px feather. Live
-// count rides bits 8-13 of scene1.x; lookups capped at 64.
-float IconHaloCalm(float2 pixel, float dpi)
-{
-    const uint haloCount = min(((uint)scene1.x >> 8) & 63u, 64u);
-    float minIconDist = 1e9;
-    for (uint haloIndex = 0u; haloIndex < 64u; ++haloIndex)
-    {
-        if (haloIndex >= haloCount)
-        {
-            break;
-        }
-        const float4 haloRect = iconInstances[haloIndex].iconRect; // l,t,w,h px
-        const float2 haloCenter = haloRect.xy + haloRect.zw * 0.5;
-        const float2 haloQ = abs(pixel - haloCenter) - haloRect.zw * 0.5;
-        minIconDist = min(minIconDist, length(max(haloQ, 0.0)));
-    }
-    return 1.0 - smoothstep(0.0, 10.0 * dpi, minIconDist);
-}
-
-// Slope damping from the halos. The dock's lens band already sits outside
-// the icon field, so it only needs a light calm; panels keep the strong one.
-float IconHaloDamp(float haloCalm, bool isPanel)
-{
-    return 1.0 - haloCalm * (isPanel ? 0.9 : 0.35);
-}
+// The lens depends only on distance from the glass edge. There is deliberately no
+// icon-proximity term: any slope/rim modulation near icons bends the glass edge.
 
 VertexOutput FullscreenVS(uint vertexId : SV_VertexID)
 {
@@ -633,17 +609,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // True surface slope dH/dDist = (B/bevel) * f'(x), B = 0.65*bevel.
     const LensGeo lens = GetLensGeo(PhysicalGlassPanel(isPanel, dockStyle), bevelWidth, dpi);
     float slopeMag = lens.slopeScale * slopeN;
-    // ---- Icon-calm halos --------------------------------------------------
-    // Lensing excludes icons: within a feather of any icon rect the slab
-    // relaxes toward flat, so refraction peaks in the background gaps
-    // instead of crowding glyphs. (Icons are opaque and drawn undisplaced
-    // on top regardless; this stills the glass around them.) Tint and frost
-    // are untouched - only the visible warp calms.
-    const float haloDamp = IconHaloDamp(IconHaloCalm(pixel, dpi), isPanel && !dockStyle);
-    slopeMag *= haloDamp;
-    // Panels also calm rim lights near glyphs; the dock keeps its rim
-    // highlight continuous around the silhouette.
-    const float rimLightDamp = (isPanel && !dockStyle) ? haloDamp : 1.0;
+    // Lens/rim depend only on edge distance (no icon-proximity modulation).
+    const float rimLightDamp = 1.0;
     // Slab thickness T(x) = T0 + B*f(x), T0 = 0.35*bevel, B = 0.65*bevel.
     const float thicknessPx = (0.35 + 0.65 * height01) * lens.thickScale;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
@@ -946,7 +913,6 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float fxBits = scene1.x;
     const float lensOn = FxEnabled(fxBits, 2.0);
     const float dispOn = FxEnabled(fxBits, 4.0);
-    slopeMag *= IconHaloDamp(IconHaloCalm(pixel, dpi), isPanel && !dockStyle);
     const float thicknessPx = (0.35 + 0.65 * height01) * lens.thickScale;
     const float thetaS = atan(slopeMag);
     const float sinS = sin(thetaS);
