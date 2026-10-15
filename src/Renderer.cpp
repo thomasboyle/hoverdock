@@ -3785,7 +3785,10 @@ void Renderer::SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const
 void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
 {
     m_ccFaceLuma.clear();
-    if (m_ccShapes.empty() || m_panelIconInstances == nullptr || m_panelMappedConstants == nullptr) {
+    if (m_panelMappedConstants == nullptr) {
+        return;
+    }
+    if (m_ccShapes.empty() || m_panelIconInstances == nullptr) {
         m_panelMappedConstants->scene1[2] = 0.0F;
         return;
     }

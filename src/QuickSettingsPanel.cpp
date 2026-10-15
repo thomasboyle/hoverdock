@@ -1,4 +1,4 @@
-﻿#include "DockApp.h"
+#include "DockApp.h"
 
 #include "QuickSettingsPanel.h"
 #include "SystemTemps.h"
@@ -170,7 +170,7 @@ LONG MeasureFlyoutLine(HFONT font, const std::wstring& text) {
     return ok != FALSE ? size.cx : LONG_MAX;
 }
 
-// Character-granular end ellipsis that always shows the "â€¦" glyph. The
+// Character-granular end ellipsis that always shows the "…" glyph. The
 // DirectWrite path trims at word granularity, which can leave a long single
 // token (device names like "WH-1000XM5") clipped with no ellipsis at all.
 std::wstring FitFlyoutLine(HFONT font, const std::wstring& text, LONG width) {
@@ -2073,14 +2073,14 @@ void FillThermometerPremul(uint8_t* dest, int destWidth, int destHeight, float c
 
 std::wstring TempPowerText(int celsius, int watts) {
     // Two lines when both values exist so the narrow CPU/GPU columns can show
-    // the full reading (single-line "XXÂ°C Â· YYW" clipped on the home row).
+    // the full reading (single-line "XX°C · YYW" clipped on the home row).
     if (celsius < 0 && watts < 0) {
         return std::wstring(L"-");
     }
     std::wstring out;
     if (celsius >= 0) {
         out += std::to_wstring(celsius);
-        out += L"Â°C";
+        out += L"°C";
     }
     if (watts >= 0) {
         if (!out.empty()) {
@@ -3196,7 +3196,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             }
             const LONG textL = static_cast<LONG>(std::lround(cx + disc * 0.5F)) + P(9.0F);
             const LONG textR = b.right - P(14.0F);
-            text({textL, cy - P(22.0F), textR, cy - P(2.0F)}, labelFont, L"Microphone",
+            text({textL, cy - P(22.0F), textR, cy - P(2.0F)}, labelFont, L"Mic",
                 DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             const LONG barH = std::max(5L, P(6.0F));
             const RECT meter{textL, cy + P(6.0F), textR, cy + P(6.0F) + barH};
