@@ -7477,9 +7477,6 @@ void DockApp::PaintSettingsPopup() {
         float amount;
     };
     const SettingsRow rows[] = {
-        {SettingsHitKind::LightPanels, L"Light mode",
-            L"Light glass for Quick Settings and Dock Settings", false, m_config.LightPanels(),
-            0.0F},
         {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows", false,
             m_config.LaunchAtStartup(), 0.0F},
         {SettingsHitKind::Updates, L"Check for updates", L"Auto-download and install builds", false,
@@ -7755,6 +7752,11 @@ void DockApp::PaintSettingsPopup() {
     }
 
     LONG y = padding;
+    {
+        const RECT titlePlate{padding, y, panelWidth - padding, y + headerHeight};
+        FillSquircleColorPremul(pixels, width, height, titlePlate,
+            ContentSquircleRadius(titlePlate, scale), 0.72F, 32, 34, 40);
+    }
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
     DrawFlyoutText(pixels, width, height, titleBounds, titleFont, L"Dock Settings",
         DT_LEFT | DT_VCENTER | DT_SINGLELINE, 250);
@@ -7774,8 +7776,10 @@ void DockApp::PaintSettingsPopup() {
     const LONG subHeight = std::max(14L, std::lround(16.0F * scale));
     for (const SettingsRow& row : rows) {
         const RECT rowBounds{padding, y, panelWidth - padding, y + rowHeight};
-        FillSquirclePremul(pixels, width, height, rowBounds, ContentSquircleRadius(rowBounds, scale),
-            0.10F);
+        // Dark tile (same as the Quick Settings tiles) so light ink stays legible on
+        // the dock-tint glass over bright wallpapers.
+        FillSquircleColorPremul(pixels, width, height, rowBounds,
+            ContentSquircleRadius(rowBounds, scale), 0.72F, 32, 34, 40);
         if (row.slider) {
             const LONG sliderLeft = padding + 4L;
             const LONG sliderRight = panelWidth - padding - 4L;
@@ -7834,7 +7838,13 @@ void DockApp::PaintSettingsPopup() {
 
     std::string current = Updater::CurrentVersion();
     std::wstring wideVersion(current.begin(), current.end());
-    RECT versionBounds{padding, y, panelWidth - padding, y + subHeight};
+    {
+        const RECT footPlate{padding, y - 2L, panelWidth - padding,
+            y + 2L * subHeight + 12L};
+        FillSquircleColorPremul(pixels, width, height, footPlate,
+            ContentSquircleRadius(footPlate, scale), 0.72F, 32, 34, 40);
+    }
+    RECT versionBounds{padding + 6L, y, panelWidth - padding - 6L, y + subHeight};
     DrawFlyoutText(pixels, width, height, versionBounds, statusFont,
         L"Hoverdock v" + wideVersion, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
     RECT statusBounds{padding, versionBounds.bottom + 2, panelWidth - padding,

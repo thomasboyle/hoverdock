@@ -2911,6 +2911,14 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         return RECT{left - 8, top - 6, right + 6, top + switchH + 6};
     };
     auto beginHeader = [&](const wchar_t* title, bool gear, int toggleIndex, bool toggleOn) {
+        if (draw && gear) {
+            // The Home title sits on bare glass (same tint as the dock, translucent):
+            // back it with the same dark tile as the controls so the light ink stays
+            // legible over any wallpaper.
+            const RECT titlePlate{padding, y, panelWidth - padding, y + headerHeight};
+            FillSquircleColorPremul(pixels, width, height, titlePlate,
+                std::max(7.0F, 8.0F * scale), 0.72F, 32, 34, 40);
+        }
         if (m_qsPage != QuickSettingsPage::Home) {
             const RECT back{padding, y, padding + headerHeight, y + headerHeight};
             text(back, titleFont, L"\u2190", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
