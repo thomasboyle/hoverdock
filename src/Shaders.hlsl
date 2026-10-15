@@ -212,6 +212,10 @@ void DockPanelShape(float2 pixel, float2 outputSize, float dpi, float2 halfSize,
 static const float kPxPerMm = 96.0 / 25.4;      // dp per mm at 96 dpi (x dpi scale)
 static const float kPanelBevelMm = 5.0;         // flat-to-rim bevel width
 static const float kPanelSlabMm = 8.0;          // glass thickness at the flat interior
+// Air gap between the slab's flat underside and the backdrop plane (the desktop
+// sits behind the glass, it is not in contact). Design assumption, not measured:
+// 2 mm = a pane floating just above the surface. 0 reproduces the old contact model.
+static const float kPanelGapMm = 2.0;
 static const float kPanelRimFadeDp = 1.0;       // AA coverage pixel only (mask is crisp)
 
 float GlassBevelWidth(float2 halfSize, float cornerRadius, float dpi, bool isPanel)
@@ -350,9 +354,11 @@ static const float kLensRimFadePx = 3.0;
 // bar-relative one. It is modelled as a thin BK7 slab with a bevelled rim:
 //   * bevel (edge) width and slab thickness are fixed physical lengths
 //     (mm -> dp at 96 dpi), independent of the panel's pixel size;
-//   * the pull is pure Snell geometry, d = T(x) * tan(theta_s - theta_r),
-//     with no artistic gain and no cap (the physical maximum is
-//     T * tan(90deg - asin(1/n)) = 0.88 T, so a cap is never needed);
+//   * the pull is pure Snell geometry (see SlabPull): the top facet refracts the
+//     view ray, it crosses the glass below the entry point, leaves through the
+//     flat underside and crosses the air gap kPanelGapMm to the desktop:
+//     d = T(x) tan(theta_s - theta_r) + g tan(asin(n sin(theta_s - theta_r))),
+//     with no artistic gain and no cap;
 //   * d is largest at the rim and falls to exactly 0 where the bevel ends,
 //     so everything deeper than the bevel (the whole interior of a big
 //     panel) is undistorted;
@@ -374,6 +380,7 @@ struct LensGeo
     float gain;
     float capPx;
     float rimFadePx;
+    float gapPx;        // glass underside -> backdrop plane (0 = dock / contact)
 };
 
 LensGeo GetLensGeo(bool physical, float bevelWidth, float dpi)
@@ -387,6 +394,7 @@ LensGeo GetLensGeo(bool physical, float bevelWidth, float dpi)
         g.gain = 1.0;
         g.capPx = 1.0e4;
         g.rimFadePx = kPanelRimFadeDp * dpi;
+        g.gapPx = kPanelGapMm * kPxPerMm * dpi;
     }
     else
     {
@@ -395,8 +403,29 @@ LensGeo GetLensGeo(bool physical, float bevelWidth, float dpi)
         g.gain = kLensGain;
         g.capPx = kLensMaxPx * dpi;
         g.rimFadePx = kLensRimFadePx * dpi;
+        g.gapPx = 0.0;
     }
     return g;
+}
+// Lateral pull of one view ray (view normal to the plate) at the backdrop plane:
+//   top facet tilted thetaS: air->glass, sin(thetaR) = sin(thetaS)/n
+//   ray leaves the facet tilted (thetaS - thetaR) from the screen normal and
+//   crosses the glass thickness T below the entry point:  T * tan(thetaS - thetaR)
+//   flat underside (parallel to the screen): glass->air, sin(phi) = n sin(thetaS - thetaR)
+//   crosses the air gap g to the backdrop plane:          g * tan(phi)
+// gapPx = 0 (dock, contact model) is exactly the first term. n sin(thetaS-thetaR)
+// >= 1 is total internal reflection at the underside (thetaS > ~82 deg for BK7);
+// the profile slope is clamped below that, the min() only guards the tan.
+float SlabPull(float thicknessPx, float thetaS, float sinS, float n, float gapPx)
+{
+    const float a = max(thetaS - asin(clamp(sinS / n, 0.0, 0.999)), 0.0);
+    float pull = thicknessPx * tan(a);
+    if (gapPx > 0.0)
+    {
+        const float sinPhi = min(n * sin(a), 0.999);
+        pull += gapPx * sinPhi * rsqrt(1.0 - sinPhi * sinPhi);
+    }
+    return pull;
 }
 // Frost mica radii: clear-glass veil (left/mid) vs full dissolve (right).
 // FrostAmount lerps between these; C++ also ramps H/V pass count above mid.
@@ -659,9 +688,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // calm center, one continuous slab; pull soft-capped to kLensMaxPx with
         // a rim fade so a high-contrast edge above the dock cannot paint the
         // opposite (dark) rim.
-        float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lens.gain * lensOn;
-        float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lens.gain * lensOn;
-        float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lens.gain * lensOn;
+        float dR = SlabPull(thicknessPx, thetaS, sinS, nR, lens.gapPx) * lens.gain * lensOn;
+        float dG = SlabPull(thicknessPx, thetaS, sinS, nG, lens.gapPx) * lens.gain * lensOn;
+        float dB = SlabPull(thicknessPx, thetaS, sinS, nB, lens.gapPx) * lens.gain * lensOn;
         // Chromatic split (ratios physical, blue bends most); shared boost.
         dR = dG + (dR - dG) * kFringeBoost;
         dB = dG + (dB - dG) * kFringeBoost;
@@ -927,9 +956,9 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float thetaRR = asin(sinRR);
     const float thetaRG = asin(sinRG);
     const float thetaRB = asin(sinRB);
-    float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * lens.gain * lensOn;
-    float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * lens.gain * lensOn;
-    float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * lens.gain * lensOn;
+    float dR = SlabPull(thicknessPx, thetaS, sinS, 1.5143, lens.gapPx) * lens.gain * lensOn;
+    float dG = SlabPull(thicknessPx, thetaS, sinS, 1.5168, lens.gapPx) * lens.gain * lensOn;
+    float dB = SlabPull(thicknessPx, thetaS, sinS, 1.5224, lens.gapPx) * lens.gain * lensOn;
     dR = dG + (dR - dG) * kFringeBoost;
     dB = dG + (dB - dG) * kFringeBoost;
     dR = lerp(dG, dR, dispOn);
