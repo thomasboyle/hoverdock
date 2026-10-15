@@ -3784,6 +3784,8 @@ void Renderer::SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const
 // per-shape adaptive face (macOS 26 Regular style tables, measured).
 void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
 {
+    static_cast<void>(width);
+    static_cast<void>(height);
     m_ccFaceLuma.clear();
     if (m_panelMappedConstants == nullptr) {
         return;
@@ -3803,46 +3805,14 @@ void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
     for (size_t i = 0; i < count; ++i) {
         const CcShapeDesc& sh = m_ccShapes[i];
         const float sPt = 2.0F * (std::min)(sh.hw, sh.hh) / dpi;
-        // Mean backdrop luma (sRGB-encoded, Rec.709) over the shape, ~1/4 of the
-        // pixels, quantised to 1/32 like the system's adaptive table.
-        float x = 0.5F;
-        if (m_panelCapturePixels != nullptr && width > 0 && height > 0) {
-            const int x0 = (std::max)(0, static_cast<int>(std::floor(sh.cx - sh.hw)));
-            const int x1 = (std::min)(static_cast<int>(width), static_cast<int>(std::ceil(sh.cx + sh.hw)));
-            const int y0 = (std::max)(0, static_cast<int>(std::floor(sh.cy - sh.hh)));
-            const int y1 = (std::min)(static_cast<int>(height), static_cast<int>(std::ceil(sh.cy + sh.hh)));
-            double sum = 0.0;
-            long long samples = 0;
-            for (int y = y0; y < y1; y += 2) {
-                const uint8_t* row = m_panelCapturePixels + static_cast<size_t>(y) * width * 4U;
-                for (int px = x0; px < x1; px += 2) {
-                    const uint8_t* p = row + static_cast<size_t>(px) * 4U;
-                    sum += 0.2126 * p[2] + 0.7152 * p[1] + 0.0722 * p[0];
-                    ++samples;
-                }
-            }
-            if (samples > 0) {
-                x = static_cast<float>(sum / (255.0 * static_cast<double>(samples)));
-            }
-        }
-        x = std::round(x * 32.0F) / 32.0F;
-        float W = 0.95F;
-        float B = 0.5F;
-        float fillA = 0.35F;
-        bool black = false;
-        if (sPt <= 64.5F) {
-            if (x < 0.2F) {
-                W = 0.5F + x;
-                B = 0.1F;
-                black = true;
-                fillA = 0.25F + (5.0F / 14.0F) * x;
-            } else {
-                W = (std::min)(0.97F, x + 0.4F);
-                B = (std::max)(0.1F, x - 0.2F);
-                fillA = (std::min)(0.6F, 0.75F - 0.5F * x);
-            }
-        }
-        // Regular style scaling laws: A = -min(0.8 s, 60), h = min(0.25 s, 20),
+        // One fixed frosted-light face for every shape, independent of the
+        // backdrop (no luma adaptation): W == B makes the face colour constant,
+        // then a white fill lifts it. Same on dark and bright backdrops.
+        const float x = 0.5F;
+        const float W = 0.90F;
+        const float B = 0.90F;
+        const float fillA = 0.35F;
+        const bool black = false;        // Regular style scaling laws: A = -min(0.8 s, 60), h = min(0.25 s, 20),
         // blur r = clamp(2 + (s-48)/56, 2, 4), sigma = 2 r (pt).
         const float amountPt = (std::min)(0.8F * sPt, 60.0F);
         const float heightPt = (std::min)(0.25F * sPt, 20.0F);
