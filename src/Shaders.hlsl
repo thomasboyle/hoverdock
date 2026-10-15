@@ -210,8 +210,8 @@ void DockPanelShape(float2 pixel, float2 outputSize, float dpi, float2 halfSize,
 // Physical glass panel constants (see the model description at kLensGain's
 // block below): fixed real-world lengths, 1 dp = 1/96 in at 100% scale.
 static const float kPxPerMm = 96.0 / 25.4;      // dp per mm at 96 dpi (x dpi scale)
-static const float kPanelBevelMm = 3.0;         // flat-to-rim bevel width
-static const float kPanelSlabMm = 4.0;          // glass thickness at the flat interior
+static const float kPanelBevelMm = 5.0;         // flat-to-rim bevel width
+static const float kPanelSlabMm = 8.0;          // glass thickness at the flat interior
 static const float kPanelRimFadeDp = 1.0;       // AA coverage pixel only (mask is crisp)
 
 float GlassBevelWidth(float2 halfSize, float cornerRadius, float dpi, bool isPanel)
