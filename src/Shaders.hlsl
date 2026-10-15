@@ -207,9 +207,26 @@ void DockPanelShape(float2 pixel, float2 outputSize, float dpi, float2 halfSize,
     distance = SdSquircleRectN(pixel - outputSize * 0.5, halfSize, cornerRadius, kDock27CornerN, nrm);
 }
 
+// Physical glass panel constants (see the model description at kLensGain's
+// block below): fixed real-world lengths, 1 dp = 1/96 in at 100% scale.
+static const float kPxPerMm = 96.0 / 25.4;      // dp per mm at 96 dpi (x dpi scale)
+static const float kPanelBevelMm = 5.0;         // flat-to-rim bevel width
+static const float kPanelSlabMm = 8.0;          // glass thickness at the flat interior
+// Air gap between the slab's flat underside and the backdrop plane (the desktop
+// sits behind the glass, it is not in contact). Design assumption, not measured:
+// 2 mm = a pane floating just above the surface. 0 reproduces the old contact model.
+static const float kPanelGapMm = 2.0;
+static const float kPanelRimFadeDp = 1.0;       // AA coverage pixel only (mask is crisp)
+
 float GlassBevelWidth(float2 halfSize, float cornerRadius, float dpi, bool isPanel)
 {
     const float faceBevel = max(min(halfSize.x, halfSize.y) * 0.95, 8.0 * dpi);
+    if (isPanel && DockStyleFace())
+    {
+        // Fixed physical edge width (never scaled with the panel); only a
+        // panel smaller than the bevel itself clamps it.
+        return min(kPanelBevelMm * kPxPerMm * dpi, faceBevel);
+    }
     const float edgeBevel = clamp(cornerRadius * 1.1, 8.0 * dpi, faceBevel);
     if (!isPanel || DockStyleFace())
     {
@@ -327,6 +344,89 @@ static const float kLensMaxPx = 10.0;
 // refracted sample from the interior. Otherwise the blended fringe reads as
 // a bright line over dark content.
 static const float kLensRimFadePx = 3.0;
+
+// ---------------------------------------------------------------------------
+// Physical glass panel lens (Quick Settings, Dock Settings, overflow: the
+// DOCK_FX_PANEL | DOCK_FX_DOCK_FACE surfaces). The dock constants above are
+// tuned for a ~74 px bar: its bevel follows the corner radius (~0.5 x bar
+// height), its pull is boosted by kLensGain and soft-capped at kLensMaxPx.
+// A large panel is a different object: the same physical edge, not a
+// bar-relative one. It is modelled as a thin BK7 slab with a bevelled rim:
+//   * bevel (edge) width and slab thickness are fixed physical lengths
+//     (mm -> dp at 96 dpi), independent of the panel's pixel size;
+//   * the pull is pure Snell geometry (see SlabPull): the top facet refracts the
+//     view ray, it crosses the glass below the entry point, leaves through the
+//     flat underside and crosses the air gap kPanelGapMm to the desktop:
+//     d = T(x) tan(theta_s - theta_r) + g tan(asin(n sin(theta_s - theta_r))),
+//     with no artistic gain and no cap;
+//   * d is largest at the rim and falls to exactly 0 where the bevel ends,
+//     so everything deeper than the bevel (the whole interior of a big
+//     panel) is undistorted;
+//   * dispersion is the per-channel BK7 index split run through the same
+//     Snell step (kFringeBoost is the one shared display scale).
+// ---------------------------------------------------------------------------
+
+// True for dock-face panels (QS / Dock Settings / overflow). The dock itself
+// and the charcoal / label panels keep the dock-tuned constants.
+bool PhysicalGlassPanel(bool isPanel, bool dockStyle)
+{
+    return isPanel && dockStyle;
+}
+
+struct LensGeo
+{
+    float slopeScale;   // dH/dDist = slopeScale * f'(x)
+    float thickScale;   // T(x) = thickPx * (0.35 + 0.65 f(x))
+    float gain;
+    float capPx;
+    float rimFadePx;
+    float gapPx;        // glass underside -> backdrop plane (0 = dock / contact)
+};
+
+LensGeo GetLensGeo(bool physical, float bevelWidth, float dpi)
+{
+    LensGeo g;
+    if (physical)
+    {
+        const float slabPx = kPanelSlabMm * kPxPerMm * dpi;
+        g.slopeScale = 0.65 * slabPx / max(bevelWidth, 1e-3);
+        g.thickScale = slabPx;
+        g.gain = 1.0;
+        g.capPx = 1.0e4;
+        g.rimFadePx = kPanelRimFadeDp * dpi;
+        g.gapPx = kPanelGapMm * kPxPerMm * dpi;
+    }
+    else
+    {
+        g.slopeScale = 0.65;
+        g.thickScale = bevelWidth;
+        g.gain = kLensGain;
+        g.capPx = kLensMaxPx * dpi;
+        g.rimFadePx = kLensRimFadePx * dpi;
+        g.gapPx = 0.0;
+    }
+    return g;
+}
+// Lateral pull of one view ray (view normal to the plate) at the backdrop plane:
+//   top facet tilted thetaS: air->glass, sin(thetaR) = sin(thetaS)/n
+//   ray leaves the facet tilted (thetaS - thetaR) from the screen normal and
+//   crosses the glass thickness T below the entry point:  T * tan(thetaS - thetaR)
+//   flat underside (parallel to the screen): glass->air, sin(phi) = n sin(thetaS - thetaR)
+//   crosses the air gap g to the backdrop plane:          g * tan(phi)
+// gapPx = 0 (dock, contact model) is exactly the first term. n sin(thetaS-thetaR)
+// >= 1 is total internal reflection at the underside (thetaS > ~82 deg for BK7);
+// the profile slope is clamped below that, the min() only guards the tan.
+float SlabPull(float thicknessPx, float thetaS, float sinS, float n, float gapPx)
+{
+    const float a = max(thetaS - asin(clamp(sinS / n, 0.0, 0.999)), 0.0);
+    float pull = thicknessPx * tan(a);
+    if (gapPx > 0.0)
+    {
+        const float sinPhi = min(n * sin(a), 0.999);
+        pull += gapPx * sinPhi * rsqrt(1.0 - sinPhi * sinPhi);
+    }
+    return pull;
+}
 // Frost mica radii: clear-glass veil (left/mid) vs full dissolve (right).
 // FrostAmount lerps between these; C++ also ramps H/V pass count above mid.
 static const float kMicaClearRim = 5.0;
@@ -531,7 +631,8 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
     const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
     // True surface slope dH/dDist = (B/bevel) * f'(x), B = 0.65*bevel.
-    float slopeMag = 0.65 * slopeN;
+    const LensGeo lens = GetLensGeo(PhysicalGlassPanel(isPanel, dockStyle), bevelWidth, dpi);
+    float slopeMag = lens.slopeScale * slopeN;
     // ---- Icon-calm halos --------------------------------------------------
     // Lensing excludes icons: within a feather of any icon rect the slab
     // relaxes toward flat, so refraction peaks in the background gaps
@@ -544,7 +645,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // highlight continuous around the silhouette.
     const float rimLightDamp = (isPanel && !dockStyle) ? haloDamp : 1.0;
     // Slab thickness T(x) = T0 + B*f(x), T0 = 0.35*bevel, B = 0.65*bevel.
-    const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
+    const float thicknessPx = (0.35 + 0.65 * height01) * lens.thickScale;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
 
     // Frost radii: clear veil through mid, full mica on the right half.
@@ -587,9 +688,9 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // calm center, one continuous slab; pull soft-capped to kLensMaxPx with
         // a rim fade so a high-contrast edge above the dock cannot paint the
         // opposite (dark) rim.
-        float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * kLensGain * lensOn;
-        float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * kLensGain * lensOn;
-        float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * kLensGain * lensOn;
+        float dR = SlabPull(thicknessPx, thetaS, sinS, nR, lens.gapPx) * lens.gain * lensOn;
+        float dG = SlabPull(thicknessPx, thetaS, sinS, nG, lens.gapPx) * lens.gain * lensOn;
+        float dB = SlabPull(thicknessPx, thetaS, sinS, nB, lens.gapPx) * lens.gain * lensOn;
         // Chromatic split (ratios physical, blue bends most); shared boost.
         dR = dG + (dR - dG) * kFringeBoost;
         dB = dG + (dB - dG) * kFringeBoost;
@@ -598,11 +699,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
         dB = lerp(dG, dB, dispOn);
         // Soft-cap the drag (see SoftLensCap / kLensMaxPx): keep white-fringe
         // protection without a hard plateau kink toward the dock center.
-        const float lensMax = kLensMaxPx * dpi;
+        const float lensMax = lens.capPx;
         dR = SoftLensCap(dR, lensMax);
         dG = SoftLensCap(dG, lensMax);
         dB = SoftLensCap(dB, lensMax);
-        const float lensRimFade = smoothstep(0.0, kLensRimFadePx * dpi, insideDistance);
+        const float lensRimFade = smoothstep(0.0, lens.rimFadePx, insideDistance);
         dR *= lensRimFade;
         dG *= lensRimFade;
         dB *= lensRimFade;
@@ -840,12 +941,13 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
     const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
     const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
-    float slopeMag = 0.65 * slopeN;
+    const LensGeo lens = GetLensGeo(PhysicalGlassPanel(isPanel, dockStyle), bevelWidth, dpi);
+    float slopeMag = lens.slopeScale * slopeN;
     const float fxBits = scene1.x;
     const float lensOn = FxEnabled(fxBits, 2.0);
     const float dispOn = FxEnabled(fxBits, 4.0);
     slopeMag *= IconHaloDamp(IconHaloCalm(pixel, dpi), isPanel && !dockStyle);
-    const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
+    const float thicknessPx = (0.35 + 0.65 * height01) * lens.thickScale;
     const float thetaS = atan(slopeMag);
     const float sinS = sin(thetaS);
     const float sinRR = clamp(sinS / 1.5143, 0.0, 0.999);
@@ -854,19 +956,19 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float thetaRR = asin(sinRR);
     const float thetaRG = asin(sinRG);
     const float thetaRB = asin(sinRB);
-    float dR = thicknessPx * tan(max(thetaS - thetaRR, 0.0)) * kLensGain * lensOn;
-    float dG = thicknessPx * tan(max(thetaS - thetaRG, 0.0)) * kLensGain * lensOn;
-    float dB = thicknessPx * tan(max(thetaS - thetaRB, 0.0)) * kLensGain * lensOn;
+    float dR = SlabPull(thicknessPx, thetaS, sinS, 1.5143, lens.gapPx) * lens.gain * lensOn;
+    float dG = SlabPull(thicknessPx, thetaS, sinS, 1.5168, lens.gapPx) * lens.gain * lensOn;
+    float dB = SlabPull(thicknessPx, thetaS, sinS, 1.5224, lens.gapPx) * lens.gain * lensOn;
     dR = dG + (dR - dG) * kFringeBoost;
     dB = dG + (dB - dG) * kFringeBoost;
     dR = lerp(dG, dR, dispOn);
     dB = lerp(dG, dB, dispOn);
     // Must stay identical to GlassPS above (see SoftLensCap / kLensMaxPx).
-    const float lensMaxFrost = kLensMaxPx * dpi;
+    const float lensMaxFrost = lens.capPx;
     dR = SoftLensCap(dR, lensMaxFrost);
     dG = SoftLensCap(dG, lensMaxFrost);
     dB = SoftLensCap(dB, lensMaxFrost);
-    const float lensRimFadeFrost = smoothstep(0.0, kLensRimFadePx * dpi, insideDistance);
+    const float lensRimFadeFrost = smoothstep(0.0, lens.rimFadePx, insideDistance);
     dR *= lensRimFadeFrost;
     dG *= lensRimFadeFrost;
     dB *= lensRimFadeFrost;
