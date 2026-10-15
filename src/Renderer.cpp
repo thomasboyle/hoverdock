@@ -3812,7 +3812,10 @@ void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
         const float W = 0.90F;
         const float B = 0.90F;
         const float fillA = 0.35F;
-        const bool black = false;        // Regular style scaling laws: A = -min(0.8 s, 60), h = min(0.25 s, 20),
+        // gain: fixed face + refraction signature (see CcGlass).
+        const float gain = 0.6F;
+        const bool black = false;
+        // Regular style scaling laws: A = -min(0.8 s, 60), h = min(0.25 s, 20),
         // blur r = clamp(2 + (s-48)/56, 2, 4), sigma = 2 r (pt).
         const float amountPt = (std::min)(0.8F * sPt, 60.0F);
         const float heightPt = (std::min)(0.25F * sPt, 20.0F);
@@ -3832,7 +3835,8 @@ void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
         b.iconRect[1] = B;
         b.iconRect[2] = fillA;
         b.iconRect[3] = black ? 1.0F : 0.0F;
-        b.iconMeta[0] = b.iconMeta[1] = b.iconMeta[2] = b.iconMeta[3] = 0.0F;
+        b.iconMeta[0] = gain;
+        b.iconMeta[1] = b.iconMeta[2] = b.iconMeta[3] = 0.0F;
         const float base = B + (W - B) * x;
         const float fill = black ? 0.0F : 1.0F;
         m_ccFaceLuma.push_back(base + (fill - base) * fillA);

@@ -472,9 +472,28 @@ float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
 //   [2i].iconRect = centre x, centre y, half w, half h (output px)
 //   [2i].iconMeta = corner radius, |A| refraction px, h bevel px, blur px
 //   [2i+1].iconRect = W, B, fill alpha, fill black(1)/white(0)
-// scene1.z carries 100 + shape count (the dock path uses scene1.z as a 0/1\n// dev-bounds flag and its packed fx word overlaps every low bit, so the CC path\n// is keyed on scene1.z alone). Shape 0 is the panel, later shapes sit on
+// scene1.z carries 100 + shape count (the dock path uses scene1.z as a 0/1
+// dev-bounds flag and its packed fx word overlaps every low bit, so the CC path
+// is keyed on scene1.z alone). Shape 0 is the panel, later shapes sit on
 // top. Lens depends only on distance from each shape's edge.
 // ---------------------------------------------------------------------------
+// CC blur axis: kGaussW has sigma = 8 taps (truncated at 2 sigma), so tap
+// spacing = blurPx/16 gives sigma_px = blurPx/2 = the spec sigma (2 r pt).
+float3 CcSampleAxis(Texture2D tex, float2 uv, float2 texel, float blurPx, float2 axis)
+{
+    const float2 lo = texel * 0.5;
+    const float2 hi = 1.0 - texel * 0.5;
+    const float step = max(blurPx * 0.0625, 0.25);
+    float3 acc = tex.Sample(linearClamp, clamp(uv, lo, hi)).rgb * kGaussW[0];
+    [unroll]
+    for (int k = 1; k <= 16; ++k)
+    {
+        const float2 off = axis * (float(k) * step) * texel;
+        acc += (tex.Sample(linearClamp, clamp(uv + off, lo, hi)).rgb +
+            tex.Sample(linearClamp, clamp(uv - off, lo, hi)).rgb) * kGaussW[k];
+    }
+    return acc;
+}
 float SdRoundRectCc(float2 p, float2 halfSize, float r)
 {
     const float2 q = abs(p) - halfSize + r;
@@ -560,9 +579,20 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
             const float disp = a.iconMeta.y * (1.0 - sqrt(max(1.0 - t * t, 0.0))) *
                 smoothstep(0.5 * dpi, 1.0 * dpi, d);
             const float2 uv = clamp((pixel - nOut * disp) * texel, lo, hi);
-            const float3 c = SampleGlassAxis(blurTemp, uv, uv, uv, texel, a.iconMeta.w, float2(0.0, 1.0));
+            const float3 c = CcSampleAxis(blurTemp, uv, texel, a.iconMeta.w, float2(0.0, 1.0));
             const float3 fillRgb = b.iconRect.w > 0.5 ? float3(0.0, 0.0, 0.0) : float3(1.0, 1.0, 1.0);
-            color = lerp(b.iconRect.y + (b.iconRect.x - b.iconRect.y) * c, fillRgb, b.iconRect.z);
+            // gain > 0: the face is a fixed colour plus the refraction signature
+            // (displaced minus undisplaced blurred backdrop), so the lens stays
+            // visible while uniform backdrops give an identical face.
+            const float gain = b.iconMeta.x;
+            float3 face = b.iconRect.y + (b.iconRect.x - b.iconRect.y) * c;
+            if (gain > 0.0)
+            {
+                const float2 uv0 = clamp(pixel * texel, lo, hi);
+                const float3 c0 = CcSampleAxis(blurTemp, uv0, texel, a.iconMeta.w, float2(0.0, 1.0));
+                face += gain * (c - c0);
+            }
+            color = lerp(saturate(face), fillRgb, b.iconRect.z);
         }
         else
         {
@@ -1091,7 +1121,8 @@ float4 BlurHPS(VertexOutput input) : SV_Target
     float2 uvB;
     float blurPx;
     ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
-    const float3 h = SampleGlassAxis(backdropTexture, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
+    const float3 h = (scene1.z > 50.0) ? CcSampleAxis(backdropTexture, uvR, texel, blurPx, float2(1.0, 0.0))
+        : SampleGlassAxis(backdropTexture, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
     return float4(h, 1.0);
 }
 
@@ -1105,7 +1136,8 @@ float4 BlurVPS(VertexOutput input) : SV_Target
     float2 uvB;
     float blurPx;
     ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
-    const float3 v = SampleGlassAxis(blurTemp, uvR, uvG, uvB, texel, blurPx, float2(0.0, 1.0));
+    const float3 v = (scene1.z > 50.0) ? CcSampleAxis(blurTemp, uvR, texel, blurPx, float2(0.0, 1.0))
+        : SampleGlassAxis(blurTemp, uvR, uvG, uvB, texel, blurPx, float2(0.0, 1.0));
     return float4(v, 1.0);
 }
 
@@ -1120,7 +1152,8 @@ float4 BlurHPS2(VertexOutput input) : SV_Target
     float2 uvB;
     float blurPx;
     ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
-    const float3 h = SampleGlassAxis(blurTemp2, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
+    const float3 h = (scene1.z > 50.0) ? CcSampleAxis(blurTemp2, uvR, texel, blurPx, float2(1.0, 0.0))
+        : SampleGlassAxis(blurTemp2, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
     return float4(h, 1.0);
 }
 
