@@ -743,6 +743,9 @@ uint8_t g_flyoutInkR = DOCK_INK_R;
 uint8_t g_flyoutInkG = DOCK_INK_G;
 uint8_t g_flyoutInkB = DOCK_INK_B;
 
+// Soft dark halo behind flyout text (no plate): set around text that sits on bare glass.
+bool g_flyoutTextHalo = false;
+
 void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept {
     g_flyoutInkR = r;
     g_flyoutInkG = g;
@@ -1062,6 +1065,45 @@ bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, REC
             bm.bmBitsPixel == 32) {
             auto* bits = static_cast<uint8_t*>(bm.bmBits);
             LinearCoverageToPremulInk(bits, width, height, bm.bmWidthBytes, gray);
+            if (g_flyoutTextHalo) {
+                // Blurred (r=2, two passes) copy of the glyph alpha as a dark shadow under the ink.
+                std::vector<float> a(static_cast<size_t>(width) * static_cast<size_t>(height));
+                for (int y = 0; y < height; ++y) {
+                    const uint8_t* row = bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes);
+                    for (int x = 0; x < width; ++x) {
+                        a[static_cast<size_t>(y) * width + x] = row[x * 4 + 3] / 255.0F;
+                    }
+                }
+                std::vector<float> tmp(a.size());
+                for (int pass = 0; pass < 2; ++pass) {
+                    for (int y = 0; y < height; ++y) {
+                        for (int x = 0; x < width; ++x) {
+                            float s = 0.0F;
+                            for (int k = -2; k <= 2; ++k) {
+                                const int xx = std::clamp(x + k, 0, width - 1);
+                                s += a[static_cast<size_t>(y) * width + xx];
+                            }
+                            tmp[static_cast<size_t>(y) * width + x] = s / 5.0F;
+                        }
+                    }
+                    for (int y = 0; y < height; ++y) {
+                        for (int x = 0; x < width; ++x) {
+                            float s = 0.0F;
+                            for (int k = -2; k <= 2; ++k) {
+                                const int yy = std::clamp(y + k, 0, height - 1);
+                                s += tmp[static_cast<size_t>(yy) * width + x];
+                            }
+                            a[static_cast<size_t>(y) * width + x] = s / 5.0F;
+                        }
+                    }
+                }
+                std::vector<uint8_t> shadow(a.size() * 4U, 0);
+                for (size_t i = 0; i < a.size(); ++i) {
+                    shadow[i * 4U + 3U] = static_cast<uint8_t>(std::clamp(a[i] * 1.8F, 0.0F, 0.62F) * 255.0F);
+                }
+                CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, shadow.data(),
+                    width, height);
+            }
             // CompositePremul expects tightly packed rows; copy if stride padded.
             if (bm.bmWidthBytes == width * 4) {
                 CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, bits, width,
@@ -7752,11 +7794,7 @@ void DockApp::PaintSettingsPopup() {
     }
 
     LONG y = padding;
-    {
-        const RECT titlePlate{padding, y, panelWidth - padding, y + headerHeight};
-        FillSquircleColorPremul(pixels, width, height, titlePlate,
-            ContentSquircleRadius(titlePlate, scale), 0.72F, 32, 34, 40);
-    }
+    g_flyoutTextHalo = true;  // soft dark halo instead of plates (legible on bright glass)
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
     DrawFlyoutText(pixels, width, height, titleBounds, titleFont, L"Dock Settings",
         DT_LEFT | DT_VCENTER | DT_SINGLELINE, 250);
@@ -7776,10 +7814,8 @@ void DockApp::PaintSettingsPopup() {
     const LONG subHeight = std::max(14L, std::lround(16.0F * scale));
     for (const SettingsRow& row : rows) {
         const RECT rowBounds{padding, y, panelWidth - padding, y + rowHeight};
-        // Dark tile (same as the Quick Settings tiles) so light ink stays legible on
-        // the dock-tint glass over bright wallpapers.
-        FillSquircleColorPremul(pixels, width, height, rowBounds,
-            ContentSquircleRadius(rowBounds, scale), 0.72F, 32, 34, 40);
+        FillSquirclePremul(pixels, width, height, rowBounds, ContentSquircleRadius(rowBounds, scale),
+            0.10F);
         if (row.slider) {
             const LONG sliderLeft = padding + 4L;
             const LONG sliderRight = panelWidth - padding - 4L;
@@ -7838,13 +7874,7 @@ void DockApp::PaintSettingsPopup() {
 
     std::string current = Updater::CurrentVersion();
     std::wstring wideVersion(current.begin(), current.end());
-    {
-        const RECT footPlate{padding, y - 2L, panelWidth - padding,
-            y + 2L * subHeight + 12L};
-        FillSquircleColorPremul(pixels, width, height, footPlate,
-            ContentSquircleRadius(footPlate, scale), 0.72F, 32, 34, 40);
-    }
-    RECT versionBounds{padding + 6L, y, panelWidth - padding - 6L, y + subHeight};
+    RECT versionBounds{padding, y, panelWidth - padding, y + subHeight};
     DrawFlyoutText(pixels, width, height, versionBounds, statusFont,
         L"Hoverdock v" + wideVersion, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
     RECT statusBounds{padding, versionBounds.bottom + 2, panelWidth - padding,
@@ -7870,6 +7900,7 @@ void DockApp::PaintSettingsPopup() {
         }
     }
 
+    g_flyoutTextHalo = false;
     const size_t bytes = pixelCount * 4U;
     m_settingsBaseBits.resize(bytes);
     std::memcpy(m_settingsBaseBits.data(), pixels, bytes);
