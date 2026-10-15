@@ -3930,7 +3930,7 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         // 5H+4V here + GlassPS final V at full frost).
         float panelFrostAmt =
             static_cast<float>((fxFlags >> 16) & 0xFFu) / 255.0F;
-        if ((fxFlags & DOCK_FX_DOCK_FACE) != 0) {
+        if ((fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
             panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
         }
         blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurPipeline.Get());
@@ -4379,7 +4379,7 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
 
         float panelFrostAmt =
             static_cast<float>((fxFlags >> 16) & 0xFFu) / 255.0F;
-        if ((fxFlags & DOCK_FX_DOCK_FACE) != 0) {
+        if ((fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
             panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
         }
         blurPass(m_panelBlurTemp.Get(), blurTempIsSrv, 0, 2, m_blurPipeline.Get());

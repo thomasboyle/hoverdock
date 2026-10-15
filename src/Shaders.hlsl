@@ -184,11 +184,34 @@ float FxEnabled(float packed, float bit)
 // Bevel (lens band) width. Context panels refract as one full-face slab. The
 // dock, and text panels (DOCK_FX_DOCK_FACE), confine the lens to an edge band
 // so the center stays flat. Shared by GlassPS and ComputeFrostUVs.
+// True for the dock itself and for dock-face panels (Quick Settings, Dock
+// Settings, overflow): they share the dock's silhouette function, lens band,
+// frost, tint, rim and shadow code. Charcoal context menus and hover labels
+// keep the older panel path.
+bool DockStyleFace()
+{
+    const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
+    const float labelFace = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_LABEL_FACE);
+    const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE) * (1.0 - labelFace);
+        return panelOn < 0.5 || textPanel > 0.5;
+}
+
+// Dock-face panel geometry: same superellipse SDF + analytic normal as the
+// dock (Dock27Shape), parameterised by the panel's half size and corner
+// radius instead of the dock's icon-size ratios. The rim/outer-line scale S
+// is the dock's reference size at this DPI so the rim reads identically.
+void DockPanelShape(float2 pixel, float2 outputSize, float dpi, float2 halfSize,
+    float cornerRadius, out float iconS, out float distance, out float2 nrm)
+{
+    iconS = kDock27RefS * dpi;
+    distance = SdSquircleRectN(pixel - outputSize * 0.5, halfSize, cornerRadius, kDock27CornerN, nrm);
+}
+
 float GlassBevelWidth(float2 halfSize, float cornerRadius, float dpi, bool isPanel)
 {
     const float faceBevel = max(min(halfSize.x, halfSize.y) * 0.95, 8.0 * dpi);
     const float edgeBevel = clamp(cornerRadius * 1.1, 8.0 * dpi, faceBevel);
-    if (!isPanel)
+    if (!isPanel || DockStyleFace())
     {
         return edgeBevel;
     }
@@ -384,6 +407,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float labelFace = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_LABEL_FACE);
     const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE) * (1.0 - labelFace);
     const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE)) * (1.0 - labelFace);
+    const bool dockStyle = !isPanel || textPanel > 0.5;
     const float marginDev = max(1.0 - panelOn, popupShadowOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     // Panels: shared DOCK_CORNER_RADIUS_PT squircle (n=4). Dock: macOS 27
     // silhouette (Dock27Shape) with an analytic outward normal.
@@ -396,13 +420,17 @@ float4 GlassPS(VertexOutput input) : SV_Target
     {
         Dock27Shape(pixel, outputSize, dpi, halfSize, dockS, cornerRadius, distance, dockNrm);
     }
+    else if (dockStyle)
+    {
+        DockPanelShape(pixel, outputSize, dpi, halfSize, cornerRadius, dockS, distance, dockNrm);
+    }
     const float aa = 1.35 * dpi;
     // Dock: crisp 1 px coverage (the spec edge is a 0.5-coverage crossing).
-    const float mask = isPanel ? 1.0 - smoothstep(-aa, aa, distance) : saturate(0.5 - distance);
+    const float mask = !dockStyle ? 1.0 - smoothstep(-aa, aa, distance) : saturate(0.5 - distance);
     // SDF gradient = 2D surface direction (CASDFLayer-style). ddx/ddy gives
     // screen-space analytic derivatives of the SDF field.
     const float2 screenGradient = float2(ddx(distance), ddy(distance));
-    const float2 gradient = isPanel ? screenGradient : dockNrm;
+    const float2 gradient = !dockStyle ? screenGradient : dockNrm;
     // Per-effect master switches (dock settings, default all on). Decoded
     // from the scene1.x bitmask; each gates exactly one pipeline stage.
     // Declared before the shadow early-out so every branch can use them.
@@ -420,7 +448,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     const float thickOn = FxEnabled(fxBits, 128.0);
     if (mask <= 0.0)
     {
-        if (!isPanel)
+        if (dockStyle)
         {
             // Dock: faint dark hairline just outside the edge, combined with
             // the downward contact shade when that effect is on.
@@ -510,11 +538,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // instead of crowding glyphs. (Icons are opaque and drawn undisplaced
     // on top regardless; this stills the glass around them.) Tint and frost
     // are untouched - only the visible warp calms.
-    const float haloDamp = IconHaloDamp(IconHaloCalm(pixel, dpi), isPanel);
+    const float haloDamp = IconHaloDamp(IconHaloCalm(pixel, dpi), isPanel && !dockStyle);
     slopeMag *= haloDamp;
     // Panels also calm rim lights near glyphs; the dock keeps its rim
     // highlight continuous around the silhouette.
-    const float rimLightDamp = isPanel ? haloDamp : 1.0;
+    const float rimLightDamp = (isPanel && !dockStyle) ? haloDamp : 1.0;
     // Slab thickness T(x) = T0 + B*f(x), T0 = 0.35*bevel, B = 0.65*bevel.
     const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
@@ -524,9 +552,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     float frostCore;
     // Panels keep a minimum mica dissolve so busy wallpaper detail cannot
     // fight glyphs even when the user parks Frost near clear.
+    // Dock-face panels follow the dock's Frost slider exactly (no floor).
     const float panelFrost = max(frostAmount,
         max(charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR,
-            textPanel * DOCK_TEXT_PANEL_FROST_FLOOR));
+            (dockStyle ? 0.0 : textPanel * DOCK_TEXT_PANEL_FROST_FLOOR)));
     FrostMicaRadii(panelFrost, frostRim, frostCore);
 
     float3 frostedBackground;
@@ -619,20 +648,25 @@ float4 GlassPS(VertexOutput input) : SV_Target
         }
     }
 
-    // ---- macOS 27 dock material -------------------------------------------
+    // ---- macOS 27 dock material (dock + dock-face panels) -----------------
     // fill = cool white tint (165,162,193) at ~29% over the backdrop; rim is a
     // white additive overlay out = fill + R (1 - fill) with the spec's n_y^2
     // band light (crisp core + soft inner glow); faint dark line outside.
-    if (!isPanel)
+    if (dockStyle)
     {
         const float rimR = Dock27Rim(-distance, dockNrm, dockS) * rimGain;
         // Always on: the Tint toggle never fed the old dock face either.
-        const float tintA = kDock27TintAlpha;
+        // Light mode (panel-only toggle, scene0.w) is the one parameter that
+        // differs: it lifts the same tint layer toward a light plate so dark
+        // ink stays legible. Dock and Light-off panels use the dock constants.
+        const float lightP = isPanel ? saturate(scene0.w) : 0.0;
+        const float tintA = lerp(kDock27TintAlpha, 0.80, lightP);
+        const float3 tintC = lerp(kDock27Tint, float3(0.95, 0.96, 0.98), lightP);
         float3 inside;
         float insideAlpha;
         if (hasBackdrop)
         {
-            const float3 fill = lerp(frostedBackground, kDock27Tint, tintA);
+            const float3 fill = lerp(frostedBackground, tintC, tintA);
             inside = fill + rimR * (1.0 - fill);
             insideAlpha = 1.0;
         }
@@ -641,7 +675,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
             // No live capture: composite the same two layers over the
             // desktop directly (tint at tintA, then white at R).
             insideAlpha = rimR + (1.0 - rimR) * tintA;
-            inside = (rimR + (1.0 - rimR) * tintA * kDock27Tint) / max(insideAlpha, 1e-4);
+            inside = (rimR + (1.0 - rimR) * tintA * tintC) / max(insideAlpha, 1e-4);
         }
         const float glint = saturate(scene2.z) * specOn;
         if (glint > 0.0)
@@ -784,12 +818,18 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
     float dockS = 1.0;
     float2 dockNrm = float2(0.0, 1.0);
+    const float textPanelF = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE) * (1.0 - labelFace);
+    const bool dockStyle = !isPanel || textPanelF > 0.5;
     if (!isPanel)
     {
         Dock27Shape(pixel, outputSize, dpi, halfSize, dockS, cornerRadius, distance, dockNrm);
     }
+    else if (dockStyle)
+    {
+        DockPanelShape(pixel, outputSize, dpi, halfSize, cornerRadius, dockS, distance, dockNrm);
+    }
     const float2 screenGradient = float2(ddx(distance), ddy(distance));
-    const float2 gradient = isPanel ? screenGradient : dockNrm;
+    const float2 gradient = !dockStyle ? screenGradient : dockNrm;
     const float2 texel = 1.0 / outputSize;
     const float2 uv = pixel * texel;
     const float2 outward = gradient / max(length(gradient), 0.0001);
@@ -804,7 +844,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float fxBits = scene1.x;
     const float lensOn = FxEnabled(fxBits, 2.0);
     const float dispOn = FxEnabled(fxBits, 4.0);
-    slopeMag *= IconHaloDamp(IconHaloCalm(pixel, dpi), isPanel);
+    slopeMag *= IconHaloDamp(IconHaloCalm(pixel, dpi), isPanel && !dockStyle);
     const float thicknessPx = (0.35 + 0.65 * height01) * bevelWidth;
     const float thetaS = atan(slopeMag);
     const float sinS = sin(thetaS);
@@ -841,7 +881,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE) * (1.0 - labelFace);
     const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE)) * (1.0 - labelFace);
     FrostMicaRadii(max(frostAmt, max(charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR,
-        textPanel * DOCK_TEXT_PANEL_FROST_FLOOR)), micaRim, micaCore);
+        (dockStyle ? 0.0 : textPanel * DOCK_TEXT_PANEL_FROST_FLOOR))), micaRim, micaCore);
     blurPx = lerp(micaRim, micaCore, height01) * dpi;
 }
 
