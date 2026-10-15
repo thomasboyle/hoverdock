@@ -3868,7 +3868,7 @@ void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
         m_ccFaceLuma.push_back(base + (fill - base) * fillA);
     }
     m_panelIconInstances->Unmap(0, nullptr);
-    m_panelMappedConstants->scene1[2] = static_cast<float>(count);
+    m_panelMappedConstants->scene1[2] = 100.0F + static_cast<float>(count);
 }
 bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, UINT fxFlags,
     float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC,

@@ -472,7 +472,7 @@ float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
 //   [2i].iconRect = centre x, centre y, half w, half h (output px)
 //   [2i].iconMeta = corner radius, |A| refraction px, h bevel px, blur px
 //   [2i+1].iconRect = W, B, fill alpha, fill black(1)/white(0)
-// scene1.z carries the shape count. Shape 0 is the panel, later shapes sit on
+// scene1.z carries 100 + shape count (the dock path uses scene1.z as a 0/1\n// dev-bounds flag and its packed fx word overlaps every low bit, so the CC path\n// is keyed on scene1.z alone). Shape 0 is the panel, later shapes sit on
 // top. Lens depends only on distance from each shape's edge.
 // ---------------------------------------------------------------------------
 float SdRoundRectCc(float2 p, float2 halfSize, float r)
@@ -483,7 +483,7 @@ float SdRoundRectCc(float2 p, float2 halfSize, float r)
 
 uint CcShapeCount()
 {
-    return min((uint)(scene1.z + 0.5), 48u);
+    return min((uint)(scene1.z - 100.0 + 0.5), 48u);
 }
 
 // Blur width (px, SampleGlassAxis units) of the topmost shape under a pixel.
@@ -582,7 +582,7 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
 }
 float4 GlassPS(VertexOutput input) : SV_Target
 {
-    if (FxEnabled(scene1.x, (float)DOCK_FX_CC) > 0.5)
+    if (scene1.z > 50.0)
     {
         return CcGlass(input.position.xy, scene0.xy, max(scene1.y, 1.0));
     }
@@ -993,7 +993,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
 void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     out float2 uvR, out float2 uvG, out float2 uvB, out float blurPx)
 {
-    if (FxEnabled(scene1.x, (float)DOCK_FX_CC) > 0.5)
+    if (scene1.z > 50.0)
     {
         const float2 ccUv = clamp(pixel / outputSize, 0.5 / outputSize, 1.0 - 0.5 / outputSize);
         uvR = ccUv;
