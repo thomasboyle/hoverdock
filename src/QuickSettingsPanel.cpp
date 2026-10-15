@@ -54,6 +54,7 @@ void FillSquirclePremul(uint8_t* dest, int destWidth, int destHeight, RECT bound
 float ContentSquircleRadius(const RECT& bounds, float scale) noexcept;
 void RemapPremulInkColor(std::vector<uint8_t>& pixels, uint8_t r, uint8_t g, uint8_t b);
 void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept;
+extern bool g_flyoutTextHalo;
 extern uint8_t g_flyoutInkR;
 extern uint8_t g_flyoutInkG;
 extern uint8_t g_flyoutInkB;
@@ -2943,8 +2944,10 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             rightLimit = toggle.left - 4;
         }
         const LONG titleLeft = m_qsPage == QuickSettingsPage::Home ? padding : padding + headerHeight;
+        dock_detail::g_flyoutTextHalo = gear;  // Home title sits on bare glass
         text({titleLeft, y, rightLimit, y + headerHeight}, titleFont, title,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+        dock_detail::g_flyoutTextHalo = false;
         y += headerHeight;
     };
     auto section = [&](const wchar_t* label) {

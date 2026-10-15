@@ -743,6 +743,9 @@ uint8_t g_flyoutInkR = DOCK_INK_R;
 uint8_t g_flyoutInkG = DOCK_INK_G;
 uint8_t g_flyoutInkB = DOCK_INK_B;
 
+// Soft dark halo behind flyout text (no plate): set around text that sits on bare glass.
+bool g_flyoutTextHalo = false;
+
 void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept {
     g_flyoutInkR = r;
     g_flyoutInkG = g;
@@ -1062,6 +1065,45 @@ bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, REC
             bm.bmBitsPixel == 32) {
             auto* bits = static_cast<uint8_t*>(bm.bmBits);
             LinearCoverageToPremulInk(bits, width, height, bm.bmWidthBytes, gray);
+            if (g_flyoutTextHalo) {
+                // Blurred (r=2, two passes) copy of the glyph alpha as a dark shadow under the ink.
+                std::vector<float> a(static_cast<size_t>(width) * static_cast<size_t>(height));
+                for (int y = 0; y < height; ++y) {
+                    const uint8_t* row = bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes);
+                    for (int x = 0; x < width; ++x) {
+                        a[static_cast<size_t>(y) * width + x] = row[x * 4 + 3] / 255.0F;
+                    }
+                }
+                std::vector<float> tmp(a.size());
+                for (int pass = 0; pass < 2; ++pass) {
+                    for (int y = 0; y < height; ++y) {
+                        for (int x = 0; x < width; ++x) {
+                            float s = 0.0F;
+                            for (int k = -2; k <= 2; ++k) {
+                                const int xx = std::clamp(x + k, 0, width - 1);
+                                s += a[static_cast<size_t>(y) * width + xx];
+                            }
+                            tmp[static_cast<size_t>(y) * width + x] = s / 5.0F;
+                        }
+                    }
+                    for (int y = 0; y < height; ++y) {
+                        for (int x = 0; x < width; ++x) {
+                            float s = 0.0F;
+                            for (int k = -2; k <= 2; ++k) {
+                                const int yy = std::clamp(y + k, 0, height - 1);
+                                s += tmp[static_cast<size_t>(yy) * width + x];
+                            }
+                            a[static_cast<size_t>(y) * width + x] = s / 5.0F;
+                        }
+                    }
+                }
+                std::vector<uint8_t> shadow(a.size() * 4U, 0);
+                for (size_t i = 0; i < a.size(); ++i) {
+                    shadow[i * 4U + 3U] = static_cast<uint8_t>(std::clamp(a[i] * 1.8F, 0.0F, 0.62F) * 255.0F);
+                }
+                CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, shadow.data(),
+                    width, height);
+            }
             // CompositePremul expects tightly packed rows; copy if stride padded.
             if (bm.bmWidthBytes == width * 4) {
                 CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, bits, width,
@@ -7477,9 +7519,6 @@ void DockApp::PaintSettingsPopup() {
         float amount;
     };
     const SettingsRow rows[] = {
-        {SettingsHitKind::LightPanels, L"Light mode",
-            L"Light glass for Quick Settings and Dock Settings", false, m_config.LightPanels(),
-            0.0F},
         {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows", false,
             m_config.LaunchAtStartup(), 0.0F},
         {SettingsHitKind::Updates, L"Check for updates", L"Auto-download and install builds", false,
@@ -7755,6 +7794,7 @@ void DockApp::PaintSettingsPopup() {
     }
 
     LONG y = padding;
+    g_flyoutTextHalo = true;  // soft dark halo instead of plates (legible on bright glass)
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
     DrawFlyoutText(pixels, width, height, titleBounds, titleFont, L"Dock Settings",
         DT_LEFT | DT_VCENTER | DT_SINGLELINE, 250);
@@ -7860,6 +7900,7 @@ void DockApp::PaintSettingsPopup() {
         }
     }
 
+    g_flyoutTextHalo = false;
     const size_t bytes = pixelCount * 4U;
     m_settingsBaseBits.resize(bytes);
     std::memcpy(m_settingsBaseBits.data(), pixels, bytes);

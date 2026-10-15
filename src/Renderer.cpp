@@ -3242,6 +3242,13 @@ void Renderer::StampDockBackdropInto(const RECT& panel, uint8_t* panelPixels) co
     if (IntersectRect(&overlap, &panel, &dock) == FALSE) {
         return;
     }
+    // The backdrop DIB can be larger than the dock HWND (label/popup headroom) and holds
+    // unfilled black there; only the HWND itself is a dock-glass overlap to replace.
+    RECT dockWindow{};
+    if (m_window != nullptr && GetWindowRect(m_window, &dockWindow) != FALSE &&
+        IntersectRect(&overlap, &overlap, &dockWindow) == FALSE) {
+        return;
+    }
     const int panelWidth = static_cast<int>(panel.right - panel.left);
     const int byteCount = static_cast<int>(overlap.right - overlap.left) * 4;
     if (panelWidth <= 0 || byteCount <= 0) {

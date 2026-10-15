@@ -1256,8 +1256,11 @@ void DockConfig::SetDepthShade(bool enabled) noexcept {
     m_depthShade = enabled;
 }
 
+// Quick Settings / Dock Settings always use the dock's own glass tint with light ink;
+// the old light plate made them milky next to the dock. The ini key is still parsed
+// (and written back) for compatibility but no longer has any effect.
 bool DockConfig::LightPanels() const noexcept {
-    return m_lightPanels;
+    return false;
 }
 
 void DockConfig::SetLightPanels(bool enabled) noexcept {
