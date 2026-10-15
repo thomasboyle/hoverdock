@@ -953,6 +953,12 @@ private:
     // Set when a new reading arrives; the next fast present restores/redraws
     // the value rects. Mic-meter frames leave them untouched.
     bool m_qsTempsDirty = false;
+    uint8_t m_qsMeterInkR = 33;
+    uint8_t m_qsMeterInkG = 34;
+    uint8_t m_qsMeterInkB = 36;
+    uint8_t m_qsScrubInkR = 33;
+    uint8_t m_qsScrubInkG = 34;
+    uint8_t m_qsScrubInkB = 36;
     uint8_t m_qsTempsInkR = 0;
     uint8_t m_qsTempsInkG = 0;
     uint8_t m_qsTempsInkB = 0;
@@ -977,6 +983,15 @@ private:
     // When true, LayoutQuickSettings paints meter/scrub tracks at empty levels and
     // records their rects for PaintOverflowLiveFast.
     bool m_qsPaintUnderlayPass = false;
+    // macOS 26 Control Centre glass shapes (content coords, shape 0 = panel).
+    // Filled by every LayoutQuickSettings pass; baked by the renderer (DOCK_FX_CC).
+    struct QsCcShape {
+        RECT bounds{};
+        float radius = 0.0F;
+    };
+    std::vector<QsCcShape> m_qsCcShapes;
+    uint64_t m_overflowGlassCcHash = 0;
+    uint64_t m_qsCcInkSig = 0;
     LayerPresentDib m_overflowLayerDib{};
     ULONGLONG m_lastOverflowHoverPresentMs = 0;
     RECT m_overflowHoverDirty{};

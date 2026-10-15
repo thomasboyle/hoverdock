@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <Windows.h>
 #include <d3d12.h>
@@ -138,6 +138,18 @@ public:
         HWND excludeC, bool lightPlate, int tag = -1, bool* skippedUnchanged = nullptr);
     [[nodiscard]] bool TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra, int* tag = nullptr);
     [[nodiscard]] bool IsLiveGlassPanelPending() const noexcept;
+    // macOS 26 Control Centre glass shapes for the panel bake (window px). Shape 0
+    // is the panel, later shapes are tiles. Used when fxFlags carries DOCK_FX_CC.
+    struct CcShapeDesc {
+        float cx = 0.0F;
+        float cy = 0.0F;
+        float hw = 0.0F;
+        float hh = 0.0F;
+        float radius = 0.0F;
+    };
+    void SetCcShapes(const std::vector<CcShapeDesc>& shapes) { m_ccShapes = shapes; }
+    // Estimated face luminance per shape from the last CC bake (drives ink choice).
+    [[nodiscard]] const std::vector<float>& CcFaceLuma() const noexcept { return m_ccFaceLuma; }
     void CancelLiveGlassPanelBake() noexcept;
     // Increments only when CaptureBackdrop uploads new pixels (desktop changed).
     [[nodiscard]] uint64_t BackdropChangeSerial() const noexcept { return m_backdropChangeSerial; }
@@ -413,6 +425,9 @@ private:
     UINT64 m_panelListFence[2] = {};
     UINT64 m_panelFenceValue = 0;
     bool m_panelBakePending = false;
+    std::vector<CcShapeDesc> m_ccShapes;
+    std::vector<float> m_ccFaceLuma;
+    void UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept;
     int m_panelBakeTag = -1;
     UINT m_panelBakeWidth = 0;
     UINT m_panelBakeHeight = 0;

@@ -466,8 +466,126 @@ float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
     return acc;
 }
 
+// ---------------------------------------------------------------------------
+// macOS 26 Control Centre glass (Quick Settings). Shapes live in the panel
+// instance buffer, two IconInstance slots per shape:
+//   [2i].iconRect = centre x, centre y, half w, half h (output px)
+//   [2i].iconMeta = corner radius, |A| refraction px, h bevel px, blur px
+//   [2i+1].iconRect = W, B, fill alpha, fill black(1)/white(0)
+// scene1.z carries the shape count. Shape 0 is the panel, later shapes sit on
+// top. Lens depends only on distance from each shape's edge.
+// ---------------------------------------------------------------------------
+float SdRoundRectCc(float2 p, float2 halfSize, float r)
+{
+    const float2 q = abs(p) - halfSize + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+uint CcShapeCount()
+{
+    return min((uint)(scene1.z + 0.5), 48u);
+}
+
+// Blur width (px, SampleGlassAxis units) of the topmost shape under a pixel.
+float CcBlurPxAt(float2 pixel)
+{
+    const uint n = CcShapeCount();
+    float blurPx = 0.0;
+    for (uint i = 0u; i < 48u; ++i)
+    {
+        if (i >= n)
+        {
+            break;
+        }
+        const IconInstance a = iconInstances[2u * i];
+        const float s = SdRoundRectCc(pixel - a.iconRect.xy, a.iconRect.zw, a.iconMeta.x);
+        if (i == 0u || s < 0.0)
+        {
+            blurPx = a.iconMeta.w;
+        }
+    }
+    return max(blurPx, 1.0);
+}
+
+float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
+{
+    const uint n = CcShapeCount();
+    const float2 texel = 1.0 / outputSize;
+    const float2 lo = texel * 0.5;
+    const float2 hi = 1.0 - texel * 0.5;
+    const bool hasBackdrop = scene1.w > 0.5;
+    float3 accum = float3(0.0, 0.0, 0.0);
+    float alpha = 0.0;
+    float ring = 0.0;
+    for (uint i = 0u; i < 48u; ++i)
+    {
+        if (i >= n)
+        {
+            break;
+        }
+        const IconInstance a = iconInstances[2u * i];
+        const IconInstance b = iconInstances[2u * i + 1u];
+        const float2 centre = a.iconRect.xy;
+        const float2 halfSize = a.iconRect.zw;
+        const float r = a.iconMeta.x;
+        const float s = SdRoundRectCc(pixel - centre, halfSize, r);
+        if (s > 1.6)
+        {
+            continue;
+        }
+        // One-pixel darkened ring just outside the shape (AA edge, no shadow).
+        if (s > 0.0)
+        {
+            ring = max(ring, saturate(1.0 - abs(s - 0.9)) * 0.16);
+        }
+        const float cov = saturate(0.5 - s);
+        if (cov <= 0.0)
+        {
+            continue;
+        }
+        const float d = max(-s, 0.0);
+        // Outward normal from the SDF gradient (central differences).
+        const float e = 0.5;
+        const float2 g = float2(
+            SdRoundRectCc(pixel + float2(e, 0.0) - centre, halfSize, r) -
+                SdRoundRectCc(pixel - float2(e, 0.0) - centre, halfSize, r),
+            SdRoundRectCc(pixel + float2(0.0, e) - centre, halfSize, r) -
+                SdRoundRectCc(pixel - float2(0.0, e) - centre, halfSize, r));
+        const float2 nOut = g / max(length(g), 1e-4);
+        float3 color;
+        if (hasBackdrop)
+        {
+            // Quarter-circle bevel: disp = |A| (1 - sqrt(1 - t^2)), t = 1 - d/h.
+            const float t = saturate(1.0 - d / max(a.iconMeta.z, 1e-3));
+            const float disp = a.iconMeta.y * (1.0 - sqrt(max(1.0 - t * t, 0.0))) *
+                smoothstep(0.5 * dpi, 1.0 * dpi, d);
+            const float2 uv = clamp((pixel - nOut * disp) * texel, lo, hi);
+            const float3 c = SampleGlassAxis(blurTemp, uv, uv, uv, texel, a.iconMeta.w, float2(0.0, 1.0));
+            const float3 fillRgb = b.iconRect.w > 0.5 ? float3(0.0, 0.0, 0.0) : float3(1.0, 1.0, 1.0);
+            color = lerp(b.iconRect.y + (b.iconRect.x - b.iconRect.y) * c, fillRgb, b.iconRect.z);
+        }
+        else
+        {
+            color = float3(0.8, 0.8, 0.82);
+        }
+        // Rim: peaks top-left / bottom-right, minima top-right / bottom-left.
+        const float ang = atan2(-nOut.y, nOut.x);
+        const float rimA = 0.18 + 0.545 * pow(abs(cos(ang - 2.356194)), 1.08);
+        const float band = saturate(1.0 - d / dpi);
+        color = lerp(color, float3(1.0, 1.0, 1.0), rimA * band);
+        accum = color * cov + accum * (1.0 - cov);
+        alpha = cov + alpha * (1.0 - cov);
+    }
+    accum *= (1.0 - ring);
+    alpha = alpha + (1.0 - alpha) * ring;
+    return float4(accum, alpha);
+}
 float4 GlassPS(VertexOutput input) : SV_Target
 {
+    if (FxEnabled(scene1.x, (float)DOCK_FX_CC) > 0.5)
+    {
+        return CcGlass(input.position.xy, scene0.xy, max(scene1.y, 1.0));
+    }
     const float2 outputSize = scene0.xy;
     const float2 pixel = input.position.xy;
     const float dpi = max(scene1.y, 1.0);
@@ -875,6 +993,15 @@ float4 GlassPS(VertexOutput input) : SV_Target
 void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     out float2 uvR, out float2 uvG, out float2 uvB, out float blurPx)
 {
+    if (FxEnabled(scene1.x, (float)DOCK_FX_CC) > 0.5)
+    {
+        const float2 ccUv = clamp(pixel / outputSize, 0.5 / outputSize, 1.0 - 0.5 / outputSize);
+        uvR = ccUv;
+        uvG = ccUv;
+        uvB = ccUv;
+        blurPx = CcBlurPxAt(pixel);
+        return;
+    }
     // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
     const float popupShadowOn = FxEnabled(scene1.x, (float)DOCK_FX_POPUP_SHADOW);
