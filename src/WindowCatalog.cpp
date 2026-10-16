@@ -1550,8 +1550,44 @@ void AppendUniqueCandidate(std::vector<std::wstring>& candidates, const std::wst
     candidates.push_back(candidate);
 }
 
-std::vector<std::wstring> WindowCatalog::IconResolutionCandidates(const PinnedApp& app,
-    HWND runningWindow) {
+std::vector<std::wstring> WindowCatalog::IconFallbackCandidates(const PinnedApp& app) {
+    std::vector<std::wstring> result;
+    const std::wstring exeStem = FileNameWithoutExtension(app.target);
+    std::vector<std::filesystem::path> roots;
+    for (const wchar_t* variable : {L"APPDATA", L"ProgramData"}) {
+        wchar_t buffer[MAX_PATH]{};
+        const DWORD length = GetEnvironmentVariableW(variable, buffer, MAX_PATH);
+        if (length > 0 && length < MAX_PATH) {
+            roots.push_back(std::filesystem::path(buffer) / L"Microsoft" / L"Windows" / L"Start Menu" /
+                L"Programs");
+        }
+    }
+    for (const std::filesystem::path& root : roots) {
+        std::error_code error;
+        std::filesystem::recursive_directory_iterator iterator(
+            root, std::filesystem::directory_options::skip_permission_denied, error);
+        const std::filesystem::recursive_directory_iterator end;
+        for (; !error && iterator != end; iterator.increment(error)) {
+            if (iterator.depth() > 3) {
+                continue;
+            }
+            const std::filesystem::path& path = iterator->path();
+            if (!EndsWithInsensitive(path.wstring(), L".lnk")) {
+                continue;
+            }
+            const std::wstring stem = path.stem().wstring();
+            if ((!app.name.empty() && EqualInsensitive(stem, app.name)) ||
+                (!exeStem.empty() && EqualInsensitive(stem, exeStem))) {
+                AppendUniqueCandidate(result, path.wstring());
+                AppendUniqueCandidate(result, ResolveShortcutTarget(path.wstring()));
+                return result;
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<std::wstring> WindowCatalog::IconResolutionCandidates(const PinnedApp& app,    HWND runningWindow) {
     std::vector<std::wstring> candidates;
     candidates.reserve(12);
 

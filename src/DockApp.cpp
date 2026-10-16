@@ -12183,6 +12183,27 @@ void DockApp::BeginBackgroundRefresh(bool force) {
         return;
     }
 
+    // A pin whose icon extraction failed once (file mid-update, shell handler
+    // hiccup) is retried on a backoff, even when nothing else changed.
+    bool retryIcons = false;
+    if (m_rendererInitialized && now - m_lastIconRetry >= m_iconRetryDelay) {
+        for (const DisplayApp& app : m_displayApps) {
+            if (app.app.target == kDividerTarget || IsLayoutOnlyTarget(app.app.target)) {
+                continue;
+            }
+            if (!m_renderer.HasCachedIconPixels(WindowCatalog::IconCacheKey(app.app))) {
+                retryIcons = true;
+                break;
+            }
+        }
+        if (retryIcons) {
+            m_lastIconRetry = now;
+            m_iconRetryDelay = std::min(m_iconRetryDelay * 2.0, 60.0);
+        } else {
+            m_iconRetryDelay = 4.0;
+        }
+    }
+
     if (m_refreshInFlight.exchange(true)) {
         return;
     }
@@ -12199,7 +12220,7 @@ void DockApp::BeginBackgroundRefresh(bool force) {
         }
     }
 
-    std::thread([this, force, generation, pins, currentApps, iconPixelExtent, cachedIconTargets]() {
+    std::thread([this, force, retryIcons, generation, pins, currentApps, iconPixelExtent, cachedIconTargets]() {
         struct RefreshScope {
             DockApp* app;
             ~RefreshScope() {
@@ -12221,7 +12242,7 @@ void DockApp::BeginBackgroundRefresh(bool force) {
         // Profiles before refresh: enrichment needs the flag set first, and a
         // fresh catalog always starts unenriched.
         windows.RebuildPinProfiles(pins);
-        if (!windows.Refresh() && !force) {
+        if (!windows.Refresh() && !force && !retryIcons) {
             return;
         }
 
@@ -12230,14 +12251,14 @@ void DockApp::BeginBackgroundRefresh(bool force) {
         snapshot.windows = std::move(windows);
         snapshot.catalogEpoch = catalogEpoch;
         snapshot.refreshGeneration = generation;
-        if (!snapshot.layoutChanged && !snapshot.runningChanged) {
+        if (!snapshot.layoutChanged && !snapshot.runningChanged && !retryIcons) {
             if (m_hiddenCatalogEpoch.load(std::memory_order_relaxed) == catalogEpoch) {
                 m_hiddenCatalogDirty.store(false, std::memory_order_relaxed);
             }
             return;
         }
 
-        if (snapshot.layoutChanged || snapshot.runningChanged) {
+        if (snapshot.layoutChanged || snapshot.runningChanged || retryIcons) {
             snapshot.missingIconTargets.clear();
             snapshot.missingIconPixels.clear();
             size_t extracted = 0;
@@ -12260,8 +12281,14 @@ void DockApp::BeginBackgroundRefresh(bool force) {
                     break;
                 }
                 snapshot.missingIconTargets.push_back(key);
-                snapshot.missingIconPixels.push_back(Renderer::ExtractIconPixels(
-                    WindowCatalog::IconResolutionCandidates(app.app, app.runningWindow), iconPixelExtent));
+                std::vector<uint8_t> extractedPixels = Renderer::ExtractIconPixels(
+                    WindowCatalog::IconResolutionCandidates(app.app, app.runningWindow), iconPixelExtent);
+                if (extractedPixels.empty()) {
+                    // Primary chain failed: fall back to the matching Start Menu shortcut.
+                    extractedPixels = Renderer::ExtractIconPixels(
+                        WindowCatalog::IconFallbackCandidates(app.app), iconPixelExtent);
+                }
+                snapshot.missingIconPixels.push_back(std::move(extractedPixels));
                 ++extracted;
             }
         }

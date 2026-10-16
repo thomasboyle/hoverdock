@@ -54,6 +54,9 @@ public:
     [[nodiscard]] static bool TargetsMatch(const std::wstring& left, const std::wstring& right);
     [[nodiscard]] static std::wstring ResolveLauncherProcessPath(const PinnedApp& app);
     [[nodiscard]] static std::wstring IconCacheKey(const PinnedApp& app);
+    // Last-resort icon sources when every primary candidate failed: the Start
+    // Menu shortcut matching the pin name / exe name, plus its target.
+    [[nodiscard]] static std::vector<std::wstring> IconFallbackCandidates(const PinnedApp& app);
     [[nodiscard]] static std::vector<std::wstring> IconResolutionCandidates(const PinnedApp& app,
         HWND runningWindow = nullptr);
     [[nodiscard]] static std::wstring DisplayNameForApp(const PinnedApp& app,
