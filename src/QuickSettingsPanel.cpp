@@ -2784,7 +2784,7 @@ void CcOnAccentInk(uint8_t accentR, uint8_t accentG, uint8_t accentB, uint8_t& r
     uint8_t& b) noexcept {
     const float luma = (0.2126F * static_cast<float>(accentR) + 0.7152F * static_cast<float>(accentG) +
                            0.0722F * static_cast<float>(accentB)) / 255.0F;
-    if (luma > 0.45F) {
+    if (luma > 0.55F) {
         r = 30;
         g = 33;
         b = 24;
