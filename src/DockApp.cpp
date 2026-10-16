@@ -6849,7 +6849,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         // Capsule modules: dark wash over the whole shape.
         SetFlyoutChromeInk(33, 34, 36);
         const float h = static_cast<float>(hit.bounds.bottom - hit.bounds.top);
-        FillSquirclePremul(pixels, width, height, hit.bounds, h * 0.5F, 0.08F);
+        FillSquirclePremul(pixels, width, height, hit.bounds, h * 0.5F, 0.10F);
         break;
     }
     case SettingsHitKind::QsColorReset:
@@ -6857,7 +6857,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         SetFlyoutChromeInk(33, 34, 36);
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
-            0.07F);
+            0.09F);
         break;
     }
     case SettingsHitKind::Startup:
@@ -6878,7 +6878,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         const RECT chip{hit.bounds.left + insetX, hit.bounds.top + insetY, hit.bounds.right - insetX,
             hit.bounds.bottom - insetY};
         const float h = static_cast<float>(chip.bottom - chip.top);
-        FillSquirclePremul(pixels, width, height, chip, std::min(h * 0.5F, 16.0F * scale), 0.07F);
+        FillSquirclePremul(pixels, width, height, chip, std::min(h * 0.5F, 16.0F * scale), 0.09F);
         break;
     }
     case SettingsHitKind::Frost:
