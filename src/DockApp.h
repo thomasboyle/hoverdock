@@ -834,6 +834,9 @@ private:
     bool m_backdropCaptureWasIdle = false;
     bool m_dropPresentPending = false;
     std::atomic<bool> m_refreshInFlight{false};
+    // Retry of pinned apps whose icon extraction failed (see BeginBackgroundRefresh).
+    double m_lastIconRetry = 0.0;
+    double m_iconRetryDelay = 4.0;
     std::atomic<UINT> m_refreshGeneration{0};
     std::mutex m_refreshSnapshotMutex;
     std::optional<RefreshSnapshot> m_refreshSnapshot;

@@ -1102,13 +1102,28 @@ void Renderer::AppendMissingIcons(const std::vector<std::wstring>& targets,
     bool added = false;
     UINT slot = NextFreeIconSlot();
     for (size_t index = 0; index < targets.size(); ++index) {
-        if (m_iconPixelCache.contains(targets[index])) {
+        // A key whose earlier extraction failed (empty pixels) is retried: it
+        // keeps its slot and takes the new pixels. Only a key that already has
+        // real pixels is skipped, so a transient failure (e.g. an exe being
+        // replaced by an auto-update) no longer leaves a permanently blank icon.
+        const auto cached = m_iconPixelCache.find(targets[index]);
+        if (cached != m_iconPixelCache.end() && !cached->second.empty()) {
+            continue;
+        }
+        const auto existingSlot = m_iconTextureByTarget.find(targets[index]);
+        if (existingSlot != m_iconTextureByTarget.end()) {
+            if (!pixelBuffers[index].empty()) {
+                m_iconPixelCache[targets[index]] = pixelBuffers[index];
+                added = true;
+            }
             continue;
         }
         if (slot >= kMaximumIcons) {
             throw std::runtime_error("The dock supports at most 512 visible icons.");
         }
-        m_iconPixelCache.emplace(targets[index], pixelBuffers[index]);
+        if (!pixelBuffers[index].empty()) {
+            m_iconPixelCache[targets[index]] = pixelBuffers[index];
+        }
         m_iconTextureByTarget[targets[index]] = slot;
         ++slot;
         added = true;
