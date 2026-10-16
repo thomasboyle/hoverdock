@@ -57,6 +57,11 @@ public:
     // setting queues ONE disable/enable of 111E on the Bluetooth worker.
     [[nodiscard]] bool HandsFree() const noexcept;
     void SetHandsFree(bool enabled) noexcept;
+    // Quick Settings accent / icon colour (0xRRGGBB). Default #98A869 keeps the
+    // shipped look; dock.ini key QuickSettingsIconColor=RRGGBB.
+    static constexpr unsigned kDefaultQsIconColor = 0x98A869U;
+    [[nodiscard]] unsigned QsIconColor() const noexcept;
+    void SetQsIconColor(unsigned rgb) noexcept;
     // Remembers the last version whose installer/mover was actually launched,
     // with the wall-clock time of the attempt (unix seconds, 0 = none). Used
     // to break reinstall loops: if the install did not take effect (wrong
@@ -94,6 +99,7 @@ private:
     bool m_depthShade = true;
     bool m_lightPanels = false;
     bool m_handsFree = true;
+    unsigned m_qsIconColor = kDefaultQsIconColor;
     std::wstring m_lastInstalledVersion;
     long long m_lastInstalledTime = 0;
     int m_lastInstalledAttempts = 0;
