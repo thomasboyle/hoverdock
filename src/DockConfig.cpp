@@ -953,6 +953,7 @@ bool DockConfig::Load() {
     m_depthShade = true;
     m_lightPanels = false;
     m_handsFree = true;
+    m_qsIconColor = kDefaultQsIconColor;
     m_lastInstalledVersion.clear();
     m_lastInstalledTime = 0;
     m_lastInstalledAttempts = 0;
@@ -1035,6 +1036,18 @@ bool DockConfig::Load() {
         if (handsFree != dockSection->second.end()) {
             m_handsFree = ParseBoolean(handsFree->second);
         }
+        const auto qsIconColor = dockSection->second.find(L"quicksettingsiconcolor");
+        if (qsIconColor != dockSection->second.end()) {
+            std::wstring hex = qsIconColor->second;
+            if (!hex.empty() && hex.front() == L'#') {
+                hex.erase(0, 1);
+            }
+            wchar_t* end = nullptr;
+            const unsigned long parsed = hex.size() == 6 ? std::wcstoul(hex.c_str(), &end, 16) : 0UL;
+            if (hex.size() == 6 && end != nullptr && *end == L'\0') {
+                m_qsIconColor = static_cast<unsigned>(parsed & 0xFFFFFFU);
+            }
+        }
         const auto lastInstalledVersion =
             dockSection->second.find(L"lastinstalledversion");
         if (lastInstalledVersion != dockSection->second.end()) {
@@ -1112,6 +1125,11 @@ bool DockConfig::Save() const {
     contents << L"DepthShade=" << (m_depthShade ? L"1" : L"0") << L"\n";
     contents << L"LightPanels=" << (m_lightPanels ? L"1" : L"0") << L"\n";
     contents << L"HandsFree=" << (m_handsFree ? L"1" : L"0") << L"\n";
+    {
+        wchar_t colorText[16]{};
+        swprintf_s(colorText, L"%06X", m_qsIconColor & 0xFFFFFFU);
+        contents << L"QuickSettingsIconColor=" << colorText << L"\n";
+    }
     if (!m_lastInstalledVersion.empty()) {
         contents << L"LastInstalledVersion=" << m_lastInstalledVersion << L"\n";
         contents << L"LastInstalledTime=" << m_lastInstalledTime << L"\n";
@@ -1275,6 +1293,14 @@ void DockConfig::SetHandsFree(bool enabled) noexcept {
     m_handsFree = enabled;
 }
 
+unsigned DockConfig::QsIconColor() const noexcept {
+    return m_qsIconColor;
+}
+
+void DockConfig::SetQsIconColor(unsigned rgb) noexcept {
+    m_qsIconColor = rgb & 0xFFFFFFU;
+}
+
 std::wstring DockConfig::LastInstalledVersion() const {
     return m_lastInstalledVersion;
 }
@@ -1339,5 +1365,6 @@ void DockConfig::SetDefaults() {
     m_depthShade = true;
     m_lightPanels = false;
     m_handsFree = true;
+    m_qsIconColor = kDefaultQsIconColor;
     m_frostAmount = 0.0F;
 }

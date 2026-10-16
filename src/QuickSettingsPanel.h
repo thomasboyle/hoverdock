@@ -128,3 +128,22 @@ void RequestQuickSettingsCacheAsync(HWND notifyHwnd, UINT notifyMsg, QuickSettin
 bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache);
 // Open the mic capture client on a worker if the peak pump is not running.
 void EnsureQuickSettingsCaptureAsync() noexcept;
+
+// Shared macOS 26 Control Centre controls + accent, used by Quick Settings and
+// Dock Settings (defined in QuickSettingsPanel.cpp).
+namespace dock_detail {
+// Quick Settings accent / icon colour (BGR order in draw calls). Default #98A869,
+// overridden by dock.ini QuickSettingsIconColor.
+extern uint8_t g_qsAccentR;
+extern uint8_t g_qsAccentG;
+extern uint8_t g_qsAccentB;
+void SetQsAccent(unsigned rgb) noexcept;
+// Dark or light glyph ink that stays legible on top of the given accent fill.
+void CcOnAccentInk(uint8_t accentR, uint8_t accentG, uint8_t accentB, uint8_t& r, uint8_t& g,
+    uint8_t& b) noexcept;
+void CcDrawSwitch(uint8_t* pixels, int width, int height, float cxLeft, float cxRight, float cy,
+    float radius, float scale, bool on, uint8_t accentR, uint8_t accentG, uint8_t accentB,
+    uint8_t inkR, uint8_t inkG, uint8_t inkB);
+void CcDrawSlider(uint8_t* pixels, int width, int height, RECT track, float level, float scale,
+    uint8_t accentR, uint8_t accentG, uint8_t accentB, uint8_t inkR, uint8_t inkG, uint8_t inkB);
+}  // namespace dock_detail

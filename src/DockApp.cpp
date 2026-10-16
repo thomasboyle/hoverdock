@@ -6615,11 +6615,22 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
             break;
         }
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        if (PtInRect(&app->m_frostSliderTrack, point)) {
-            SetCapture(window);
-            app->m_frostSliderDragging = true;
-            app->ApplyFrostSliderAt(point.x);
-            return 0;
+        const int downHit = app->SettingsHitIndex(point);
+        if (downHit >= 0 && static_cast<size_t>(downHit) < app->m_settingsHits.size()) {
+            const SettingsHitKind downKind = app->m_settingsHits[static_cast<size_t>(downHit)].kind;
+            if (downKind == SettingsHitKind::Frost) {
+                SetCapture(window);
+                app->m_frostSliderDragging = true;
+                app->ApplyFrostSliderAt(point.x);
+                return 0;
+            }
+            if (downKind == SettingsHitKind::QsColorHue || downKind == SettingsHitKind::QsColorSat ||
+                downKind == SettingsHitKind::QsColorVal) {
+                SetCapture(window);
+                app->m_dsDragKind = downKind;
+                app->ApplyQsColorDragAt(point.x);
+                return 0;
+            }
         }
         return 0;
     }
@@ -6631,6 +6642,10 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         if (app->m_frostSliderDragging) {
             app->ApplyFrostSliderAt(point.x);
+            return 0;
+        }
+        if (app->m_dsDragKind != SettingsHitKind::None) {
+            app->ApplyQsColorDragAt(point.x);
             return 0;
         }
         const int hover = app->SettingsHitIndex(point);
@@ -6654,6 +6669,14 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
             ReleaseCapture();
             app->ApplyFrostSliderAt(point.x);
             app->ScheduleConfigSave();
+            return 0;
+        }
+        if (app->m_dsDragKind != SettingsHitKind::None) {
+            app->ApplyQsColorDragAt(point.x);
+            app->m_dsDragKind = SettingsHitKind::None;
+            ReleaseCapture();
+            app->ScheduleConfigSave();
+            app->QueueSettingsPaint();
             return 0;
         }
         const int hit = app->SettingsHitIndex(point);
@@ -6822,28 +6845,48 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         break;
     }
     case SettingsHitKind::CheckNow:
-    case SettingsHitKind::PerfProfile:
-    case SettingsHitKind::PerfLog:
+    case SettingsHitKind::PerfProfile: {
+        // Capsule modules: dark wash over the whole shape.
+        SetFlyoutChromeInk(33, 34, 36);
+        const float h = static_cast<float>(hit.bounds.bottom - hit.bounds.top);
+        FillSquirclePremul(pixels, width, height, hit.bounds, h * 0.5F, 0.08F);
+        break;
+    }
+    case SettingsHitKind::QsColorReset:
+    case SettingsHitKind::PerfLog: {
+        SetFlyoutChromeInk(33, 34, 36);
+        const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+        FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
+            0.07F);
+        break;
+    }
     case SettingsHitKind::Startup:
     case SettingsHitKind::Updates:
     case SettingsHitKind::RimLight:
     case SettingsHitKind::Lensing:
     case SettingsHitKind::Dispersion:
-    case SettingsHitKind::Frost:
     case SettingsHitKind::Specular:
     case SettingsHitKind::DropShadow:
     case SettingsHitKind::DepthShade:
     case SettingsHitKind::HandsFree:
     case SettingsHitKind::LightPanels: {
+        // Rows sit inside a group module: wash an inset chip so module corners stay clean.
+        SetFlyoutChromeInk(33, 34, 36);
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
-        const float wash = (hit.kind == SettingsHitKind::CheckNow ||
-                               hit.kind == SettingsHitKind::PerfProfile)
-            ? 0.14F
-            : 0.10F;
-        FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
-            wash);
+        const LONG insetX = std::lround(6.0F * scale);
+        const LONG insetY = std::lround(3.0F * scale);
+        const RECT chip{hit.bounds.left + insetX, hit.bounds.top + insetY, hit.bounds.right - insetX,
+            hit.bounds.bottom - insetY};
+        const float h = static_cast<float>(chip.bottom - chip.top);
+        FillSquirclePremul(pixels, width, height, chip, std::min(h * 0.5F, 16.0F * scale), 0.07F);
         break;
     }
+    case SettingsHitKind::Frost:
+    case SettingsHitKind::QsColorSwatch:
+    case SettingsHitKind::QsColorHue:
+    case SettingsHitKind::QsColorSat:
+    case SettingsHitKind::QsColorVal:
+        break;
     case SettingsHitKind::None:
         break;
     }
@@ -7009,8 +7052,8 @@ UINT DockApp::PackPopupGlassFxFlags(bool dockFace, bool popupShadow) const noexc
     constexpr UINT haloSlots = 0u;
     UINT frostByte =
         static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0f, 1.0f) * 255.0f));
-    if (popupShadow && !m_qsCcShapes.empty()) {
-        // Quick Settings: macOS 26 Control Centre material (own blur/lens stack).
+    if ((popupShadow && !m_qsCcShapes.empty()) || (dockFace && !popupShadow && !m_dsCcDescs.empty())) {
+        // Quick Settings / Dock Settings: macOS 26 Control Centre material (own blur/lens stack).
         glassFx |= DOCK_FX_CC;
         frostByte = 0;
     }
@@ -7176,6 +7219,9 @@ bool DockApp::TickLivePopupGlass()
             continue;
         }
         bool unchanged = false;
+        m_renderer.SetCcShapes(target == 0 ? m_dsCcDescs
+                                           : (target == 1 ? m_qsCcDescs
+                                                          : std::vector<Renderer::CcShapeDesc>{}));
         if (m_renderer.BeginLiveGlassPanelBake(screenRect, static_cast<UINT>(width),
                 static_cast<UINT>(height), fxFlags, glassAlpha, dpiScale, m_settingsWindow,
                 m_overflowWindow, m_contextWindow, target != 2 && m_config.LightPanels(), target,
@@ -7208,6 +7254,9 @@ bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* 
             (1.0f - DOCK_PANEL_GLASS_ALPHA) * frostAmount;
     const float dpiScale = static_cast<float>(HostDpi()) / 96.0F;
     std::vector<uint8_t> glass;
+    // Shapes are consumed at bake start; pick the set for this panel.
+    m_renderer.SetCcShapes(popupShadow ? m_qsCcDescs
+                                       : (dockFace ? m_dsCcDescs : std::vector<Renderer::CcShapeDesc>{}));
     if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(width), static_cast<UINT>(height),
             PackPopupGlassFxFlags(dockFace, popupShadow), glassAlpha, dpiScale, m_settingsWindow,
             m_overflowWindow, m_contextWindow, dockFace && m_config.LightPanels(), glass)) {
@@ -7218,6 +7267,131 @@ bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* 
     }
     std::memcpy(pixels, glass.data(), glass.size());
     return true;
+}
+
+namespace {
+
+// Quick Settings colour picker presets; the first is the shipped default.
+constexpr unsigned kQsColorSwatches[8] = {0x98A869U, 0x1A91DCU, 0x3DB5A6U, 0x8E6CD8U, 0xE0629AU,
+    0xE5574BU, 0xF0923AU, 0xE8C547U};
+
+unsigned QsHsvToRgb(float h, float s, float v) noexcept {
+    h = h - std::floor(h);
+    s = std::clamp(s, 0.0F, 1.0F);
+    v = std::clamp(v, 0.0F, 1.0F);
+    const float scaled = h * 6.0F;
+    const int sector = static_cast<int>(scaled) % 6;
+    const float f = scaled - std::floor(scaled);
+    const float p = v * (1.0F - s);
+    const float q = v * (1.0F - f * s);
+    const float t = v * (1.0F - (1.0F - f) * s);
+    float r = v;
+    float g = t;
+    float b = p;
+    switch (sector) {
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    case 5: r = v; g = p; b = q; break;
+    default: break;
+    }
+    const auto byte = [](float x) { return static_cast<unsigned>(std::lround(std::clamp(x, 0.0F, 1.0F) * 255.0F)); };
+    return (byte(r) << 16) | (byte(g) << 8) | byte(b);
+}
+
+void QsRgbToHsv(unsigned rgb, float& h, float& s, float& v) noexcept {
+    const float r = static_cast<float>((rgb >> 16) & 0xFFU) / 255.0F;
+    const float g = static_cast<float>((rgb >> 8) & 0xFFU) / 255.0F;
+    const float b = static_cast<float>(rgb & 0xFFU) / 255.0F;
+    const float mx = std::max({r, g, b});
+    const float mn = std::min({r, g, b});
+    const float d = mx - mn;
+    v = mx;
+    s = mx <= 0.0F ? 0.0F : d / mx;
+    if (d <= 1e-6F) {
+        return;  // grey: keep the previous hue
+    }
+    float hue;
+    if (mx == r) {
+        hue = std::fmod((g - b) / d, 6.0F);
+    } else if (mx == g) {
+        hue = (b - r) / d + 2.0F;
+    } else {
+        hue = (r - g) / d + 4.0F;
+    }
+    hue /= 6.0F;
+    h = hue < 0.0F ? hue + 1.0F : hue;
+}
+
+// Pill filled with a horizontal colour ramp (0xRRGGBB from colorAt(t)).
+template <class ColorAt>
+void FillGradientPillPremul(uint8_t* dest, int destWidth, int destHeight, float cxLeft, float cxRight,
+    float cy, float radius, float alpha, ColorAt&& colorAt) {
+    const int left = std::max(0, static_cast<int>(std::floor(cxLeft - radius - 1.0F)));
+    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 1.0F)));
+    const int right = std::min(destWidth, static_cast<int>(std::ceil(cxRight + radius + 1.0F)));
+    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 1.0F)));
+    const float span = std::max(cxRight - cxLeft, 1.0F);
+    for (int y = top; y < bottom; ++y) {
+        for (int x = left; x < right; ++x) {
+            const float px = static_cast<float>(x) + 0.5F;
+            const float dx = px < cxLeft ? cxLeft - px : (px > cxRight ? px - cxRight : 0.0F);
+            const float dy = static_cast<float>(y) + 0.5F - cy;
+            const float coverage =
+                1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / 1.15F + 0.5F, 0.0F, 1.0F);
+            if (coverage <= 0.0F) {
+                continue;
+            }
+            const unsigned rgb = colorAt(std::clamp((px - cxLeft) / span, 0.0F, 1.0F));
+            const float srcA = coverage * alpha;
+            uint8_t pixel[4] = {
+                static_cast<uint8_t>(std::lround(static_cast<float>(rgb & 0xFFU) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>((rgb >> 8) & 0xFFU) * srcA)),
+                static_cast<uint8_t>(std::lround(static_cast<float>((rgb >> 16) & 0xFFU) * srcA)),
+                static_cast<uint8_t>(std::lround(255.0F * srcA)),
+            };
+            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+        }
+    }
+}
+
+}  // namespace
+
+void DockApp::SetQsIconColorLive(unsigned rgb) {
+    m_config.SetQsIconColor(rgb);
+    SetQsAccent(m_config.QsIconColor());
+    if (IsOverflowOpen()) {
+        QueueOverflowPaint();
+    }
+    QueueSettingsPaint();
+}
+
+void DockApp::ApplyQsColorDragAt(LONG clientX) {
+    int index = 0;
+    switch (m_dsDragKind) {
+    case SettingsHitKind::QsColorHue: index = 0; break;
+    case SettingsHitKind::QsColorSat: index = 1; break;
+    case SettingsHitKind::QsColorVal: index = 2; break;
+    default: return;
+    }
+    const RECT& track = m_dsColorTracks[index];
+    const float span = static_cast<float>(std::max(1L, track.right - track.left));
+    const float f = std::clamp(static_cast<float>(clientX - track.left) / span, 0.0F, 1.0F);
+    if (index == 0) {
+        m_dsHue = std::min(f, 0.9999F);
+    } else if (index == 1) {
+        m_dsSat = f;
+    } else {
+        m_dsVal = f;
+    }
+    m_dsHsvValid = true;
+    const unsigned rgb = QsHsvToRgb(m_dsHue, m_dsSat, m_dsVal);
+    if (rgb != m_config.QsIconColor()) {
+        SetQsIconColorLive(rgb);
+    } else {
+        QueueSettingsPaint();
+    }
 }
 
 void DockApp::ApplyFrostSliderAt(LONG clientX) {
@@ -7371,6 +7545,22 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         }
         break;
     }
+    case SettingsHitKind::QsColorSwatch:
+        if (hit.index >= 0 && hit.index < 8) {
+            m_dsHsvValid = false;
+            SetQsIconColorLive(kQsColorSwatches[hit.index]);
+            ScheduleConfigSave();
+        }
+        break;
+    case SettingsHitKind::QsColorReset:
+        m_dsHsvValid = false;
+        SetQsIconColorLive(DockConfig::kDefaultQsIconColor);
+        ScheduleConfigSave();
+        break;
+    case SettingsHitKind::QsColorHue:
+    case SettingsHitKind::QsColorSat:
+    case SettingsHitKind::QsColorVal:
+        break;  // drag tracks, handled in the window procedure
     case SettingsHitKind::CheckNow:
         if (!m_updateInFlight.load() && !m_updateInstalling.load()) {
             CheckForUpdatesAsync(true);
@@ -7500,18 +7690,26 @@ void DockApp::DestroyDockSettings() noexcept {
 void DockApp::PaintSettingsPopup() {
     const UINT dpi = HostDpi();
     const float scale = static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F;
-    const LONG padding = std::max(16L, std::lround(18.0F * scale));
+    auto P = [&](float pt) { return static_cast<LONG>(std::lround(pt * scale)); };
+    // macOS 26 Control Centre grid: 291pt of content between 20pt margins, 13pt
+    // gutters between modules, every module a separate glass shape.
+    const LONG padding = P(20.0F);
+    const LONG moduleWidth = P(291.0F);
+    const LONG panelWidth = padding * 2L + moduleWidth;
     const LONG radius = std::max(16L, std::lround(DOCK_CORNER_RADIUS_PT * scale));
-    const LONG headerHeight = std::max(28L, std::lround(32.0F * scale));
-    const LONG closeExtent = std::max(22L, std::lround(24.0F * scale));
-    const LONG rowHeight = std::max(56L, std::lround(60.0F * scale));
-    const LONG rowGap = std::max(6L, std::lround(8.0F * scale));
-    const LONG buttonHeight = std::max(34L, std::lround(38.0F * scale));
-    const LONG dividerGap = std::max(10L, std::lround(12.0F * scale));
-    const LONG statusHeight = std::max(40L, std::lround(46.0F * scale));
-    const LONG switchWidth = std::max(40L, std::lround(46.0F * scale));
-    const LONG switchHeight = std::max(22L, std::lround(24.0F * scale));
-    const LONG panelWidth = std::max(280L, std::lround(308.0F * scale));
+    const LONG headerHeight = P(34.0F);
+    const LONG closeExtent = P(24.0F);
+    const LONG gutter = P(13.0F);
+    const LONG rowHeight = P(44.0F);
+    const LONG frostRowHeight = P(58.0F);
+    const LONG buttonHeight = P(44.0F);
+    const LONG colorHeight = P(166.0F);
+    const LONG statusHeight = P(46.0F);
+    const LONG subHeight = P(15.0F);
+    const LONG labelHeight = P(18.0F);
+    const LONG switchWidth = P(44.0F);
+    const LONG switchHeight = P(24.0F);
+    const LONG moduleRadius = P(26.0F);
 
     // Switch rows live here (above the size math) so the panel always fits
     // exactly the rows it paints - adding a row never clips again.
@@ -7523,11 +7721,15 @@ void DockApp::PaintSettingsPopup() {
         bool enabled;
         float amount;
     };
-    const SettingsRow rows[] = {
+    const SettingsRow generalRows[] = {
         {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows", false,
             m_config.LaunchAtStartup(), 0.0F},
         {SettingsHitKind::Updates, L"Check for updates", L"Auto-download and install builds", false,
             m_config.CheckForUpdates(), 0.0F},
+        {SettingsHitKind::HandsFree, L"Hands-free (mic) for headsets",
+            L"Restore Hands-Free after Bluetooth connect", false, m_config.HandsFree(), 0.0F},
+    };
+    const SettingsRow glassRows[] = {
         {SettingsHitKind::RimLight, L"Rim light", L"Edge glow and caustic on the glass", false,
             m_config.RimLight(), 0.0F},
         {SettingsHitKind::Lensing, L"Lensing", L"Refraction warp through the bevel", false,
@@ -7542,24 +7744,49 @@ void DockApp::PaintSettingsPopup() {
             m_config.DropShadow(), 0.0F},
         {SettingsHitKind::DepthShade, L"Depth shade", L"Inner shading at the glass edge", false,
             m_config.DepthShade(), 0.0F},
-        {SettingsHitKind::HandsFree, L"Hands-free (mic) for headsets",
-            L"Restore Hands-Free after Bluetooth connect", false, m_config.HandsFree(), 0.0F},
     };
-    const LONG switchRowCount = static_cast<LONG>(sizeof(rows) / sizeof(rows[0]));
+    const LONG generalCount = static_cast<LONG>(sizeof(generalRows) / sizeof(generalRows[0]));
+    const LONG glassCount = static_cast<LONG>(sizeof(glassRows) / sizeof(glassRows[0]));
 
-    LONG contentY = padding;
-    contentY += headerHeight;
-    contentY += dividerGap;
-    const LONG statusLineHeight = std::max(14L, std::lround(16.0F * scale));
-    contentY += (rowHeight + rowGap) * switchRowCount;
-    contentY += buttonHeight;
-    contentY += rowGap;
-    contentY += buttonHeight;
-    contentY += dividerGap;
-    contentY += statusHeight + statusLineHeight;  // update status + perf path
-    contentY += padding;
+    LONG contentY = padding + headerHeight + P(10.0F);
+    const RECT generalRect{padding, contentY, padding + moduleWidth,
+        contentY + rowHeight * generalCount};
+    contentY = generalRect.bottom + gutter;
+    const RECT glassRect{padding, contentY, padding + moduleWidth,
+        contentY + rowHeight * (glassCount - 1L) + frostRowHeight};
+    contentY = glassRect.bottom + gutter;
+    const RECT colorRect{padding, contentY, padding + moduleWidth, contentY + colorHeight};
+    contentY = colorRect.bottom + gutter;
+    const RECT checkRect{padding, contentY, padding + moduleWidth, contentY + buttonHeight};
+    contentY = checkRect.bottom + gutter;
+    const RECT perfRect{padding, contentY, padding + moduleWidth, contentY + buttonHeight};
+    const LONG statusTop = perfRect.bottom + gutter;
+    contentY = statusTop + statusHeight + subHeight + padding;  // version, update status, perf path
     m_settingsSize.cx = panelWidth;
     m_settingsSize.cy = contentY;
+
+    // Glass shapes for the CC bake: shape 0 is the panel (inset so the 1px dark
+    // ring stays inside the window), then one shape per module.
+    {
+        const LONG ringInset = std::max(2L, P(2.0F));
+        m_dsCcDescs.clear();
+        auto addShape = [&](const RECT& bounds, float shapeRadius) {
+            Renderer::CcShapeDesc desc;
+            desc.cx = 0.5F * static_cast<float>(bounds.left + bounds.right);
+            desc.cy = 0.5F * static_cast<float>(bounds.top + bounds.bottom);
+            desc.hw = 0.5F * static_cast<float>(bounds.right - bounds.left);
+            desc.hh = 0.5F * static_cast<float>(bounds.bottom - bounds.top);
+            desc.radius = shapeRadius;
+            m_dsCcDescs.push_back(desc);
+        };
+        addShape(RECT{ringInset, ringInset, panelWidth - ringInset, contentY - ringInset},
+            34.0F * scale);
+        addShape(generalRect, static_cast<float>(moduleRadius));
+        addShape(glassRect, static_cast<float>(moduleRadius));
+        addShape(colorRect, static_cast<float>(moduleRadius));
+        addShape(checkRect, static_cast<float>(buttonHeight) * 0.5F);
+        addShape(perfRect, static_cast<float>(buttonHeight) * 0.5F);
+    }
 
     // WM_CLOSE / external destroy can kill the HWND while leaving a dangling
     // m_settingsWindow; without this check OpenDockSettings silently no-ops
@@ -7747,159 +7974,218 @@ void DockApp::PaintSettingsPopup() {
     const int pendingHover = m_settingsHover;
     m_settingsHits.clear();
 
-    auto pushHit = [this](SettingsHitKind kind, RECT bounds) {
+    auto pushHit = [this](SettingsHitKind kind, RECT bounds, int index = -1) {
         SettingsHit hit;
         hit.kind = kind;
         hit.bounds = bounds;
+        hit.index = index;
         m_settingsHits.push_back(hit);
     };
-    auto drawSwitch = [&](LONG centerY, LONG right, bool enabled, bool hovered) {
-        const LONG trackLeft = right - switchWidth;
-        const LONG trackTop = centerY - switchHeight / 2L;
-        const float trackRadius = static_cast<float>(switchHeight) * 0.5F;
-        const float trackCxL = static_cast<float>(trackLeft) + trackRadius;
-        const float trackCxR = static_cast<float>(right) - trackRadius;
-        const float trackCy = static_cast<float>(trackTop) + trackRadius;
-        const float wash = enabled ? (hovered ? 0.96F : 0.90F) : (hovered ? 0.72F : 0.62F);
-        if (enabled) {
-            // On = #98A869 toggle fill (Concept D Minimal Sage).
-            FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
-                wash, kAmberB, kAmberG, kAmberR);
-        } else {
-            FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
-                wash, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
-        }
-        const float knobRadius = trackRadius - std::max(2.0F, 2.0F * scale);
-        const float knobCx = enabled ? trackCxR : trackCxL;
-        FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
-    };
-    auto drawSlider = [&](LONG centerY, LONG left, LONG right, float amount, bool hovered) {
-        const LONG trackHeight = std::max(6L, std::lround(8.0F * scale));
-        const float trackRadius = static_cast<float>(trackHeight) * 0.5F;
-        const float trackCy = static_cast<float>(centerY);
-        const float trackCxL = static_cast<float>(left) + trackRadius;
-        const float trackCxR = static_cast<float>(right) - trackRadius;
-        FillPillColorPremul(pixels, width, height, trackCxL, trackCxR, trackCy, trackRadius,
-            hovered ? 0.78F : 0.68F, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
-        const float filled = std::clamp(amount, 0.0F, 1.0F);
-        const float fillRight = trackCxL + (trackCxR - trackCxL) * filled;
-        if (fillRight > trackCxL + 0.5F) {
-            FillPillColorPremul(pixels, width, height, trackCxL, fillRight, trackCy, trackRadius,
-                hovered ? 0.96F : 0.90F, kAmberB, kAmberG, kAmberR);
-        }
-        const float knobRadius = std::max(7.0F, 8.0F * scale);
-        const float knobCx = trackCxL + (trackCxR - trackCxL) * filled;
-        FillCirclePremul(pixels, width, height, knobCx, trackCy, knobRadius, 0.95F);
-    };
 
-    if (m_config.LightPanels()) {
-        SetFlyoutChromeInk(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B);
-    } else {
-        SetFlyoutChromeInk(DOCK_CHROME_INK_R, DOCK_CHROME_INK_G, DOCK_CHROME_INK_B);
-    }
+    // Fixed Control Centre face: identical dark ink in dark and light mode.
+    constexpr uint8_t inkR = 33;
+    constexpr uint8_t inkG = 34;
+    constexpr uint8_t inkB = 36;
+    SetFlyoutChromeInk(inkR, inkG, inkB);
+    g_flyoutTextHalo = false;  // text sits on the CC glass face
+    uint8_t onAccentR = 30;
+    uint8_t onAccentG = 33;
+    uint8_t onAccentB = 24;
+    CcOnAccentInk(DOCK_PANEL_TOGGLE_R, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_B, onAccentR,
+        onAccentG, onAccentB);
 
     LONG y = padding;
-    g_flyoutTextHalo = true;  // soft dark halo instead of plates (legible on bright glass)
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
     DrawFlyoutText(pixels, width, height, titleBounds, titleFont, L"Dock Settings",
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE, 250);
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
     RECT closeBounds{panelWidth - padding - closeExtent, y + (headerHeight - closeExtent) / 2L,
         panelWidth - padding, y + (headerHeight - closeExtent) / 2L + closeExtent};
     DrawFlyoutText(pixels, width, height, closeBounds, titleFont, L"\u00D7",
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE, 250);
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
     pushHit(SettingsHitKind::Close, {closeBounds.left - 6, y, panelWidth - padding + 4,
         y + headerHeight});
-    y += headerHeight;
 
-    FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
-        y - dividerGap / 2L + 1}, 0.16F);
-
-    // (Switch rows are defined above the size computation.)
-    const LONG labelHeight = std::max(16L, std::lround(18.0F * scale));
-    const LONG subHeight = std::max(14L, std::lround(16.0F * scale));
-    for (const SettingsRow& row : rows) {
-        const RECT rowBounds{padding, y, panelWidth - padding, y + rowHeight};
-        FillSquirclePremul(pixels, width, height, rowBounds, ContentSquircleRadius(rowBounds, scale),
-            0.10F);
-        if (row.slider) {
-            const LONG sliderLeft = padding + 4L;
-            const LONG sliderRight = panelWidth - padding - 4L;
-            RECT labelBounds{sliderLeft, y + 4L, sliderRight,
-                y + 4L + labelHeight};
-            RECT subBounds{sliderLeft, labelBounds.bottom, sliderRight,
-                labelBounds.bottom + subHeight};
-            DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
-                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
-                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
-            const LONG sliderY = y + rowHeight - std::max(14L, std::lround(16.0F * scale));
-            m_frostSliderTrack = {sliderLeft, sliderY - 10L, sliderRight, sliderY + 10L};
-            drawSlider(sliderY, sliderLeft, sliderRight, row.amount, m_frostSliderDragging);
-            pushHit(row.kind, rowBounds);
-        } else {
-            const LONG textRight = panelWidth - padding - switchWidth - 12L;
-            RECT labelBounds{padding + 4, y + (rowHeight - labelHeight - subHeight) / 2L, textRight,
-                y + (rowHeight - labelHeight - subHeight) / 2L + labelHeight};
-            RECT subBounds{labelBounds.left, labelBounds.bottom, textRight,
-                labelBounds.bottom + subHeight};
-            DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
-                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
-                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
-            drawSwitch(y + rowHeight / 2L, panelWidth - padding - 4L, row.enabled, false);
-            pushHit(row.kind, rowBounds);
+    const LONG insetX = P(18.0F);
+    auto drawRows = [&](const RECT& module, const SettingsRow* list, LONG count) {
+        LONG rowTop = module.top;
+        for (LONG i = 0; i < count; ++i) {
+            const SettingsRow& row = list[i];
+            const LONG rowH = row.slider ? frostRowHeight : rowHeight;
+            const LONG textLeft = module.left + insetX;
+            if (row.slider) {
+                const LONG textRight = module.right - insetX;
+                const RECT labelBounds{textLeft, rowTop + P(6.0F), textRight,
+                    rowTop + P(6.0F) + labelHeight};
+                const RECT subBounds{textLeft, labelBounds.bottom, textRight,
+                    labelBounds.bottom + subHeight};
+                DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
+                    DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
+                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
+                const RECT track{textLeft, rowTop + P(40.0F), textRight, rowTop + P(54.0F)};
+                CcDrawSlider(pixels, width, height, track, row.amount, scale, DOCK_PANEL_TOGGLE_R,
+                    DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_B, inkR, inkG, inkB);
+                const LONG cap = (track.bottom - track.top) / 2L;
+                m_frostSliderTrack = {track.left + cap, track.top - P(6.0F), track.right - cap,
+                    track.bottom + P(6.0F)};
+                pushHit(row.kind, {track.left - P(4.0F), track.top - P(8.0F), track.right + P(4.0F),
+                    track.bottom + P(8.0F)});
+            } else {
+                const LONG textRight = module.right - insetX - switchWidth - P(10.0F);
+                const LONG blockTop = rowTop + (rowH - labelHeight - subHeight) / 2L;
+                const RECT labelBounds{textLeft, blockTop, textRight, blockTop + labelHeight};
+                const RECT subBounds{textLeft, labelBounds.bottom, textRight,
+                    labelBounds.bottom + subHeight};
+                DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
+                    DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
+                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
+                const float capRadius = static_cast<float>(switchHeight) * 0.5F;
+                const float right = static_cast<float>(module.right - P(16.0F));
+                CcDrawSwitch(pixels, width, height, right - static_cast<float>(switchWidth) + capRadius,
+                    right - capRadius, static_cast<float>(rowTop) + static_cast<float>(rowH) * 0.5F,
+                    capRadius, scale, row.enabled, DOCK_PANEL_TOGGLE_R, DOCK_PANEL_TOGGLE_G,
+                    DOCK_PANEL_TOGGLE_B, inkR, inkG, inkB);
+                pushHit(row.kind, {module.left, rowTop, module.right, rowTop + rowH});
+            }
+            if (i + 1 < count) {
+                FillRectPremul(pixels, width, height, {textLeft, rowTop + rowH - 1,
+                    module.right - insetX, rowTop + rowH}, 0.10F);
+            }
+            rowTop += rowH;
         }
-        y += rowHeight + rowGap;
+    };
+    drawRows(generalRect, generalRows, generalCount);
+    drawRows(glassRect, glassRows, glassCount);
+
+    // ---- Quick Settings icon colour picker -----------------------------------
+    {
+        const RECT& m = colorRect;
+        const LONG textLeft = m.left + insetX;
+        const LONG right = m.right - insetX;
+        const unsigned current = m_config.QsIconColor();
+        if (!m_dsHsvValid || QsHsvToRgb(m_dsHue, m_dsSat, m_dsVal) != current) {
+            QsRgbToHsv(current, m_dsHue, m_dsSat, m_dsVal);
+            m_dsHsvValid = true;
+        }
+        const bool isDefault = current == DockConfig::kDefaultQsIconColor;
+        const RECT resetBounds{right - P(46.0F), m.top + P(10.0F), right, m.top + P(32.0F)};
+        const RECT hexBounds{resetBounds.left - P(66.0F), resetBounds.top, resetBounds.left - P(6.0F),
+            resetBounds.bottom};
+        const RECT titleRect{textLeft, resetBounds.top, hexBounds.left, resetBounds.bottom};
+        wchar_t hexText[16]{};
+        swprintf_s(hexText, L"#%06X", current & 0xFFFFFFU);
+        DrawFlyoutText(pixels, width, height, titleRect, labelFont, L"Quick Settings colour",
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+        DrawFlyoutText(pixels, width, height, hexBounds, statusFont, hexText,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 190);
+        DrawFlyoutText(pixels, width, height, resetBounds, labelFont, L"Reset",
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE, isDefault ? 90 : 255);
+        pushHit(SettingsHitKind::QsColorReset, {resetBounds.left - P(6.0F), resetBounds.top - P(4.0F),
+            resetBounds.right + P(4.0F), resetBounds.bottom + P(4.0F)});
+
+        // Preset swatches (first one is the shipped default).
+        const float swatchR = static_cast<float>(P(12.0F));
+        const float swatchStep = (static_cast<float>(right - textLeft) - 2.0F * swatchR) / 7.0F;
+        const float swatchCy = static_cast<float>(m.top + P(56.0F));
+        for (int i = 0; i < 8; ++i) {
+            const unsigned rgb = kQsColorSwatches[i];
+            const float cx = static_cast<float>(textLeft) + swatchR + swatchStep * static_cast<float>(i);
+            if (rgb == current) {
+                FillCirclePremul(pixels, width, height, cx, swatchCy, swatchR + static_cast<float>(P(4.0F)),
+                    0.45F, true);
+                FillCirclePremul(pixels, width, height, cx, swatchCy, swatchR + static_cast<float>(P(2.5F)),
+                    0.98F, false);
+            }
+            FillPillColorPremul(pixels, width, height, cx, cx, swatchCy, swatchR, 0.98F,
+                static_cast<uint8_t>(rgb & 0xFFU), static_cast<uint8_t>((rgb >> 8) & 0xFFU),
+                static_cast<uint8_t>((rgb >> 16) & 0xFFU));
+            pushHit(SettingsHitKind::QsColorSwatch,
+                {static_cast<LONG>(cx - swatchR) - P(3.0F), static_cast<LONG>(swatchCy - swatchR) - P(3.0F),
+                    static_cast<LONG>(cx + swatchR) + P(3.0F), static_cast<LONG>(swatchCy + swatchR) + P(3.0F)},
+                i);
+        }
+
+        // Hue / saturation / value tracks (drag; applied live to Quick Settings).
+        auto colorTrack = [&](int index, SettingsHitKind kind, LONG centerY, float level,
+                              auto&& colorAt) {
+            const RECT track{textLeft, centerY - P(6.0F), right, centerY + P(6.0F)};
+            const float trackRadius = static_cast<float>(track.bottom - track.top) * 0.5F;
+            const float left = static_cast<float>(track.left) + trackRadius;
+            const float rightCap = static_cast<float>(track.right) - trackRadius;
+            FillGradientPillPremul(pixels, width, height, left, rightCap, static_cast<float>(centerY),
+                trackRadius, 0.98F, colorAt);
+            const float knobX = left + (rightCap - left) * std::clamp(level, 0.0F, 1.0F);
+            const float knobR = trackRadius + static_cast<float>(P(2.0F));
+            FillCirclePremul(pixels, width, height, knobX, static_cast<float>(centerY) + std::max(1.0F, 1.5F * scale),
+                knobR, 0.20F, true);
+            FillCirclePremul(pixels, width, height, knobX, static_cast<float>(centerY), knobR, 0.99F, false);
+            const unsigned knobRgb = colorAt(std::clamp(level, 0.0F, 1.0F));
+            FillPillColorPremul(pixels, width, height, knobX, knobX, static_cast<float>(centerY),
+                knobR - std::max(2.0F, 2.5F * scale), 1.0F, static_cast<uint8_t>(knobRgb & 0xFFU),
+                static_cast<uint8_t>((knobRgb >> 8) & 0xFFU), static_cast<uint8_t>((knobRgb >> 16) & 0xFFU));
+            m_dsColorTracks[index] = {static_cast<LONG>(std::lround(left)), track.top - P(6.0F),
+                static_cast<LONG>(std::lround(rightCap)), track.bottom + P(6.0F)};
+            pushHit(kind, {track.left - P(4.0F), track.top - P(8.0F), track.right + P(4.0F),
+                track.bottom + P(8.0F)});
+        };
+        const float hue = m_dsHue;
+        const float sat = m_dsSat;
+        const float val = m_dsVal;
+        colorTrack(0, SettingsHitKind::QsColorHue, m.top + P(92.0F), hue,
+            [&](float t) { return QsHsvToRgb(t, 1.0F, 1.0F); });
+        colorTrack(1, SettingsHitKind::QsColorSat, m.top + P(118.0F), sat,
+            [&](float t) { return QsHsvToRgb(hue, t, 1.0F); });
+        colorTrack(2, SettingsHitKind::QsColorVal, m.top + P(144.0F), val,
+            [&](float t) { return QsHsvToRgb(hue, sat, t); });
     }
 
     const bool checking = m_updateInFlight.load() || m_updateInstalling.load();
-    RECT buttonBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    // #98A869 squircle + light chrome label ink (already set).
-    FillSquircleColorPremul(pixels, width, height, buttonBounds,
-        ContentSquircleRadius(buttonBounds, scale), 0.50F, DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G,
-        DOCK_PANEL_TOGGLE_R);
-    DrawFlyoutText(pixels, width, height, buttonBounds, labelFont,
+    DrawFlyoutText(pixels, width, height, checkRect, labelFont,
         checking ? L"Checking..." : L"Check for updates now",
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 170 : 245);
-    pushHit(SettingsHitKind::CheckNow, buttonBounds);
-    y += buttonHeight + rowGap;
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 150 : 255);
+    pushHit(SettingsHitKind::CheckNow, checkRect);
 
     const bool profiling = m_perfProfiler.IsRunning();
-    RECT perfBounds{padding, y, panelWidth - padding, y + buttonHeight};
-    FillSquircleColorPremul(pixels, width, height, perfBounds,
-        ContentSquircleRadius(perfBounds, scale), profiling ? 0.70F : 0.50F, DOCK_PANEL_TOGGLE_B,
-        DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
-    DrawFlyoutText(pixels, width, height, perfBounds, labelFont,
+    if (profiling) {
+        // Active capsule: accent fill inset 2pt so the glass rim stays visible.
+        const float capRadius = static_cast<float>(buttonHeight) * 0.5F - static_cast<float>(P(2.0F));
+        FillPillColorPremul(pixels, width, height,
+            static_cast<float>(perfRect.left) + static_cast<float>(buttonHeight) * 0.5F,
+            static_cast<float>(perfRect.right) - static_cast<float>(buttonHeight) * 0.5F,
+            0.5F * static_cast<float>(perfRect.top + perfRect.bottom), capRadius, 0.98F,
+            DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
+        SetFlyoutChromeInk(onAccentR, onAccentG, onAccentB);
+    }
+    DrawFlyoutText(pixels, width, height, perfRect, labelFont,
         profiling ? L"Stop profiling" : L"Start performance profile",
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE, profiling ? 250 : 245);
-    pushHit(SettingsHitKind::PerfProfile, perfBounds);
-    y += buttonHeight + dividerGap;
-    FillRectPremul(pixels, width, height, {padding, y - dividerGap / 2L, panelWidth - padding,
-        y - dividerGap / 2L + 1}, 0.16F);
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
+    SetFlyoutChromeInk(inkR, inkG, inkB);
+    pushHit(SettingsHitKind::PerfProfile, perfRect);
 
     std::string current = Updater::CurrentVersion();
     std::wstring wideVersion(current.begin(), current.end());
-    RECT versionBounds{padding, y, panelWidth - padding, y + subHeight};
+    RECT versionBounds{padding, statusTop, panelWidth - padding, statusTop + subHeight};
     DrawFlyoutText(pixels, width, height, versionBounds, statusFont,
-        L"Hoverdock v" + wideVersion, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 240);
+        L"Hoverdock v" + wideVersion, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 200);
     RECT statusBounds{padding, versionBounds.bottom + 2, panelWidth - padding,
         versionBounds.bottom + 2 + subHeight + 4};
     DrawFlyoutText(pixels, width, height, statusBounds, statusFont, m_updateStatus,
-        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 245);
+        DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
     if (!m_perfStatus.empty() || profiling) {
         std::wstring perfLine = m_perfStatus;
         if (profiling && perfLine.empty()) {
             perfLine = L"Profiling... " + m_perfProfiler.LogPath();
         }
         RECT perfStatusBounds{padding, statusBounds.bottom, panelWidth - padding,
-            y + statusHeight + subHeight};
+            statusTop + statusHeight + subHeight};
         const bool savedLink = !profiling && !m_perfSavedLog.empty();
         const std::wstring savedPrefix = L"Saved ";
         const int underlineFrom = savedLink && perfLine.starts_with(savedPrefix)
             ? static_cast<int>(savedPrefix.size())
             : -1;
         DrawFlyoutText(pixels, width, height, perfStatusBounds, statusFont, perfLine,
-            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 245, underlineFrom);
+            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 210, underlineFrom);
         if (savedLink) {
             pushHit(SettingsHitKind::PerfLog, perfStatusBounds);
         }
@@ -8770,6 +9056,7 @@ void DockApp::PaintOverflowPopup() {
             }
             ccShapes.push_back(desc);
         }
+        m_qsCcDescs = ccShapes;
         m_renderer.SetCcShapes(ccShapes);
     }
 

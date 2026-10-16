@@ -262,11 +262,17 @@ private:
         PerfProfile,
         PerfLog,
         Close,
+        QsColorSwatch,
+        QsColorHue,
+        QsColorSat,
+        QsColorVal,
+        QsColorReset,
     };
 
     struct SettingsHit {
         SettingsHitKind kind = SettingsHitKind::None;
         RECT bounds{};
+        int index = -1;
     };
 
     struct ContextItem {
@@ -393,6 +399,10 @@ private:
     void RebuildSettingsPopup();
     void HandleSettingsClick(const SettingsHit& hit, UINT message);
     void ApplyFrostSliderAt(LONG clientX);
+    // Quick Settings icon colour picker (Dock Settings). Drag maps x on the
+    // active hue / saturation / value track; Set applies live to Quick Settings.
+    void ApplyQsColorDragAt(LONG clientX);
+    void SetQsIconColorLive(unsigned rgb);
     [[nodiscard]] int SettingsHitIndex(POINT point) const noexcept;
     [[nodiscard]] bool SettingsScreenOrigin(POINT& origin) const noexcept;
     void InvalidateSettingsGlass() noexcept;
@@ -909,6 +919,15 @@ private:
     // settings, 2 context). Cleared when the bake is submitted or the pixels match.
     bool m_popupGlassDirty[3] = {};
     RECT m_frostSliderTrack{};
+    // Dock Settings Control Centre glass shapes (window px) and picker state.
+    std::vector<Renderer::CcShapeDesc> m_dsCcDescs;
+    std::vector<Renderer::CcShapeDesc> m_qsCcDescs;
+    float m_dsHue = 0.0F;
+    float m_dsSat = 0.0F;
+    float m_dsVal = 1.0F;
+    bool m_dsHsvValid = false;
+    SettingsHitKind m_dsDragKind = SettingsHitKind::None;
+    RECT m_dsColorTracks[3]{};
     SIZE m_settingsSize{};
     std::vector<uint8_t> m_settingsGlass;
     SIZE m_settingsGlassSize{};

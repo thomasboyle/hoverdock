@@ -65,10 +65,6 @@ using namespace dock_detail;
 
 namespace {
 
-// QS accent (#98A869) for active toggles, slider fills and meters.
-constexpr uint8_t kBlueB = 105;
-constexpr uint8_t kBlueG = 168;
-constexpr uint8_t kBlueR = 152;
 constexpr uint8_t kInkDarkR = 33;
 constexpr uint8_t kInkDarkG = 34;
 constexpr uint8_t kInkDarkB = 36;
@@ -2663,7 +2659,7 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
                 const LONG left = meter.left + 12 + index * (segW + segGap);
                 const RECT seg{left, meter.top + 8, left + segW, meter.bottom - 8};
                 FillSquircleColorPremul(pixels, width, height, seg, 2.0F, index < lit ? 0.95F : 0.25F,
-                    index < lit ? kBlueB : inkB, index < lit ? kBlueG : inkG, index < lit ? kBlueR : inkR);
+                    index < lit ? g_qsAccentB : inkB, index < lit ? g_qsAccentG : inkG, index < lit ? g_qsAccentR : inkR);
             }
         } else {
             constexpr int segments = 12;
@@ -2682,7 +2678,7 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
                 const float cy = 0.5F * static_cast<float>(meter.top + meter.bottom);
                 if (index < lit) {
                     FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
-                        1.0F, kBlueB, kBlueG, kBlueR, kBlueB, kBlueG, kBlueR);
+                        1.0F, g_qsAccentB, g_qsAccentG, g_qsAccentR, g_qsAccentB, g_qsAccentG, g_qsAccentR);
                 } else {
                     FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
                         0.28F, inkB, inkG, inkR, inkB, inkG, inkR);
@@ -2702,7 +2698,7 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
             m_qsScrubInkG, m_qsScrubInkR);
         if (level > 0.01F) {
             FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
-                kBlueB, kBlueG, kBlueR);
+                g_qsAccentB, g_qsAccentG, g_qsAccentR);
         }
         FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(1.0F, 1.5F * scale), 0.99F,
             false);
@@ -2772,6 +2768,68 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
     }
 }
 
+namespace dock_detail {
+
+uint8_t g_qsAccentR = 152;
+uint8_t g_qsAccentG = 168;
+uint8_t g_qsAccentB = 105;
+
+void SetQsAccent(unsigned rgb) noexcept {
+    g_qsAccentR = static_cast<uint8_t>((rgb >> 16) & 0xFFU);
+    g_qsAccentG = static_cast<uint8_t>((rgb >> 8) & 0xFFU);
+    g_qsAccentB = static_cast<uint8_t>(rgb & 0xFFU);
+}
+
+void CcOnAccentInk(uint8_t accentR, uint8_t accentG, uint8_t accentB, uint8_t& r, uint8_t& g,
+    uint8_t& b) noexcept {
+    const float luma = (0.2126F * static_cast<float>(accentR) + 0.7152F * static_cast<float>(accentG) +
+                           0.0722F * static_cast<float>(accentB)) / 255.0F;
+    if (luma > 0.45F) {
+        r = 30;
+        g = 33;
+        b = 24;
+    } else {
+        r = 250;
+        g = 250;
+        b = 248;
+    }
+}
+
+void CcDrawSwitch(uint8_t* pixels, int width, int height, float cxLeft, float cxRight, float cy,
+    float radius, float scale, bool on, uint8_t accentR, uint8_t accentG, uint8_t accentB,
+    uint8_t inkR, uint8_t inkG, uint8_t inkB) {
+    if (on) {
+        FillPillColorPremul(pixels, width, height, cxLeft, cxRight, cy, radius, 0.96F, accentB,
+            accentG, accentR);
+    } else {
+        FillPillColorPremul(pixels, width, height, cxLeft, cxRight, cy, radius, 0.45F, inkB, inkG,
+            inkR);
+    }
+    FillCirclePremul(pixels, width, height, on ? cxRight : cxLeft, cy,
+        radius - std::max(2.0F, 2.0F * scale), 0.98F, false);
+}
+
+void CcDrawSlider(uint8_t* pixels, int width, int height, RECT track, float level, float scale,
+    uint8_t accentR, uint8_t accentG, uint8_t accentB, uint8_t inkR, uint8_t inkG, uint8_t inkB) {
+    level = std::clamp(level, 0.0F, 1.0F);
+    const float radius = static_cast<float>(track.bottom - track.top) * 0.5F;
+    const float cy = 0.5F * static_cast<float>(track.top + track.bottom);
+    const float left = static_cast<float>(track.left) + radius;
+    const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
+    const float fill = left + (right - left) * level;
+    FillPillColorPremul(pixels, width, height, left, right, cy, radius, 0.26F, inkB, inkG, inkR);
+    if (level > 0.01F) {
+        FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
+            accentB, accentG, accentR);
+    }
+    FillSoftDisc(pixels, width, height, fill, cy + std::max(1.0F, 1.5F * scale),
+        radius + std::max(1.5F, 2.0F * scale), 0.20F, 60, 60, 66);
+    FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(1.0F, 1.5F * scale), 0.99F,
+        false);
+}
+
+}  // namespace dock_detail
+
 void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int height, HDC memory,
     float scale, LONG padding, LONG gearSize, LONG headerHeight, HFONT titleFont, HFONT sectionFont,
     HFONT labelFont, HFONT statusFont, LONG& panelWidth, LONG& contentBottom) {
@@ -2788,6 +2846,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         m_qsBoostStatusRect = {};
         m_qsBtStatusRect = {};
     }
+    SetQsAccent(m_config.QsIconColor());
     const bool home = m_qsPage == QuickSettingsPage::Home;
     panelWidth = std::max(320L, std::lround((home ? 600.0F : 380.0F) * scale));
     m_qsCcShapes.clear();
@@ -2850,8 +2909,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         }
         const float radius = ContentSquircleRadius(bounds, scale);
         if (active) {
-            FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.96F, kBlueB, kBlueG,
-                kBlueR);
+            FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.96F, g_qsAccentB, g_qsAccentG,
+                g_qsAccentR);
         } else if (light) {
             FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.72F, 255, 255, 255);
         } else {
@@ -2872,7 +2931,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         const float fill = left + (right - left) * level;
         if (level > 0.015F) {
             FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
-                kBlueB, kBlueG, kBlueR);
+                g_qsAccentB, g_qsAccentG, g_qsAccentR);
         }
         FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(2.0F, 3.0F * scale),
             0.98F, false);
@@ -2886,8 +2945,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         FillPillColorPremul(pixels, width, height, cx, cx, cy, radius - 1.8F, 0.96F,
             light ? 255 : 32, light ? 255 : 34, light ? 255 : 40);
         if (selected) {
-            FillPillColorPremul(pixels, width, height, cx, cx, cy, radius * 0.46F, 1.0F, kBlueB,
-                kBlueG, kBlueR);
+            FillPillColorPremul(pixels, width, height, cx, cx, cy, radius * 0.46F, 1.0F, g_qsAccentB,
+                g_qsAccentG, g_qsAccentR);
         }
     };
     auto toggleRect = [&](LONG centerY, LONG right, bool enabled) {
@@ -2897,18 +2956,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         const LONG top = centerY - switchH / 2L;
         if (draw) {
             const float radius = static_cast<float>(switchH) * 0.5F;
-            const float cxL = static_cast<float>(left) + radius;
-            const float cxR = static_cast<float>(right) - radius;
-            const float cy = static_cast<float>(top) + radius;
-            if (enabled) {
-                FillPillColorPremul(pixels, width, height, cxL, cxR, cy, radius, 0.96F, kBlueB,
-                    kBlueG, kBlueR);
-            } else {
-                FillPillColorPremul(pixels, width, height, cxL, cxR, cy, radius, 0.45F, inkB, inkG,
-                    inkR);
-            }
-            FillCirclePremul(pixels, width, height, enabled ? cxR : cxL, cy,
-                radius - std::max(2.0F, 2.0F * scale), 0.98F, false);
+            CcDrawSwitch(pixels, width, height, static_cast<float>(left) + radius,
+                static_cast<float>(right) - radius, static_cast<float>(top) + radius, radius, scale,
+                enabled, g_qsAccentR, g_qsAccentG, g_qsAccentB, inkR, inkG, inkB);
         }
         return RECT{left - 8, top - 6, right + 6, top + switchH + 6};
     };
@@ -3016,17 +3066,18 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             return dark ? CcInk{kInkDarkR, kInkDarkG, kInkDarkB, true}
                         : CcInk{kInkLightR, kInkLightG, kInkLightB, false};
         };
-        constexpr uint8_t kOnAccentR = 30;
-        constexpr uint8_t kOnAccentG = 33;
-        constexpr uint8_t kOnAccentB = 24;
+        uint8_t kOnAccentR = 30;
+        uint8_t kOnAccentG = 33;
+        uint8_t kOnAccentB = 24;
+        CcOnAccentInk(g_qsAccentR, g_qsAccentG, g_qsAccentB, kOnAccentR, kOnAccentG, kOnAccentB);
         auto glyphDisc = [&](float cx, float cy, float radius, bool active, const CcInk& ink,
                              wchar_t symbol, UINT extent) {
             if (!draw) {
                 return;
             }
             if (active) {
-                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, kBlueB, kBlueG,
-                    kBlueR);
+                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, g_qsAccentB, g_qsAccentG,
+                    g_qsAccentR);
             } else {
                 FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.16F, ink.b, ink.g,
                     ink.r);
@@ -3094,7 +3145,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 if (active) {
                     // Accent fill inset 2pt so the glass rim highlight stays visible.
                     FillPillColorPremul(pixels, width, height, cx, cx, cy,
-                        w * 0.5F - static_cast<float>(P(2.0F)), 0.98F, kBlueB, kBlueG, kBlueR);
+                        w * 0.5F - static_cast<float>(P(2.0F)), 0.98F, g_qsAccentB, g_qsAccentG, g_qsAccentR);
                 }
                 const UINT extent = static_cast<UINT>(std::max(16L, P(25.0F)));
                 const LONG left = static_cast<LONG>(std::lround(cx - static_cast<float>(extent) * 0.5F));
@@ -3111,21 +3162,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             if (!draw) {
                 return;
             }
-            level = std::clamp(level, 0.0F, 1.0F);
-            const float radius = static_cast<float>(track.bottom - track.top) * 0.5F;
-            const float cy = 0.5F * static_cast<float>(track.top + track.bottom);
-            const float left = static_cast<float>(track.left) + radius;
-            const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
-            const float fill = left + (right - left) * level;
-            FillPillColorPremul(pixels, width, height, left, right, cy, radius, 0.26F, ink.b, ink.g, ink.r);
-            if (level > 0.01F) {
-                FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
-                    kBlueB, kBlueG, kBlueR);
-            }
-            FillSoftDisc(pixels, width, height, fill, cy + std::max(1.0F, 1.5F * scale),
-                radius + std::max(1.5F, 2.0F * scale), 0.20F, 60, 60, 66);
-            FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(1.0F, 1.5F * scale), 0.99F,
-                false);
+            CcDrawSlider(pixels, width, height, track, level, scale, g_qsAccentR, g_qsAccentG,
+                g_qsAccentB, ink.r, ink.g, ink.b);
         };
         auto sliderCapsule = [&](RECT b, wchar_t symbol, const wchar_t* title, const std::wstring& value,
                                  float level, TrayFlyoutHitKind sliderKind, bool sliderEnabled,
@@ -3480,7 +3518,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 const LONG left = level.left + 12 + index * (segW + segGap);
                 const RECT seg{left, level.top + 8, left + segW, level.bottom - 8};
                 FillSquircleColorPremul(pixels, width, height, seg, 2.0F, index < lit ? 0.95F : 0.25F,
-                    index < lit ? kBlueB : inkB, index < lit ? kBlueG : inkG, index < lit ? kBlueR : inkR);
+                    index < lit ? g_qsAccentB : inkB, index < lit ? g_qsAccentG : inkG, index < lit ? g_qsAccentR : inkR);
             }
         }
         y += 28 + gap;
@@ -3669,7 +3707,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 draw ? FitFlyoutLine(statusFont, subtitle, textW) : subtitle,
                 DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
             if (action != nullptr && draw) {
-                SetFlyoutChromeInk(kBlueR, kBlueG, kBlueB);
+                SetFlyoutChromeInk(g_qsAccentR, g_qsAccentG, g_qsAccentB);
                 text({row.right - 12 - actionW, row.top, row.right - 12, row.bottom}, labelFont, action,
                     DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 255);
                 restoreInk();
