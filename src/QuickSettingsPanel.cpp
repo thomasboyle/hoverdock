@@ -1722,6 +1722,22 @@ int MeterBucket(float peak) noexcept {
     return static_cast<int>(std::lround(shaped * 32.0F));
 }
 
+// Home Mic capsule meter: slim rounded track with an accent fill, confined to `meter`.
+void PaintMicPillMeter(uint8_t* pixels, int width, int height, const RECT& meter, float level,
+    uint8_t inkR, uint8_t inkG, uint8_t inkB) {
+    const float barH = static_cast<float>(meter.bottom - meter.top);
+    const float radius = std::max(1.0F, barH * 0.5F);
+    const float cy = 0.5F * static_cast<float>(meter.top + meter.bottom);
+    const float left = static_cast<float>(meter.left) + radius;
+    const float right = std::max(left, static_cast<float>(meter.right) - radius);
+    FillPillColorPremul(pixels, width, height, left, right, cy, radius, 0.28F, inkB, inkG, inkR);
+    const float clamped = std::clamp(level, 0.0F, 1.0F);
+    if (clamped > 0.02F) {
+        FillPillColorPremul(pixels, width, height, left, left + (right - left) * clamped, cy, radius, 1.0F,
+            g_qsAccentB, g_qsAccentG, g_qsAccentR);
+    }
+}
+
 void QueryNightLight(QuickSettingsCache& cache) {
     cache.nightKnown = false;
     cache.nightLight = false;
@@ -2394,6 +2410,7 @@ bool ApplyQuickSettingsTemps(QuickSettingsCache& cache) {
 
 QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
     const int beforeBucket = MeterBucket(cache.inputPeak);
+    const float prevPeak = cache.inputPeak;
     const std::wstring beforeTitle = cache.mediaTitle;
     const std::wstring beforeArtist = cache.mediaArtist;
     const bool beforeHave = cache.mediaHave;
@@ -2414,6 +2431,16 @@ QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
     g_captureMeter.ReadPublished(cache);
     if (!pumpAlive && cache.inputNote.empty()) {
         cache.inputPeak = 0.0F;
+    }
+    // Fast attack, slower release so the Home Mic meter reads as a smooth level bar.
+    {
+        const float raw = cache.inputPeak;
+        const float k = raw > prevPeak ? 0.65F : 0.18F;
+        float smooth = prevPeak + (raw - prevPeak) * k;
+        if (smooth < 0.002F) {
+            smooth = 0.0F;
+        }
+        cache.inputPeak = smooth;
     }
 
     // GSMTC: session ~1 Hz, scrub/progress ~5 Hz.
@@ -2662,28 +2689,10 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
                     index < lit ? g_qsAccentB : inkB, index < lit ? g_qsAccentG : inkG, index < lit ? g_qsAccentR : inkR);
             }
         } else {
-            constexpr int segments = 12;
-            const int lit = m_qsCache.inputMuted
-                ? 0
-                : static_cast<int>(std::lround(std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) *
-                      static_cast<float>(segments)));
-            const LONG barH = std::max(1L, meter.bottom - meter.top);
-            const LONG segGap = std::max(2L, std::lround(3.0F * scale));
-            const LONG segW = std::max(4L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
-            const float segRadius = static_cast<float>(barH) * 0.5F;
-            for (int index = 0; index < segments; ++index) {
-                const LONG left = meter.left + index * (segW + segGap);
-                const float cxL = static_cast<float>(left) + segRadius;
-                const float cxR = static_cast<float>(left + segW) - segRadius;
-                const float cy = 0.5F * static_cast<float>(meter.top + meter.bottom);
-                if (index < lit) {
-                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
-                        1.0F, g_qsAccentB, g_qsAccentG, g_qsAccentR, g_qsAccentB, g_qsAccentG, g_qsAccentR);
-                } else {
-                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cy, segRadius,
-                        0.28F, inkB, inkG, inkR, inkB, inkG, inkR);
-                }
-            }
+            const float level = m_qsCache.inputMuted
+                ? 0.0F
+                : std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F);
+            PaintMicPillMeter(pixels, width, height, meter, level, inkR, inkG, inkB);
         }
     }
     if (m_qsScrubValid && m_qsPage == QuickSettingsPage::Home) {
@@ -3236,7 +3245,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const LONG textR = b.right - P(14.0F);
             text({textL, cy - P(22.0F), textR, cy - P(2.0F)}, labelFont, L"Mic",
                 DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            const LONG barH = std::max(5L, P(6.0F));
+            const LONG barH = std::max(4L, P(5.0F));
             const RECT meter{textL, cy + P(6.0F), textR, cy + P(6.0F) + barH};
             if (draw) {
                 m_qsMeterRect = meter;
@@ -3244,18 +3253,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 m_qsMeterInkR = ink.r;
                 m_qsMeterInkG = ink.g;
                 m_qsMeterInkB = ink.b;
-                constexpr int segments = 12;
-                const LONG segGap = std::max(2L, P(2.5F));
-                const LONG segW = std::max(3L, (meter.right - meter.left - segGap * (segments - 1)) / segments);
-                const float segRadius = static_cast<float>(barH) * 0.5F;
-                for (int index = 0; index < segments; ++index) {
-                    const LONG left = meter.left + index * (segW + segGap);
-                    const float cxL = static_cast<float>(left) + segRadius;
-                    const float cxR = static_cast<float>(left + segW) - segRadius;
-                    const float cyM = 0.5F * static_cast<float>(meter.top + meter.bottom);
-                    FillHGradientPill(pixels, width, height, cxL, std::max(cxL + 1.0F, cxR), cyM, segRadius,
-                        0.28F, ink.b, ink.g, ink.r, ink.b, ink.g, ink.r);
-                }
+                PaintMicPillMeter(pixels, width, height, meter, 0.0F, ink.r, ink.g, ink.b);
             }
             push(TrayFlyoutHitKind::Microphone, b);
         }
