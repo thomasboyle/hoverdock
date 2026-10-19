@@ -233,6 +233,12 @@ std::vector<std::wstring> BluetoothTileStatusCandidates(const BluetoothSnapshot&
     if (!bt.radioOn) {
         return {L"Off"};
     }
+    // Home tile shows the radio state only; the drill-in names connected devices.
+    return {L"On"};
+}
+
+// "Connected to <device> +N" for the drill-in summary, or empty when none is.
+std::wstring BluetoothConnectedSummary(const BluetoothSnapshot& bt) {
     const BluetoothDeviceInfo* first = nullptr;
     int connected = 0;
     for (const BluetoothDeviceInfo& device : bt.paired) {
@@ -244,11 +250,11 @@ std::vector<std::wstring> BluetoothTileStatusCandidates(const BluetoothSnapshot&
         }
     }
     if (first == nullptr) {
-        return {L"On"};
+        return {};
     }
     const std::wstring name = first->name.empty() ? L"device" : first->name;
     const std::wstring more = connected > 1 ? (L" +" + std::to_wstring(connected - 1)) : L"";
-    return {L"Connected to " + name + more, name + more};
+    return L"Connected to " + name + more;
 }
 
 // Boost report app name without the ".exe" suffix, with a "(N)" process count.
@@ -306,8 +312,8 @@ std::wstring BluetoothPageSummary(const BluetoothSnapshot& bt) {
     if (!bt.radioOn) {
         return L"Off";
     }
-    const std::vector<std::wstring> status = BluetoothTileStatusCandidates(bt);
-    return status.front() == L"On" ? L"On \u00B7 not connected" : status.front();
+    const std::wstring connected = BluetoothConnectedSummary(bt);
+    return connected.empty() ? L"On \u00B7 not connected" : connected;
 }
 
 // Device-type glyph for Bluetooth rows, guessed from the friendly name since
@@ -2990,7 +2996,7 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
                 }
             }
             if (chosen.empty()) {
-                // "Connected to <long name>" and "<long name>" both overflow:
+                // Nothing fits the status band:
                 // clean character ellipsis on the short form.
                 chosen = FitFlyoutLine(statusFont, candidates.back(), avail);
             }
