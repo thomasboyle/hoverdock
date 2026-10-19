@@ -3060,6 +3060,27 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         }
         return 0;
 
+    case kQsRefreshResultMessage:
+        if (app != nullptr) {
+            const int hz = static_cast<int>(wParam);
+            app->m_qsRefreshPendingHz = 0;
+            if (lParam != 0) {
+                app->m_qsCache.refreshHz = hz;
+                app->m_qsRefreshNote.clear();
+            } else {
+                app->m_qsRefreshNote = L"Couldn\u2019t switch to " + std::to_wstring(hz) + L" Hz.";
+            }
+            if (app->IsOverflowOpen()) {
+                // Confirm against the driver (it may round or refuse quietly).
+                app->m_qsCache.stampNetwork = 0;
+                RequestQuickSettingsCacheAsync(window, kQsCacheResultMessage, app->m_qsPage);
+                app->m_overflowHover = -1;
+                app->m_overflowHoverDirtyValid = false;
+                app->QueueOverflowPaint(false);
+            }
+        }
+        return 0;
+
     case kQsEnergyResultMessage:
         if (app != nullptr && app->IsOverflowOpen()) {
             if (ApplyEnergyAppsResult(app->m_qsCache)) {
@@ -8932,6 +8953,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::WifiOthers:
     case TrayFlyoutHitKind::BluetoothOthers:
     case TrayFlyoutHitKind::BoostPage:
+    case TrayFlyoutHitKind::RefreshRate:
         ApplyQuickSettingsCommand(hit, message);
         break;
     case TrayFlyoutHitKind::NotifyIcon:
@@ -9082,13 +9104,14 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         // menu rows get a plate; other pages keep their bare footer links.
         if (hit.kind == TrayFlyoutHitKind::MoreSettings && m_qsPage != QuickSettingsPage::Wifi &&
             m_qsPage != QuickSettingsPage::Bluetooth && m_qsPage != QuickSettingsPage::Boost &&
-            m_qsPage != QuickSettingsPage::Display) {
+            m_qsPage != QuickSettingsPage::Display && m_qsPage != QuickSettingsPage::RefreshRate) {
             break;
         }
         [[fallthrough]];
     case TrayFlyoutHitKind::WifiNetwork:
     case TrayFlyoutHitKind::WifiOthers:
     case TrayFlyoutHitKind::BluetoothOthers:
+    case TrayFlyoutHitKind::RefreshRate:
     case TrayFlyoutHitKind::BluetoothConnect:
     case TrayFlyoutHitKind::BluetoothPair:
     case TrayFlyoutHitKind::BluetoothDiscover: {

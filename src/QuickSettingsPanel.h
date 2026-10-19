@@ -21,6 +21,7 @@ enum class QuickSettingsPage : uint8_t {
     Bluetooth,
     Display,
     Boost,
+    RefreshRate,
 };
 
 // Home Control Centre modules, in default grid order. The user can drag them
@@ -124,6 +125,12 @@ struct QuickSettingsCache {
     // resolution, ascending. 0 / empty when unknown.
     int refreshHz = 0;
     std::vector<int> refreshRates;
+    // GDI device (\\.\DISPLAYn) of the monitor Quick Settings is on, its
+    // friendly name and current resolution, for the Refresh Rate menu.
+    std::wstring refreshDevice;
+    std::wstring refreshMonitor;
+    int refreshWidth = 0;
+    int refreshHeight = 0;
     // Home temperature tile. Whole degrees C / watts; -1 shows an em dash.
     int cpuTempC = -1;
     int gpuTempC = -1;

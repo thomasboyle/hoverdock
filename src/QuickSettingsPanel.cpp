@@ -89,6 +89,7 @@ constexpr int kLinkMixer = 10;
 // Opens the in-panel Bluetooth drill-in (Airplane page row).
 constexpr int kLinkBluetoothPage = 11;
 constexpr int kLinkStartupApps = 12;
+constexpr int kLinkDisplayAdvanced = 13;
 
 constexpr int kToggleWifi = 0;
 constexpr int kToggleMute = 1;
@@ -1180,23 +1181,79 @@ bool SetDarkMode(bool dark) {
     return true;
 }
 
-void QueryRefreshRate(QuickSettingsCache& cache) {
+// Friendly name ("DELL U2723QE") of the monitor behind a GDI device name.
+std::wstring MonitorFriendlyName(const std::wstring& device) {
+    UINT pathCount = 0;
+    UINT modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS ||
+        pathCount == 0) {
+        return {};
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(),
+            nullptr) != ERROR_SUCCESS) {
+        return {};
+    }
+    for (UINT index = 0; index < pathCount; ++index) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = paths[index].sourceInfo.adapterId;
+        source.header.id = paths[index].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+            _wcsicmp(source.viewGdiDeviceName, device.c_str()) != 0) {
+            continue;
+        }
+        DISPLAYCONFIG_TARGET_DEVICE_NAME target{};
+        target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        target.header.size = sizeof(target);
+        target.header.adapterId = paths[index].targetInfo.adapterId;
+        target.header.id = paths[index].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&target.header) == ERROR_SUCCESS) {
+            return target.monitorFriendlyDeviceName;
+        }
+    }
+    return {};
+}
+
+// Rates for the monitor `anchor` sits on (the dock's / Quick Settings'),
+// limited to modes matching the current resolution, depth and scan type.
+void QueryRefreshRate(QuickSettingsCache& cache, HWND anchor) {
     cache.refreshHz = 0;
     cache.refreshRates.clear();
-    DEVMODEW current{};
-    current.dmSize = sizeof(current);
-    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &current) == FALSE) {
+    cache.refreshDevice.clear();
+    cache.refreshMonitor.clear();
+    cache.refreshWidth = 0;
+    cache.refreshHeight = 0;
+    MONITORINFOEXW monitor{};
+    monitor.cbSize = sizeof(monitor);
+    const HMONITOR handle = anchor != nullptr ? MonitorFromWindow(anchor, MONITOR_DEFAULTTOPRIMARY)
+                                              : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (handle == nullptr || GetMonitorInfoW(handle, &monitor) == FALSE) {
         return;
     }
+    const std::wstring device = monitor.szDevice;
+    DEVMODEW current{};
+    current.dmSize = sizeof(current);
+    if (EnumDisplaySettingsW(device.c_str(), ENUM_CURRENT_SETTINGS, &current) == FALSE) {
+        return;
+    }
+    cache.refreshDevice = device;
+    cache.refreshMonitor = MonitorFriendlyName(device);
+    cache.refreshWidth = static_cast<int>(current.dmPelsWidth);
+    cache.refreshHeight = static_cast<int>(current.dmPelsHeight);
     // 0 and 1 mean "hardware default", not a real rate.
     if (current.dmDisplayFrequency > 1U) {
         cache.refreshHz = static_cast<int>(current.dmDisplayFrequency);
     }
     DEVMODEW mode{};
     mode.dmSize = sizeof(mode);
-    for (DWORD index = 0; EnumDisplaySettingsW(nullptr, index, &mode) != FALSE; ++index) {
+    for (DWORD index = 0; EnumDisplaySettingsW(device.c_str(), index, &mode) != FALSE; ++index) {
         if (mode.dmPelsWidth != current.dmPelsWidth || mode.dmPelsHeight != current.dmPelsHeight ||
-            mode.dmBitsPerPel != current.dmBitsPerPel || mode.dmDisplayFrequency <= 1U) {
+            mode.dmBitsPerPel != current.dmBitsPerPel ||
+            (mode.dmDisplayFlags & DM_INTERLACED) != (current.dmDisplayFlags & DM_INTERLACED) ||
+            mode.dmDisplayFrequency <= 1U) {
             continue;
         }
         const int hz = static_cast<int>(mode.dmDisplayFrequency);
@@ -1204,19 +1261,29 @@ void QueryRefreshRate(QuickSettingsCache& cache) {
             cache.refreshRates.push_back(hz);
         }
     }
-    std::sort(cache.refreshRates.begin(), cache.refreshRates.end());
+    if (cache.refreshHz > 0 &&
+        std::find(cache.refreshRates.begin(), cache.refreshRates.end(), cache.refreshHz) == cache.refreshRates.end()) {
+        cache.refreshRates.push_back(cache.refreshHz);
+    }
+    // Fastest first, like the macOS display menu.
+    std::sort(cache.refreshRates.rbegin(), cache.refreshRates.rend());
 }
 
-// Mode switch on the primary display; blocks while the display retrains.
-bool SetRefreshRate(int hz) {
+// Switch `device` to `hz` at its current resolution. The mode is validated
+// with CDS_TEST first so an unsupported rate never blanks the screen. Blocks
+// while the display retrains: workers only.
+bool SetRefreshRate(const std::wstring& device, int hz) {
     DEVMODEW mode{};
     mode.dmSize = sizeof(mode);
-    if (hz <= 1 || EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) == FALSE) {
+    if (device.empty() || hz <= 1 || EnumDisplaySettingsW(device.c_str(), ENUM_CURRENT_SETTINGS, &mode) == FALSE) {
         return false;
     }
     mode.dmDisplayFrequency = static_cast<DWORD>(hz);
     mode.dmFields = DM_DISPLAYFREQUENCY;
-    return ChangeDisplaySettingsExW(nullptr, &mode, nullptr, CDS_UPDATEREGISTRY, nullptr) ==
+    if (ChangeDisplaySettingsExW(device.c_str(), &mode, nullptr, CDS_TEST, nullptr) != DISP_CHANGE_SUCCESSFUL) {
+        return false;
+    }
+    return ChangeDisplaySettingsExW(device.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY, nullptr) ==
         DISP_CHANGE_SUCCESSFUL;
 }
 
@@ -2004,7 +2071,7 @@ void QueryCapture(QuickSettingsCache& cache) {
     }
 }
 
-void FillQsNetworkCache(QuickSettingsCache& cache, QuickSettingsPage page) {
+void FillQsNetworkCache(QuickSettingsCache& cache, QuickSettingsPage page, HWND anchor) {
     // Heavy WLAN / IP helper / MMDevice / WASAPI / power / HDR / Night Light.
     // Runs only on the network worker - never on the UI thread.
     QueryWifiRadio(cache);
@@ -2021,7 +2088,7 @@ void FillQsNetworkCache(QuickSettingsCache& cache, QuickSettingsPage page) {
     QueryHdr(cache);
     QueryNightLight(cache);
     QueryDarkMode(cache);
-    QueryRefreshRate(cache);
+    QueryRefreshRate(cache, anchor);
     const ULONGLONG now = GetTickCount64();
     cache.stampNetwork = now;
     cache.stampNight = now;
@@ -2450,12 +2517,14 @@ void RequestQuickSettingsCacheAsync(HWND notifyHwnd, UINT notifyMsg, QuickSettin
     std::thread([] {
         const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         QuickSettingsPage page = QuickSettingsPage::Home;
+        HWND anchor = nullptr;
         {
             std::lock_guard<std::mutex> lock(g_network.mutex);
             page = g_network.page;
+            anchor = g_network.notifyHwnd;
         }
         QuickSettingsCache local{};
-        FillQsNetworkCache(local, page);
+        FillQsNetworkCache(local, page, anchor);
         HWND hwnd = nullptr;
         UINT msg = 0;
         {
@@ -2492,6 +2561,8 @@ bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache) {
         cache.nightLight != r.nightLight || cache.nightKnown != r.nightKnown ||
         cache.darkMode != r.darkMode || cache.darkKnown != r.darkKnown ||
         cache.refreshHz != r.refreshHz || cache.refreshRates != r.refreshRates ||
+        cache.refreshDevice != r.refreshDevice || cache.refreshMonitor != r.refreshMonitor ||
+        cache.refreshWidth != r.refreshWidth || cache.refreshHeight != r.refreshHeight ||
         cache.wifi.size() != r.wifi.size() || cache.vpn.size() != r.vpn.size() ||
         cache.renderDevices.size() != r.renderDevices.size() ||
         cache.captureDevices.size() != r.captureDevices.size();
@@ -2522,6 +2593,10 @@ bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache) {
     cache.darkKnown = r.darkKnown;
     cache.refreshHz = r.refreshHz;
     cache.refreshRates = r.refreshRates;
+    cache.refreshDevice = r.refreshDevice;
+    cache.refreshMonitor = r.refreshMonitor;
+    cache.refreshWidth = r.refreshWidth;
+    cache.refreshHeight = r.refreshHeight;
     cache.stampNetwork = r.stampNetwork;
     cache.stampNight = r.stampNight;
     cache.stamp = r.stamp;
@@ -2731,6 +2806,9 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
     ResetQsChevronFade();
+    if (page == QuickSettingsPage::RefreshRate) {
+        m_qsRefreshNote.clear();
+    }
     if (page == QuickSettingsPage::Wifi) {
         m_qsWifiOthersOpen = false;
     } else if (page == QuickSettingsPage::Bluetooth) {
@@ -4315,6 +4393,47 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             hairline();
         }
         menuLink(L"Bluetooth Settings\u2026", kLinkBluetooth);
+    } else if (m_qsPage == QuickSettingsPage::RefreshRate) {
+        // macOS Control Centre style menu: one row per rate for the display
+        // Quick Settings is on, the current one filled with the accent.
+        static const std::wstring kNoTrailing;
+        beginHeader(L"Refresh Rate", false, -1, false);
+        {
+            std::wstring subtitle = m_qsCache.refreshMonitor.empty() ? std::wstring(L"Display") : m_qsCache.refreshMonitor;
+            if (m_qsCache.refreshWidth > 0 && m_qsCache.refreshHeight > 0) {
+                subtitle += L"  \u00B7  " + std::to_wstring(m_qsCache.refreshWidth) + L" \u00D7 " +
+                    std::to_wstring(m_qsCache.refreshHeight);
+            }
+            const LONG summaryW = panelWidth - padding * 2L - menuInset * 2L;
+            text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont,
+                draw ? FitFlyoutLine(statusFont, subtitle, summaryW) : subtitle,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
+            y += sectionH + 2;
+        }
+        hairline();
+        const std::vector<int>& rates = m_qsCache.refreshRates;
+        if (rates.empty()) {
+            menuNote(m_qsCache.refreshDevice.empty() ? L"Checking display\u2026" : L"Refresh rate unavailable");
+        }
+        const int fastest = rates.empty() ? 0 : rates.front();
+        for (const int hz : rates) {
+            const bool pending = hz == m_qsRefreshPendingHz;
+            const bool current = m_qsRefreshPendingHz == 0 ? hz == m_qsCache.refreshHz : pending;
+            static const std::wstring kApplying = L"Applying\u2026";
+            static const std::wstring kSmoothest = L"Smoothest";
+            const std::wstring& trailing = pending ? kApplying : (hz == fastest && rates.size() > 1U ? kSmoothest : kNoTrailing);
+            menuItem(L'\uEC4A', current, m_qsRefreshPendingHz != 0 && !pending, std::to_wstring(hz) + L" Hz",
+                trailing, L'\0', TrayFlyoutHitKind::RefreshRate, hz);
+        }
+        if (!m_qsRefreshNote.empty()) {
+            const LONG noteW = panelWidth - padding * 2L - menuInset * 2L;
+            text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont,
+                draw ? FitFlyoutLine(statusFont, m_qsRefreshNote, noteW) : m_qsRefreshNote,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
+            y += sectionH;
+        }
+        hairline();
+        menuLink(L"Advanced Display Settings\u2026", kLinkDisplayAdvanced);
     } else if (m_qsPage == QuickSettingsPage::Boost) {
         // Boost report: what the most recent run closed, freed and turned off,
         // in the same flat macOS menu style as the Wi-Fi / Bluetooth pages.
@@ -4601,6 +4720,32 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
         // Home Boost tile (outside the glyph disc): last-run report.
         navigate(QuickSettingsPage::Boost, L"ms-settings:startupapps");
         break;
+    case TrayFlyoutHitKind::RefreshRate: {
+        const int hz = hit.index;
+        const std::wstring device = m_qsCache.refreshDevice;
+        if (alternate || device.empty()) {
+            openUri(L"ms-settings:display-advanced");
+            break;
+        }
+        if (hz <= 1 || hz == m_qsCache.refreshHz || m_qsRefreshPendingHz != 0) {
+            break;
+        }
+        // Mode switches block for ~1 s while the display retrains: worker
+        // only. The row shows "Applying" until kQsRefreshResultMessage.
+        m_qsRefreshPendingHz = hz;
+        m_qsRefreshNote.clear();
+        const HWND notify = m_overflowWindow;
+        std::thread([device, hz, notify] {
+            const bool ok = SetRefreshRate(device, hz);
+            if (notify != nullptr) {
+                PostMessageW(notify, kQsRefreshResultMessage, static_cast<WPARAM>(hz), ok ? 1 : 0);
+            }
+        }).detach();
+        m_overflowHover = -1;
+        m_overflowHoverDirtyValid = false;
+        QueueOverflowPaint();
+        break;
+    }
     case TrayFlyoutHitKind::WifiRadio:
         // Home Wi-Fi tile glyph disc: flip the radio like the Bluetooth disc.
         // Right-click keeps the old shortcut to the Windows network flyout.
@@ -4726,26 +4871,11 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             QueueOverflowPaint();
             break;
         }
-        case kToggleRefreshRate: {
-            // Step to the next supported rate (wrapping). With one or no known
-            // rate there is nothing to cycle, so open the advanced page.
-            const std::vector<int>& rates = m_qsCache.refreshRates;
-            if (alternate || rates.size() < 2U) {
-                openUri(L"ms-settings:display-advanced");
-                break;
-            }
-            const auto above = std::upper_bound(rates.begin(), rates.end(), m_qsCache.refreshHz);
-            const int next = above == rates.end() ? rates.front() : *above;
-            m_qsCache.refreshHz = next;
-            const HWND notify = m_overflowWindow;
-            const QuickSettingsPage page = m_qsPage;
-            std::thread([next, notify, page] {
-                static_cast<void>(SetRefreshRate(next));
-                RequestQuickSettingsCacheAsync(notify, kQsCacheResultMessage, page);
-            }).detach();
-            QueueOverflowPaint();
+        case kToggleRefreshRate:
+            // Control Centre style: the button opens a menu of rates for this
+            // display. Right-click keeps the shortcut to Windows settings.
+            navigate(QuickSettingsPage::RefreshRate, L"ms-settings:display-advanced");
             break;
-        }
         case kToggleHdr:
             SetHdrEnabled(!m_qsCache.hdrOn);
             m_qsCache.stamp = 0;
@@ -4845,6 +4975,9 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             break;
         case kLinkStartupApps:
             openUri(L"ms-settings:startupapps");
+            break;
+        case kLinkDisplayAdvanced:
+            openUri(L"ms-settings:display-advanced");
             break;
         default:
             break;

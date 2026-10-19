@@ -212,6 +212,8 @@ private:
     static constexpr UINT kQsCacheResultMessage = WM_APP + 27;
     static constexpr UINT kOpenDockSettingsMessage = WM_APP + 29;
     static constexpr UINT kHiddenCatalogMessage = WM_APP + 30;
+    // Refresh-rate worker finished: wParam = Hz, lParam = 1 on success.
+    static constexpr UINT kQsRefreshResultMessage = WM_APP + 31;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -256,6 +258,8 @@ private:
         BluetoothOthers,
         // Home Boost tile outside its glyph disc: opens the last-run report.
         BoostPage,
+        // Refresh Rate menu row; index is the rate in Hz.
+        RefreshRate,
     };
 
     struct TrayFlyoutHit {
@@ -1106,6 +1110,9 @@ private:
     RECT m_qsReorderBounds{};
     RECT m_qsReorderDirty{};
     ULONGLONG m_qsReorderLastMs = 0;
+    // Refresh Rate menu: the rate being applied (0 = none) and a failure note.
+    int m_qsRefreshPendingHz = 0;
+    std::wstring m_qsRefreshNote;
     bool m_qsWifiOthersOpen = false;
     bool m_qsBtOthersOpen = false;
     RECT m_qsBtStatusRect{};
