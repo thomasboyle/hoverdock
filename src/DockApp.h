@@ -457,13 +457,21 @@ private:
     void KickQsChevronFade() noexcept;
     void StepQsChevronFade();
     void ResetQsChevronFade() noexcept;
-    // Restore drawn arrow boxes in the present frame from the arrow-free base.
-    void ClearQsTileChevrons(RECT* dirty) noexcept;
-    void PaintQsTileChevrons(uint8_t* pixels, int width, int height);
+    // Exact square the tile arrow glyph occupies (window px).
+    RECT QsChevronGlyphRect(size_t tile) const noexcept;
+    // Restore drawn arrows in the present frame from the arrow-free base. With
+    // `within`, only arrows overlapping it are cleared. Returns a tile bitmask.
+    unsigned ClearQsTileChevrons(RECT* dirty, const RECT* within = nullptr) noexcept;
+    void PaintQsTileChevrons(uint8_t* pixels, int width, int height, unsigned tiles = 3U);
+    // Arrow-only present for fade frames (two glyph squares, nothing else).
+    void PaintQsChevronFadeFast();
+    // Signatures of what the live meter / scrub would draw; equal means no pixel change.
+    void QsLiveSignatures(int64_t& meter, int64_t& scrub) const noexcept;
     // Meter/scrub-only present from underlay via UpdateLayeredWindowIndirect.
     void PaintOverflowLiveFast();
     void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
-        bool includeTemps = true, bool includeBoost = true, bool includeBluetooth = true) const;
+        bool includeTemps = true, bool includeBoost = true, bool includeBluetooth = true,
+        bool includeMeter = true, bool includeScrub = true) const;
     void ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
         const TrayFlyoutHit& hit) const;
     void DestroyOverflowPopup() noexcept;
@@ -1024,6 +1032,9 @@ private:
     bool m_qsChevronDrawn[2]{};
     ULONGLONG m_qsChevronFadeLastMs = 0;
     std::vector<uint8_t> m_qsChevronScratch;
+    std::vector<uint8_t> m_qsContentScratch;
+    int64_t m_qsMeterPaintedSig = -1;
+    int64_t m_qsScrubPaintedSig = -1;
     bool m_qsWifiOthersOpen = false;
     bool m_qsBtOthersOpen = false;
     RECT m_qsBtStatusRect{};

@@ -462,6 +462,36 @@ void CollectEndpoints(EDataFlow flow, std::vector<QsNamedId>& devices, std::wstr
     enumerator->Release();
 }
 
+bool SetWifiRadio(bool enabled);
+
+// WlanSetInterface can block for tens of ms; run it on a worker so the UI
+// thread (which also services the low-level mouse hook) never waits on it.
+// Rapid toggles collapse to the latest requested state, applied in order.
+void SetWifiRadioAsync(bool enabled, HWND notifyHwnd, UINT notifyMsg, QuickSettingsPage page) {
+    static std::atomic<int> desired{-1};
+    static std::atomic<bool> busy{false};
+    desired.store(enabled ? 1 : 0);
+    if (busy.exchange(true)) {
+        return;
+    }
+    std::thread([notifyHwnd, notifyMsg, page] {
+        for (;;) {
+            const int want = desired.exchange(-1);
+            if (want < 0) {
+                busy.store(false);
+                // A request that raced the store above restarts the loop.
+                if (desired.load() >= 0 && !busy.exchange(true)) {
+                    continue;
+                }
+                break;
+            }
+            static_cast<void>(SetWifiRadio(want == 1));
+        }
+        // Real radio state + network list replace the optimistic flip.
+        RequestQuickSettingsCacheAsync(notifyHwnd, notifyMsg, page);
+    }).detach();
+}
+
 bool SetWifiRadio(bool enabled) {
     HANDLE client = nullptr;
     DWORD version = 0;
@@ -2672,7 +2702,10 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
         return;
     }
     const size_t bytes = static_cast<size_t>(contentWidth) * static_cast<size_t>(contentHeight) * 4U;
-    std::vector<uint8_t> content(bytes, 0);
+    // Reused across paints: assign keeps capacity, so no fresh multi-MB
+    // allocation (and its page faults) per Quick Settings rebuild.
+    std::vector<uint8_t>& content = m_qsContentScratch;
+    content.assign(bytes, 0);
     LONG widthOut = panelWidth;
     LONG heightOut = 0;
     LayoutQuickSettings(true, content.data(), contentWidth, contentHeight, memory, scale, padding,
@@ -2705,15 +2738,48 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
     m_overflowGearY += static_cast<int>(shadowMargin);
 }
 
+void DockApp::QsLiveSignatures(int64_t& meter, int64_t& scrub) const noexcept {
+    meter = -1;
+    scrub = -1;
+    const int64_t accent = (static_cast<int64_t>(g_qsAccentR) << 16) | (static_cast<int64_t>(g_qsAccentG) << 8) |
+        static_cast<int64_t>(g_qsAccentB);
+    if (m_qsMeterValid) {
+        const int64_t ink = (static_cast<int64_t>(m_qsMeterInkR) << 16) |
+            (static_cast<int64_t>(m_qsMeterInkG) << 8) | static_cast<int64_t>(m_qsMeterInkB);
+        uint32_t level = 0;
+        if (m_qsPage == QuickSettingsPage::Microphone) {
+            level = m_qsCache.inputMuted ? 0U
+                : static_cast<uint32_t>(std::lround(
+                      std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F) * 16.0F));
+        } else {
+            // Exact float the pill meter draws with (see PaintQsLiveOverlays).
+            const float shaped = m_qsCache.inputMuted
+                ? 0.0F
+                : std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F);
+            std::memcpy(&level, &shaped, sizeof(level));
+        }
+        meter = (((ink << 24) | accent) * 1000003LL) ^ static_cast<int64_t>(level);
+    }
+    if (m_qsScrubValid && m_qsPage == QuickSettingsPage::Home) {
+        const int64_t ink = (static_cast<int64_t>(m_qsScrubInkR) << 16) |
+            (static_cast<int64_t>(m_qsScrubInkG) << 8) | static_cast<int64_t>(m_qsScrubInkB);
+        const float level = m_qsCache.mediaHave ? std::clamp(m_qsCache.mediaProgress, 0.0F, 1.0F) : 0.0F;
+        // Quarter-pixel knob position: finer motion is below the AA edge step.
+        const float span = static_cast<float>(std::max(1L, m_qsScrubRect.right - m_qsScrubRect.left));
+        const int64_t position = std::lround(level * span * 4.0F);
+        scrub = (((ink << 24) | accent) * 1000003LL) ^ position;
+    }
+}
+
 void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
-    bool includeTemps, bool includeBoost, bool includeBluetooth) const {
+    bool includeTemps, bool includeBoost, bool includeBluetooth, bool includeMeter, bool includeScrub) const {
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
     const uint8_t inkR = m_qsMeterInkR;
     const uint8_t inkG = m_qsMeterInkG;
     const uint8_t inkB = m_qsMeterInkB;
-    if (m_qsMeterValid) {
+    if (includeMeter && m_qsMeterValid) {
         const RECT& meter = m_qsMeterRect;
         if (m_qsPage == QuickSettingsPage::Microphone) {
             const int segments = 16;
@@ -2737,7 +2803,7 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
             PaintMicPillMeter(pixels, width, height, meter, level, inkR, inkG, inkB);
         }
     }
-    if (m_qsScrubValid && m_qsPage == QuickSettingsPage::Home) {
+    if (includeScrub && m_qsScrubValid && m_qsPage == QuickSettingsPage::Home) {
         const RECT& track = m_qsScrubRect;
         const float level = m_qsCache.mediaHave ? std::clamp(m_qsCache.mediaProgress, 0.0F, 1.0F) : 0.0F;
         const float radius = std::max(4.0F, static_cast<float>(track.bottom - track.top) * 0.5F);
@@ -4016,14 +4082,9 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             }
             break;
         }
-        SetWifiRadio(!m_qsCache.wifiRadioOn);
         m_qsCache.wifiRadioOn = !m_qsCache.wifiRadioOn;
-        static_cast<void>(m_tray.Refresh());
-        m_qsCache.stamp = 0;
-        m_qsCache.stampNetwork = 0;
-        EnsureTrayIcons();
+        SetWifiRadioAsync(m_qsCache.wifiRadioOn, m_overflowWindow, kQsCacheResultMessage, m_qsPage);
         QueueOverflowPaint();
-        QueueRenderFrame();
         break;
     case TrayFlyoutHitKind::WifiOthers:
         m_qsWifiOthersOpen = !m_qsWifiOthersOpen;
@@ -4080,12 +4141,11 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
     case TrayFlyoutHitKind::Toggle:
         switch (hit.index) {
         case kToggleWifi:
-            SetWifiRadio(!m_qsCache.wifiRadioOn);
-            static_cast<void>(m_tray.Refresh());
-            m_qsCache.stamp = 0;
-            EnsureTrayIcons();
+            // Optimistic flip; the worker applies it and the 1 Hz tray tick
+            // picks up the new network state for the dock.
+            m_qsCache.wifiRadioOn = !m_qsCache.wifiRadioOn;
+            SetWifiRadioAsync(m_qsCache.wifiRadioOn, m_overflowWindow, kQsCacheResultMessage, m_qsPage);
             QueueOverflowPaint();
-            QueueRenderFrame();
             break;
         case kToggleMute:
             if (!m_tray.ToggleMute()) {
@@ -4109,7 +4169,8 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
         case kToggleAirplane: {
             const bool radiosOn = !m_qsCache.wifiRadioOn &&
                 (!m_bluetoothSnapshot.radioPresent || !m_bluetoothSnapshot.radioOn);
-            SetWifiRadio(radiosOn);
+            m_qsCache.wifiRadioOn = radiosOn;
+            SetWifiRadioAsync(radiosOn, m_overflowWindow, kQsCacheResultMessage, m_qsPage);
             if (m_bluetoothSnapshot.radioPresent) {
                 m_bluetoothSnapshot.radioOn = radiosOn;
                 m_bluetoothSnapshot.discovering = radiosOn ? m_bluetoothSnapshot.discovering : false;
@@ -4118,11 +4179,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
                 }
                 m_bluetooth.SetRadioEnabled(radiosOn);
             }
-            static_cast<void>(m_tray.Refresh());
-            m_qsCache.stamp = 0;
-            EnsureTrayIcons();
             QueueOverflowPaint();
-            QueueRenderFrame();
             break;
         }
         case kToggleHdr:

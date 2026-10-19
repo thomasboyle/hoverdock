@@ -440,33 +440,138 @@ LONG DockShadowMarginPx(float scale) noexcept {
     return std::lround(DOCK_SHADOW_MARGIN_PT * scale);
 }
 
-void CompositePremul(uint8_t* dest, int destWidth, int destHeight, int destX, int destY,
-    const uint8_t* source, int sourceWidth, int sourceHeight) {
-    for (int y = 0; y < sourceHeight; ++y) {
-        const int pixelY = destY + y;
-        if (pixelY < 0 || pixelY >= destHeight) {
+// Premultiplied src-over of one pixel. (s*255 + d*(255-a) + 127) / 255 is the
+// exact rounding of s + d*(1 - a/255); a .5 tie is impossible because 255 is
+// odd, so this matches the former float + lround form bit for bit.
+inline void CompositePremulPixel(uint8_t* dst, const uint8_t* src) noexcept {
+    const unsigned alpha = src[3];
+    if (alpha == 0U) {
+        return;
+    }
+    const unsigned inv = 255U - alpha;
+    dst[0] = static_cast<uint8_t>((src[0] * 255U + dst[0] * inv + 127U) / 255U);
+    dst[1] = static_cast<uint8_t>((src[1] * 255U + dst[1] * inv + 127U) / 255U);
+    dst[2] = static_cast<uint8_t>((src[2] * 255U + dst[2] * inv + 127U) / 255U);
+    dst[3] = static_cast<uint8_t>((src[3] * 255U + dst[3] * inv + 127U) / 255U);
+}
+
+// Per-channel lookup for compositing one constant premultiplied pixel, built on
+// first use so fills only pay for it when they have fully covered pixels.
+struct PremulConstant {
+    uint8_t pixel[4]{};
+    uint8_t table[4][256]{};
+    bool built = false;
+
+    void Composite(uint8_t* dst) noexcept {
+        if (pixel[3] == 0U) {
+            return;
+        }
+        if (!built) {
+            built = true;
+            const unsigned inv = 255U - pixel[3];
+            for (unsigned channel = 0; channel < 4U; ++channel) {
+                for (unsigned value = 0; value < 256U; ++value) {
+                    table[channel][value] =
+                        static_cast<uint8_t>((pixel[channel] * 255U + value * inv + 127U) / 255U);
+                }
+            }
+        }
+        dst[0] = table[0][dst[0]];
+        dst[1] = table[1][dst[1]];
+        dst[2] = table[2][dst[2]];
+        dst[3] = table[3][dst[3]];
+    }
+
+    // Same exact formula as the table, as plain arithmetic over a contiguous
+    // run so the compiler can vectorise long interior spans.
+    void CompositeSpan(uint8_t* dst, int count) const noexcept {
+        if (pixel[3] == 0U || count <= 0) {
+            return;
+        }
+        const unsigned inv = 255U - pixel[3];
+        const unsigned base[4] = {pixel[0] * 255U + 127U, pixel[1] * 255U + 127U, pixel[2] * 255U + 127U,
+            pixel[3] * 255U + 127U};
+        for (int x = 0; x < count; ++x, dst += 4) {
+            dst[0] = static_cast<uint8_t>((base[0] + dst[0] * inv) / 255U);
+            dst[1] = static_cast<uint8_t>((base[1] + dst[1] * inv) / 255U);
+            dst[2] = static_cast<uint8_t>((base[2] + dst[2] * inv) / 255U);
+            dst[3] = static_cast<uint8_t>((base[3] + dst[3] * inv) / 255U);
+        }
+    }
+};
+
+// Row-span fill for shapes whose coverage never rises moving away from the
+// middle of a row (circle, pill, squircle). Only edge pixels evaluate the
+// distance field; the fully covered span between them uses the solid table.
+// Every pixel is composited once with the same value as a per-pixel loop.
+template <class CoverageAt, class Edge>
+void FillCoverageSpans(uint8_t* dest, int destWidth, int left, int top, int right, int bottom,
+    PremulConstant& solid, CoverageAt coverageAt, Edge edge) {
+    for (int y = top; y < bottom; ++y) {
+        uint8_t* row = dest + static_cast<size_t>(y) * static_cast<size_t>(destWidth) * 4U;
+        int inner = left;
+        for (; inner < right; ++inner) {
+            const float coverage = coverageAt(inner, y);
+            if (coverage >= 1.0F) {
+                break;
+            }
+            if (coverage > 0.0F) {
+                edge(row + static_cast<size_t>(inner) * 4U, inner, y, coverage);
+            }
+        }
+        if (inner >= right) {
             continue;
         }
-        for (int x = 0; x < sourceWidth; ++x) {
-            const int pixelX = destX + x;
-            if (pixelX < 0 || pixelX >= destWidth) {
+        int outer = right - 1;
+        for (; outer > inner; --outer) {
+            const float coverage = coverageAt(outer, y);
+            if (coverage >= 1.0F) {
+                break;
+            }
+            if (coverage > 0.0F) {
+                edge(row + static_cast<size_t>(outer) * 4U, outer, y, coverage);
+            }
+        }
+        const int span = outer - inner + 1;
+        if (span >= 4) {
+            solid.CompositeSpan(row + static_cast<size_t>(inner) * 4U, span);
+        } else {
+            for (int x = inner; x <= outer; ++x) {
+                solid.Composite(row + static_cast<size_t>(x) * 4U);
+            }
+        }
+    }
+}
+
+void CompositePremul(uint8_t* dest, int destWidth, int destHeight, int destX, int destY,
+    const uint8_t* source, int sourceWidth, int sourceHeight) {
+    const int x0 = std::max(0, -destX);
+    const int x1 = std::min(sourceWidth, destWidth - destX);
+    const int y0 = std::max(0, -destY);
+    const int y1 = std::min(sourceHeight, destHeight - destY);
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+    for (int y = y0; y < y1; ++y) {
+        uint8_t* dst = dest + (static_cast<size_t>(destY + y) * destWidth + destX + x0) * 4U;
+        const uint8_t* src = source + (static_cast<size_t>(y) * sourceWidth + x0) * 4U;
+        int x = x0;
+        // Layers are mostly transparent: skip four alpha-0 pixels per test.
+        for (; x + 4 <= x1; x += 4, dst += 16, src += 16) {
+            uint64_t lo = 0;
+            uint64_t hi = 0;
+            std::memcpy(&lo, src, 8);
+            std::memcpy(&hi, src + 8, 8);
+            if (((lo | hi) & 0xFF000000FF000000ULL) == 0U) {
                 continue;
             }
-            uint8_t* dst = dest + (static_cast<size_t>(pixelY) * destWidth + pixelX) * 4U;
-            const uint8_t* src = source + (static_cast<size_t>(y) * sourceWidth + x) * 4U;
-            const float srcA = static_cast<float>(src[3]) / 255.0F;
-            if (srcA <= 0.0F) {
-                continue;
-            }
-            const float inv = 1.0F - srcA;
-            dst[0] = static_cast<uint8_t>(std::lround(static_cast<float>(src[0]) +
-                static_cast<float>(dst[0]) * inv));
-            dst[1] = static_cast<uint8_t>(std::lround(static_cast<float>(src[1]) +
-                static_cast<float>(dst[1]) * inv));
-            dst[2] = static_cast<uint8_t>(std::lround(static_cast<float>(src[2]) +
-                static_cast<float>(dst[2]) * inv));
-            dst[3] = static_cast<uint8_t>(std::lround(static_cast<float>(src[3]) +
-                static_cast<float>(dst[3]) * inv));
+            CompositePremulPixel(dst, src);
+            CompositePremulPixel(dst + 4, src + 4);
+            CompositePremulPixel(dst + 8, src + 8);
+            CompositePremulPixel(dst + 12, src + 12);
+        }
+        for (; x < x1; ++x, dst += 4, src += 4) {
+            CompositePremulPixel(dst, src);
         }
     }
 }
@@ -913,6 +1018,158 @@ void LinearCoverageToPremulInk(uint8_t* pixels, int width, int height, int strid
     }
 }
 
+// Per-thread DirectWrite state reused across DrawFlyoutText calls. A Quick
+// Settings rebuild draws dozens of strings; recreating the GDI interop,
+// rendering params, a DIB-backed render target and the text format per call
+// dominated text cost. Only the text layout is per string now.
+struct FlyoutDWriteCache {
+    struct Format {
+        std::wstring face;
+        DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+        bool italic = false;
+        float size = 0.0F;
+        UINT layoutBits = 0;
+        IDWriteTextFormat* format = nullptr;
+    };
+    IDWriteGdiInterop* interop = nullptr;
+    IDWriteRenderingParams* params = nullptr;
+    IDWriteBitmapRenderTarget* target = nullptr;
+    int targetWidth = 0;
+    int targetHeight = 0;
+    std::vector<Format> formats;
+
+    FlyoutDWriteCache() = default;
+    FlyoutDWriteCache(const FlyoutDWriteCache&) = delete;
+    FlyoutDWriteCache& operator=(const FlyoutDWriteCache&) = delete;
+    ~FlyoutDWriteCache() {
+        ReleaseFormats();
+        if (target != nullptr) {
+            target->Release();
+        }
+        if (params != nullptr) {
+            params->Release();
+        }
+        if (interop != nullptr) {
+            interop->Release();
+        }
+    }
+    void ReleaseFormats() noexcept {
+        for (Format& entry : formats) {
+            entry.format->Release();
+        }
+        formats.clear();
+    }
+};
+
+FlyoutDWriteCache& FlyoutDWriteState() {
+    thread_local FlyoutDWriteCache cache;
+    return cache;
+}
+
+// Text format with alignment / wrapping / ellipsis applied, cached by font and
+// the DT_* bits that map onto format state.
+IDWriteTextFormat* FlyoutTextFormat(IDWriteFactory* factory, FlyoutDWriteCache& cache, const wchar_t* face,
+    DWRITE_FONT_WEIGHT weight, bool italic, float size, UINT format) {
+    constexpr UINT kLayoutBits = DT_CENTER | DT_RIGHT | DT_VCENTER | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS;
+    const UINT layoutBits = format & kLayoutBits;
+    for (const FlyoutDWriteCache::Format& entry : cache.formats) {
+        if (entry.weight == weight && entry.italic == italic && entry.size == size &&
+            entry.layoutBits == layoutBits && entry.face == face) {
+            return entry.format;
+        }
+    }
+    IDWriteTextFormat* textFormat = nullptr;
+    if (FAILED(factory->CreateTextFormat(face, nullptr, weight,
+            italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size,
+            L"en-us", &textFormat)) ||
+        textFormat == nullptr) {
+        return nullptr;
+    }
+    if ((format & DT_CENTER) != 0U) {
+        textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    } else if ((format & DT_RIGHT) != 0U) {
+        textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+    } else {
+        textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+    if ((format & DT_VCENTER) != 0U) {
+        textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    } else if ((format & DT_BOTTOM) != 0U) {
+        textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR);
+    } else {
+        textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    }
+    textFormat->SetWordWrapping(
+        (format & DT_SINGLELINE) != 0U ? DWRITE_WORD_WRAPPING_NO_WRAP : DWRITE_WORD_WRAPPING_WRAP);
+    if ((format & DT_END_ELLIPSIS) != 0U) {
+        IDWriteInlineObject* ellipsis = nullptr;
+        if (SUCCEEDED(factory->CreateEllipsisTrimmingSign(textFormat, &ellipsis)) && ellipsis != nullptr) {
+            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_WORD, 0, 0};
+            textFormat->SetTrimming(&trimming, ellipsis);
+            ellipsis->Release();
+        }
+    }
+    // DPI changes mint new sizes; keep the cache bounded.
+    if (cache.formats.size() >= 96U) {
+        cache.ReleaseFormats();
+    }
+    FlyoutDWriteCache::Format entry;
+    entry.face = face;
+    entry.weight = weight;
+    entry.italic = italic;
+    entry.size = size;
+    entry.layoutBits = layoutBits;
+    entry.format = textFormat;
+    cache.formats.push_back(std::move(entry));
+    return textFormat;
+}
+
+// Render target at least width x height. It only grows; callers read their own
+// width x height corner, which is cleared before every draw.
+IDWriteBitmapRenderTarget* FlyoutRenderTarget(IDWriteFactory* factory, FlyoutDWriteCache& cache, int width,
+    int height) {
+    if (cache.interop == nullptr && (FAILED(factory->GetGdiInterop(&cache.interop)) || cache.interop == nullptr)) {
+        cache.interop = nullptr;
+        return nullptr;
+    }
+    if (cache.params == nullptr) {
+        // gamma=1 -> linear coverage in RGB; clearTypeLevel=0 + FLAT -> grayscale AA
+        // (no RGB fringes). enhancedContrast=0 avoids stem fattening that reads soft.
+        if (FAILED(factory->CreateCustomRenderingParams(1.0F, 0.0F, 0.0F, DWRITE_PIXEL_GEOMETRY_FLAT,
+                DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, &cache.params)) ||
+            cache.params == nullptr) {
+            cache.params = nullptr;
+            return nullptr;
+        }
+    }
+    if (cache.target == nullptr) {
+        HDC screen = GetDC(nullptr);
+        if (screen == nullptr) {
+            return nullptr;
+        }
+        const int initialW = std::max(width, 256);
+        const int initialH = std::max(height, 64);
+        const HRESULT hr = cache.interop->CreateBitmapRenderTarget(screen, initialW, initialH, &cache.target);
+        ReleaseDC(nullptr, screen);
+        if (FAILED(hr) || cache.target == nullptr) {
+            cache.target = nullptr;
+            return nullptr;
+        }
+        cache.target->SetPixelsPerDip(1.0F);
+        cache.targetWidth = initialW;
+        cache.targetHeight = initialH;
+    } else if (width > cache.targetWidth || height > cache.targetHeight) {
+        const int grownW = std::max(width, cache.targetWidth);
+        const int grownH = std::max(height, cache.targetHeight);
+        if (FAILED(cache.target->Resize(static_cast<UINT32>(grownW), static_cast<UINT32>(grownH)))) {
+            return nullptr;
+        }
+        cache.targetWidth = grownW;
+        cache.targetHeight = grownH;
+    }
+    return cache.target;
+}
+
 bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
     HFONT font, const std::wstring& text, UINT format, uint8_t gray, int underlineFrom) {
     IDWriteFactory* factory = FlyoutDWriteFactory();
@@ -940,46 +1197,17 @@ bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, REC
 
     const wchar_t* face =
         logFont.lfFaceName[0] != L'\0' ? logFont.lfFaceName : DockTextFontFace();
-    IDWriteTextFormat* textFormat = nullptr;
-    if (FAILED(factory->CreateTextFormat(face, nullptr, weight,
-            logFont.lfItalic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, fontEmSize, L"en-us", &textFormat)) ||
-        textFormat == nullptr) {
+    FlyoutDWriteCache& cache = FlyoutDWriteState();
+    IDWriteTextFormat* textFormat =
+        FlyoutTextFormat(factory, cache, face, weight, logFont.lfItalic != 0, fontEmSize, format);
+    if (textFormat == nullptr) {
         return false;
-    }
-
-    if ((format & DT_CENTER) != 0U) {
-        textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    } else if ((format & DT_RIGHT) != 0U) {
-        textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-    } else {
-        textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-    }
-    if ((format & DT_VCENTER) != 0U) {
-        textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    } else if ((format & DT_BOTTOM) != 0U) {
-        textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR);
-    } else {
-        textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-    }
-    textFormat->SetWordWrapping(
-        (format & DT_SINGLELINE) != 0U ? DWRITE_WORD_WRAPPING_NO_WRAP : DWRITE_WORD_WRAPPING_WRAP);
-
-    if ((format & DT_END_ELLIPSIS) != 0U) {
-        IDWriteInlineObject* ellipsis = nullptr;
-        if (SUCCEEDED(factory->CreateEllipsisTrimmingSign(textFormat, &ellipsis)) &&
-            ellipsis != nullptr) {
-            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_WORD, 0, 0};
-            textFormat->SetTrimming(&trimming, ellipsis);
-            ellipsis->Release();
-        }
     }
 
     IDWriteTextLayout* layout = nullptr;
     if (FAILED(factory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), textFormat,
             static_cast<FLOAT>(width), static_cast<FLOAT>(height), &layout)) ||
         layout == nullptr) {
-        textFormat->Release();
         return false;
     }
     if (underlineFrom >= 0 && static_cast<size_t>(underlineFrom) < text.size()) {
@@ -989,146 +1217,83 @@ bool DrawFlyoutTextDirectWrite(uint8_t* dest, int destWidth, int destHeight, REC
         layout->SetUnderline(TRUE, range);
     }
 
-    IDWriteGdiInterop* interop = nullptr;
-    if (FAILED(factory->GetGdiInterop(&interop)) || interop == nullptr) {
+    IDWriteBitmapRenderTarget* target = FlyoutRenderTarget(factory, cache, width, height);
+    HDC memory = target != nullptr ? target->GetMemoryDC() : nullptr;
+    HBITMAP dib = memory != nullptr ? static_cast<HBITMAP>(GetCurrentObject(memory, OBJ_BITMAP)) : nullptr;
+    BITMAP bm{};
+    if (dib == nullptr || GetObjectW(dib, sizeof(bm), &bm) == 0 || bm.bmBits == nullptr ||
+        bm.bmBitsPixel != 32) {
         layout->Release();
-        textFormat->Release();
         return false;
     }
-
-    HDC screen = GetDC(nullptr);
-    if (screen == nullptr) {
-        interop->Release();
-        layout->Release();
-        textFormat->Release();
-        return false;
-    }
-    IDWriteBitmapRenderTarget* target = nullptr;
-    const HRESULT targetHr =
-        interop->CreateBitmapRenderTarget(screen, width, height, &target);
-    ReleaseDC(nullptr, screen);
-    if (FAILED(targetHr) || target == nullptr) {
-        interop->Release();
-        layout->Release();
-        textFormat->Release();
-        return false;
-    }
-    target->SetPixelsPerDip(1.0F);
-
-    // gamma=1 â†’ linear coverage in RGB; clearTypeLevel=0 + FLAT â†’ grayscale AA
-    // (no RGB fringes). enhancedContrast=0 avoids stem fattening that reads soft.
-    IDWriteRenderingParams* params = nullptr;
-    if (FAILED(factory->CreateCustomRenderingParams(1.0F, 0.0F, 0.0F, DWRITE_PIXEL_GEOMETRY_FLAT,
-            DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, &params)) ||
-        params == nullptr) {
-        target->Release();
-        interop->Release();
-        layout->Release();
-        textFormat->Release();
-        return false;
-    }
-
-    HDC memory = target->GetMemoryDC();
-    RECT fill{0, 0, width, height};
-    FillRect(memory, &fill, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-    // Force opaque black in case FillRect left alpha=0 on the DIB.
-    {
-        HBITMAP dib = static_cast<HBITMAP>(GetCurrentObject(memory, OBJ_BITMAP));
-        BITMAP bm{};
-        if (dib != nullptr && GetObjectW(dib, sizeof(bm), &bm) != 0 && bm.bmBits != nullptr) {
-            auto* bits = static_cast<uint8_t*>(bm.bmBits);
-            for (int y = 0; y < height; ++y) {
-                uint8_t* row =
-                    bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes);
-                for (int x = 0; x < width; ++x) {
-                    uint8_t* px = row + static_cast<size_t>(x) * 4U;
-                    px[0] = 0;
-                    px[1] = 0;
-                    px[2] = 0;
-                    px[3] = 255;
-                }
-            }
+    auto* bits = static_cast<uint8_t*>(bm.bmBits);
+    // Opaque black under this string's width x height corner only.
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes);
+        for (int x = 0; x < width; ++x) {
+            uint8_t* px = row + static_cast<size_t>(x) * 4U;
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+            px[3] = 255;
         }
     }
 
     FlyoutTextRenderer renderer;
     renderer.target = target;
-    renderer.params = params;
+    renderer.params = cache.params;
     renderer.color = RGB(255, 255, 255);
     const HRESULT drawHr = layout->Draw(nullptr, &renderer, 0.0F, 0.0F);
-
-    bool ok = false;
-    if (SUCCEEDED(drawHr)) {
-        HBITMAP dib = static_cast<HBITMAP>(GetCurrentObject(memory, OBJ_BITMAP));
-        BITMAP bm{};
-        if (dib != nullptr && GetObjectW(dib, sizeof(bm), &bm) != 0 && bm.bmBits != nullptr &&
-            bm.bmBitsPixel == 32) {
-            auto* bits = static_cast<uint8_t*>(bm.bmBits);
-            LinearCoverageToPremulInk(bits, width, height, bm.bmWidthBytes, gray);
-            if (g_flyoutTextHalo) {
-                // Blurred (r=2, two passes) copy of the glyph alpha as a dark shadow under the ink.
-                std::vector<float> a(static_cast<size_t>(width) * static_cast<size_t>(height));
-                for (int y = 0; y < height; ++y) {
-                    const uint8_t* row = bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes);
-                    for (int x = 0; x < width; ++x) {
-                        a[static_cast<size_t>(y) * width + x] = row[x * 4 + 3] / 255.0F;
-                    }
-                }
-                std::vector<float> tmp(a.size());
-                for (int pass = 0; pass < 2; ++pass) {
-                    for (int y = 0; y < height; ++y) {
-                        for (int x = 0; x < width; ++x) {
-                            float s = 0.0F;
-                            for (int k = -2; k <= 2; ++k) {
-                                const int xx = std::clamp(x + k, 0, width - 1);
-                                s += a[static_cast<size_t>(y) * width + xx];
-                            }
-                            tmp[static_cast<size_t>(y) * width + x] = s / 5.0F;
-                        }
-                    }
-                    for (int y = 0; y < height; ++y) {
-                        for (int x = 0; x < width; ++x) {
-                            float s = 0.0F;
-                            for (int k = -2; k <= 2; ++k) {
-                                const int yy = std::clamp(y + k, 0, height - 1);
-                                s += tmp[static_cast<size_t>(yy) * width + x];
-                            }
-                            a[static_cast<size_t>(y) * width + x] = s / 5.0F;
-                        }
-                    }
-                }
-                std::vector<uint8_t> shadow(a.size() * 4U, 0);
-                for (size_t i = 0; i < a.size(); ++i) {
-                    shadow[i * 4U + 3U] = static_cast<uint8_t>(std::clamp(a[i] * 1.8F, 0.0F, 0.62F) * 255.0F);
-                }
-                CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, shadow.data(),
-                    width, height);
-            }
-            // CompositePremul expects tightly packed rows; copy if stride padded.
-            if (bm.bmWidthBytes == width * 4) {
-                CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, bits, width,
-                    height);
-            } else {
-                std::vector<uint8_t> packed(static_cast<size_t>(width) * static_cast<size_t>(height) *
-                    4U);
-                for (int y = 0; y < height; ++y) {
-                    std::memcpy(packed.data() + static_cast<size_t>(y) * width * 4U,
-                        bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes),
-                        static_cast<size_t>(width) * 4U);
-                }
-                CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, packed.data(),
-                    width, height);
-            }
-            ok = true;
-        }
+    layout->Release();
+    if (FAILED(drawHr)) {
+        return false;
     }
 
-    params->Release();
-    target->Release();
-    interop->Release();
-    layout->Release();
-    textFormat->Release();
-    return ok;
+    LinearCoverageToPremulInk(bits, width, height, bm.bmWidthBytes, gray);
+    if (g_flyoutTextHalo) {
+        // Blurred (r=2, two passes) copy of the glyph alpha as a dark shadow under the ink.
+        std::vector<float> a(static_cast<size_t>(width) * static_cast<size_t>(height));
+        for (int y = 0; y < height; ++y) {
+            const uint8_t* row = bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes);
+            for (int x = 0; x < width; ++x) {
+                a[static_cast<size_t>(y) * width + x] = row[x * 4 + 3] / 255.0F;
+            }
+        }
+        std::vector<float> tmp(a.size());
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    float s = 0.0F;
+                    for (int k = -2; k <= 2; ++k) {
+                        const int xx = std::clamp(x + k, 0, width - 1);
+                        s += a[static_cast<size_t>(y) * width + xx];
+                    }
+                    tmp[static_cast<size_t>(y) * width + x] = s / 5.0F;
+                }
+            }
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    float s = 0.0F;
+                    for (int k = -2; k <= 2; ++k) {
+                        const int yy = std::clamp(y + k, 0, height - 1);
+                        s += tmp[static_cast<size_t>(yy) * width + x];
+                    }
+                    a[static_cast<size_t>(y) * width + x] = s / 5.0F;
+                }
+            }
+        }
+        std::vector<uint8_t> shadow(a.size() * 4U, 0);
+        for (size_t i = 0; i < a.size(); ++i) {
+            shadow[i * 4U + 3U] = static_cast<uint8_t>(std::clamp(a[i] * 1.8F, 0.0F, 0.62F) * 255.0F);
+        }
+        CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top, shadow.data(),
+            width, height);
+    }
+    for (int y = 0; y < height; ++y) {
+        CompositePremul(dest, destWidth, destHeight, bounds.left, bounds.top + y,
+            bits + static_cast<size_t>(y) * static_cast<size_t>(bm.bmWidthBytes), width, 1);
+    }
+    return true;
 }
 
 void DrawFlyoutTextGdiFallback(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
@@ -1246,25 +1411,27 @@ void FillCirclePremul(uint8_t* dest, int destWidth, int destHeight, float cx, fl
     const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 1.0F)));
     const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 1.0F)));
     const float aa = 1.15F;
-    for (int y = top; y < bottom; ++y) {
-        for (int x = left; x < right; ++x) {
+    PremulConstant solid;
+    solid.pixel[0] = static_cast<uint8_t>(std::lround(255.0F * alpha * inkB));
+    solid.pixel[1] = static_cast<uint8_t>(std::lround(255.0F * alpha * inkG));
+    solid.pixel[2] = static_cast<uint8_t>(std::lround(255.0F * alpha * inkR));
+    solid.pixel[3] = static_cast<uint8_t>(std::lround(255.0F * alpha));
+    FillCoverageSpans(dest, destWidth, left, top, right, bottom, solid,
+        [&](int x, int y) {
             const float dx = static_cast<float>(x) + 0.5F - cx;
             const float dy = static_cast<float>(y) + 0.5F - cy;
-            const float coverage =
-                1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / aa + 0.5F, 0.0F, 1.0F);
-            if (coverage <= 0.0F) {
-                continue;
-            }
+            return 1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / aa + 0.5F, 0.0F, 1.0F);
+        },
+        [&](uint8_t* dst, int, int, float coverage) {
             const float srcA = coverage * alpha;
-            uint8_t pixel[4] = {
+            const uint8_t pixel[4] = {
                 static_cast<uint8_t>(std::lround(255.0F * srcA * inkB)),
                 static_cast<uint8_t>(std::lround(255.0F * srcA * inkG)),
                 static_cast<uint8_t>(std::lround(255.0F * srcA * inkR)),
                 static_cast<uint8_t>(std::lround(255.0F * srcA)),
             };
-            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
-        }
-    }
+            CompositePremulPixel(dst, pixel);
+        });
 }
 
 void FillCircleLevelPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
@@ -1350,27 +1517,29 @@ void FillPillColorPremul(uint8_t* dest, int destWidth, int destHeight, float cxL
     const int right = std::min(destWidth, static_cast<int>(std::ceil(cxRight + radius + 1.0F)));
     const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 1.0F)));
     const float aa = 1.15F;
-    for (int y = top; y < bottom; ++y) {
-        for (int x = left; x < right; ++x) {
+    PremulConstant solid;
+    solid.pixel[0] = static_cast<uint8_t>(std::lround(static_cast<float>(blue) * alpha));
+    solid.pixel[1] = static_cast<uint8_t>(std::lround(static_cast<float>(green) * alpha));
+    solid.pixel[2] = static_cast<uint8_t>(std::lround(static_cast<float>(red) * alpha));
+    solid.pixel[3] = static_cast<uint8_t>(std::lround(255.0F * alpha));
+    FillCoverageSpans(dest, destWidth, left, top, right, bottom, solid,
+        [&](int x, int y) {
             const float px = static_cast<float>(x) + 0.5F;
             const float py = static_cast<float>(y) + 0.5F;
             const float dx = px < cxLeft ? cxLeft - px : (px > cxRight ? px - cxRight : 0.0F);
             const float dy = py - cy;
-            const float coverage =
-                1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / aa + 0.5F, 0.0F, 1.0F);
-            if (coverage <= 0.0F) {
-                continue;
-            }
+            return 1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / aa + 0.5F, 0.0F, 1.0F);
+        },
+        [&](uint8_t* dst, int, int, float coverage) {
             const float srcA = coverage * alpha;
-            uint8_t pixel[4] = {
+            const uint8_t pixel[4] = {
                 static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
                 static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
                 static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
                 static_cast<uint8_t>(std::lround(255.0F * srcA)),
             };
-            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
-        }
-    }
+            CompositePremulPixel(dst, pixel);
+        });
 }
 
 // Same superellipse as SdSquircleBox in Shaders.hlsl (n = 4). Negative inside.
@@ -1398,14 +1567,17 @@ void CompositeCoverage(uint8_t* dest, int destWidth, int destHeight, int x, int 
     if (coverage <= 0.0F || alpha <= 0.0F) {
         return;
     }
+    if (x < 0 || y < 0 || x >= destWidth || y >= destHeight) {
+        return;
+    }
     const float srcA = coverage * alpha;
-    uint8_t pixel[4] = {
+    const uint8_t pixel[4] = {
         static_cast<uint8_t>(std::lround(static_cast<float>(blue) * srcA)),
         static_cast<uint8_t>(std::lround(static_cast<float>(green) * srcA)),
         static_cast<uint8_t>(std::lround(static_cast<float>(red) * srcA)),
         static_cast<uint8_t>(std::lround(255.0F * srcA)),
     };
-    CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+    CompositePremulPixel(dest + (static_cast<size_t>(y) * destWidth + x) * 4U, pixel);
 }
 
 // Nested panel controls. The plate uses DOCK_CORNER_RADIUS_PT (20); chips inside
@@ -1444,14 +1616,19 @@ void FillSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT 
     const int top = std::max(0, static_cast<int>(bounds.top) - 1);
     const int right = std::min(destWidth, static_cast<int>(bounds.right) + 1);
     const int bottom = std::min(destHeight, static_cast<int>(bounds.bottom) + 1);
-    for (int y = top; y < bottom; ++y) {
-        for (int x = left; x < right; ++x) {
-            const float dist = SdSquircleBox(static_cast<float>(x) + 0.5F,
-                static_cast<float>(y) + 0.5F, cx, cy, halfW, halfH, radius);
-            CompositeCoverage(dest, destWidth, destHeight, x, y, SquircleCoverage(dist), alpha,
-                blue, green, red);
-        }
-    }
+    PremulConstant solid;
+    solid.pixel[0] = static_cast<uint8_t>(std::lround(static_cast<float>(blue) * alpha));
+    solid.pixel[1] = static_cast<uint8_t>(std::lround(static_cast<float>(green) * alpha));
+    solid.pixel[2] = static_cast<uint8_t>(std::lround(static_cast<float>(red) * alpha));
+    solid.pixel[3] = static_cast<uint8_t>(std::lround(255.0F * alpha));
+    FillCoverageSpans(dest, destWidth, left, top, right, bottom, solid,
+        [&](int x, int y) {
+            return SquircleCoverage(SdSquircleBox(static_cast<float>(x) + 0.5F, static_cast<float>(y) + 0.5F,
+                cx, cy, halfW, halfH, radius));
+        },
+        [&](uint8_t*, int x, int y, float coverage) {
+            CompositeCoverage(dest, destWidth, destHeight, x, y, coverage, alpha, blue, green, red);
+        });
 }
 
 void FillSquirclePremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, float radius,
@@ -5995,7 +6172,6 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
     if (window == nullptr || pixels == nullptr || width <= 0 || height <= 0) {
         return false;
     }
-    ClearPopupLayeredCorners(window);
     const size_t need = static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
     if (byteCount < need) {
         return false;
@@ -6027,6 +6203,9 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
             }
         }
     } else {
+        // DWM plate opt-out is HWND state (also applied at creation); refresh it
+        // on full presents only, not on every hover / meter / fade dirty rect.
+        ClearPopupLayeredCorners(window);
         std::memcpy(slot.bits, pixels, need);
         slot.contentValid = true;
         // Clip the HWND to the frosted shape so DWM cannot paint black in the
@@ -8859,6 +9038,87 @@ void DockApp::ResetQsChevronFade() noexcept {
     }
 }
 
+namespace {
+
+bool RectsOverlap(const RECT& a, const RECT& b) noexcept {
+    return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+void UnionInto(RECT& into, const RECT& add) noexcept {
+    into.left = (std::min)(into.left, add.left);
+    into.top = (std::min)(into.top, add.top);
+    into.right = (std::max)(into.right, add.right);
+    into.bottom = (std::max)(into.bottom, add.bottom);
+}
+
+// Copy `rect` (clamped) from one full-frame BGRA buffer to another.
+RECT CopyFrameRect(uint8_t* to, const uint8_t* from, LONG width, LONG height, const RECT& rect) noexcept {
+    const RECT clamped{(std::max)(0L, rect.left), (std::max)(0L, rect.top), (std::min)(width, rect.right),
+        (std::min)(height, rect.bottom)};
+    if (clamped.right <= clamped.left || clamped.bottom <= clamped.top) {
+        return RECT{};
+    }
+    const size_t rowBytes = static_cast<size_t>(clamped.right - clamped.left) * 4U;
+    for (LONG y = clamped.top; y < clamped.bottom; ++y) {
+        const size_t offset =
+            (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(clamped.left)) * 4U;
+        std::memcpy(to + offset, from + offset, rowBytes);
+    }
+    return clamped;
+}
+
+}  // namespace
+
+RECT DockApp::QsChevronGlyphRect(size_t tile) const noexcept {
+    const RECT& chevron = m_qsTileChevron[tile];
+    const LONG extent = static_cast<LONG>(m_qsTileChevronExtent);
+    const LONG left = (chevron.left + chevron.right) / 2L - extent / 2L;
+    const LONG top = (chevron.top + chevron.bottom) / 2L - extent / 2L;
+    return RECT{left, top, left + extent, top + extent};
+}
+
+void DockApp::PaintQsChevronFadeFast() {
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (m_overflowBaseBits.empty() || m_overflowWindow == nullptr ||
+        m_overflowBaseBits.size() != m_overflowPresentBits.size() ||
+        m_overflowPresentSize.cx != m_overflowSize.cx || m_overflowPresentSize.cy != m_overflowSize.cy ||
+        !OverflowScreenOrigin(origin, caret)) {
+        PaintOverflowHoverFast();
+        return;
+    }
+    m_overflowCaretX = caret;
+    const LONG width = m_overflowPresentSize.cx;
+    const LONG height = m_overflowPresentSize.cy;
+    RECT dirty{};
+    bool haveDirty = false;
+    unsigned tiles = 0U;
+    for (size_t tile = 0; tile < 2; ++tile) {
+        if (!m_qsChevronDrawn[tile] && m_qsChevronAlpha[tile] <= 0.0F) {
+            continue;
+        }
+        // Tiles have no hover plate, so the arrow-free base is the right backdrop.
+        const RECT copied = CopyFrameRect(m_overflowPresentBits.data(), m_overflowBaseBits.data(), width,
+            height, QsChevronGlyphRect(tile));
+        if (copied.right <= copied.left) {
+            continue;
+        }
+        tiles |= 1U << tile;
+        if (!haveDirty) {
+            dirty = copied;
+            haveDirty = true;
+        } else {
+            UnionInto(dirty, copied);
+        }
+    }
+    if (!haveDirty) {
+        return;
+    }
+    PaintQsTileChevrons(m_overflowPresentBits.data(), static_cast<int>(width), static_cast<int>(height), tiles);
+    static_cast<void>(PresentLayeredBits(m_overflowWindow, origin, width, height, m_overflowPresentBits.data(),
+        m_overflowPresentBits.size(), m_overflowLayerDib, &dirty));
+}
+
 void DockApp::StepQsChevronFade() {
     if (!IsOverflowOpen() || m_qsPage != QuickSettingsPage::Home) {
         ResetQsChevronFade();
@@ -8878,54 +9138,46 @@ void DockApp::StepQsChevronFade() {
     if (settled && m_overflowWindow != nullptr) {
         KillTimer(m_overflowWindow, kQsChevronFadeTimerId);
     }
-    PaintOverflowHoverFast();
+    PaintQsChevronFadeFast();
 }
 
-void DockApp::ClearQsTileChevrons(RECT* dirty) noexcept {
+unsigned DockApp::ClearQsTileChevrons(RECT* dirty, const RECT* within) noexcept {
     if (m_overflowBaseBits.size() != m_overflowPresentBits.size() || m_overflowPresentSize.cx <= 0) {
-        return;
+        return 0U;
     }
-    const LONG width = m_overflowPresentSize.cx;
-    const LONG height = m_overflowPresentSize.cy;
+    unsigned cleared = 0U;
     for (size_t tile = 0; tile < 2; ++tile) {
         if (!m_qsChevronDrawn[tile]) {
             continue;
         }
-        m_qsChevronDrawn[tile] = false;
-        const RECT& box = m_qsTileChevron[tile];
-        const LONG left = (std::max)(0L, box.left);
-        const LONG top = (std::max)(0L, box.top);
-        const LONG right = (std::min)(width, box.right);
-        const LONG bottom = (std::min)(height, box.bottom);
-        if (right <= left || bottom <= top) {
+        const RECT glyph = QsChevronGlyphRect(tile);
+        if (within != nullptr && !RectsOverlap(glyph, *within)) {
             continue;
         }
-        const size_t rowBytes = static_cast<size_t>(right - left) * 4U;
-        for (LONG y = top; y < bottom; ++y) {
-            const size_t offset =
-                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) * 4U;
-            std::memcpy(m_overflowPresentBits.data() + offset, m_overflowBaseBits.data() + offset, rowBytes);
-        }
-        if (dirty != nullptr) {
-            dirty->left = (std::min)(dirty->left, left);
-            dirty->top = (std::min)(dirty->top, top);
-            dirty->right = (std::max)(dirty->right, right);
-            dirty->bottom = (std::max)(dirty->bottom, bottom);
+        m_qsChevronDrawn[tile] = false;
+        cleared |= 1U << tile;
+        const RECT copied = CopyFrameRect(m_overflowPresentBits.data(), m_overflowBaseBits.data(),
+            m_overflowPresentSize.cx, m_overflowPresentSize.cy, glyph);
+        if (dirty != nullptr && copied.right > copied.left) {
+            UnionInto(*dirty, copied);
         }
     }
+    return cleared;
 }
 
-void DockApp::PaintQsTileChevrons(uint8_t* pixels, int width, int height) {
+void DockApp::PaintQsTileChevrons(uint8_t* pixels, int width, int height, unsigned tiles) {
     const bool home = m_qsPage == QuickSettingsPage::Home;
     const int extent = static_cast<int>(m_qsTileChevronExtent);
+    const size_t bytes = static_cast<size_t>(std::max(0, extent)) * static_cast<size_t>(std::max(0, extent)) * 4U;
     for (size_t tile = 0; tile < 2; ++tile) {
+        if ((tiles & (1U << tile)) == 0U) {
+            continue;
+        }
         m_qsChevronDrawn[tile] = false;
         const float alpha = m_qsChevronAlpha[tile];
-        const RECT& chevron = m_qsTileChevron[tile];
         const std::vector<uint8_t>& glyph = m_qsTileChevronGlyph[tile];
-        const size_t bytes = static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U;
-        if (!home || pixels == nullptr || alpha <= 0.0F || extent <= 0 || chevron.right <= chevron.left ||
-            glyph.size() < bytes) {
+        if (!home || pixels == nullptr || alpha <= 0.0F || extent <= 0 ||
+            m_qsTileChevron[tile].right <= m_qsTileChevron[tile].left || glyph.size() < bytes) {
             continue;
         }
         // Ease the premultiplied glyph by alpha (smoothstep reads as a fade).
@@ -8935,9 +9187,9 @@ void DockApp::PaintQsTileChevrons(uint8_t* pixels, int width, int height) {
         for (size_t i = 0; i < bytes; ++i) {
             m_qsChevronScratch[i] = static_cast<uint8_t>((glyph[i] * factor) >> 8U);
         }
-        const int left = static_cast<int>((chevron.left + chevron.right) / 2L) - extent / 2;
-        const int top = static_cast<int>((chevron.top + chevron.bottom) / 2L) - extent / 2;
-        CompositePremul(pixels, width, height, left, top, m_qsChevronScratch.data(), extent, extent);
+        const RECT at = QsChevronGlyphRect(tile);
+        CompositePremul(pixels, width, height, static_cast<int>(at.left), static_cast<int>(at.top),
+            m_qsChevronScratch.data(), extent, extent);
         m_qsChevronDrawn[tile] = true;
     }
 }
@@ -9016,7 +9268,7 @@ void DockApp::PaintOverflowHoverFast() {
     RECT chevronDirty[2]{};
     for (size_t tile = 0; tile < 2; ++tile) {
         if (m_qsChevronDrawn[tile] || m_qsChevronAlpha[tile] > 0.0F) {
-            chevronDirty[tile] = expandDirty(m_qsTileChevron[tile]);
+            chevronDirty[tile] = QsChevronGlyphRect(tile);
             restoreRect(chevronDirty[tile]);
         }
     }
@@ -9117,76 +9369,81 @@ void DockApp::PaintOverflowLiveFast() {
         return rect;
     };
 
-    RECT dirty{};
-    bool haveDirty = false;
-    auto addDirty = [&](RECT rect) {
-        rect = expandDirty(rect);
-        restoreRect(rect);
-        if (!haveDirty) {
-            dirty = rect;
-            haveDirty = true;
-        } else {
-            dirty.left = (std::min)(dirty.left, rect.left);
-            dirty.top = (std::min)(dirty.top, rect.top);
-            dirty.right = (std::max)(dirty.right, rect.right);
-            dirty.bottom = (std::max)(dirty.bottom, rect.bottom);
-        }
-    };
-
-    if (m_qsMeterValid) {
-        addDirty(m_qsMeterRect);
-    }
-    if (m_qsScrubValid) {
-        addDirty(m_qsScrubRect);
-    }
+    // Only elements whose drawn output changed are restored and presented: a
+    // mic-level tick no longer drags the scrub (rows away) into the dirty box.
+    int64_t meterSig = -1;
+    int64_t scrubSig = -1;
+    QsLiveSignatures(meterSig, scrubSig);
+    const bool meter = m_qsMeterValid && meterSig != m_qsMeterPaintedSig;
+    const bool scrub = m_qsScrubValid && scrubSig != m_qsScrubPaintedSig;
     // Temperature values only when a new reading arrived; mic-meter frames
     // leave those rects (and their text) untouched.
     const bool temps = m_qsTempsValid && m_qsTempsDirty;
     m_qsTempsDirty = false;
-    if (temps) {
-        addDirty(m_qsTempCpuRect);
-        addDirty(m_qsTempGpuRect);
-    }
     const bool boost = m_qsBoostStatusValid && m_qsBoostStatusDirty;
     m_qsBoostStatusDirty = false;
-    if (boost) {
-        addDirty(m_qsBoostStatusRect);
-    }
     const bool bluetooth = m_qsBtStatusValid && m_qsBtStatusDirty;
     m_qsBtStatusDirty = false;
-    if (bluetooth) {
-        addDirty(m_qsBtStatusRect);
-    }
-    if (!haveDirty) {
+
+    RECT targets[6]{};
+    size_t targetCount = 0;
+    auto target = [&](bool use, const RECT& rect) {
+        if (use) {
+            targets[targetCount++] = expandDirty(rect);
+        }
+    };
+    target(meter, m_qsMeterRect);
+    target(scrub, m_qsScrubRect);
+    target(temps, m_qsTempCpuRect);
+    target(temps, m_qsTempGpuRect);
+    target(boost, m_qsBoostStatusRect);
+    target(bluetooth, m_qsBtStatusRect);
+    if (targetCount == 0) {
         return;
     }
-    // Clear arrows back to the arrow-free base before the base sync below
-    // (its bounding box can span a tile arrow); they are redrawn after.
-    ClearQsTileChevrons(&dirty);
+    RECT dirty = targets[0];
+    for (size_t index = 1; index < targetCount; ++index) {
+        UnionInto(dirty, targets[index]);
+    }
+    // The base sync below copies the whole dirty box from present to base, so
+    // hover chrome and tile arrows inside it are first reset from the clean
+    // base and re-applied once afterwards (re-applying without the reset
+    // stacked the hover plate on every tick).
+    bool hoverReset = false;
+    if (m_overflowHoverDirtyValid && RectsOverlap(m_overflowHoverDirty, dirty) &&
+        m_overflowBaseBits.size() == m_overflowPresentBits.size()) {
+        const RECT copied = CopyFrameRect(m_overflowPresentBits.data(), m_overflowBaseBits.data(), width, height,
+            m_overflowHoverDirty);
+        if (copied.right > copied.left) {
+            UnionInto(dirty, copied);
+        }
+        hoverReset = true;
+    }
+    const unsigned chevrons = ClearQsTileChevrons(&dirty, &dirty);
+    for (size_t index = 0; index < targetCount; ++index) {
+        restoreRect(targets[index]);
+    }
 
     // includeBoost / includeBluetooth only when their rect was restored;
     // otherwise meter ticks would DrawFlyoutText over existing glyphs
     // (fake-bold regression from PR #26).
-    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps, boost, bluetooth);
+    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps, boost, bluetooth, meter, scrub);
+    if (meter) {
+        m_qsMeterPaintedSig = meterSig;
+    }
+    if (scrub) {
+        m_qsScrubPaintedSig = scrubSig;
+    }
     if (m_overflowBaseBits.size() == m_overflowPresentBits.size()) {
         // Keep base in sync so hover-fast restores still show live meters.
-        const LONG left = dirty.left;
-        const LONG top = dirty.top;
-        const LONG right = dirty.right;
-        const LONG bottom = dirty.bottom;
-        const size_t rowBytes = static_cast<size_t>(right - left) * 4U;
-        for (LONG y = top; y < bottom; ++y) {
-            const size_t offset =
-                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) * 4U;
-            std::memcpy(m_overflowBaseBits.data() + offset, m_overflowPresentBits.data() + offset, rowBytes);
-        }
+        static_cast<void>(CopyFrameRect(m_overflowBaseBits.data(), m_overflowPresentBits.data(), width, height,
+            dirty));
     }
-    if (m_overflowHover >= 0 && static_cast<size_t>(m_overflowHover) < m_overflowHits.size()) {
+    if (hoverReset && m_overflowHover >= 0 && static_cast<size_t>(m_overflowHover) < m_overflowHits.size()) {
         ApplyOverflowHoverHighlight(m_overflowPresentBits.data(), width, height,
             m_overflowHits[static_cast<size_t>(m_overflowHover)]);
-        m_overflowHoverDirtyValid = false;
     }
-    PaintQsTileChevrons(m_overflowPresentBits.data(), width, height);
+    PaintQsTileChevrons(m_overflowPresentBits.data(), width, height, chevrons);
 
     if (!PresentLayeredBits(m_overflowWindow, origin, m_overflowPresentSize.cx,
             m_overflowPresentSize.cy, m_overflowPresentBits.data(), m_overflowPresentBits.size(),
@@ -9461,12 +9718,20 @@ void DockApp::PaintOverflowPopup() {
     m_overflowUnderlayBits.resize(bytes);
     std::memcpy(m_overflowUnderlayBits.data(), pixels, bytes);
     PaintQsLiveOverlays(pixels, width, height, scale);
+    QsLiveSignatures(m_qsMeterPaintedSig, m_qsScrubPaintedSig);
 
     m_overflowBaseBits.resize(bytes);
     std::memcpy(m_overflowBaseBits.data(), pixels, bytes);
+    m_overflowHoverDirtyValid = false;
     if (pendingHover >= 0 && static_cast<size_t>(pendingHover) < m_overflowHits.size()) {
-        ApplyOverflowHoverHighlight(pixels, width, height,
-            m_overflowHits[static_cast<size_t>(pendingHover)]);
+        const TrayFlyoutHit& hit = m_overflowHits[static_cast<size_t>(pendingHover)];
+        ApplyOverflowHoverHighlight(pixels, width, height, hit);
+        // Same box PaintOverflowHoverFast records, so the next hover change
+        // restores this plate instead of leaving it behind.
+        m_overflowHoverDirty = RECT{(std::max)(0L, hit.bounds.left - 8), (std::max)(0L, hit.bounds.top - 8),
+            (std::min)(static_cast<LONG>(width), hit.bounds.right + 8),
+            (std::min)(static_cast<LONG>(height), hit.bounds.bottom + 8)};
+        m_overflowHoverDirtyValid = true;
     }
     PaintQsTileChevrons(pixels, width, height);
     m_overflowPresentBits.resize(bytes);
