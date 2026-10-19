@@ -95,6 +95,8 @@ constexpr int kToggleMic = 2;
 constexpr int kToggleUsb = 3;
 constexpr int kToggleAirplane = 4;
 constexpr int kToggleHdr = 5;
+constexpr int kToggleDarkMode = 6;
+constexpr int kToggleRefreshRate = 7;
 
 const GUID kUsbSubgroup = {
     0x2a737441, 0x1930, 0x4402, {0x8d, 0x77, 0xb2, 0xbe, 0xbb, 0xa3, 0x08, 0xa3}};
@@ -1115,6 +1117,73 @@ bool SetHdrEnabled(bool enabled) {
     return wrote;
 }
 
+constexpr wchar_t kPersonalizeKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+
+void QueryDarkMode(QuickSettingsCache& cache) {
+    DWORD light = 1;
+    DWORD size = sizeof(light);
+    cache.darkKnown = RegGetValueW(HKEY_CURRENT_USER, kPersonalizeKey, L"AppsUseLightTheme", RRF_RT_REG_DWORD,
+                          nullptr, &light, &size) == ERROR_SUCCESS;
+    cache.darkMode = cache.darkKnown && light == 0;
+}
+
+// Apps and system (taskbar/Start) follow together, like the Settings toggle.
+// The WM_SETTINGCHANGE broadcast can stall on hung windows: workers only.
+bool SetDarkMode(bool dark) {
+    const DWORD light = dark ? 0U : 1U;
+    const LSTATUS apps = RegSetKeyValueW(HKEY_CURRENT_USER, kPersonalizeKey, L"AppsUseLightTheme", REG_DWORD,
+        &light, sizeof(light));
+    const LSTATUS system = RegSetKeyValueW(HKEY_CURRENT_USER, kPersonalizeKey, L"SystemUsesLightTheme",
+        REG_DWORD, &light, sizeof(light));
+    if (apps != ERROR_SUCCESS && system != ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD_PTR ignored = 0;
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"ImmersiveColorSet"),
+        SMTO_ABORTIFHUNG, 1000, &ignored);
+    return true;
+}
+
+void QueryRefreshRate(QuickSettingsCache& cache) {
+    cache.refreshHz = 0;
+    cache.refreshRates.clear();
+    DEVMODEW current{};
+    current.dmSize = sizeof(current);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &current) == FALSE) {
+        return;
+    }
+    // 0 and 1 mean "hardware default", not a real rate.
+    if (current.dmDisplayFrequency > 1U) {
+        cache.refreshHz = static_cast<int>(current.dmDisplayFrequency);
+    }
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    for (DWORD index = 0; EnumDisplaySettingsW(nullptr, index, &mode) != FALSE; ++index) {
+        if (mode.dmPelsWidth != current.dmPelsWidth || mode.dmPelsHeight != current.dmPelsHeight ||
+            mode.dmBitsPerPel != current.dmBitsPerPel || mode.dmDisplayFrequency <= 1U) {
+            continue;
+        }
+        const int hz = static_cast<int>(mode.dmDisplayFrequency);
+        if (std::find(cache.refreshRates.begin(), cache.refreshRates.end(), hz) == cache.refreshRates.end()) {
+            cache.refreshRates.push_back(hz);
+        }
+    }
+    std::sort(cache.refreshRates.begin(), cache.refreshRates.end());
+}
+
+// Mode switch on the primary display; blocks while the display retrains.
+bool SetRefreshRate(int hz) {
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    if (hz <= 1 || EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) == FALSE) {
+        return false;
+    }
+    mode.dmDisplayFrequency = static_cast<DWORD>(hz);
+    mode.dmFields = DM_DISPLAYFREQUENCY;
+    return ChangeDisplaySettingsExW(nullptr, &mode, nullptr, CDS_UPDATEREGISTRY, nullptr) ==
+        DISP_CHANGE_SUCCESSFUL;
+}
+
 void SendMediaKey(WORD key);
 
 bool NightLightEnabled(const BYTE* data, DWORD size) noexcept {
@@ -1915,6 +1984,8 @@ void FillQsNetworkCache(QuickSettingsCache& cache, QuickSettingsPage page) {
     QueryPower(cache);
     QueryHdr(cache);
     QueryNightLight(cache);
+    QueryDarkMode(cache);
+    QueryRefreshRate(cache);
     const ULONGLONG now = GetTickCount64();
     cache.stampNetwork = now;
     cache.stampNight = now;
@@ -2383,6 +2454,8 @@ bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache) {
         cache.usbSuspend != r.usbSuspend || cache.usbKnown != r.usbKnown ||
         cache.hdrOn != r.hdrOn || cache.hdrSupported != r.hdrSupported ||
         cache.nightLight != r.nightLight || cache.nightKnown != r.nightKnown ||
+        cache.darkMode != r.darkMode || cache.darkKnown != r.darkKnown ||
+        cache.refreshHz != r.refreshHz || cache.refreshRates != r.refreshRates ||
         cache.wifi.size() != r.wifi.size() || cache.vpn.size() != r.vpn.size() ||
         cache.renderDevices.size() != r.renderDevices.size() ||
         cache.captureDevices.size() != r.captureDevices.size();
@@ -2409,6 +2482,10 @@ bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache) {
     cache.hdrSupported = r.hdrSupported;
     cache.nightLight = r.nightLight;
     cache.nightKnown = r.nightKnown;
+    cache.darkMode = r.darkMode;
+    cache.darkKnown = r.darkKnown;
+    cache.refreshHz = r.refreshHz;
+    cache.refreshRates = r.refreshRates;
     cache.stampNetwork = r.stampNetwork;
     cache.stampNight = r.stampNight;
     cache.stamp = r.stamp;
@@ -3461,13 +3538,13 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         }
         // Row 3: Sound slider capsule (4x1).
         sliderCapsule(cellRect(0, 3, 4, 1), tray.volumeMuted ? L'\uE74F' : L'\uE767', L"Sound",
-            std::to_wstring(static_cast<int>(std::lround(volume * 100.0F))) + L"%", volume,
+            std::wstring{}, volume,
             TrayFlyoutHitKind::VolumeSlider, true, TrayFlyoutHitKind::Sound, 4);
         // Row 4: Display slider capsule (4x1, brightness).
         const bool brightnessUsable = tray.brightnessAvailable || projected >= 0;
         sliderCapsule(cellRect(0, 4, 4, 1), L'\uE706', L"Display",
             brightnessUsable
-                ? std::to_wstring(static_cast<int>(std::lround(brightness * 100.0F))) + L"%"
+                ? std::wstring{}
                 : ((m_qsCache.nightKnown && m_qsCache.nightLight) ? std::wstring(L"Night light")
                                                                     : std::wstring(L"On")),
             brightness, TrayFlyoutHitKind::BrightnessSlider, brightnessUsable, TrayFlyoutHitKind::Display, 5);
@@ -4204,37 +4281,105 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             running ? m_boostStatus : kNoTrailing, L'\0', TrayFlyoutHitKind::Boost, -1);
         menuLink(L"Startup Apps Settings\u2026", kLinkStartupApps);
     } else {
+        // macOS Control Centre Display module: brightness slider between two
+        // suns, a row of round buttons, then a "Display Settings..." link.
+        auto P = [&](float pt) { return static_cast<LONG>(std::lround(pt * scale)); };
         beginHeader(L"Display", false, -1, false);
-        y += gap;
-        const RECT brightRow{padding, y, panelWidth - padding, y + listRow};
-        card(brightRow, false);
-        icon(brightRow.left + 14, brightRow.top + (listRow - 18) / 2L, L'\uE706', 18, inkR, inkG, inkB);
-        text({brightRow.left + 42, brightRow.top + 4, brightRow.right - 14, brightRow.top + 24}, labelFont,
-            L"Brightness", DT_LEFT | DT_BOTTOM | DT_SINGLELINE, 255);
-        const RECT brightTrack{brightRow.left + 42, brightRow.bottom - 8 - sliderH, brightRow.right - 16,
-            brightRow.bottom - 8};
-        push(TrayFlyoutHitKind::BrightnessSlider, brightTrack);
-        slider(brightTrack, brightness);
-        y += listRow + gap;
-        const RECT night{padding, y, panelWidth - padding, y + listRow};
-        card(night, false);
-        navRow(night, L'\uE706', L"Night light",
-            m_qsCache.nightKnown ? (m_qsCache.nightLight ? L"On" : L"Off") : L"Open settings",
-            TrayFlyoutHitKind::MoreSettings, kLinkNight);
-        y += listRow + gap;
-        const RECT hdr{padding, y, panelWidth - padding, y + listRow};
-        card(hdr, false);
-        text({hdr.left + 14, hdr.top, hdr.right - 70, hdr.bottom}, labelFont, L"HDR",
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-        text({hdr.left + 70, hdr.top, hdr.right - 78, hdr.bottom}, statusFont,
-            !m_qsCache.hdrSupported ? L"Unavailable" : (m_qsCache.hdrOn ? L"On" : L"Off"),
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180);
-        if (m_qsCache.hdrSupported) {
-            push(TrayFlyoutHitKind::Toggle,
-                toggleRect(hdr.top + listRow / 2L, hdr.right - 12, m_qsCache.hdrOn), kToggleHdr);
+        hairline();
+        {
+            const LONG rowH = std::max(36L, P(42.0F));
+            const RECT row{padding + menuInset, y, panelWidth - padding - menuInset, y + rowH};
+            const LONG cy = (row.top + row.bottom) / 2L;
+            const UINT small = static_cast<UINT>(std::max(12L, P(14.0F)));
+            const UINT large = static_cast<UINT>(std::max(16L, P(20.0F)));
+            icon(row.left, cy - static_cast<LONG>(small) / 2L, L'\uE706', small, inkR, inkG, inkB);
+            icon(row.right - static_cast<LONG>(large), cy - static_cast<LONG>(large) / 2L, L'\uE706', large, inkR,
+                inkG, inkB);
+            const LONG trackH = std::max(14L, P(18.0F));
+            const RECT track{row.left + static_cast<LONG>(small) + P(12.0F), cy - trackH / 2L,
+                row.right - static_cast<LONG>(large) - P(12.0F), cy - trackH / 2L + trackH};
+            if (draw) {
+                CcDrawSlider(pixels, width, height, track, brightness, scale, g_qsAccentR, g_qsAccentG, g_qsAccentB,
+                    inkR, inkG, inkB);
+            }
+            // Pushed even when DDC/WMI brightness is unavailable: a click then
+            // opens Windows display settings (ApplyQuickSettingsSlider).
+            push(TrayFlyoutHitKind::BrightnessSlider, track);
+            y = row.bottom + P(6.0F);
         }
-        y += listRow + gap;
-        footer(L"More display settings", kLinkDisplay);
+        {
+            struct DisplayButton {
+                wchar_t glyph;
+                const wchar_t* title;
+                std::wstring status;
+                bool active;
+                bool enabled;
+                TrayFlyoutHitKind kind;
+                int index;
+            };
+            const DisplayButton buttons[] = {
+                {L'\uE7A1', L"Dark Mode",
+                    m_qsCache.darkKnown ? std::wstring(m_qsCache.darkMode ? L"On" : L"Off") : std::wstring(L"\u2014"),
+                    m_qsCache.darkMode, m_qsCache.darkKnown, TrayFlyoutHitKind::Toggle, kToggleDarkMode},
+                {L'\uE708', L"Night Light",
+                    m_qsCache.nightKnown ? std::wstring(m_qsCache.nightLight ? L"On" : L"Off")
+                                         : std::wstring(L"Settings"),
+                    m_qsCache.nightKnown && m_qsCache.nightLight, true, TrayFlyoutHitKind::MoreSettings, kLinkNight},
+                {L'\uEC4A', L"Refresh Rate",
+                    m_qsCache.refreshHz > 0 ? std::to_wstring(m_qsCache.refreshHz) + L" Hz" : std::wstring(L"\u2014"),
+                    false, true, TrayFlyoutHitKind::Toggle, kToggleRefreshRate},
+                {L'\uE790', L"HDR",
+                    m_qsCache.hdrSupported ? std::wstring(m_qsCache.hdrOn ? L"On" : L"Off")
+                                           : std::wstring(L"Unavailable"),
+                    m_qsCache.hdrSupported && m_qsCache.hdrOn, m_qsCache.hdrSupported, TrayFlyoutHitKind::Toggle,
+                    kToggleHdr},
+            };
+            constexpr LONG kColumns = static_cast<LONG>(sizeof(buttons) / sizeof(buttons[0]));
+            const LONG left = padding;
+            const LONG colW = (panelWidth - padding * 2L) / kColumns;
+            const float radius = static_cast<float>(std::max(18L, P(23.0F)));
+            const UINT extent = static_cast<UINT>(std::max(14L, P(19.0F)));
+            const LONG discTop = y + P(4.0F);
+            const LONG titleTop = discTop + static_cast<LONG>(radius * 2.0F) + P(6.0F);
+            const LONG titleH = P(20.0F);
+            const LONG statusH = P(18.0F);
+            for (LONG column = 0; column < kColumns; ++column) {
+                const DisplayButton& button = buttons[column];
+                const LONG colLeft = left + column * colW;
+                const LONG colRight = colLeft + colW;
+                const float cx = static_cast<float>(colLeft) + static_cast<float>(colW) * 0.5F;
+                const float cy = static_cast<float>(discTop) + radius;
+                if (draw) {
+                    if (button.active) {
+                        FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, g_qsAccentB,
+                            g_qsAccentG, g_qsAccentR);
+                    } else {
+                        FillPillColorPremul(pixels, width, height, cx, cx, cy, radius,
+                            button.enabled ? 0.14F : 0.07F, inkB, inkG, inkR);
+                    }
+                }
+                const LONG glyphLeft = static_cast<LONG>(std::lround(cx - static_cast<float>(extent) * 0.5F));
+                const LONG glyphTop = static_cast<LONG>(std::lround(cy - static_cast<float>(extent) * 0.5F));
+                if (button.active) {
+                    icon(glyphLeft, glyphTop, button.glyph, extent, onAccentR, onAccentG, onAccentB);
+                } else if (button.enabled) {
+                    icon(glyphLeft, glyphTop, button.glyph, extent, inkR, inkG, inkB);
+                } else {
+                    icon(glyphLeft, glyphTop, button.glyph, extent, dimR, dimG, dimB);
+                }
+                text({colLeft + 2, titleTop, colRight - 2, titleTop + titleH}, labelFont, button.title,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, button.enabled ? 255 : 150);
+                text({colLeft + 2, titleTop + titleH, colRight - 2, titleTop + titleH + statusH}, statusFont,
+                    button.status, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 160);
+                if (button.enabled) {
+                    push(button.kind, {colLeft, discTop - P(4.0F), colRight, titleTop + titleH + statusH + P(4.0F)},
+                        button.index);
+                }
+            }
+            y = titleTop + titleH + statusH + P(10.0F);
+        }
+        hairline();
+        menuLink(L"Display Settings\u2026", kLinkDisplay);
     }
     y += padding;
     contentBottom = y;
@@ -4391,6 +4536,41 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
                 }
                 m_bluetooth.SetRadioEnabled(radiosOn);
             }
+            QueueOverflowPaint();
+            break;
+        }
+        case kToggleDarkMode: {
+            // Optimistic flip; the registry write + broadcast run on a worker,
+            // which then refreshes the cache to confirm.
+            const bool dark = !m_qsCache.darkMode;
+            m_qsCache.darkMode = dark;
+            m_qsCache.darkKnown = true;
+            const HWND notify = m_overflowWindow;
+            const QuickSettingsPage page = m_qsPage;
+            std::thread([dark, notify, page] {
+                static_cast<void>(SetDarkMode(dark));
+                RequestQuickSettingsCacheAsync(notify, kQsCacheResultMessage, page);
+            }).detach();
+            QueueOverflowPaint();
+            break;
+        }
+        case kToggleRefreshRate: {
+            // Step to the next supported rate (wrapping). With one or no known
+            // rate there is nothing to cycle, so open the advanced page.
+            const std::vector<int>& rates = m_qsCache.refreshRates;
+            if (alternate || rates.size() < 2U) {
+                openUri(L"ms-settings:display-advanced");
+                break;
+            }
+            const auto above = std::upper_bound(rates.begin(), rates.end(), m_qsCache.refreshHz);
+            const int next = above == rates.end() ? rates.front() : *above;
+            m_qsCache.refreshHz = next;
+            const HWND notify = m_overflowWindow;
+            const QuickSettingsPage page = m_qsPage;
+            std::thread([next, notify, page] {
+                static_cast<void>(SetRefreshRate(next));
+                RequestQuickSettingsCacheAsync(notify, kQsCacheResultMessage, page);
+            }).detach();
             QueueOverflowPaint();
             break;
         }

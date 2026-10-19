@@ -82,6 +82,13 @@ struct QuickSettingsCache {
     bool hdrSupported = false;
     bool nightLight = false;
     bool nightKnown = false;
+    // Windows app/system theme (Personalize AppsUseLightTheme == 0).
+    bool darkMode = false;
+    bool darkKnown = false;
+    // Primary display refresh rate and the rates it supports at the current
+    // resolution, ascending. 0 / empty when unknown.
+    int refreshHz = 0;
+    std::vector<int> refreshRates;
     // Home temperature tile. Whole degrees C / watts; -1 shows an em dash.
     int cpuTempC = -1;
     int gpuTempC = -1;

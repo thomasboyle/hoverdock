@@ -8991,9 +8991,15 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
             0.12F);
         break;
     }
+    case TrayFlyoutHitKind::Toggle:
+        // Display page round buttons get a plate; switches elsewhere do not.
+        if (m_qsPage != QuickSettingsPage::Display) {
+            break;
+        }
+        [[fallthrough]];
     case TrayFlyoutHitKind::Boost:
         // Home glyph disc: no plate. The Boost page "Boost Now" row is a menu row.
-        if (m_qsPage != QuickSettingsPage::Boost) {
+        if (hit.kind == TrayFlyoutHitKind::Boost && m_qsPage != QuickSettingsPage::Boost) {
             break;
         }
         [[fallthrough]];
@@ -9001,7 +9007,8 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         // Only the macOS style "Wi-Fi Settings..." / "Bluetooth Settings..."
         // menu rows get a plate; other pages keep their bare footer links.
         if (hit.kind == TrayFlyoutHitKind::MoreSettings && m_qsPage != QuickSettingsPage::Wifi &&
-            m_qsPage != QuickSettingsPage::Bluetooth && m_qsPage != QuickSettingsPage::Boost) {
+            m_qsPage != QuickSettingsPage::Bluetooth && m_qsPage != QuickSettingsPage::Boost &&
+            m_qsPage != QuickSettingsPage::Display) {
             break;
         }
         [[fallthrough]];
@@ -9038,7 +9045,6 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::VolumeSlider:
     case TrayFlyoutHitKind::BrightnessSlider:
     case TrayFlyoutHitKind::CaptureGain:
-    case TrayFlyoutHitKind::Toggle:
     case TrayFlyoutHitKind::PowerMode:
     case TrayFlyoutHitKind::AudioOutput:
     case TrayFlyoutHitKind::AudioInput:
