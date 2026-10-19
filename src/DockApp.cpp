@@ -3897,6 +3897,15 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
     }
 
+    case kTrayIconsMessage: {
+        std::unique_ptr<std::vector<TrayNotifyIcon>> icons(reinterpret_cast<std::vector<TrayNotifyIcon>*>(lParam));
+        m_trayIconsInFlight.store(false);
+        if (icons != nullptr) {
+            ApplyTrayIcons(std::move(*icons));
+        }
+        return 0;
+    }
+
     case kBoostResultMessage: {
         std::unique_ptr<BoostReply> reply(reinterpret_cast<BoostReply*>(lParam));
         if (reply != nullptr) {
@@ -6231,6 +6240,9 @@ void DockApp::FinishOverflowHide() noexcept {
         m_qsBtStatusValid = false;
         m_qsBtStatusDirty = false;
         m_qsBtStatusRect = {};
+        m_qsTrayStatusValid = false;
+        m_qsTrayStatusDirty = false;
+        m_qsTrayStatusRect = {};
         m_qsMeterRect = {};
         m_qsScrubRect = {};
         m_qsTempCpuRect = {};
@@ -6497,6 +6509,8 @@ void DockApp::BeginOverflowShow() {
     }
     InstallOverflowDismissHook();
     qsOpenMark(L"InstallOverflowDismissHook");
+    // Fresh tray icons for the System Tray tile count / page (UIA on a worker).
+    RequestTrayIconsAsync();
     // Soft refresh for radio/ready; periodic CollectPaired only while on BT page.
     m_bluetooth.RequestRefresh(false);
     qsOpenMark(L"BluetoothRequestRefresh");
@@ -8743,6 +8757,68 @@ void DockApp::RepaintBluetoothStatus() {
     }
 }
 
+void DockApp::RequestTrayIconsAsync() {
+    if (m_window == nullptr || m_trayIconsInFlight.exchange(true)) {
+        return;
+    }
+    const HWND reply = m_window;
+    std::thread([this, reply] {
+        auto* icons = new std::vector<TrayNotifyIcon>();
+        try {
+            const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            *icons = m_tray.EnumerateNotifyIcons();
+            if (SUCCEEDED(hr)) {
+                CoUninitialize();
+            }
+        } catch (...) {
+            icons->clear();
+        }
+        if (PostMessageW(reply, kTrayIconsMessage, 0, reinterpret_cast<LPARAM>(icons)) == FALSE) {
+            delete icons;
+            m_trayIconsInFlight.store(false);
+        }
+    }).detach();
+}
+
+void DockApp::ApplyTrayIcons(std::vector<TrayNotifyIcon>&& icons) {
+    bool same = m_overflowIconsLoaded && icons.size() == m_overflowIcons.size();
+    for (size_t index = 0; same && index < icons.size(); ++index) {
+        same = icons[index].tip == m_overflowIcons[index].tip &&
+            icons[index].executablePath == m_overflowIcons[index].executablePath;
+    }
+    m_overflowIcons = std::move(icons);
+    m_overflowIconsLoaded = true;
+    if (!IsOverflowOpen()) {
+        return;
+    }
+    if (same) {
+        // Same items in the same order: the frame and row hits still match.
+        return;
+    }
+    if (m_qsPage == QuickSettingsPage::Home) {
+        // Count only: present the tile status rect, no full rebuild.
+        if (m_qsTrayStatusValid) {
+            m_qsTrayStatusDirty = true;
+            PaintOverflowLiveFast();
+        }
+    } else if (m_qsPage == QuickSettingsPage::SystemTray) {
+        m_overflowHover = -1;
+        m_overflowHoverDirtyValid = false;
+        QueueOverflowPaint();
+    }
+}
+
+RECT DockApp::OverflowHoverBounds(const TrayFlyoutHit& hit) const noexcept {
+    if (hit.kind == TrayFlyoutHitKind::TrayIconOptions) {
+        for (const TrayFlyoutHit& other : m_overflowHits) {
+            if (other.kind == TrayFlyoutHitKind::NotifyIcon && other.index == hit.index) {
+                return other.bounds;
+            }
+        }
+    }
+    return hit.bounds;
+}
+
 int DockApp::AppSlotCount() const noexcept {
     return static_cast<int>(m_displayApps.size());
 }
@@ -8976,6 +9052,13 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::RefreshRate:
         ApplyQuickSettingsCommand(hit, message);
         break;
+    case TrayFlyoutHitKind::TrayIconOptions:
+        // Row arrow: the item's own menu (what right-click on the tray shows).
+        // Quick Settings stays open so the menu stays usable.
+        if (hit.index >= 0 && static_cast<size_t>(hit.index) < m_overflowIcons.size()) {
+            SystemTray::InvokeNotifyIcon(m_overflowIcons[static_cast<size_t>(hit.index)], WM_RBUTTONUP);
+        }
+        break;
     case TrayFlyoutHitKind::NotifyIcon:
         if (hit.index >= 0 && static_cast<size_t>(hit.index) < m_overflowIcons.size()) {
             SystemTray::InvokeNotifyIcon(m_overflowIcons[static_cast<size_t>(hit.index)], message);
@@ -9154,12 +9237,34 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
             radius, 0.10F, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
         break;
     }
-    case TrayFlyoutHitKind::NotifyIcon: {
-        // Full-row highlight like other list pages. A centered icon plate on a
-        // wide row looked like a grey placeholder square over the app name.
+    case TrayFlyoutHitKind::NotifyIcon:
+    case TrayFlyoutHitKind::TrayIconOptions: {
+        // Full-row plate, plus the Control Centre style arrow that reveals the
+        // item's menu. Hovering the arrow itself adds a round plate behind it.
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
-        FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
-            0.10F);
+        const RECT row = OverflowHoverBounds(hit);
+        FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
+        RECT arrow{};
+        for (const TrayFlyoutHit& other : m_overflowHits) {
+            if (other.kind == TrayFlyoutHitKind::TrayIconOptions && other.index == hit.index) {
+                arrow = other.bounds;
+                break;
+            }
+        }
+        const int extent = static_cast<int>(m_qsTrayArrowExtent);
+        if (arrow.right > arrow.left && extent > 0 &&
+            m_qsTrayArrowGlyph.size() >= static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U) {
+            const float cx = 0.5F * static_cast<float>(arrow.left + arrow.right);
+            const float cy = 0.5F * static_cast<float>(arrow.top + arrow.bottom);
+            if (hit.kind == TrayFlyoutHitKind::TrayIconOptions) {
+                const float radius = (std::min)(0.5F * static_cast<float>(arrow.bottom - arrow.top),
+                    0.5F * static_cast<float>(arrow.right - arrow.left)) - 2.0F * scale;
+                FillPillColorPremul(pixels, width, height, cx, cx, cy, (std::max)(4.0F, radius), 0.12F,
+                    g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
+            }
+            CompositePremul(pixels, width, height, static_cast<int>(std::lround(cx)) - extent / 2,
+                static_cast<int>(std::lround(cy)) - extent / 2, m_qsTrayArrowGlyph.data(), extent, extent);
+        }
         break;
     }
     case TrayFlyoutHitKind::Wifi:
@@ -9216,6 +9321,8 @@ int DockApp::QsChevronTarget() const noexcept {
     case TrayFlyoutHitKind::Display:
     case TrayFlyoutHitKind::BrightnessSlider:
         return 5;
+    case TrayFlyoutHitKind::SystemTrayPage:
+        return 6;
     default:
         return -1;
     }
@@ -9491,7 +9598,7 @@ void DockApp::PaintOverflowHoverFast() {
         ApplyOverflowHoverHighlight(m_overflowPresentBits.data(), width, height, hit);
         RECT next = (hit.kind == TrayFlyoutHitKind::Settings && m_overflowGearExtent > 0U)
             ? gearDirty()
-            : expandDirty(hit.bounds);
+            : expandDirty(OverflowHoverBounds(hit));
         if (!haveDirty) {
             dirty = next;
             haveDirty = true;
@@ -9546,7 +9653,7 @@ void DockApp::PaintOverflowLiveFast() {
         m_overflowPresentSize.cx != m_overflowSize.cx ||
         m_overflowPresentSize.cy != m_overflowSize.cy ||
         (!m_qsMeterValid && !m_qsScrubValid && !m_qsTempsValid &&
-            !m_qsBoostStatusValid && !m_qsBtStatusValid) ||
+            !m_qsBoostStatusValid && !m_qsBtStatusValid && !m_qsTrayStatusValid) ||
         m_overflowUnderlayBits.size() != m_overflowPresentBits.size() ||
         !OverflowScreenOrigin(origin, caret)) {
         PaintOverflowPopup();
@@ -9601,8 +9708,10 @@ void DockApp::PaintOverflowLiveFast() {
     m_qsBoostStatusDirty = false;
     const bool bluetooth = m_qsBtStatusValid && m_qsBtStatusDirty;
     m_qsBtStatusDirty = false;
+    const bool tray = m_qsTrayStatusValid && m_qsTrayStatusDirty;
+    m_qsTrayStatusDirty = false;
 
-    RECT targets[6]{};
+    RECT targets[7]{};
     size_t targetCount = 0;
     auto target = [&](bool use, const RECT& rect) {
         if (use) {
@@ -9615,6 +9724,7 @@ void DockApp::PaintOverflowLiveFast() {
     target(temps, m_qsTempGpuRect);
     target(boost, m_qsBoostStatusRect);
     target(bluetooth, m_qsBtStatusRect);
+    target(tray, m_qsTrayStatusRect);
     if (targetCount == 0) {
         return;
     }
@@ -9644,7 +9754,8 @@ void DockApp::PaintOverflowLiveFast() {
     // includeBoost / includeBluetooth only when their rect was restored;
     // otherwise meter ticks would DrawFlyoutText over existing glyphs
     // (fake-bold regression from PR #26).
-    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps, boost, bluetooth, meter, scrub);
+    PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps, boost, bluetooth, meter, scrub,
+        tray);
     if (meter) {
         m_qsMeterPaintedSig = meterSig;
     }
@@ -9950,9 +10061,10 @@ void DockApp::PaintOverflowPopup() {
         ApplyOverflowHoverHighlight(pixels, width, height, hit);
         // Same box PaintOverflowHoverFast records, so the next hover change
         // restores this plate instead of leaving it behind.
-        m_overflowHoverDirty = RECT{(std::max)(0L, hit.bounds.left - 8), (std::max)(0L, hit.bounds.top - 8),
-            (std::min)(static_cast<LONG>(width), hit.bounds.right + 8),
-            (std::min)(static_cast<LONG>(height), hit.bounds.bottom + 8)};
+        const RECT hoverBounds = OverflowHoverBounds(hit);
+        m_overflowHoverDirty = RECT{(std::max)(0L, hoverBounds.left - 8), (std::max)(0L, hoverBounds.top - 8),
+            (std::min)(static_cast<LONG>(width), hoverBounds.right + 8),
+            (std::min)(static_cast<LONG>(height), hoverBounds.bottom + 8)};
         m_overflowHoverDirtyValid = true;
     }
     PaintQsTileChevrons(pixels, width, height);

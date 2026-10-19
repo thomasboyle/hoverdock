@@ -259,10 +259,10 @@ std::wstring BluetoothConnectedSummary(const BluetoothSnapshot& bt) {
     return L"Connected to " + name + more;
 }
 
-constexpr int kQsModuleW[kQsModuleCount] = {2, 2, 2, 2, 1, 1, 2, 4, 4, 2, 2};
-constexpr int kQsModuleH[kQsModuleCount] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2};
+constexpr int kQsModuleW[kQsModuleCount] = {2, 2, 2, 2, 2, 2, 4, 4, 2, 2};
+constexpr int kQsModuleH[kQsModuleCount] = {1, 1, 1, 1, 1, 1, 1, 1, 2, 2};
 constexpr const wchar_t* kQsModuleNames[kQsModuleCount] = {L"wifi", L"bluetooth", L"boost", L"power", L"tray",
-    L"vpn", L"mic", L"sound", L"display", L"temps", L"media"};
+    L"mic", L"sound", L"display", L"temps", L"media"};
 constexpr int kQsGridCols = 4;
 // The default order tiles 28 cells into 7 full rows; reorders must too.
 constexpr int kQsGridRows = 7;
@@ -2882,9 +2882,9 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     // after this paint - never run WLAN/COM/UIA on the UI thread here.
     m_qsCache.stampNetwork = 0;
     m_qsCache.stampNight = 0;
-    if (page == QuickSettingsPage::SystemTray && !m_overflowIconsLoaded) {
-        m_overflowIcons = m_tray.EnumerateNotifyIcons();
-        m_overflowIconsLoaded = true;
+    if (page == QuickSettingsPage::SystemTray) {
+        // UIA scrape on a worker; the page shows the last scan meanwhile.
+        RequestTrayIconsAsync();
     }
     if (page == QuickSettingsPage::Bluetooth) {
         m_lastBluetoothUiAt = QpcSeconds();
@@ -3029,6 +3029,9 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
     if (m_qsBtStatusValid) {
         OffsetRect(&m_qsBtStatusRect, shadowMargin, shadowMargin);
     }
+    if (m_qsTrayStatusValid) {
+        OffsetRect(&m_qsTrayStatusRect, shadowMargin, shadowMargin);
+    }
     for (RECT& chevron : m_qsTileChevron) {
         OffsetRect(&chevron, shadowMargin, shadowMargin);
     }
@@ -3077,7 +3080,8 @@ void DockApp::QsLiveSignatures(int64_t& meter, int64_t& scrub) const noexcept {
 }
 
 void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
-    bool includeTemps, bool includeBoost, bool includeBluetooth, bool includeMeter, bool includeScrub) const {
+    bool includeTemps, bool includeBoost, bool includeBluetooth, bool includeMeter, bool includeScrub,
+    bool includeTray) const {
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
@@ -3188,6 +3192,32 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
             SetFlyoutChromeInk(savedR, savedG, savedB);
         }
     }
+    // System Tray tile item count: same contract as Bluetooth (the async tray
+    // scan presents only this rect).
+    if (includeTray && m_qsTrayStatusValid && m_qsPage == QuickSettingsPage::Home) {
+        HFONT statusFont =
+            m_overflowStatusFont != nullptr ? m_overflowStatusFont : m_overflowLabelFont;
+        if (statusFont != nullptr) {
+            const uint8_t savedR = g_flyoutInkR;
+            const uint8_t savedG = g_flyoutInkG;
+            const uint8_t savedB = g_flyoutInkB;
+            SetFlyoutChromeInk(m_qsTrayStatusInkR, m_qsTrayStatusInkG, m_qsTrayStatusInkB);
+            DrawFlyoutText(pixels, width, height, m_qsTrayStatusRect, statusFont, TrayItemCountText(),
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 196);
+            SetFlyoutChromeInk(savedR, savedG, savedB);
+        }
+    }
+}
+
+std::wstring DockApp::TrayItemCountText() const {
+    if (!m_overflowIconsLoaded) {
+        return L"\u2026";
+    }
+    const size_t count = m_overflowIcons.size();
+    if (count == 0) {
+        return L"No items";
+    }
+    return std::to_wstring(count) + (count == 1 ? L" item" : L" items");
 }
 
 namespace dock_detail {
@@ -3383,6 +3413,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             chevron = {};
         }
         m_qsModuleRectsValid = false;
+        m_qsTrayStatusValid = false;
+        m_qsTrayStatusRect = {};
     }
     SetQsAccent(m_config.QsIconColor());
     const bool home = m_qsPage == QuickSettingsPage::Home;
@@ -3715,6 +3747,14 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                     m_qsBtStatusInkG = ink.g;
                     m_qsBtStatusInkB = ink.b;
                 }
+            } else if (live == 3) {
+                if (draw) {
+                    m_qsTrayStatusRect = statusRect;
+                    m_qsTrayStatusValid = true;
+                    m_qsTrayStatusInkR = ink.r;
+                    m_qsTrayStatusInkG = ink.g;
+                    m_qsTrayStatusInkB = ink.b;
+                }
             } else {
                 text(statusRect, statusFont, sub, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
             }
@@ -3733,29 +3773,6 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 // Arrow centred 12pt in from the edge, like the macOS module arrow.
                 tileChevron(chevronTile, {std::max(b.left, b.right - P(24.0F)), b.top, b.right, b.bottom}, ink);
             }
-        };
-        auto circle = [&](RECT b, wchar_t symbol, TrayFlyoutHitKind kind, bool active) {
-            const float w = static_cast<float>(b.right - b.left);
-            const size_t idx = addShape(b, w * 0.5F);
-            const CcInk ink = ccInk(idx);
-            const float cx = 0.5F * static_cast<float>(b.left + b.right);
-            const float cy = 0.5F * static_cast<float>(b.top + b.bottom);
-            if (draw) {
-                if (active) {
-                    // Accent fill inset 2pt so the glass rim highlight stays visible.
-                    FillPillColorPremul(pixels, width, height, cx, cx, cy,
-                        w * 0.5F - static_cast<float>(P(2.0F)), 0.98F, g_qsAccentB, g_qsAccentG, g_qsAccentR);
-                }
-                const UINT extent = static_cast<UINT>(std::max(16L, P(25.0F)));
-                const LONG left = static_cast<LONG>(std::lround(cx - static_cast<float>(extent) * 0.5F));
-                const LONG top = static_cast<LONG>(std::lround(cy - static_cast<float>(extent) * 0.5F));
-                if (active) {
-                    icon(left, top, symbol, extent, kOnAccentR, kOnAccentG, kOnAccentB);
-                } else {
-                    icon(left, top, symbol, extent, ink.r, ink.g, ink.b);
-                }
-            }
-            push(kind, b);
         };
         auto accentSlider = [&](RECT track, float level, const CcInk& ink) {
             if (!draw) {
@@ -3811,16 +3828,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             2, TrayFlyoutHitKind::BoostPage);
         capsule(moduleRect(QsModule::Power), L'\uE83F', L"Power", EnergyModeLabel(m_qsCache.powerMode),
             TrayFlyoutHitKind::Power, false, 0, 3, TrayFlyoutHitKind::None);
-        // Row 2: System Tray + VPN circles, Microphone capsule (live meter).
-        bool vpnOn = false;
-        for (const QsVpnEntry& entry : m_qsCache.vpn) {
-            if (entry.connected) {
-                vpnOn = true;
-                break;
-            }
-        }
-        circle(moduleRect(QsModule::SystemTray), L'\uE7F4', TrayFlyoutHitKind::SystemTrayPage, false);
-        circle(moduleRect(QsModule::Vpn), L'\uE72E', TrayFlyoutHitKind::Vpn, vpnOn);
+        // Row 2: System Tray capsule (item count, live overlay) + Microphone.
+        capsule(moduleRect(QsModule::SystemTray), L'\uE70E', L"System Tray", std::wstring{},
+            TrayFlyoutHitKind::SystemTrayPage, false, 3, 6, TrayFlyoutHitKind::None);
         {
             const RECT b = moduleRect(QsModule::Microphone);
             const float h = static_cast<float>(b.bottom - b.top);
@@ -4342,52 +4352,81 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         footer(L"More power settings", kLinkPower);
 
     } else if (m_qsPage == QuickSettingsPage::SystemTray) {
+        // Windows' notification area as a Control Centre menu: every tray
+        // item with its icon and status. Clicking a row is the item's normal
+        // (left) click; the arrow that appears on hover opens its own menu,
+        // which on the taskbar needs a right-click.
         beginHeader(L"System Tray", false, -1, false);
-        y += 2;
-        text({padding, y, panelWidth - padding, y + sectionH}, statusFont, L"Icons and right-click actions",
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 170);
-        y += sectionH;
-        const size_t shown = std::min(m_overflowIcons.size(), static_cast<size_t>(8));
-        if (shown == 0) {
-            card({padding, y, panelWidth - padding, y + listRow}, false);
-            text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"No tray icons",
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
-            y += listRow + gap;
-        } else {
-            const RECT group{padding, y, panelWidth - padding, y + static_cast<LONG>(shown) * listRow};
-            card(group, false);
-            for (size_t index = 0; index < shown; ++index) {
-                const RECT row{group.left, group.top + static_cast<LONG>(index) * listRow, group.right,
-                    group.top + static_cast<LONG>(index + 1) * listRow};
-                std::wstring title = NotifyIconTitle(m_overflowIcons[index]);
-                const size_t paren = title.find(L" (");
-                if (paren != std::wstring::npos && paren > 0) {
-                    title.resize(paren);
-                }
-                std::wstring subtitle = NotifyIconStatus(m_overflowIcons[index]);
-                if (subtitle.empty()) {
-                    subtitle = L"Click to open";
-                }
-                if (draw) {
-                    const LONG iconLeft = row.left + 12;
-                    const LONG iconTop = row.top + (listRow - 18) / 2L;
-                    if (m_overflowIcons[index].icon != nullptr) {
-                        BlitIcon(pixels, width, height, memory, m_overflowIcons[index].icon,
-                            static_cast<int>(iconLeft), static_cast<int>(iconTop), 18);
-                    } else {
-                        // No grey placeholder plate - use a Fluent app glyph instead.
-                        icon(iconLeft, iconTop, static_cast<wchar_t>(0xE8A5), 18, inkR, inkG, inkB);
-                    }
-                }
-                text({row.left + 40, row.top + 6, row.right - 16, row.top + 28}, labelFont, title,
-                    DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-                text({row.left + 40, row.top + 28, row.right - 16, row.bottom - 4}, statusFont, subtitle,
-                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
-                push(TrayFlyoutHitKind::NotifyIcon, row, static_cast<int>(index));
-            }
-            y += static_cast<LONG>(shown) * listRow + gap;
+        {
+            const std::wstring summary = TrayItemCountText();
+            text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont, summary,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
+            y += sectionH + 2;
         }
-        footer(L"Manage tray icons", kLinkTaskbar);
+        hairline();
+        const UINT arrowExtent = static_cast<UINT>(std::max(10L, std::lround(12.0F * scale)));
+        if (draw) {
+            m_qsTrayArrowExtent = arrowExtent;
+            m_qsTrayArrowGlyph = CachedGlyph(m_tray, L'\uE76C', arrowExtent, inkR, inkG, inkB);
+        }
+        const LONG rowH = std::max(40L, std::lround(46.0F * scale));
+        const LONG iconExtent = std::max(16L, std::lround(20.0F * scale));
+        const LONG arrowW = std::max(28L, std::lround(34.0F * scale));
+        if (!m_overflowIconsLoaded) {
+            menuNote(L"Loading tray items\u2026");
+        } else if (m_overflowIcons.empty()) {
+            menuNote(L"No tray items");
+        }
+        // Keep the panel on screen with a very full tray.
+        constexpr size_t kMaxTrayRows = 14;
+        const size_t shown = std::min(m_overflowIcons.size(), kMaxTrayRows);
+        for (size_t index = 0; index < shown; ++index) {
+            const TrayNotifyIcon& item = m_overflowIcons[index];
+            const RECT row{padding, y, panelWidth - padding, y + rowH};
+            const RECT arrow{row.right - menuInset - arrowW, row.top + std::lround(4.0F * scale), row.right - menuInset,
+                row.bottom - std::lround(4.0F * scale)};
+            const LONG iconLeft = row.left + menuInset + std::lround(4.0F * scale);
+            const LONG iconTop = row.top + (rowH - iconExtent) / 2L;
+            if (draw) {
+                if (item.icon != nullptr) {
+                    BlitIcon(pixels, width, height, memory, item.icon, static_cast<int>(iconLeft),
+                        static_cast<int>(iconTop), static_cast<int>(iconExtent));
+                } else {
+                    icon(iconLeft, iconTop, static_cast<wchar_t>(0xE8A5), static_cast<UINT>(iconExtent), inkR, inkG,
+                        inkB);
+                }
+            }
+            std::wstring title = NotifyIconTitle(item);
+            const size_t paren = title.find(L" (");
+            if (paren != std::wstring::npos && paren > 0) {
+                title.resize(paren);
+            }
+            const std::wstring status = NotifyIconStatus(item);
+            const LONG textLeft = iconLeft + iconExtent + std::lround(12.0F * scale);
+            const LONG textRight = arrow.left - std::lround(4.0F * scale);
+            if (status.empty()) {
+                text({textLeft, row.top, textRight, row.bottom}, labelFont, title,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            } else {
+                const LONG mid = (row.top + row.bottom) / 2L;
+                text({textLeft, row.top + 2, textRight, mid + 1}, labelFont, title,
+                    DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                text({textLeft, mid + 1, textRight, row.bottom - 2}, statusFont, status,
+                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 160);
+            }
+            // Arrow first so it wins over the row hit.
+            push(TrayFlyoutHitKind::TrayIconOptions, arrow, static_cast<int>(index));
+            push(TrayFlyoutHitKind::NotifyIcon, row, static_cast<int>(index));
+            y += rowH;
+        }
+        if (m_overflowIcons.size() > shown) {
+            text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont,
+                L"+" + std::to_wstring(m_overflowIcons.size() - shown) + L" more in Taskbar settings",
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+            y += sectionH;
+        }
+        hairline();
+        menuLink(L"Taskbar Settings\u2026", kLinkTaskbar);
     } else if (m_qsPage == QuickSettingsPage::Airplane) {
         const bool airplane = !m_qsCache.wifiRadioOn &&
             (!m_bluetoothSnapshot.radioPresent || !m_bluetoothSnapshot.radioOn);
@@ -4788,6 +4827,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
     case TrayFlyoutHitKind::CaptureGain:
     case TrayFlyoutHitKind::MediaSeek:
     case TrayFlyoutHitKind::QsEditControls:
+    case TrayFlyoutHitKind::TrayIconOptions:
         break;
     case TrayFlyoutHitKind::Back:
         CloseQuickSettingsPage();

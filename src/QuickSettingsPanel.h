@@ -32,14 +32,13 @@ enum class QsModule : uint8_t {
     Boost,
     Power,
     SystemTray,
-    Vpn,
     Microphone,
     Sound,
     Display,
     Temps,
     Media,
 };
-inline constexpr size_t kQsModuleCount = 11;
+inline constexpr size_t kQsModuleCount = 10;
 using QsModuleOrder = std::array<uint8_t, kQsModuleCount>;
 struct QsGridCell {
     int col = 0;

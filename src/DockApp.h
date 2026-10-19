@@ -166,8 +166,9 @@ private:
     static constexpr UINT_PTR kQsReorderTimerId = 21;
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
     static constexpr float kQsChevronFadeMs = 140.0F;
-    // Home tiles with a hover arrow: Wi-Fi, Bluetooth, Boost, Power, Sound, Display.
-    static constexpr size_t kQsChevronTiles = 6;
+    // Home tiles with a hover arrow: Wi-Fi, Bluetooth, Boost, Power, Sound,
+    // Display, System Tray.
+    static constexpr size_t kQsChevronTiles = 7;
     // Pointer glint easing cadence (~60 Hz); the timer only runs while the
     // glint is still converging on the cursor, so an idle dock costs nothing.
     static constexpr UINT kGlintIntervalMs = 16;
@@ -214,6 +215,8 @@ private:
     static constexpr UINT kHiddenCatalogMessage = WM_APP + 30;
     // Refresh-rate worker finished: wParam = Hz, lParam = 1 on success.
     static constexpr UINT kQsRefreshResultMessage = WM_APP + 31;
+    // Tray icon worker finished: lParam owns a std::vector<TrayNotifyIcon>.
+    static constexpr UINT kTrayIconsMessage = WM_APP + 32;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -262,6 +265,8 @@ private:
         RefreshRate,
         // Home "Edit Controls" / "Done" capsule (macOS 26 edit mode).
         QsEditControls,
+        // System Tray page row arrow: opens the item's menu (its right-click).
+        TrayIconOptions,
     };
 
     struct TrayFlyoutHit {
@@ -487,7 +492,14 @@ private:
     void PaintOverflowLiveFast();
     void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
         bool includeTemps = true, bool includeBoost = true, bool includeBluetooth = true,
-        bool includeMeter = true, bool includeScrub = true) const;
+        bool includeMeter = true, bool includeScrub = true, bool includeTray = true) const;
+    // "N items" for the Home System Tray tile ("..." until the first scan).
+    [[nodiscard]] std::wstring TrayItemCountText() const;
+    // Scan tray icons (UI Automation) on a worker; kTrayIconsMessage applies.
+    void RequestTrayIconsAsync();
+    void ApplyTrayIcons(std::vector<TrayNotifyIcon>&& icons);
+    // Hover/dirty extent of a hit: tray option arrows light their whole row.
+    [[nodiscard]] RECT OverflowHoverBounds(const TrayFlyoutHit& hit) const noexcept;
     void ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
         const TrayFlyoutHit& hit) const;
     void DestroyOverflowPopup() noexcept;
@@ -1130,6 +1142,16 @@ private:
     std::wstring m_qsRefreshNote;
     bool m_qsWifiOthersOpen = false;
     bool m_qsBtOthersOpen = false;
+    RECT m_qsTrayStatusRect{};
+    bool m_qsTrayStatusValid = false;
+    bool m_qsTrayStatusDirty = false;
+    uint8_t m_qsTrayStatusInkR = 0;
+    uint8_t m_qsTrayStatusInkG = 0;
+    uint8_t m_qsTrayStatusInkB = 0;
+    std::atomic<bool> m_trayIconsInFlight{false};
+    // Right-chevron for tray rows, in the page ink (built during layout).
+    std::vector<uint8_t> m_qsTrayArrowGlyph;
+    UINT m_qsTrayArrowExtent = 0;
     RECT m_qsBtStatusRect{};
     bool m_qsBtStatusValid = false;
     bool m_qsBtStatusDirty = false;
