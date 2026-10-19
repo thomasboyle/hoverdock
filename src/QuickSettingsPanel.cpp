@@ -4290,14 +4290,14 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const LONG rowH = std::max(36L, P(42.0F));
             const RECT row{padding + menuInset, y, panelWidth - padding - menuInset, y + rowH};
             const LONG cy = (row.top + row.bottom) / 2L;
-            const UINT small = static_cast<UINT>(std::max(12L, P(14.0F)));
-            const UINT large = static_cast<UINT>(std::max(16L, P(20.0F)));
-            icon(row.left, cy - static_cast<LONG>(small) / 2L, L'\uE706', small, inkR, inkG, inkB);
-            icon(row.right - static_cast<LONG>(large), cy - static_cast<LONG>(large) / 2L, L'\uE706', large, inkR,
+            const UINT sunSmall = static_cast<UINT>(std::max(12L, P(14.0F)));
+            const UINT sunLarge = static_cast<UINT>(std::max(16L, P(20.0F)));
+            icon(row.left, cy - static_cast<LONG>(sunSmall) / 2L, L'\uE706', sunSmall, inkR, inkG, inkB);
+            icon(row.right - static_cast<LONG>(sunLarge), cy - static_cast<LONG>(sunLarge) / 2L, L'\uE706', sunLarge, inkR,
                 inkG, inkB);
             const LONG trackH = std::max(14L, P(18.0F));
-            const RECT track{row.left + static_cast<LONG>(small) + P(12.0F), cy - trackH / 2L,
-                row.right - static_cast<LONG>(large) - P(12.0F), cy - trackH / 2L + trackH};
+            const RECT track{row.left + static_cast<LONG>(sunSmall) + P(12.0F), cy - trackH / 2L,
+                row.right - static_cast<LONG>(sunLarge) - P(12.0F), cy - trackH / 2L + trackH};
             if (draw) {
                 CcDrawSlider(pixels, width, height, track, brightness, scale, g_qsAccentR, g_qsAccentG, g_qsAccentB,
                     inkR, inkG, inkB);
