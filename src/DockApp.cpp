@@ -2907,10 +2907,11 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         bool sliderPress = false;
         if (downHit >= 0 && static_cast<size_t>(downHit) < app->m_overflowHits.size()) {
             const TrayFlyoutHit& slider = app->m_overflowHits[static_cast<size_t>(downHit)];
-            if (slider.kind == TrayFlyoutHitKind::VolumeSlider ||
+            const bool editing = app->m_qsEditMode && app->m_qsPage == QuickSettingsPage::Home;
+            if (!editing && (slider.kind == TrayFlyoutHitKind::VolumeSlider ||
                 slider.kind == TrayFlyoutHitKind::BrightnessSlider ||
                 slider.kind == TrayFlyoutHitKind::CaptureGain ||
-                slider.kind == TrayFlyoutHitKind::MediaSeek) {
+                slider.kind == TrayFlyoutHitKind::MediaSeek)) {
                 app->m_qsDragging = true;
                 app->m_qsDragMoved = false;
                 app->m_qsDragKind = slider.kind;
@@ -2920,9 +2921,10 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
                 sliderPress = true;
             }
         }
-        // Anywhere else on a Home module arms drag-to-rearrange; a release
-        // before the drag threshold is still an ordinary click.
-        if (!sliderPress) {
+        // Like macOS, modules rearrange in Edit Controls mode or while the
+        // modifier is held (Ctrl stands in for Command). A release before the
+        // drag threshold is still an ordinary click.
+        if (!sliderPress && (app->m_qsEditMode || GetKeyState(VK_CONTROL) < 0)) {
             const int module = app->QsModuleAt(downPoint);
             if (module >= 0) {
                 app->m_qsPressArmed = true;
@@ -6195,6 +6197,12 @@ void DockApp::FinishOverflowHide() noexcept {
     }
     // Before keepHomeFrame: a reorder composite must not be reused on reopen.
     AbortQsReorder();
+    // macOS leaves Edit Controls when Control Centre closes; the kept frame
+    // would show "Done", so rebuild on the next open instead.
+    if (m_qsEditMode) {
+        m_qsEditMode = false;
+        std::vector<uint8_t>().swap(m_overflowPresentBits);
+    }
     // Keep the last Home present/base/underlay + glass across hide so the next
     // chevron click can UpdateLayeredWindow without a BakeGlassPanel / full
     // Quick Settings rebuild on the UI thread (was the remaining cursor hitch).
@@ -8793,8 +8801,20 @@ bool DockApp::OverflowScreenOrigin(POINT& origin, LONG& caretX) const noexcept {
 }
 
 void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
+    // Edit mode (macOS "Edit Controls"): modules only rearrange, never act.
+    if (m_qsEditMode && m_qsPage == QuickSettingsPage::Home && hit.kind != TrayFlyoutHitKind::QsEditControls &&
+        hit.kind != TrayFlyoutHitKind::Settings) {
+        return;
+    }
     switch (hit.kind) {
     case TrayFlyoutHitKind::None:
+        break;
+    case TrayFlyoutHitKind::QsEditControls:
+        m_qsEditMode = !m_qsEditMode;
+        m_overflowHover = -1;
+        m_overflowHoverDirtyValid = false;
+        ResetQsChevronFade();
+        QueueOverflowPaint();
         break;
     case TrayFlyoutHitKind::Settings:
         // The gear is the dock's own settings (startup + updates), not
@@ -9063,6 +9083,10 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
+    // Edit mode: modules are inert, so only the Done capsule highlights.
+    if (m_qsEditMode && m_qsPage == QuickSettingsPage::Home && hit.kind != TrayFlyoutHitKind::QsEditControls) {
+        return;
+    }
     switch (hit.kind) {
     case TrayFlyoutHitKind::Settings:
         // The cog stays its idle size. A hover plate or scale-up covered the
@@ -9112,6 +9136,7 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::WifiOthers:
     case TrayFlyoutHitKind::BluetoothOthers:
     case TrayFlyoutHitKind::RefreshRate:
+    case TrayFlyoutHitKind::QsEditControls:
     case TrayFlyoutHitKind::BluetoothConnect:
     case TrayFlyoutHitKind::BluetoothPair:
     case TrayFlyoutHitKind::BluetoothDiscover: {
@@ -9160,7 +9185,7 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
 }
 
 int DockApp::QsChevronTarget() const noexcept {
-    if (m_qsPage != QuickSettingsPage::Home || m_overflowHover < 0 ||
+    if (m_qsPage != QuickSettingsPage::Home || m_qsEditMode || m_overflowHover < 0 ||
         static_cast<size_t>(m_overflowHover) >= m_overflowHits.size()) {
         return -1;
     }

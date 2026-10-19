@@ -288,6 +288,70 @@ float QsModuleRadius(size_t module, const RECT& bounds, float scale) noexcept {
     return static_cast<float>(std::lround(30.0F * scale));
 }
 
+// One damped-spring step, parameterised like SwiftUI/UIKit springs: response
+// is the undamped period in seconds, damping the damping fraction.
+void StepSpring(float& pos, float& vel, float target, float response, float damping, float dt) noexcept {
+    const float omega = 2.0F * 3.14159265F / std::max(response, 0.01F);
+    constexpr float kStep = 1.0F / 240.0F;
+    for (float remaining = dt; remaining > 0.0F; remaining -= kStep) {
+        const float h = std::min(kStep, remaining);
+        vel += (omega * omega * (target - pos) - 2.0F * damping * omega * vel) * h;
+        pos += vel * h;
+    }
+}
+
+// Three box passes ~ Gaussian blur of a single-channel plane, in place.
+void BlurAlphaPlane(std::vector<uint8_t>& plane, LONG width, LONG height, int radius) {
+    if (radius <= 0 || width <= 0 || height <= 0) {
+        return;
+    }
+    std::vector<uint8_t> scratch(plane.size());
+    auto pass = [&](const uint8_t* src, uint8_t* dst, LONG count, LONG stride, LONG lines, LONG lineStride) {
+        const int window = radius * 2 + 1;
+        for (LONG line = 0; line < lines; ++line) {
+            const uint8_t* in = src + static_cast<size_t>(line) * static_cast<size_t>(lineStride);
+            uint8_t* out = dst + static_cast<size_t>(line) * static_cast<size_t>(lineStride);
+            int sum = 0;
+            for (int k = -radius; k <= radius; ++k) {
+                const LONG at = std::clamp(static_cast<LONG>(k), 0L, count - 1);
+                sum += in[static_cast<size_t>(at) * static_cast<size_t>(stride)];
+            }
+            for (LONG i = 0; i < count; ++i) {
+                out[static_cast<size_t>(i) * static_cast<size_t>(stride)] = static_cast<uint8_t>(sum / window);
+                const LONG drop = std::clamp(i - radius, 0L, count - 1);
+                const LONG add = std::clamp(i + radius + 1, 0L, count - 1);
+                sum += in[static_cast<size_t>(add) * static_cast<size_t>(stride)] -
+                    in[static_cast<size_t>(drop) * static_cast<size_t>(stride)];
+            }
+        }
+    };
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        pass(plane.data(), scratch.data(), width, 1, height, width);
+        pass(scratch.data(), plane.data(), height, width, width, 1);
+    }
+}
+
+// Bilinear tap of a single- or four-channel plane; zero outside.
+inline float SamplePlane(const uint8_t* plane, LONG width, LONG height, size_t channels, size_t channel, float u,
+    float v) noexcept {
+    const float fx = std::floor(u);
+    const float fy = std::floor(v);
+    const LONG x0 = static_cast<LONG>(fx);
+    const LONG y0 = static_cast<LONG>(fy);
+    const float tx = u - fx;
+    const float ty = v - fy;
+    auto at = [&](LONG x, LONG y) -> float {
+        if (x < 0 || y < 0 || x >= width || y >= height) {
+            return 0.0F;
+        }
+        return static_cast<float>(
+            plane[(static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * channels + channel]);
+    };
+    const float top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+    const float bottom = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+    return top + (bottom - top) * ty;
+}
+
 // Boost report app name without the ".exe" suffix, with a "(N)" process count.
 std::wstring BoostAppLabel(const BoostReportItem& item) {
     std::wstring name = item.name;
@@ -3900,10 +3964,39 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const float scrubLevel = (!m_qsPaintUnderlayPass && m_qsCache.mediaHave) ? m_qsCache.mediaProgress : 0.0F;
             accentSlider(scrub, scrubLevel, ink);
         }
+        // macOS 26 "Edit Controls" capsule under the grid. In edit mode it is
+        // the accent "Done" button and modules drag instead of acting.
+        {
+            const LONG gridBottom = cellRect(0, std::max(1, gridRows) - 1, 1, 1).bottom;
+            const LONG buttonH = std::max(24L, P(28.0F));
+            const LONG buttonW = P(m_qsEditMode ? 72.0F : 112.0F);
+            const LONG centreX = panelWidth / 2L;
+            const LONG top = gridBottom + P(14.0F);
+            const RECT button{centreX - buttonW / 2L, top, centreX + buttonW / 2L, top + buttonH};
+            const size_t idx = addShape(button, static_cast<float>(buttonH) * 0.5F);
+            const CcInk ink = ccInk(idx);
+            if (m_qsEditMode) {
+                if (draw) {
+                    const float radius = 0.5F * static_cast<float>(buttonH) - static_cast<float>(std::max(1L, P(1.0F)));
+                    FillPillColorPremul(pixels, width, height, static_cast<float>(button.left) + 0.5F * static_cast<float>(buttonH),
+                        static_cast<float>(button.right) - 0.5F * static_cast<float>(buttonH),
+                        0.5F * static_cast<float>(button.top + button.bottom), radius, 0.98F, g_qsAccentB, g_qsAccentG,
+                        g_qsAccentR);
+                    SetFlyoutChromeInk(kOnAccentR, kOnAccentG, kOnAccentB);
+                }
+                text(button, labelFont, L"Done", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
+            } else {
+                if (draw) {
+                    SetFlyoutChromeInk(ink.r, ink.g, ink.b);
+                }
+                text(button, labelFont, L"Edit Controls", DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            }
+            push(TrayFlyoutHitKind::QsEditControls, button);
+            y = button.bottom + padding;
+        }
         if (draw) {
             m_qsCcInkSig = inkSigNew;
         }
-        y = cellRect(0, std::max(1, gridRows) - 1, 1, 1).bottom + padding;
         contentBottom = y;
     m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
         m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
@@ -4704,6 +4797,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
     case TrayFlyoutHitKind::BrightnessSlider:
     case TrayFlyoutHitKind::CaptureGain:
     case TrayFlyoutHitKind::MediaSeek:
+    case TrayFlyoutHitKind::QsEditControls:
         break;
     case TrayFlyoutHitKind::Back:
         CloseQuickSettingsPage();
@@ -5138,8 +5232,9 @@ bool DockApp::BeginQsReorder(int module, POINT cursor) {
         m_qsReorderVel[index][1] = 0.0F;
     }
     m_qsReorderBounds = bounds;
-    // Lift shadow reaches ~10px past a tile; tiles never leave the grid box.
-    const LONG margin = std::max(12L, std::lround(14.0F * m_qsGridScale));
+    // The lifted tile grows ~6% and casts a ~14pt blurred shadow 7pt down;
+    // tiles themselves never leave the grid box.
+    const LONG margin = std::max(24L, std::lround(30.0F * m_qsGridScale));
     m_qsReorderDirty = RECT{std::max(0L, bounds.left - margin), std::max(0L, bounds.top - margin),
         std::min(width, bounds.right + margin), std::min(height, bounds.bottom + margin)};
 
@@ -5151,6 +5246,24 @@ bool DockApp::BeginQsReorder(int module, POINT cursor) {
     m_qsReorderOrder = m_qsOrder;
     m_qsReorderStartOrder = m_qsOrder;
     m_qsReorderLift = 0.0F;
+    m_qsReorderScale = 1.0F;
+    m_qsReorderScaleVel = 0.0F;
+    {
+        // Soft lift shadow: the lifted tile's coverage, padded and blurred once.
+        const QsReorderSprite& lifted = m_qsReorderSprites[static_cast<size_t>(module)];
+        const LONG pad = std::max(8L, std::lround(14.0F * m_qsGridScale));
+        const LONG shadowW = lifted.width + pad * 2L;
+        const LONG shadowH = lifted.height + pad * 2L;
+        m_qsReorderShadowPad = pad;
+        m_qsReorderShadow.assign(static_cast<size_t>(shadowW) * static_cast<size_t>(shadowH), 0);
+        for (LONG y = 0; y < lifted.height; ++y) {
+            std::memcpy(m_qsReorderShadow.data() + static_cast<size_t>(y + pad) * static_cast<size_t>(shadowW) +
+                    static_cast<size_t>(pad),
+                lifted.cover.data() + static_cast<size_t>(y) * static_cast<size_t>(lifted.width),
+                static_cast<size_t>(lifted.width));
+        }
+        BlurAlphaPlane(m_qsReorderShadow, shadowW, shadowH, static_cast<int>(std::max(2L, pad / 3L)));
+    }
     m_qsReorderActive = true;
     m_qsReorderDropped = false;
     m_qsReorderPaintPending = false;
@@ -5269,10 +5382,8 @@ void DockApp::StepQsReorder() {
         static_cast<void>(PackQsModules(m_qsReorderOrder, cells, rows));
     }
     const size_t dragged = static_cast<size_t>(m_qsReorderModule);
-    // Damped springs (~2.8 Hz). Displaced tiles barely overshoot; the dropped
-    // tile is a little looser so it visibly settles into its slot.
-    constexpr float kOmega = 2.0F * 3.14159265F * 2.8F;
-    constexpr float kStep = 1.0F / 240.0F;
+    // UIKit-like springs: displaced tiles glide (0.32 s, 0.86); the dropped
+    // tile is a touch looser so it visibly settles into its slot.
     bool settled = true;
     for (size_t module = 0; module < kQsModuleCount; ++module) {
         float* pos = m_qsReorderPos[module];
@@ -5289,16 +5400,10 @@ void DockApp::StepQsReorder() {
         }
         const RECT slot = QsModuleSlot(module, cells[module]);
         const float target[2] = {static_cast<float>(slot.left), static_cast<float>(slot.top)};
-        const float zeta = module == dragged ? 0.62F : 0.8F;
-        for (float remaining = dt; remaining > 0.0F; remaining -= kStep) {
-            const float h = std::min(kStep, remaining);
-            for (int axis = 0; axis < 2; ++axis) {
-                const float accel = kOmega * kOmega * (target[axis] - pos[axis]) - 2.0F * zeta * kOmega * vel[axis];
-                vel[axis] += accel * h;
-                pos[axis] += vel[axis] * h;
-            }
-        }
+        const float response = module == dragged ? 0.38F : 0.32F;
+        const float damping = module == dragged ? 0.74F : 0.86F;
         for (int axis = 0; axis < 2; ++axis) {
+            StepSpring(pos[axis], vel[axis], target[axis], response, damping, dt);
             if (std::fabs(target[axis] - pos[axis]) < 0.35F && std::fabs(vel[axis]) < 8.0F) {
                 pos[axis] = target[axis];
                 vel[axis] = 0.0F;
@@ -5307,13 +5412,17 @@ void DockApp::StepQsReorder() {
             }
         }
     }
-    const float liftGoal = m_qsReorderDropped ? 0.0F : 1.0F;
-    m_qsReorderLift += (liftGoal - m_qsReorderLift) * std::min(1.0F, dt * 14.0F);
-    if (std::fabs(liftGoal - m_qsReorderLift) < 0.02F) {
-        m_qsReorderLift = liftGoal;
+    // Lift: the held tile pops up ~6% (slightly bouncy) and drops back to 1.
+    constexpr float kLiftScale = 1.06F;
+    const float scaleGoal = m_qsReorderDropped ? 1.0F : kLiftScale;
+    StepSpring(m_qsReorderScale, m_qsReorderScaleVel, scaleGoal, 0.3F, m_qsReorderDropped ? 0.8F : 0.62F, dt);
+    if (std::fabs(scaleGoal - m_qsReorderScale) < 0.0015F && std::fabs(m_qsReorderScaleVel) < 0.02F) {
+        m_qsReorderScale = scaleGoal;
+        m_qsReorderScaleVel = 0.0F;
     } else {
         settled = false;
     }
+    m_qsReorderLift = std::clamp((m_qsReorderScale - 1.0F) / (kLiftScale - 1.0F), 0.0F, 1.0F);
     PresentQsReorderFrame();
     if (!settled) {
         return;
@@ -5379,23 +5488,71 @@ void DockApp::PresentQsReorderFrame() {
         }
     }
     if (dragged < kQsModuleCount) {
+        // Lifted tile: scaled about its centre (bilinear), over a blurred
+        // shadow that deepens and drops as it rises.
+        const QsReorderSprite& sprite = m_qsReorderSprites[dragged];
+        const float scaleNow = std::max(0.5F, m_qsReorderScale);
         const float lift = m_qsReorderLift;
-        if (lift > 0.01F) {
-            // Soft lift shadow: a few widening, fading rounded rects.
-            const QsReorderSprite& sprite = m_qsReorderSprites[dragged];
-            const LONG left = static_cast<LONG>(std::lround(m_qsReorderPos[dragged][0]));
-            const LONG top = static_cast<LONG>(std::lround(m_qsReorderPos[dragged][1]));
-            const LONG drop = static_cast<LONG>(std::lround(4.0F * m_qsGridScale * lift));
-            for (int ring = 1; ring <= 4; ++ring) {
-                const LONG grow = static_cast<LONG>(std::lround(static_cast<float>(ring) * 2.0F * m_qsGridScale));
-                const RECT shade{std::max(dirty.left, left - grow), std::max(dirty.top, top - grow + drop),
-                    std::min(dirty.right, left + sprite.width + grow),
-                    std::min(dirty.bottom, top + sprite.height + grow + drop)};
-                FillSquircleColorPremul(frame, static_cast<int>(width), static_cast<int>(height), shade,
-                    sprite.radius + static_cast<float>(grow), 0.045F * lift, 0, 0, 0);
+        const float centreX = m_qsReorderPos[dragged][0] + 0.5F * static_cast<float>(sprite.width);
+        const float centreY = m_qsReorderPos[dragged][1] + 0.5F * static_cast<float>(sprite.height);
+        const LONG pad = m_qsReorderShadowPad;
+        const LONG shadowW = sprite.width + pad * 2L;
+        const LONG shadowH = sprite.height + pad * 2L;
+        if (lift > 0.01F && m_qsReorderShadow.size() == static_cast<size_t>(shadowW) * static_cast<size_t>(shadowH)) {
+            const float drop = 7.0F * m_qsGridScale * lift;
+            const float strength = 0.30F * lift;
+            const float halfW = 0.5F * static_cast<float>(shadowW) * scaleNow;
+            const float halfH = 0.5F * static_cast<float>(shadowH) * scaleNow;
+            const LONG x0 = std::max(dirty.left, static_cast<LONG>(std::floor(centreX - halfW)));
+            const LONG x1 = std::min(dirty.right, static_cast<LONG>(std::ceil(centreX + halfW)));
+            const LONG y0 = std::max(dirty.top, static_cast<LONG>(std::floor(centreY + drop - halfH)));
+            const LONG y1 = std::min(dirty.bottom, static_cast<LONG>(std::ceil(centreY + drop + halfH)));
+            for (LONG y = y0; y < y1; ++y) {
+                const float v = (static_cast<float>(y) + 0.5F - (centreY + drop - halfH)) / scaleNow - 0.5F;
+                for (LONG x = x0; x < x1; ++x) {
+                    const float u = (static_cast<float>(x) + 0.5F - (centreX - halfW)) / scaleNow - 0.5F;
+                    const float a = SamplePlane(m_qsReorderShadow.data(), shadowW, shadowH, 1U, 0U, u, v) / 255.0F *
+                        strength;
+                    if (a <= 0.002F) {
+                        continue;
+                    }
+                    uint8_t* dst = frame + (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 4U;
+                    // Premultiplied black over: colour darkens, alpha builds.
+                    const float keep = 1.0F - a;
+                    dst[0] = static_cast<uint8_t>(static_cast<float>(dst[0]) * keep + 0.5F);
+                    dst[1] = static_cast<uint8_t>(static_cast<float>(dst[1]) * keep + 0.5F);
+                    dst[2] = static_cast<uint8_t>(static_cast<float>(dst[2]) * keep + 0.5F);
+                    dst[3] = static_cast<uint8_t>(static_cast<float>(dst[3]) * keep + 255.0F * a + 0.5F);
+                }
             }
         }
-        blit(dragged);
+        if (std::fabs(scaleNow - 1.0F) < 0.001F) {
+            blit(dragged);
+        } else {
+            const float halfW = 0.5F * static_cast<float>(sprite.width) * scaleNow;
+            const float halfH = 0.5F * static_cast<float>(sprite.height) * scaleNow;
+            const LONG x0 = std::max(dirty.left, static_cast<LONG>(std::floor(centreX - halfW)));
+            const LONG x1 = std::min(dirty.right, static_cast<LONG>(std::ceil(centreX + halfW)));
+            const LONG y0 = std::max(dirty.top, static_cast<LONG>(std::floor(centreY - halfH)));
+            const LONG y1 = std::min(dirty.bottom, static_cast<LONG>(std::ceil(centreY + halfH)));
+            for (LONG y = y0; y < y1; ++y) {
+                const float v = (static_cast<float>(y) + 0.5F - (centreY - halfH)) / scaleNow - 0.5F;
+                for (LONG x = x0; x < x1; ++x) {
+                    const float u = (static_cast<float>(x) + 0.5F - (centreX - halfW)) / scaleNow - 0.5F;
+                    const float c = SamplePlane(sprite.cover.data(), sprite.width, sprite.height, 1U, 0U, u, v);
+                    if (c <= 0.5F) {
+                        continue;
+                    }
+                    uint8_t* dst = frame + (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * 4U;
+                    const float keep = 1.0F - c / 255.0F;
+                    for (size_t channel = 0; channel < 4U; ++channel) {
+                        const float src = SamplePlane(sprite.bits.data(), sprite.width, sprite.height, 4U, channel, u, v);
+                        dst[channel] = static_cast<uint8_t>(
+                            std::clamp(src + static_cast<float>(dst[channel]) * keep + 0.5F, 0.0F, 255.0F));
+                    }
+                }
+            }
+        }
     }
     static_cast<void>(PresentLayeredBits(m_overflowWindow, origin, width, height, frame, bytes, m_overflowLayerDib,
         &dirty));
@@ -5416,6 +5573,7 @@ void DockApp::FinishQsReorder() {
         std::vector<uint8_t>().swap(sprite.cover);
     }
     std::vector<uint8_t>().swap(m_qsReorderBackdrop);
+    std::vector<uint8_t>().swap(m_qsReorderShadow);
     m_overflowHover = -1;
     m_overflowHoverDirtyValid = false;
     if (changed) {
@@ -5464,6 +5622,7 @@ void DockApp::AbortQsReorder() noexcept {
         std::vector<uint8_t>().swap(sprite.cover);
     }
     std::vector<uint8_t>().swap(m_qsReorderBackdrop);
+    std::vector<uint8_t>().swap(m_qsReorderShadow);
     // The present frame is a reorder composite: never reopen with it.
     std::vector<uint8_t>().swap(m_overflowPresentBits);
     std::vector<uint8_t>().swap(m_overflowBaseBits);

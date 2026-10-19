@@ -260,6 +260,8 @@ private:
         BoostPage,
         // Refresh Rate menu row; index is the rate in Hz.
         RefreshRate,
+        // Home "Edit Controls" / "Done" capsule (macOS 26 edit mode).
+        QsEditControls,
     };
 
     struct TrayFlyoutHit {
@@ -1079,6 +1081,9 @@ private:
     LONG m_qsGridLeft = 0;
     LONG m_qsGridTop = 0;
     float m_qsGridScale = 1.0F;
+    // macOS "Edit Controls" mode: modules drag instead of acting. Ctrl-drag
+    // (the Windows stand-in for holding Command) works outside it too.
+    bool m_qsEditMode = false;
     // Left press on a Home module, not yet a drag.
     bool m_qsPressArmed = false;
     POINT m_qsPressPoint{};
@@ -1105,6 +1110,12 @@ private:
     float m_qsReorderPos[kQsModuleCount][2]{};
     float m_qsReorderVel[kQsModuleCount][2]{};
     float m_qsReorderLift = 0.0F;
+    // Lifted tile scale (springs to ~1.06 while held, back to 1 on drop).
+    float m_qsReorderScale = 1.0F;
+    float m_qsReorderScaleVel = 0.0F;
+    // Blurred coverage of the lifted tile, padded by m_qsReorderShadowPad.
+    std::vector<uint8_t> m_qsReorderShadow;
+    LONG m_qsReorderShadowPad = 0;
     QsReorderSprite m_qsReorderSprites[kQsModuleCount];
     std::vector<uint8_t> m_qsReorderBackdrop;
     RECT m_qsReorderBounds{};
