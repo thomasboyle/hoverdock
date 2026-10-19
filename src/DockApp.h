@@ -237,6 +237,12 @@ private:
         MoreSettings,
         MediaTransport,
         MediaSeek,
+        // Home Wi-Fi tile body (radio toggle) and its hover chevron (drill-in).
+        WifiRadio,
+        WifiPage,
+        // Collapsible "Other Networks" / "Other Devices" rows on the drill-ins.
+        WifiOthers,
+        BluetoothOthers,
     };
 
     struct TrayFlyoutHit {
@@ -442,6 +448,8 @@ private:
     void PresentOverflowLayer() noexcept;
     void QueueOverflowPaint(bool hoverOnly = false);
     void PaintOverflowHoverFast();
+    // macOS style arrow on the hovered Home Wi-Fi / Bluetooth tile.
+    void PaintQsTileChevron(uint8_t* pixels, int width, int height, const TrayFlyoutHit& hit) const;
     // Meter/scrub-only present from underlay via UpdateLayeredWindowIndirect.
     void PaintOverflowLiveFast();
     void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
@@ -996,6 +1004,14 @@ private:
     // Home Bluetooth tile status ("Off" / "On" / "Connected to X"): live
     // overlay like Boost so BT worker snapshots and the tile toggle present
     // one rect via PaintOverflowLiveFast instead of a full PaintQuickSettings.
+    // Home Wi-Fi (0) / Bluetooth (1) tile chevrons, composited only on hover
+    // like the macOS Control Centre module arrow. Glyphs match the tile ink.
+    RECT m_qsTileChevron[2]{};
+    std::vector<uint8_t> m_qsTileChevronGlyph[2];
+    UINT m_qsTileChevronExtent = 0;
+    uint8_t m_qsTileChevronInk[2][3]{};
+    bool m_qsWifiOthersOpen = false;
+    bool m_qsBtOthersOpen = false;
     RECT m_qsBtStatusRect{};
     bool m_qsBtStatusValid = false;
     bool m_qsBtStatusDirty = false;

@@ -8614,6 +8614,10 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::MoreSettings:
     case TrayFlyoutHitKind::MediaTransport:
     case TrayFlyoutHitKind::MediaSeek:
+    case TrayFlyoutHitKind::WifiRadio:
+    case TrayFlyoutHitKind::WifiPage:
+    case TrayFlyoutHitKind::WifiOthers:
+    case TrayFlyoutHitKind::BluetoothOthers:
         ApplyQuickSettingsCommand(hit, message);
         break;
     case TrayFlyoutHitKind::NotifyIcon:
@@ -8728,10 +8732,16 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         // The cog stays its idle size. A hover plate or scale-up covered the
         // tile underneath.
         break;
+    case TrayFlyoutHitKind::WifiRadio:
+    case TrayFlyoutHitKind::WifiPage:
+    case TrayFlyoutHitKind::BluetoothPage:
+        PaintQsTileChevron(pixels, width, height, hit);
+        break;
     case TrayFlyoutHitKind::BluetoothRadio:
-        // Home tile body: no plate (matches Wi-Fi / VPN tiles). The drill-in
+        // Home tile body: no plate, just the macOS module arrow. The drill-in
         // header switch keeps its subtle plate.
         if (m_qsPage == QuickSettingsPage::Home) {
+            PaintQsTileChevron(pixels, width, height, hit);
             break;
         }
         [[fallthrough]];
@@ -8741,6 +8751,16 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
             0.12F);
         break;
     }
+    case TrayFlyoutHitKind::MoreSettings:
+        // Only the macOS style "Wi-Fi Settings..." / "Bluetooth Settings..."
+        // menu rows get a plate; other pages keep their bare footer links.
+        if (m_qsPage != QuickSettingsPage::Wifi && m_qsPage != QuickSettingsPage::Bluetooth) {
+            break;
+        }
+        [[fallthrough]];
+    case TrayFlyoutHitKind::WifiNetwork:
+    case TrayFlyoutHitKind::WifiOthers:
+    case TrayFlyoutHitKind::BluetoothOthers:
     case TrayFlyoutHitKind::BluetoothConnect:
     case TrayFlyoutHitKind::BluetoothPair:
     case TrayFlyoutHitKind::BluetoothDiscover: {
@@ -8762,7 +8782,6 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::Boost:
     case TrayFlyoutHitKind::Brightness:
     case TrayFlyoutHitKind::Back:
-    case TrayFlyoutHitKind::BluetoothPage:
     case TrayFlyoutHitKind::Vpn:
     case TrayFlyoutHitKind::Microphone:
     case TrayFlyoutHitKind::Display:
@@ -8775,11 +8794,9 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::CaptureGain:
     case TrayFlyoutHitKind::Toggle:
     case TrayFlyoutHitKind::PowerMode:
-    case TrayFlyoutHitKind::WifiNetwork:
     case TrayFlyoutHitKind::AudioOutput:
     case TrayFlyoutHitKind::AudioInput:
     case TrayFlyoutHitKind::VpnEntry:
-    case TrayFlyoutHitKind::MoreSettings:
     case TrayFlyoutHitKind::MediaSeek:
         break;
     case TrayFlyoutHitKind::MediaTransport: {
@@ -8791,6 +8808,32 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     default:
         break;
     }
+}
+
+void DockApp::PaintQsTileChevron(uint8_t* pixels, int width, int height,
+    const TrayFlyoutHit& hit) const {
+    if (m_qsPage != QuickSettingsPage::Home) {
+        return;
+    }
+    const bool wifi = hit.kind == TrayFlyoutHitKind::WifiRadio || hit.kind == TrayFlyoutHitKind::WifiPage;
+    const size_t tile = wifi ? 0U : 1U;
+    const RECT& chevron = m_qsTileChevron[tile];
+    const std::vector<uint8_t>& glyph = m_qsTileChevronGlyph[tile];
+    const int extent = static_cast<int>(m_qsTileChevronExtent);
+    if (glyph.empty() || extent <= 0 || chevron.right <= chevron.left ||
+        glyph.size() < static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U) {
+        return;
+    }
+    const float cx = 0.5F * static_cast<float>(chevron.left + chevron.right);
+    const float cy = 0.5F * static_cast<float>(chevron.top + chevron.bottom);
+    if (hit.kind == TrayFlyoutHitKind::WifiPage || hit.kind == TrayFlyoutHitKind::BluetoothPage) {
+        // Pointer on the arrow itself: soft disc so the drill-in target reads.
+        const float radius = 0.34F * static_cast<float>(chevron.right - chevron.left);
+        FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.12F, m_qsTileChevronInk[tile][2],
+            m_qsTileChevronInk[tile][1], m_qsTileChevronInk[tile][0]);
+    }
+    CompositePremul(pixels, width, height, static_cast<int>(std::lround(cx)) - extent / 2,
+        static_cast<int>(std::lround(cy)) - extent / 2, glyph.data(), extent, extent);
 }
 
 void DockApp::PaintOverflowHoverFast() {

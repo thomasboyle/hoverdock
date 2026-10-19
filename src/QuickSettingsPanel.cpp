@@ -51,6 +51,8 @@ void FillSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT 
     float radius, float alpha, uint8_t blue, uint8_t green, uint8_t red);
 void FillSquirclePremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, float radius,
     float alpha);
+void FillRectColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, float alpha,
+    uint8_t blue, uint8_t green, uint8_t red);
 float ContentSquircleRadius(const RECT& bounds, float scale) noexcept;
 void RemapPremulInkColor(std::vector<uint8_t>& pixels, uint8_t r, uint8_t g, uint8_t b);
 void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept;
@@ -261,6 +263,36 @@ std::wstring BluetoothPageSummary(const BluetoothSnapshot& bt) {
     }
     const std::vector<std::wstring> status = BluetoothTileStatusCandidates(bt);
     return status.front() == L"On" ? L"On \u00B7 not connected" : status.front();
+}
+
+// Device-type glyph for Bluetooth rows, guessed from the friendly name since
+// the snapshot carries no class-of-device.
+wchar_t BluetoothDeviceGlyph(const std::wstring& name) {
+    std::wstring lower = name;
+    for (wchar_t& ch : lower) {
+        ch = static_cast<wchar_t>(std::towlower(ch));
+    }
+    auto has = [&](const wchar_t* needle) { return lower.find(needle) != std::wstring::npos; };
+    if (has(L"mouse") || has(L"trackpad") || has(L"touchpad")) {
+        return L'\uE962';
+    }
+    if (has(L"keyboard")) {
+        return L'\uE765';
+    }
+    if (has(L"airpods") || has(L"buds") || has(L"headphone") || has(L"headset") || has(L"earphone") ||
+        has(L"wh-") || has(L"wf-")) {
+        return L'\uE7F6';
+    }
+    if (has(L"speaker") || has(L"soundbar") || has(L"boom")) {
+        return L'\uE7F5';
+    }
+    if (has(L"controller") || has(L"gamepad") || has(L"xbox") || has(L"dualsense") || has(L"dualshock")) {
+        return L'\uE7FC';
+    }
+    if (has(L"phone") || has(L"iphone") || has(L"pixel") || has(L"galaxy")) {
+        return L'\uE8EA';
+    }
+    return L'\uE702';
 }
 
 std::wstring SsidText(const DOT11_SSID& ssid) {
@@ -2512,6 +2544,11 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     m_overflowHover = -1;
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
+    if (page == QuickSettingsPage::Wifi) {
+        m_qsWifiOthersOpen = false;
+    } else if (page == QuickSettingsPage::Bluetooth) {
+        m_qsBtOthersOpen = m_bluetoothSnapshot.discovering;
+    }
     // Expire TTLs so the worker refreshes page-specific data (wifi list, etc.)
     // after this paint - never run WLAN/COM/UIA on the UI thread here.
     m_qsCache.stampNetwork = 0;
@@ -3100,8 +3137,11 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             }
         };
         // 2x1 capsule: O36 glyph disc at 14pt inset, title + status to its right.
+        // chevronTile: -1 none, 0 Wi-Fi, 1 Bluetooth. Those tiles show a macOS
+        // style arrow on hover (composited by the hover pass) that opens the
+        // drill-in, while the body toggles the radio.
         auto capsule = [&](RECT b, wchar_t symbol, const wchar_t* title, const std::wstring& sub,
-                           TrayFlyoutHitKind kind, bool active, int live, bool splitChevron) {
+                           TrayFlyoutHitKind kind, bool active, int live, int chevronTile) {
             const float h = static_cast<float>(b.bottom - b.top);
             const size_t idx = addShape(b, h * 0.5F);
             const CcInk ink = ccInk(idx);
@@ -3114,7 +3154,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 SetFlyoutChromeInk(ink.r, ink.g, ink.b);
             }
             const LONG textL = static_cast<LONG>(std::lround(cx + disc * 0.5F)) + P(9.0F);
-            const LONG textR = b.right - P(12.0F);
+            const LONG textR = b.right - (chevronTile >= 0 ? P(30.0F) : P(12.0F));
             text({textL, cy - P(21.0F), textR, cy + P(1.0F)}, labelFont, title,
                 DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             const RECT statusRect{textL, cy + P(1.0F), textR, cy + P(21.0F)};
@@ -3137,10 +3177,26 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             } else {
                 text(statusRect, statusFont, sub, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
             }
-            if (splitChevron) {
+            if (chevronTile >= 0) {
                 // Right edge opens the drill-in page, the body toggles the radio.
-                push(TrayFlyoutHitKind::BluetoothPage,
-                    {std::max(b.left, b.right - P(36.0F)), b.top, b.right, b.bottom});
+                const RECT chevron{std::max(b.left, b.right - P(36.0F)), b.top, b.right, b.bottom};
+                push(chevronTile == 0 ? TrayFlyoutHitKind::WifiPage : TrayFlyoutHitKind::BluetoothPage,
+                    chevron);
+                if (draw) {
+                    const UINT extent = static_cast<UINT>(std::max(10L, P(12.0F)));
+                    const size_t tile = static_cast<size_t>(chevronTile);
+                    m_qsTileChevron[tile] = chevron;
+                    uint8_t* cachedInk = m_qsTileChevronInk[tile];
+                    // Re-copy the glyph only when its extent or adaptive ink changes.
+                    if (m_qsTileChevronGlyph[tile].empty() || m_qsTileChevronExtent != extent ||
+                        cachedInk[0] != ink.r || cachedInk[1] != ink.g || cachedInk[2] != ink.b) {
+                        cachedInk[0] = ink.r;
+                        cachedInk[1] = ink.g;
+                        cachedInk[2] = ink.b;
+                        m_qsTileChevronGlyph[tile] = CachedGlyph(m_tray, L'\uE76C', extent, ink.r, ink.g, ink.b);
+                    }
+                    m_qsTileChevronExtent = extent;
+                }
             }
             push(kind, b);
         };
@@ -3209,15 +3265,15 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         }
         const bool btOn = m_bluetoothSnapshot.radioOn;
         // Row 0: Wi-Fi + Bluetooth capsules.
-        capsule(cellRect(0, 0, 2, 1), L'\uE701', L"Wi-Fi", wifiLabel, TrayFlyoutHitKind::Wifi,
-            wifiOn || m_qsCache.wifiRadioOn, 0, false);
+        capsule(cellRect(0, 0, 2, 1), L'\uE701', L"Wi-Fi", wifiLabel, TrayFlyoutHitKind::WifiRadio,
+            wifiOn || m_qsCache.wifiRadioOn, 0, 0);
         capsule(cellRect(2, 0, 2, 1), L'\uE702', L"Bluetooth", std::wstring{},
-            TrayFlyoutHitKind::BluetoothRadio, btOn, 2, true);
+            TrayFlyoutHitKind::BluetoothRadio, btOn, 2, 1);
         // Row 1: Boost + Power capsules.
         capsule(cellRect(0, 1, 2, 1), L'\uE945', L"Boost", m_boostStatus, TrayFlyoutHitKind::Boost, false, 1,
-            false);
+            -1);
         capsule(cellRect(2, 1, 2, 1), L'\uE708', L"Power", EnergyModeLabel(m_qsCache.powerMode),
-            TrayFlyoutHitKind::Power, false, 0, false);
+            TrayFlyoutHitKind::Power, false, 0, -1);
         // Row 2: System Tray + VPN circles, Microphone capsule (live meter).
         bool vpnOn = false;
         for (const QsVpnEntry& entry : m_qsCache.vpn) {
@@ -3399,34 +3455,150 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         push(kind, row, index);
     };
 
+    // macOS Control Centre module menus (Wi-Fi / Bluetooth): flat rows on the
+    // glass split by hairlines, round glyph discs, and a "Settings..." link.
+    const LONG menuRow = std::max(40L, std::lround(44.0F * scale));
+    const LONG menuInset = std::max(4L, std::lround(6.0F * scale));
+    constexpr uint8_t dimR = 128;
+    constexpr uint8_t dimG = 130;
+    constexpr uint8_t dimB = 134;
+    uint8_t onAccentR = 30;
+    uint8_t onAccentG = 33;
+    uint8_t onAccentB = 24;
+    CcOnAccentInk(g_qsAccentR, g_qsAccentG, g_qsAccentB, onAccentR, onAccentG, onAccentB);
+    auto hairline = [&]() {
+        const LONG lineY = y + gap / 2L;
+        if (draw) {
+            FillRectColorPremul(pixels, width, height,
+                {padding + menuInset, lineY, panelWidth - padding - menuInset,
+                    lineY + std::max(1L, std::lround(scale))},
+                0.14F, inkB, inkG, inkR);
+        }
+        y += gap;
+    };
+    auto menuSection = [&](const wchar_t* label) {
+        text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, sectionFont, label,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 150);
+        y += sectionH;
+    };
+    auto menuNote = [&](const std::wstring& label) {
+        text({padding + menuInset, y, panelWidth - padding - menuInset, y + menuRow}, labelFont, label,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+        y += menuRow;
+    };
+    // Glyph disc + title, optional trailing status text and trailing glyph.
+    // Active rows fill the disc with the accent; dim rows grey out the title.
+    auto menuItem = [&](wchar_t symbol, bool active, bool dim, const std::wstring& title,
+                        const std::wstring& trailing, wchar_t trailingGlyph, TrayFlyoutHitKind kind, int index) {
+        const RECT row{padding, y, panelWidth - padding, y + menuRow};
+        const float radius = static_cast<float>(std::max(12L, std::lround(15.0F * scale)));
+        const float cx = static_cast<float>(row.left + menuInset) + radius;
+        const float cy = 0.5F * static_cast<float>(row.top + row.bottom);
+        const UINT extent = static_cast<UINT>(std::max(12L, std::lround(16.0F * scale)));
+        if (draw) {
+            if (active) {
+                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, g_qsAccentB, g_qsAccentG,
+                    g_qsAccentR);
+            } else {
+                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, dim ? 0.08F : 0.14F, inkB, inkG,
+                    inkR);
+            }
+        }
+        const LONG glyphLeft = static_cast<LONG>(std::lround(cx - static_cast<float>(extent) * 0.5F));
+        const LONG glyphTop = static_cast<LONG>(std::lround(cy - static_cast<float>(extent) * 0.5F));
+        if (active) {
+            icon(glyphLeft, glyphTop, symbol, extent, onAccentR, onAccentG, onAccentB);
+        } else if (dim) {
+            icon(glyphLeft, glyphTop, symbol, extent, dimR, dimG, dimB);
+        } else {
+            icon(glyphLeft, glyphTop, symbol, extent, inkR, inkG, inkB);
+        }
+        LONG textRight = row.right - menuInset;
+        if (trailingGlyph != 0) {
+            const UINT trailExtent = static_cast<UINT>(std::max(10L, std::lround(13.0F * scale)));
+            icon(textRight - static_cast<LONG>(trailExtent),
+                static_cast<LONG>(std::lround(cy - static_cast<float>(trailExtent) * 0.5F)), trailingGlyph,
+                trailExtent, dimR, dimG, dimB);
+            textRight -= static_cast<LONG>(trailExtent) + std::lround(8.0F * scale);
+        }
+        if (!trailing.empty()) {
+            const LONG trailW = std::lround(110.0F * scale);
+            text({textRight - trailW, row.top, textRight, row.bottom}, statusFont, trailing,
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 160);
+            textRight -= trailW + std::lround(6.0F * scale);
+        }
+        const LONG textLeft = static_cast<LONG>(std::lround(cx + radius)) + std::lround(10.0F * scale);
+        const LONG textW = (std::max)(0L, textRight - textLeft);
+        text({textLeft, row.top, textRight, row.bottom}, labelFont,
+            draw ? FitFlyoutLine(labelFont, title, textW) : title,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, dim ? 150 : 255);
+        push(kind, row, index);
+        y += menuRow;
+    };
+    // Grey section title with a right chevron that turns down when expanded.
+    auto menuDisclosure = [&](const wchar_t* label, bool open, TrayFlyoutHitKind kind) {
+        const RECT row{padding, y, panelWidth - padding, y + menuRow};
+        const UINT extent = static_cast<UINT>(std::max(10L, std::lround(13.0F * scale)));
+        text({row.left + menuInset, row.top, row.right - menuInset - static_cast<LONG>(extent) - 8, row.bottom},
+            sectionFont, label, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 150);
+        icon(row.right - menuInset - static_cast<LONG>(extent), (row.top + row.bottom - static_cast<LONG>(extent)) / 2L,
+            open ? L'\uE70D' : L'\uE76C', extent, dimR, dimG, dimB);
+        push(kind, row);
+        y += menuRow;
+    };
+    auto menuLink = [&](const wchar_t* label, int link) {
+        const RECT row{padding, y, panelWidth - padding, y + menuRow};
+        text({row.left + menuInset, row.top, row.right - menuInset, row.bottom}, labelFont, label,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+        push(TrayFlyoutHitKind::MoreSettings, row, link);
+        y += menuRow;
+    };
+
     if (m_qsPage == QuickSettingsPage::Wifi) {
         beginHeader(L"Wi-Fi", false, kToggleWifi, m_qsCache.wifiRadioOn);
-        y += gap;
-        if (!m_qsCache.wifiRadioOn) {
-            card({padding, y, panelWidth - padding, y + listRow}, false);
-            text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"Wi-Fi is off",
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
-            y += listRow + gap;
-        } else if (m_qsCache.wifi.empty()) {
-            card({padding, y, panelWidth - padding, y + listRow}, false);
-            text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"No networks found",
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
-            y += listRow + gap;
-        } else {
-            const LONG rows = static_cast<LONG>(m_qsCache.wifi.size());
-            const RECT group{padding, y, panelWidth - padding, y + rows * listRow};
-            card(group, false);
-            for (LONG index = 0; index < rows; ++index) {
-                const QsWifiNetwork& network = m_qsCache.wifi[static_cast<size_t>(index)];
-                const RECT row{group.left, group.top + index * listRow, group.right,
-                    group.top + (index + 1) * listRow};
-                std::wstring subtitle = network.connected ? L"Connected" : (network.secure ? L"Secured" : L"Open");
-                navRow(row, L'\uE701', network.name, subtitle, TrayFlyoutHitKind::WifiNetwork,
-                    static_cast<int>(index));
+        hairline();
+        if (m_qsCache.wifiRadioOn) {
+            // Filtered passes over the cache instead of per-layout index vectors:
+            // connected first, then other saved profiles, then unsaved networks.
+            static const std::wstring kHiddenNetwork = L"Hidden network";
+            static const std::wstring kNoTrailing;
+            const std::vector<QsWifiNetwork>& networks = m_qsCache.wifi;
+            size_t knownCount = 0;
+            for (const QsWifiNetwork& network : networks) {
+                knownCount += (network.connected || network.hasProfile) ? 1U : 0U;
             }
-            y += rows * listRow + gap;
+            const size_t otherCount = networks.size() - knownCount;
+            auto networkRows = [&](auto&& include) {
+                for (size_t index = 0; index < networks.size(); ++index) {
+                    const QsWifiNetwork& network = networks[index];
+                    if (!include(network)) {
+                        continue;
+                    }
+                    constexpr wchar_t kBars[4] = {L'\uE872', L'\uE873', L'\uE874', L'\uE701'};
+                    menuItem(kBars[std::clamp(network.bars, 0, 3)], network.connected, false,
+                        network.name.empty() ? kHiddenNetwork : network.name, kNoTrailing,
+                        network.secure ? L'\uE72E' : L'\0', TrayFlyoutHitKind::WifiNetwork, static_cast<int>(index));
+                }
+            };
+            if (networks.empty()) {
+                menuNote(L"No networks found");
+                hairline();
+            }
+            if (knownCount > 0) {
+                menuSection(knownCount == 1 ? L"Known Network" : L"Known Networks");
+                networkRows([](const QsWifiNetwork& network) { return network.connected; });
+                networkRows([](const QsWifiNetwork& network) { return !network.connected && network.hasProfile; });
+                hairline();
+            }
+            if (otherCount > 0) {
+                menuDisclosure(L"Other Networks", m_qsWifiOthersOpen, TrayFlyoutHitKind::WifiOthers);
+                if (m_qsWifiOthersOpen) {
+                    networkRows([](const QsWifiNetwork& network) { return !network.connected && !network.hasProfile; });
+                }
+                hairline();
+            }
         }
-        footer(L"More Wi-Fi settings", kLinkWifi);
+        menuLink(L"Wi-Fi Settings\u2026", kLinkWifi);
     } else if (m_qsPage == QuickSettingsPage::Vpn) {
         beginHeader(L"VPN", false, -1, false);
         y += gap;
@@ -3685,100 +3857,67 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const RECT toggle = toggleRect(padding + headerHeight / 2L, panelWidth - padding, bt.radioOn);
             push(TrayFlyoutHitKind::BluetoothRadio, toggle);
         }
-        y += 4;
-        text({padding, y, panelWidth - padding, y + sectionH}, statusFont,
-            draw ? FitFlyoutLine(statusFont, BluetoothPageSummary(bt), panelWidth - padding * 2L - 4L)
-                 : BluetoothPageSummary(bt),
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 180);
-        y += sectionH + 6;
-        // Device row: icon, name, state, and a blue right-aligned action word
-        // (Connect / Disconnect / Pair) so the row's click effect is explicit.
-        auto deviceRow = [&](RECT row, wchar_t symbol, const std::wstring& title, const std::wstring& subtitle,
-                             const wchar_t* action, TrayFlyoutHitKind kind, int index) {
-            const LONG actionW = action != nullptr ? std::max(78L, std::lround(88.0F * scale)) : 0L;
-            const LONG textW = (std::max)(0L, row.right - 14 - actionW - (row.left + 40) - 4);
-            icon(row.left + 12, row.top + (listRow - 18) / 2L, symbol, 18, inkR, inkG, inkB);
-            text({row.left + 40, row.top + 6, row.right - 14 - actionW, row.top + 28}, labelFont,
-                draw ? FitFlyoutLine(labelFont, title, textW) : title,
-                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            text({row.left + 40, row.top + 28, row.right - 14 - actionW, row.bottom - 4}, statusFont,
-                draw ? FitFlyoutLine(statusFont, subtitle, textW) : subtitle,
-                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
-            if (action != nullptr && draw) {
-                SetFlyoutChromeInk(g_qsAccentR, g_qsAccentG, g_qsAccentB);
-                text({row.right - 12 - actionW, row.top, row.right - 12, row.bottom}, labelFont, action,
-                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 255);
-                restoreInk();
+        hairline();
+        if (!bt.hint.empty() || !bt.ready || !bt.radioPresent) {
+            const std::wstring summary = BluetoothPageSummary(bt);
+            const LONG summaryW = panelWidth - padding * 2L - menuInset * 2L;
+            text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont,
+                draw ? FitFlyoutLine(statusFont, summary, summaryW) : summary,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
+            y += sectionH + 4;
+        }
+        // Worker status words that only restate the row's look stay hidden;
+        // progress / errors ("Connecting...", "Couldn't connect") show trailing.
+        static const std::wstring kNoTrailing;
+        static const std::wstring kUnknownDevice = L"Unknown device";
+        auto trailingStatus = [](const BluetoothDeviceInfo& device) -> const std::wstring& {
+            if (device.status == L"Connected" || device.status == L"Not connected" ||
+                device.status == L"Available") {
+                return kNoTrailing;
             }
-            push(kind, row, index);
+            return device.status;
         };
-        if (!bt.ready) {
-            card({padding, y, panelWidth - padding, y + listRow}, false);
-            text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"Looking for devices\u2026",
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
-            y += listRow + gap;
-        } else if (!bt.radioPresent || !bt.radioOn) {
-            card({padding, y, panelWidth - padding, y + listRow}, false);
-            text({padding, y, panelWidth - padding, y + listRow}, labelFont,
-                bt.radioPresent ? L"Bluetooth is off" : L"Bluetooth is unavailable",
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
-            y += listRow + gap;
-        } else {
-            section(L"Paired devices");
+        // Glyph lookup lowercases the name; the measure pass draws nothing.
+        auto deviceGlyph = [&](const std::wstring& name) { return draw ? BluetoothDeviceGlyph(name) : L'\uE702'; };
+        if (bt.ready && bt.radioPresent && bt.radioOn) {
             const size_t paired = std::min(bt.paired.size(), static_cast<size_t>(6));
             if (paired == 0) {
-                card({padding, y, panelWidth - padding, y + listRow}, false);
-                text({padding, y, panelWidth - padding, y + listRow}, labelFont, L"No paired devices",
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
-                y += listRow + gap;
-            } else {
-                const RECT group{padding, y, panelWidth - padding, y + static_cast<LONG>(paired) * listRow};
-                card(group, false);
-                for (size_t index = 0; index < paired; ++index) {
-                    const BluetoothDeviceInfo& device = bt.paired[index];
-                    const RECT row{group.left, group.top + static_cast<LONG>(index) * listRow, group.right,
-                        group.top + static_cast<LONG>(index + 1) * listRow};
-                    const std::wstring status = !device.status.empty()
-                        ? device.status
-                        : (device.connected ? L"Connected" : L"Not connected");
-                    const wchar_t* action =
-                        device.busy ? nullptr : (device.connected ? L"Disconnect" : L"Connect");
-                    deviceRow(row, L'\uE702', device.name, status, action,
-                        TrayFlyoutHitKind::BluetoothConnect, static_cast<int>(index));
-                }
-                y += static_cast<LONG>(paired) * listRow;
-                if (bt.hiddenPaired > 0) {
-                    text({padding + 4, y, panelWidth - padding, y + sectionH}, statusFont,
-                        L"+" + std::to_wstring(bt.hiddenPaired) + L" more in Bluetooth settings",
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 160);
-                    y += sectionH;
-                }
-                y += gap;
+                menuNote(L"No paired devices");
             }
-            section(bt.discovering ? L"Nearby devices" : L"Add a device");
-            const size_t found = std::min(bt.discovered.size(), static_cast<size_t>(4));
-            const LONG rows = static_cast<LONG>(found) + 1L;
-            const RECT group{padding, y, panelWidth - padding, y + rows * listRow};
-            card(group, false);
-            for (size_t index = 0; index < found; ++index) {
-                const BluetoothDeviceInfo& device = bt.discovered[index];
-                const RECT row{group.left, group.top + static_cast<LONG>(index) * listRow, group.right,
-                    group.top + static_cast<LONG>(index + 1) * listRow};
-                deviceRow(row, L'\uE702', device.name.empty() ? std::wstring(L"Unknown device") : device.name,
-                    device.status.empty() ? std::wstring(L"Available") : device.status,
-                    device.busy || m_bluetooth.IsPairing() ? nullptr : L"Pair",
-                    TrayFlyoutHitKind::BluetoothPair, static_cast<int>(index));
+            for (size_t index = 0; index < paired; ++index) {
+                const BluetoothDeviceInfo& device = bt.paired[index];
+                menuItem(deviceGlyph(device.name), device.connected, !device.connected && !device.busy,
+                    device.name, trailingStatus(device), L'\0', TrayFlyoutHitKind::BluetoothConnect,
+                    static_cast<int>(index));
             }
-            const RECT scanRow{group.left, group.top + static_cast<LONG>(found) * listRow, group.right,
-                group.bottom};
-            deviceRow(scanRow, bt.discovering ? L'\uE711' : L'\uE721',
-                bt.discovering ? L"Stop searching" : L"Search for devices",
-                bt.discovering ? (found == 0 ? L"Searching nearby\u2026" : L"Tap a device to pair and connect")
-                               : L"Headphones, speakers, and more",
-                bt.discovering ? L"Stop" : L"Scan", TrayFlyoutHitKind::BluetoothDiscover, -1);
-            y += rows * listRow + gap;
+            if (bt.hiddenPaired > 0) {
+                text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont,
+                    L"+" + std::to_wstring(bt.hiddenPaired) + L" more in Bluetooth settings",
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 160);
+                y += sectionH;
+            }
+            hairline();
+            menuDisclosure(L"Other Devices", m_qsBtOthersOpen, TrayFlyoutHitKind::BluetoothOthers);
+            if (m_qsBtOthersOpen) {
+                const size_t found = std::min(bt.discovered.size(), static_cast<size_t>(4));
+                for (size_t index = 0; index < found; ++index) {
+                    const BluetoothDeviceInfo& device = bt.discovered[index];
+                    menuItem(deviceGlyph(device.name), false, false,
+                        device.name.empty() ? kUnknownDevice : device.name, trailingStatus(device),
+                        L'\0', TrayFlyoutHitKind::BluetoothPair, static_cast<int>(index));
+                }
+                if (bt.discovering) {
+                    if (found == 0) {
+                        menuNote(L"Searching\u2026");
+                    }
+                } else {
+                    menuItem(L'\uE721', false, false, L"Search for devices", kNoTrailing, L'\0',
+                        TrayFlyoutHitKind::BluetoothDiscover, -1);
+                }
+            }
+            hairline();
         }
-        footer(L"More Bluetooth settings", kLinkBluetooth);
+        menuLink(L"Bluetooth Settings\u2026", kLinkBluetooth);
     } else {
         beginHeader(L"Display", false, -1, false);
         y += gap;
@@ -3851,6 +3990,56 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
     case TrayFlyoutHitKind::BluetoothPage:
         // Chevron on the Home Bluetooth tile. Right-click opens Windows Settings.
         navigate(QuickSettingsPage::Bluetooth, L"ms-settings:bluetooth");
+        break;
+    case TrayFlyoutHitKind::WifiPage:
+        // Chevron on the Home Wi-Fi tile. Right-click opens Windows Settings.
+        navigate(QuickSettingsPage::Wifi, L"ms-settings:network-wifi");
+        break;
+    case TrayFlyoutHitKind::WifiRadio:
+        // Home Wi-Fi tile body: flip the radio like the Bluetooth tile.
+        // Right-click keeps the old shortcut to the Windows network flyout.
+        if (alternate) {
+            CloseOverflowPopup();
+            if (!SystemTray::OpenNetworkPanel()) {
+                Log(L"Network panel did not open.");
+            }
+            break;
+        }
+        SetWifiRadio(!m_qsCache.wifiRadioOn);
+        m_qsCache.wifiRadioOn = !m_qsCache.wifiRadioOn;
+        static_cast<void>(m_tray.Refresh());
+        m_qsCache.stamp = 0;
+        m_qsCache.stampNetwork = 0;
+        EnsureTrayIcons();
+        QueueOverflowPaint();
+        QueueRenderFrame();
+        break;
+    case TrayFlyoutHitKind::WifiOthers:
+        m_qsWifiOthersOpen = !m_qsWifiOthersOpen;
+        m_overflowHover = -1;
+        m_overflowHoverDirtyValid = false;
+        QueueOverflowPaint();
+        break;
+    case TrayFlyoutHitKind::BluetoothOthers:
+        // Expanding "Other Devices" starts a scan; collapsing stops it.
+        m_lastBluetoothUiAt = QpcSeconds();
+        m_qsBtOthersOpen = !m_qsBtOthersOpen;
+        if (m_qsBtOthersOpen && !m_bluetoothSnapshot.discovering && m_bluetoothSnapshot.radioOn) {
+            if (m_window != nullptr) {
+                SetTimer(m_window, kBluetoothTimerId, 4000, nullptr);
+            }
+            m_bluetoothSnapshot.discovering = true;
+            m_bluetoothSnapshot.hint = L"Searching...";
+            m_bluetooth.StartDiscovery();
+        } else if (!m_qsBtOthersOpen && m_bluetoothSnapshot.discovering && !m_bluetooth.IsPairing()) {
+            m_bluetoothSnapshot.discovering = false;
+            m_bluetoothSnapshot.discovered.clear();
+            m_bluetoothSnapshot.hint.clear();
+            m_bluetooth.StopDiscovery();
+        }
+        m_overflowHover = -1;
+        m_overflowHoverDirtyValid = false;
+        QueueOverflowPaint();
         break;
     case TrayFlyoutHitKind::Vpn:
         navigate(QuickSettingsPage::Vpn, L"ms-settings:network-vpn");
