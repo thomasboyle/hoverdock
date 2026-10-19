@@ -3226,10 +3226,14 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 SetFlyoutChromeInk(ink.r, ink.g, ink.b);
             }
             const LONG textL = static_cast<LONG>(std::lround(cx + disc * 0.5F)) + P(9.0F);
-            const LONG textR = b.right - (chevronTile >= 0 ? P(32.0F) : P(12.0F));
+            // The title keeps the full width ("Bluetooth" needs ~61pt); the hover
+            // arrow sits beside it near the edge, so only the status line, which
+            // can be long, stops short of the arrow.
+            const LONG textR = b.right - P(12.0F);
+            const LONG statusR = chevronTile >= 0 ? b.right - P(22.0F) : textR;
             text({textL, cy - P(21.0F), textR, cy + P(1.0F)}, labelFont, title,
                 DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            const RECT statusRect{textL, cy + P(1.0F), textR, cy + P(21.0F)};
+            const RECT statusRect{textL, cy + P(1.0F), statusR, cy + P(21.0F)};
             if (live == 1) {
                 if (draw) {
                     m_qsBoostStatusRect = statusRect;
@@ -3257,7 +3261,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 const LONG discCx = static_cast<LONG>(std::lround(cx));
                 push(kind, {discCx - discHalf, cy - discHalf, discCx + discHalf, cy + discHalf});
                 push(chevronTile == 0 ? TrayFlyoutHitKind::WifiPage : TrayFlyoutHitKind::BluetoothPage, b);
-                const RECT chevron{std::max(b.left, b.right - P(36.0F)), b.top, b.right, b.bottom};
+                // Arrow centred 12pt in from the edge, like the macOS module arrow.
+                const RECT chevron{std::max(b.left, b.right - P(24.0F)), b.top, b.right, b.bottom};
                 if (draw) {
                     const UINT extent = static_cast<UINT>(std::max(10L, P(12.0F)));
                     const size_t tile = static_cast<size_t>(chevronTile);
@@ -3349,7 +3354,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         // Row 1: Boost + Power capsules.
         capsule(cellRect(0, 1, 2, 1), L'\uE945', L"Boost", m_boostStatus, TrayFlyoutHitKind::Boost, false, 1,
             -1);
-        capsule(cellRect(2, 1, 2, 1), L'\uE708', L"Power", EnergyModeLabel(m_qsCache.powerMode),
+        capsule(cellRect(2, 1, 2, 1), L'\uE83F', L"Power", EnergyModeLabel(m_qsCache.powerMode),
             TrayFlyoutHitKind::Power, false, 0, -1);
         // Row 2: System Tray + VPN circles, Microphone capsule (live meter).
         bool vpnOn = false;
