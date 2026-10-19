@@ -7988,11 +7988,15 @@ void DockApp::PaintSettingsPopup() {
     constexpr uint8_t inkB = 36;
     SetFlyoutChromeInk(inkR, inkG, inkB);
     g_flyoutTextHalo = false;  // text sits on the CC glass face
+    // Switches, sliders and active capsules follow the colour picker accent.
+    const unsigned accentRgb = m_config.QsIconColor();
+    const uint8_t accentR = static_cast<uint8_t>((accentRgb >> 16) & 0xFFU);
+    const uint8_t accentG = static_cast<uint8_t>((accentRgb >> 8) & 0xFFU);
+    const uint8_t accentB = static_cast<uint8_t>(accentRgb & 0xFFU);
     uint8_t onAccentR = 30;
     uint8_t onAccentG = 33;
     uint8_t onAccentB = 24;
-    CcOnAccentInk(DOCK_PANEL_TOGGLE_R, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_B, onAccentR,
-        onAccentG, onAccentB);
+    CcOnAccentInk(accentR, accentG, accentB, onAccentR, onAccentG, onAccentB);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
@@ -8023,8 +8027,8 @@ void DockApp::PaintSettingsPopup() {
                 DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
                     DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
                 const RECT track{textLeft, rowTop + P(40.0F), textRight, rowTop + P(54.0F)};
-                CcDrawSlider(pixels, width, height, track, row.amount, scale, DOCK_PANEL_TOGGLE_R,
-                    DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_B, inkR, inkG, inkB);
+                CcDrawSlider(pixels, width, height, track, row.amount, scale, accentR,
+                    accentG, accentB, inkR, inkG, inkB);
                 const LONG cap = (track.bottom - track.top) / 2L;
                 m_frostSliderTrack = {track.left + cap, track.top - P(6.0F), track.right - cap,
                     track.bottom + P(6.0F)};
@@ -8044,8 +8048,8 @@ void DockApp::PaintSettingsPopup() {
                 const float right = static_cast<float>(module.right - P(16.0F));
                 CcDrawSwitch(pixels, width, height, right - static_cast<float>(switchWidth) + capRadius,
                     right - capRadius, static_cast<float>(rowTop) + static_cast<float>(rowH) * 0.5F,
-                    capRadius, scale, row.enabled, DOCK_PANEL_TOGGLE_R, DOCK_PANEL_TOGGLE_G,
-                    DOCK_PANEL_TOGGLE_B, inkR, inkG, inkB);
+                    capRadius, scale, row.enabled, accentR, accentG,
+                    accentB, inkR, inkG, inkB);
                 pushHit(row.kind, {module.left, rowTop, module.right, rowTop + rowH});
             }
             if (i + 1 < count) {
@@ -8154,7 +8158,7 @@ void DockApp::PaintSettingsPopup() {
             static_cast<float>(perfRect.left) + static_cast<float>(buttonHeight) * 0.5F,
             static_cast<float>(perfRect.right) - static_cast<float>(buttonHeight) * 0.5F,
             0.5F * static_cast<float>(perfRect.top + perfRect.bottom), capRadius, 0.98F,
-            DOCK_PANEL_TOGGLE_B, DOCK_PANEL_TOGGLE_G, DOCK_PANEL_TOGGLE_R);
+            accentB, accentG, accentR);
         SetFlyoutChromeInk(onAccentR, onAccentG, onAccentB);
     }
     DrawFlyoutText(pixels, width, height, perfRect, labelFont,
