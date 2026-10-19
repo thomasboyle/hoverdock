@@ -1089,9 +1089,13 @@ private:
     POINT m_qsPressPoint{};
     int m_qsPressModule = -1;
     struct QsReorderSprite {
-        // Module pixels premultiplied by shape coverage, plus that coverage.
+        // Border (px) around the tile in every plane, for the outline ring.
+        static constexpr LONG kEdge = 2;
+        // Module pixels premultiplied by shape coverage, that coverage, and
+        // CcGlass's dark outline ring just outside the shape.
         std::vector<uint8_t> bits;
         std::vector<uint8_t> cover;
+        std::vector<uint8_t> ring;
         LONG width = 0;
         LONG height = 0;
         float radius = 0.0F;

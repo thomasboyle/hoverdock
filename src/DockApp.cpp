@@ -9136,13 +9136,22 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::WifiOthers:
     case TrayFlyoutHitKind::BluetoothOthers:
     case TrayFlyoutHitKind::RefreshRate:
-    case TrayFlyoutHitKind::QsEditControls:
     case TrayFlyoutHitKind::BluetoothConnect:
     case TrayFlyoutHitKind::BluetoothPair:
     case TrayFlyoutHitKind::BluetoothDiscover: {
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
             0.10F);
+        break;
+    }
+    case TrayFlyoutHitKind::QsEditControls: {
+        // Exact pill (not a squircle) inset 1px, so the shade stays inside
+        // the capsule's rounded ends and glass rim.
+        const float h = static_cast<float>(hit.bounds.bottom - hit.bounds.top);
+        const float radius = (std::max)(1.0F, 0.5F * h - 1.0F);
+        FillPillColorPremul(pixels, width, height, static_cast<float>(hit.bounds.left) + 0.5F * h,
+            static_cast<float>(hit.bounds.right) - 0.5F * h, 0.5F * static_cast<float>(hit.bounds.top + hit.bounds.bottom),
+            radius, 0.10F, g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
         break;
     }
     case TrayFlyoutHitKind::NotifyIcon: {
