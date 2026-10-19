@@ -2756,6 +2756,7 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         if (hover != app->m_overflowHover) {
             app->m_overflowHover = hover;
             app->QueueOverflowPaint(true);
+            app->KickQsChevronFade();
         }
         TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
         TrackMouseEvent(&track);
@@ -2802,6 +2803,7 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         if (app != nullptr && app->m_overflowHover >= 0) {
             app->m_overflowHover = -1;
             app->QueueOverflowPaint(true);
+            app->KickQsChevronFade();
         }
         return 0;
 
@@ -2839,6 +2841,10 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         return 0;
 
     case WM_TIMER:
+        if (wParam == kQsChevronFadeTimerId && app != nullptr) {
+            app->StepQsChevronFade();
+            return 0;
+        }
         if (wParam == kEnergySampleTimerId && app != nullptr) {
             if (app->m_qsPage != QuickSettingsPage::Power || !app->IsOverflowOpen()) {
                 KillTimer(window, kEnergySampleTimerId);
@@ -5881,6 +5887,9 @@ void DockApp::FinishOverflowHide() noexcept {
     m_qsPage = QuickSettingsPage::Home;
     m_qsReturn = QuickSettingsPage::Home;
     m_qsDragging = false;
+    // The kept Home frame must not reopen with a half-faded tile arrow.
+    ClearQsTileChevrons(nullptr);
+    ResetQsChevronFade();
     if (!keepHomeFrame) {
         std::vector<uint8_t>().swap(m_overflowPresentBits);
         std::vector<uint8_t>().swap(m_overflowBaseBits);
@@ -8507,7 +8516,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         RunPerformanceBoost();
         break;
     case TrayFlyoutHitKind::BluetoothRadio:
-        // Home tile body or drill-in header switch. Optimistic flip, then the
+        // Home tile glyph disc or drill-in header switch. Optimistic flip, then the
         // WinRT Radio.SetStateAsync runs on the BT worker (never here).
         ProfileScope::Mark(BluetoothService::ThreadTag("UI BluetoothRadio click").c_str());
         m_lastBluetoothUiAt = QpcSeconds();
@@ -8735,13 +8744,12 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::WifiRadio:
     case TrayFlyoutHitKind::WifiPage:
     case TrayFlyoutHitKind::BluetoothPage:
-        PaintQsTileChevron(pixels, width, height, hit);
+        // The tile arrow fades separately (PaintQsTileChevrons); no plate.
         break;
     case TrayFlyoutHitKind::BluetoothRadio:
-        // Home tile body: no plate, just the macOS module arrow. The drill-in
+        // Home tile glyph disc: no plate, only the fading arrow. The drill-in
         // header switch keeps its subtle plate.
         if (m_qsPage == QuickSettingsPage::Home) {
-            PaintQsTileChevron(pixels, width, height, hit);
             break;
         }
         [[fallthrough]];
@@ -8810,30 +8818,128 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     }
 }
 
-void DockApp::PaintQsTileChevron(uint8_t* pixels, int width, int height,
-    const TrayFlyoutHit& hit) const {
-    if (m_qsPage != QuickSettingsPage::Home) {
+int DockApp::QsChevronTarget() const noexcept {
+    if (m_qsPage != QuickSettingsPage::Home || m_overflowHover < 0 ||
+        static_cast<size_t>(m_overflowHover) >= m_overflowHits.size()) {
+        return -1;
+    }
+    switch (m_overflowHits[static_cast<size_t>(m_overflowHover)].kind) {
+    case TrayFlyoutHitKind::WifiRadio:
+    case TrayFlyoutHitKind::WifiPage:
+        return 0;
+    case TrayFlyoutHitKind::BluetoothRadio:
+    case TrayFlyoutHitKind::BluetoothPage:
+        return 1;
+    default:
+        return -1;
+    }
+}
+
+void DockApp::KickQsChevronFade() noexcept {
+    if (m_overflowWindow == nullptr) {
         return;
     }
-    const bool wifi = hit.kind == TrayFlyoutHitKind::WifiRadio || hit.kind == TrayFlyoutHitKind::WifiPage;
-    const size_t tile = wifi ? 0U : 1U;
-    const RECT& chevron = m_qsTileChevron[tile];
-    const std::vector<uint8_t>& glyph = m_qsTileChevronGlyph[tile];
+    const int target = QsChevronTarget();
+    for (int tile = 0; tile < 2; ++tile) {
+        if (m_qsChevronAlpha[tile] != (tile == target ? 1.0F : 0.0F)) {
+            m_qsChevronFadeLastMs = GetTickCount64();
+            SetTimer(m_overflowWindow, kQsChevronFadeTimerId, kQsChevronFadeIntervalMs, nullptr);
+            return;
+        }
+    }
+}
+
+void DockApp::ResetQsChevronFade() noexcept {
+    m_qsChevronAlpha[0] = 0.0F;
+    m_qsChevronAlpha[1] = 0.0F;
+    m_qsChevronDrawn[0] = false;
+    m_qsChevronDrawn[1] = false;
+    if (m_overflowWindow != nullptr) {
+        KillTimer(m_overflowWindow, kQsChevronFadeTimerId);
+    }
+}
+
+void DockApp::StepQsChevronFade() {
+    if (!IsOverflowOpen() || m_qsPage != QuickSettingsPage::Home) {
+        ResetQsChevronFade();
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    const float step = static_cast<float>(now - m_qsChevronFadeLastMs) / kQsChevronFadeMs;
+    m_qsChevronFadeLastMs = now;
+    const int target = QsChevronTarget();
+    bool settled = true;
+    for (int tile = 0; tile < 2; ++tile) {
+        const float goal = tile == target ? 1.0F : 0.0F;
+        float& alpha = m_qsChevronAlpha[tile];
+        alpha = goal > alpha ? std::min(goal, alpha + step) : std::max(goal, alpha - step);
+        settled = settled && alpha == goal;
+    }
+    if (settled && m_overflowWindow != nullptr) {
+        KillTimer(m_overflowWindow, kQsChevronFadeTimerId);
+    }
+    PaintOverflowHoverFast();
+}
+
+void DockApp::ClearQsTileChevrons(RECT* dirty) noexcept {
+    if (m_overflowBaseBits.size() != m_overflowPresentBits.size() || m_overflowPresentSize.cx <= 0) {
+        return;
+    }
+    const LONG width = m_overflowPresentSize.cx;
+    const LONG height = m_overflowPresentSize.cy;
+    for (size_t tile = 0; tile < 2; ++tile) {
+        if (!m_qsChevronDrawn[tile]) {
+            continue;
+        }
+        m_qsChevronDrawn[tile] = false;
+        const RECT& box = m_qsTileChevron[tile];
+        const LONG left = (std::max)(0L, box.left);
+        const LONG top = (std::max)(0L, box.top);
+        const LONG right = (std::min)(width, box.right);
+        const LONG bottom = (std::min)(height, box.bottom);
+        if (right <= left || bottom <= top) {
+            continue;
+        }
+        const size_t rowBytes = static_cast<size_t>(right - left) * 4U;
+        for (LONG y = top; y < bottom; ++y) {
+            const size_t offset =
+                (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) * 4U;
+            std::memcpy(m_overflowPresentBits.data() + offset, m_overflowBaseBits.data() + offset, rowBytes);
+        }
+        if (dirty != nullptr) {
+            dirty->left = (std::min)(dirty->left, left);
+            dirty->top = (std::min)(dirty->top, top);
+            dirty->right = (std::max)(dirty->right, right);
+            dirty->bottom = (std::max)(dirty->bottom, bottom);
+        }
+    }
+}
+
+void DockApp::PaintQsTileChevrons(uint8_t* pixels, int width, int height) {
+    const bool home = m_qsPage == QuickSettingsPage::Home;
     const int extent = static_cast<int>(m_qsTileChevronExtent);
-    if (glyph.empty() || extent <= 0 || chevron.right <= chevron.left ||
-        glyph.size() < static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U) {
-        return;
+    for (size_t tile = 0; tile < 2; ++tile) {
+        m_qsChevronDrawn[tile] = false;
+        const float alpha = m_qsChevronAlpha[tile];
+        const RECT& chevron = m_qsTileChevron[tile];
+        const std::vector<uint8_t>& glyph = m_qsTileChevronGlyph[tile];
+        const size_t bytes = static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U;
+        if (!home || pixels == nullptr || alpha <= 0.0F || extent <= 0 || chevron.right <= chevron.left ||
+            glyph.size() < bytes) {
+            continue;
+        }
+        // Ease the premultiplied glyph by alpha (smoothstep reads as a fade).
+        const float eased = alpha * alpha * (3.0F - 2.0F * alpha);
+        const uint32_t factor = static_cast<uint32_t>(std::lround(eased * 256.0F));
+        m_qsChevronScratch.resize(bytes);
+        for (size_t i = 0; i < bytes; ++i) {
+            m_qsChevronScratch[i] = static_cast<uint8_t>((glyph[i] * factor) >> 8U);
+        }
+        const int left = static_cast<int>((chevron.left + chevron.right) / 2L) - extent / 2;
+        const int top = static_cast<int>((chevron.top + chevron.bottom) / 2L) - extent / 2;
+        CompositePremul(pixels, width, height, left, top, m_qsChevronScratch.data(), extent, extent);
+        m_qsChevronDrawn[tile] = true;
     }
-    const float cx = 0.5F * static_cast<float>(chevron.left + chevron.right);
-    const float cy = 0.5F * static_cast<float>(chevron.top + chevron.bottom);
-    if (hit.kind == TrayFlyoutHitKind::WifiPage || hit.kind == TrayFlyoutHitKind::BluetoothPage) {
-        // Pointer on the arrow itself: soft disc so the drill-in target reads.
-        const float radius = 0.34F * static_cast<float>(chevron.right - chevron.left);
-        FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.12F, m_qsTileChevronInk[tile][2],
-            m_qsTileChevronInk[tile][1], m_qsTileChevronInk[tile][0]);
-    }
-    CompositePremul(pixels, width, height, static_cast<int>(std::lround(cx)) - extent / 2,
-        static_cast<int>(std::lround(cy)) - extent / 2, glyph.data(), extent, extent);
 }
 
 void DockApp::PaintOverflowHoverFast() {
@@ -8907,6 +9013,14 @@ void DockApp::PaintOverflowHoverFast() {
         haveDirty = true;
     }
 
+    RECT chevronDirty[2]{};
+    for (size_t tile = 0; tile < 2; ++tile) {
+        if (m_qsChevronDrawn[tile] || m_qsChevronAlpha[tile] > 0.0F) {
+            chevronDirty[tile] = expandDirty(m_qsTileChevron[tile]);
+            restoreRect(chevronDirty[tile]);
+        }
+    }
+
     if (m_overflowHover >= 0 && static_cast<size_t>(m_overflowHover) < m_overflowHits.size()) {
         const TrayFlyoutHit& hit = m_overflowHits[static_cast<size_t>(m_overflowHover)];
         ApplyOverflowHoverHighlight(m_overflowPresentBits.data(), width, height, hit);
@@ -8926,6 +9040,22 @@ void DockApp::PaintOverflowHoverFast() {
         m_overflowHoverDirtyValid = true;
     } else {
         m_overflowHoverDirtyValid = false;
+    }
+
+    PaintQsTileChevrons(m_overflowPresentBits.data(), width, height);
+    for (const RECT& next : chevronDirty) {
+        if (next.right <= next.left) {
+            continue;
+        }
+        if (!haveDirty) {
+            dirty = next;
+            haveDirty = true;
+        } else {
+            dirty.left = (std::min)(dirty.left, next.left);
+            dirty.top = (std::min)(dirty.top, next.top);
+            dirty.right = (std::max)(dirty.right, next.right);
+            dirty.bottom = (std::max)(dirty.bottom, next.bottom);
+        }
     }
 
     if (!PresentLayeredBits(m_overflowWindow, origin, m_overflowPresentSize.cx,
@@ -9030,6 +9160,9 @@ void DockApp::PaintOverflowLiveFast() {
     if (!haveDirty) {
         return;
     }
+    // Clear arrows back to the arrow-free base before the base sync below
+    // (its bounding box can span a tile arrow); they are redrawn after.
+    ClearQsTileChevrons(&dirty);
 
     // includeBoost / includeBluetooth only when their rect was restored;
     // otherwise meter ticks would DrawFlyoutText over existing glyphs
@@ -9053,6 +9186,7 @@ void DockApp::PaintOverflowLiveFast() {
             m_overflowHits[static_cast<size_t>(m_overflowHover)]);
         m_overflowHoverDirtyValid = false;
     }
+    PaintQsTileChevrons(m_overflowPresentBits.data(), width, height);
 
     if (!PresentLayeredBits(m_overflowWindow, origin, m_overflowPresentSize.cx,
             m_overflowPresentSize.cy, m_overflowPresentBits.data(), m_overflowPresentBits.size(),
@@ -9334,6 +9468,7 @@ void DockApp::PaintOverflowPopup() {
         ApplyOverflowHoverHighlight(pixels, width, height,
             m_overflowHits[static_cast<size_t>(pendingHover)]);
     }
+    PaintQsTileChevrons(pixels, width, height);
     m_overflowPresentBits.resize(bytes);
     std::memcpy(m_overflowPresentBits.data(), pixels, bytes);
     m_overflowPresentSize = m_overflowSize;

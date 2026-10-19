@@ -2544,6 +2544,7 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     m_overflowHover = -1;
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
+    ResetQsChevronFade();
     if (page == QuickSettingsPage::Wifi) {
         m_qsWifiOthersOpen = false;
     } else if (page == QuickSettingsPage::Bluetooth) {
@@ -2583,6 +2584,7 @@ void DockApp::CloseQuickSettingsPage() {
     m_qsReturn = QuickSettingsPage::Home;
     m_qsPage = back;
     m_overflowHover = -1;
+    ResetQsChevronFade();
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
     if (leaving == QuickSettingsPage::Bluetooth && back != QuickSettingsPage::Bluetooth &&
@@ -2695,6 +2697,9 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
     }
     if (m_qsBtStatusValid) {
         OffsetRect(&m_qsBtStatusRect, shadowMargin, shadowMargin);
+    }
+    for (RECT& chevron : m_qsTileChevron) {
+        OffsetRect(&chevron, shadowMargin, shadowMargin);
     }
     m_overflowGearX += static_cast<int>(shadowMargin);
     m_overflowGearY += static_cast<int>(shadowMargin);
@@ -2891,6 +2896,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         m_qsTempGpuRect = {};
         m_qsBoostStatusRect = {};
         m_qsBtStatusRect = {};
+        m_qsTileChevron[0] = {};
+        m_qsTileChevron[1] = {};
     }
     SetQsAccent(m_config.QsIconColor());
     const bool home = m_qsPage == QuickSettingsPage::Home;
@@ -3137,9 +3144,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             }
         };
         // 2x1 capsule: O36 glyph disc at 14pt inset, title + status to its right.
-        // chevronTile: -1 none, 0 Wi-Fi, 1 Bluetooth. Those tiles show a macOS
-        // style arrow on hover (composited by the hover pass) that opens the
-        // drill-in, while the body toggles the radio.
+        // chevronTile: -1 none, 0 Wi-Fi, 1 Bluetooth. Those tiles fade in a macOS
+        // style arrow on hover; the glyph disc toggles, the rest opens the menu.
         auto capsule = [&](RECT b, wchar_t symbol, const wchar_t* title, const std::wstring& sub,
                            TrayFlyoutHitKind kind, bool active, int live, int chevronTile) {
             const float h = static_cast<float>(b.bottom - b.top);
@@ -3154,7 +3160,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 SetFlyoutChromeInk(ink.r, ink.g, ink.b);
             }
             const LONG textL = static_cast<LONG>(std::lround(cx + disc * 0.5F)) + P(9.0F);
-            const LONG textR = b.right - (chevronTile >= 0 ? P(30.0F) : P(12.0F));
+            const LONG textR = b.right - (chevronTile >= 0 ? P(32.0F) : P(12.0F));
             text({textL, cy - P(21.0F), textR, cy + P(1.0F)}, labelFont, title,
                 DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             const RECT statusRect{textL, cy + P(1.0F), textR, cy + P(21.0F)};
@@ -3178,10 +3184,14 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 text(statusRect, statusFont, sub, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
             }
             if (chevronTile >= 0) {
-                // Right edge opens the drill-in page, the body toggles the radio.
+                // macOS Control Centre: the glyph disc toggles the radio and the
+                // rest of the module opens its menu. The disc hit is pushed first
+                // so it wins over the whole-tile page hit.
+                const LONG discHalf = static_cast<LONG>(std::lround(disc * 0.5F)) + P(2.0F);
+                const LONG discCx = static_cast<LONG>(std::lround(cx));
+                push(kind, {discCx - discHalf, cy - discHalf, discCx + discHalf, cy + discHalf});
+                push(chevronTile == 0 ? TrayFlyoutHitKind::WifiPage : TrayFlyoutHitKind::BluetoothPage, b);
                 const RECT chevron{std::max(b.left, b.right - P(36.0F)), b.top, b.right, b.bottom};
-                push(chevronTile == 0 ? TrayFlyoutHitKind::WifiPage : TrayFlyoutHitKind::BluetoothPage,
-                    chevron);
                 if (draw) {
                     const UINT extent = static_cast<UINT>(std::max(10L, P(12.0F)));
                     const size_t tile = static_cast<size_t>(chevronTile);
@@ -3197,8 +3207,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                     }
                     m_qsTileChevronExtent = extent;
                 }
+            } else {
+                push(kind, b);
             }
-            push(kind, b);
         };
         auto circle = [&](RECT b, wchar_t symbol, TrayFlyoutHitKind kind, bool active) {
             const float w = static_cast<float>(b.right - b.left);
@@ -3847,7 +3858,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         y += listRow * 2L + gap;
         footer(L"More network settings", kLinkNetwork);
     } else if (m_qsPage == QuickSettingsPage::Bluetooth) {
-        // Bluetooth drill-in (Home tile chevron or Airplane row). Every action
+        // Bluetooth drill-in (Home tile or Airplane row). Every action
         // here only enqueues a BluetoothService job; WinRT radio / enumeration /
         // pair / connect / disconnect run on the BT worker, which posts
         // kBluetoothMessage back and ApplyBluetoothSnapshot queues the repaint.
@@ -3988,15 +3999,15 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
         CloseQuickSettingsPage();
         break;
     case TrayFlyoutHitKind::BluetoothPage:
-        // Chevron on the Home Bluetooth tile. Right-click opens Windows Settings.
+        // Home Bluetooth tile (outside the glyph disc). Right-click opens Windows Settings.
         navigate(QuickSettingsPage::Bluetooth, L"ms-settings:bluetooth");
         break;
     case TrayFlyoutHitKind::WifiPage:
-        // Chevron on the Home Wi-Fi tile. Right-click opens Windows Settings.
+        // Home Wi-Fi tile (outside the glyph disc). Right-click opens Windows Settings.
         navigate(QuickSettingsPage::Wifi, L"ms-settings:network-wifi");
         break;
     case TrayFlyoutHitKind::WifiRadio:
-        // Home Wi-Fi tile body: flip the radio like the Bluetooth tile.
+        // Home Wi-Fi tile glyph disc: flip the radio like the Bluetooth disc.
         // Right-click keeps the old shortcut to the Windows network flyout.
         if (alternate) {
             CloseOverflowPopup();

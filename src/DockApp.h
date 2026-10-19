@@ -157,6 +157,10 @@ private:
     static constexpr UINT_PTR kEnergySampleTimerId = 17;
     static constexpr UINT_PTR kQsLiveTimerId = 18;
     static constexpr UINT_PTR kQsTempsTimerId = 19;
+    // Home Wi-Fi / Bluetooth tile arrow fade; runs only while an arrow is fading.
+    static constexpr UINT_PTR kQsChevronFadeTimerId = 20;
+    static constexpr UINT kQsChevronFadeIntervalMs = 16;
+    static constexpr float kQsChevronFadeMs = 140.0F;
     // Pointer glint easing cadence (~60 Hz); the timer only runs while the
     // glint is still converging on the cursor, so an idle dock costs nothing.
     static constexpr UINT kGlintIntervalMs = 16;
@@ -216,7 +220,7 @@ private:
         BluetoothSettings,
         NotifyIcon,
         Back,
-        // Chevron on the Home Bluetooth tile (replaced Ethernet).
+        // Home Bluetooth tile outside its glyph disc: opens the menu.
         BluetoothPage,
         Vpn,
         Microphone,
@@ -237,7 +241,7 @@ private:
         MoreSettings,
         MediaTransport,
         MediaSeek,
-        // Home Wi-Fi tile body (radio toggle) and its hover chevron (drill-in).
+        // Home Wi-Fi tile glyph disc (radio toggle) and the rest of the tile (menu).
         WifiRadio,
         WifiPage,
         // Collapsible "Other Networks" / "Other Devices" rows on the drill-ins.
@@ -448,8 +452,14 @@ private:
     void PresentOverflowLayer() noexcept;
     void QueueOverflowPaint(bool hoverOnly = false);
     void PaintOverflowHoverFast();
-    // macOS style arrow on the hovered Home Wi-Fi / Bluetooth tile.
-    void PaintQsTileChevron(uint8_t* pixels, int width, int height, const TrayFlyoutHit& hit) const;
+    // macOS style arrow that fades in on the hovered Home Wi-Fi / Bluetooth tile.
+    int QsChevronTarget() const noexcept;
+    void KickQsChevronFade() noexcept;
+    void StepQsChevronFade();
+    void ResetQsChevronFade() noexcept;
+    // Restore drawn arrow boxes in the present frame from the arrow-free base.
+    void ClearQsTileChevrons(RECT* dirty) noexcept;
+    void PaintQsTileChevrons(uint8_t* pixels, int width, int height);
     // Meter/scrub-only present from underlay via UpdateLayeredWindowIndirect.
     void PaintOverflowLiveFast();
     void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
@@ -1010,6 +1020,10 @@ private:
     std::vector<uint8_t> m_qsTileChevronGlyph[2];
     UINT m_qsTileChevronExtent = 0;
     uint8_t m_qsTileChevronInk[2][3]{};
+    float m_qsChevronAlpha[2]{};
+    bool m_qsChevronDrawn[2]{};
+    ULONGLONG m_qsChevronFadeLastMs = 0;
+    std::vector<uint8_t> m_qsChevronScratch;
     bool m_qsWifiOthersOpen = false;
     bool m_qsBtOthersOpen = false;
     RECT m_qsBtStatusRect{};
