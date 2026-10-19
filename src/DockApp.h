@@ -11,6 +11,7 @@
 #include "QuickSettingsPanel.h"
 #include "Weather.h"
 #include "PerfProfiler.h"
+#include "PerfBoost.h"
 
 #include <Windows.h>
 
@@ -106,6 +107,8 @@ private:
     struct BoostReply {
         std::wstring status;
         bool finished = true;
+        // Set on the finished reply: what the run did, for the Boost page.
+        std::optional<BoostRunReport> report;
     };
 
     struct UpdateReply {
@@ -161,6 +164,8 @@ private:
     static constexpr UINT_PTR kQsChevronFadeTimerId = 20;
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
     static constexpr float kQsChevronFadeMs = 140.0F;
+    // Home tiles with a hover arrow: Wi-Fi, Bluetooth, Boost, Power, Sound, Display.
+    static constexpr size_t kQsChevronTiles = 6;
     // Pointer glint easing cadence (~60 Hz); the timer only runs while the
     // glint is still converging on the cursor, so an idle dock costs nothing.
     static constexpr UINT kGlintIntervalMs = 16;
@@ -247,6 +252,8 @@ private:
         // Collapsible "Other Networks" / "Other Devices" rows on the drill-ins.
         WifiOthers,
         BluetoothOthers,
+        // Home Boost tile outside its glyph disc: opens the last-run report.
+        BoostPage,
     };
 
     struct TrayFlyoutHit {
@@ -462,8 +469,9 @@ private:
     // Restore drawn arrows in the present frame from the arrow-free base. With
     // `within`, only arrows overlapping it are cleared. Returns a tile bitmask.
     unsigned ClearQsTileChevrons(RECT* dirty, const RECT* within = nullptr) noexcept;
-    void PaintQsTileChevrons(uint8_t* pixels, int width, int height, unsigned tiles = 3U);
-    // Arrow-only present for fade frames (two glyph squares, nothing else).
+    void PaintQsTileChevrons(uint8_t* pixels, int width, int height,
+        unsigned tiles = (1U << kQsChevronTiles) - 1U);
+    // Arrow-only present for fade frames (arrow glyph squares, nothing else).
     void PaintQsChevronFadeFast();
     // Signatures of what the live meter / scrub would draw; equal means no pixel change.
     void QsLiveSignatures(int64_t& meter, int64_t& scrub) const noexcept;
@@ -721,6 +729,8 @@ private:
     UINT m_openQsPageMessage = 0;
     UINT m_bluetoothTestMessage = 0;
     void RepaintBluetoothStatus();
+    // Boost status/report changed: live tile overlay on Home, full repaint on the Boost page.
+    void RepaintBoostStatus();
     HPOWERNOTIFY m_suspendNotify = nullptr;
     HPOWERNOTIFY m_monitorNotify = nullptr;
     bool m_sessionNotifyRegistered = false;
@@ -983,6 +993,9 @@ private:
     // circle shows key info instead of an ellipsized cut-off.
     std::wstring m_boostStatus = L"Tap to boost";
     std::atomic<bool> m_boostInFlight{false};
+    // Most recent finished boost run (UI thread) and when it arrived.
+    std::optional<BoostRunReport> m_boostReport;
+    ULONGLONG m_boostReportTick = 0;
     SIZE m_overflowSize{};
     LONG m_overflowCaretX = 0;
     std::vector<uint8_t> m_overflowBaseBits;
@@ -1022,14 +1035,14 @@ private:
     // Home Bluetooth tile status ("Off" / "On" / "Connected to X"): live
     // overlay like Boost so BT worker snapshots and the tile toggle present
     // one rect via PaintOverflowLiveFast instead of a full PaintQuickSettings.
-    // Home Wi-Fi (0) / Bluetooth (1) tile chevrons, composited only on hover
+    // Home tile chevrons (kQsChevronTiles order), composited only on hover
     // like the macOS Control Centre module arrow. Glyphs match the tile ink.
-    RECT m_qsTileChevron[2]{};
-    std::vector<uint8_t> m_qsTileChevronGlyph[2];
+    RECT m_qsTileChevron[kQsChevronTiles]{};
+    std::vector<uint8_t> m_qsTileChevronGlyph[kQsChevronTiles];
     UINT m_qsTileChevronExtent = 0;
-    uint8_t m_qsTileChevronInk[2][3]{};
-    float m_qsChevronAlpha[2]{};
-    bool m_qsChevronDrawn[2]{};
+    uint8_t m_qsTileChevronInk[kQsChevronTiles][3]{};
+    float m_qsChevronAlpha[kQsChevronTiles]{};
+    bool m_qsChevronDrawn[kQsChevronTiles]{};
     ULONGLONG m_qsChevronFadeLastMs = 0;
     std::vector<uint8_t> m_qsChevronScratch;
     std::vector<uint8_t> m_qsContentScratch;

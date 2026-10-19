@@ -19,6 +19,7 @@ enum class QuickSettingsPage : uint8_t {
     Airplane,
     Bluetooth,
     Display,
+    Boost,
 };
 
 struct QsNamedId {

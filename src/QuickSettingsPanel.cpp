@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <string>
 #include <thread>
@@ -86,6 +87,7 @@ constexpr int kLinkNight = 9;
 constexpr int kLinkMixer = 10;
 // Opens the in-panel Bluetooth drill-in (Airplane page row).
 constexpr int kLinkBluetoothPage = 11;
+constexpr int kLinkStartupApps = 12;
 
 constexpr int kToggleWifi = 0;
 constexpr int kToggleMute = 1;
@@ -245,6 +247,47 @@ std::vector<std::wstring> BluetoothTileStatusCandidates(const BluetoothSnapshot&
     const std::wstring name = first->name.empty() ? L"device" : first->name;
     const std::wstring more = connected > 1 ? (L" +" + std::to_wstring(connected - 1)) : L"";
     return {L"Connected to " + name + more, name + more};
+}
+
+// Boost report app name without the ".exe" suffix, with a "(N)" process count.
+std::wstring BoostAppLabel(const BoostReportItem& item) {
+    std::wstring name = item.name;
+    if (name.size() > 4U) {
+        std::wstring tail = name.substr(name.size() - 4U);
+        for (wchar_t& ch : tail) {
+            ch = static_cast<wchar_t>(std::towlower(ch));
+        }
+        if (tail == L".exe") {
+            name.resize(name.size() - 4U);
+        }
+    }
+    if (item.count > 1) {
+        name += L" (" + std::to_wstring(item.count) + L")";
+    }
+    return name;
+}
+
+std::wstring BoostAgeText(ULONGLONG elapsedMs) {
+    const ULONGLONG minutes = elapsedMs / 60000ULL;
+    if (minutes < 1ULL) {
+        return L"Last run just now";
+    }
+    if (minutes < 60ULL) {
+        return L"Last run " + std::to_wstring(minutes) + L" min ago";
+    }
+    if (minutes < 1440ULL) {
+        return L"Last run " + std::to_wstring(minutes / 60ULL) + L" h ago";
+    }
+    return L"Last run " + std::to_wstring(minutes / 1440ULL) + L" d ago";
+}
+
+std::wstring BoostDurationText(uint64_t ms) {
+    if (ms >= 60000ULL) {
+        return std::to_wstring(ms / 60000ULL) + L" min " + std::to_wstring((ms % 60000ULL) / 1000ULL) + L" s";
+    }
+    wchar_t buffer[24]{};
+    std::swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%.1f s", static_cast<double>(ms) / 1000.0);
+    return buffer;
 }
 
 // One line for the drill-in header summary.
@@ -2962,8 +3005,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         m_qsTempGpuRect = {};
         m_qsBoostStatusRect = {};
         m_qsBtStatusRect = {};
-        m_qsTileChevron[0] = {};
-        m_qsTileChevron[1] = {};
+        for (RECT& chevron : m_qsTileChevron) {
+            chevron = {};
+        }
     }
     SetQsAccent(m_config.QsIconColor());
     const bool home = m_qsPage == QuickSettingsPage::Home;
@@ -3209,11 +3253,41 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 icon(left, top, symbol, extent, ink.r, ink.g, ink.b);
             }
         };
+        // Hover arrow for a Home tile (kQsChevronTiles order), centred in `area`.
+        // Only the glyph is cached here; PaintQsTileChevrons fades it in.
+        auto tileChevron = [&](int tile, RECT area, const CcInk& ink) {
+            if (!draw || tile < 0 || static_cast<size_t>(tile) >= kQsChevronTiles) {
+                return;
+            }
+            const UINT extent = static_cast<UINT>(std::max(10L, P(12.0F)));
+            const size_t index = static_cast<size_t>(tile);
+            m_qsTileChevron[index] = area;
+            uint8_t* cachedInk = m_qsTileChevronInk[index];
+            // Re-copy the glyph only when its extent or adaptive ink changes.
+            if (m_qsTileChevronGlyph[index].empty() || m_qsTileChevronExtent != extent ||
+                cachedInk[0] != ink.r || cachedInk[1] != ink.g || cachedInk[2] != ink.b) {
+                cachedInk[0] = ink.r;
+                cachedInk[1] = ink.g;
+                cachedInk[2] = ink.b;
+                m_qsTileChevronGlyph[index] = CachedGlyph(m_tray, L'\uE76C', extent, ink.r, ink.g, ink.b);
+            }
+            if (m_qsTileChevronExtent != extent) {
+                // A DPI change invalidates every tile's cached glyph, not just this one.
+                for (size_t other = 0; other < kQsChevronTiles; ++other) {
+                    if (other != index) {
+                        m_qsTileChevronGlyph[other].clear();
+                    }
+                }
+            }
+            m_qsTileChevronExtent = extent;
+        };
         // 2x1 capsule: O36 glyph disc at 14pt inset, title + status to its right.
-        // chevronTile: -1 none, 0 Wi-Fi, 1 Bluetooth. Those tiles fade in a macOS
-        // style arrow on hover; the glyph disc toggles, the rest opens the menu.
+        // chevronTile >= 0 fades in a macOS style arrow on hover. With a pageKind
+        // the glyph disc runs `kind` and the rest of the tile opens the page;
+        // without one the whole tile is `kind`.
         auto capsule = [&](RECT b, wchar_t symbol, const wchar_t* title, const std::wstring& sub,
-                           TrayFlyoutHitKind kind, bool active, int live, int chevronTile) {
+                           TrayFlyoutHitKind kind, bool active, int live, int chevronTile,
+                           TrayFlyoutHitKind pageKind) {
             const float h = static_cast<float>(b.bottom - b.top);
             const size_t idx = addShape(b, h * 0.5F);
             const CcInk ink = ccInk(idx);
@@ -3253,33 +3327,20 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             } else {
                 text(statusRect, statusFont, sub, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
             }
-            if (chevronTile >= 0) {
-                // macOS Control Centre: the glyph disc toggles the radio and the
-                // rest of the module opens its menu. The disc hit is pushed first
-                // so it wins over the whole-tile page hit.
+            if (pageKind != TrayFlyoutHitKind::None) {
+                // macOS Control Centre: the glyph disc acts and the rest of the
+                // module opens its menu. The disc hit is pushed first so it wins
+                // over the whole-tile page hit.
                 const LONG discHalf = static_cast<LONG>(std::lround(disc * 0.5F)) + P(2.0F);
                 const LONG discCx = static_cast<LONG>(std::lround(cx));
                 push(kind, {discCx - discHalf, cy - discHalf, discCx + discHalf, cy + discHalf});
-                push(chevronTile == 0 ? TrayFlyoutHitKind::WifiPage : TrayFlyoutHitKind::BluetoothPage, b);
-                // Arrow centred 12pt in from the edge, like the macOS module arrow.
-                const RECT chevron{std::max(b.left, b.right - P(24.0F)), b.top, b.right, b.bottom};
-                if (draw) {
-                    const UINT extent = static_cast<UINT>(std::max(10L, P(12.0F)));
-                    const size_t tile = static_cast<size_t>(chevronTile);
-                    m_qsTileChevron[tile] = chevron;
-                    uint8_t* cachedInk = m_qsTileChevronInk[tile];
-                    // Re-copy the glyph only when its extent or adaptive ink changes.
-                    if (m_qsTileChevronGlyph[tile].empty() || m_qsTileChevronExtent != extent ||
-                        cachedInk[0] != ink.r || cachedInk[1] != ink.g || cachedInk[2] != ink.b) {
-                        cachedInk[0] = ink.r;
-                        cachedInk[1] = ink.g;
-                        cachedInk[2] = ink.b;
-                        m_qsTileChevronGlyph[tile] = CachedGlyph(m_tray, L'\uE76C', extent, ink.r, ink.g, ink.b);
-                    }
-                    m_qsTileChevronExtent = extent;
-                }
+                push(pageKind, b);
             } else {
                 push(kind, b);
+            }
+            if (chevronTile >= 0) {
+                // Arrow centred 12pt in from the edge, like the macOS module arrow.
+                tileChevron(chevronTile, {std::max(b.left, b.right - P(24.0F)), b.top, b.right, b.bottom}, ink);
             }
         };
         auto circle = [&](RECT b, wchar_t symbol, TrayFlyoutHitKind kind, bool active) {
@@ -3314,7 +3375,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         };
         auto sliderCapsule = [&](RECT b, wchar_t symbol, const wchar_t* title, const std::wstring& value,
                                  float level, TrayFlyoutHitKind sliderKind, bool sliderEnabled,
-                                 TrayFlyoutHitKind drillKind) {
+                                 TrayFlyoutHitKind drillKind, int chevronTile) {
             const float h = static_cast<float>(b.bottom - b.top);
             const size_t idx = addShape(b, h * 0.5F);
             const CcInk ink = ccInk(idx);
@@ -3336,6 +3397,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 push(sliderKind, track);
             }
             push(drillKind, b);
+            // Title-row arrow, 12pt in from the edge (right of the value text).
+            tileChevron(chevronTile, {std::max(b.left, b.right - P(24.0F)), rowTop, b.right, rowBottom}, ink);
         };
 
         const bool wifiOn = tray.network == TrayNetworkKind::Wifi;
@@ -3348,14 +3411,15 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         const bool btOn = m_bluetoothSnapshot.radioOn;
         // Row 0: Wi-Fi + Bluetooth capsules.
         capsule(cellRect(0, 0, 2, 1), L'\uE701', L"Wi-Fi", wifiLabel, TrayFlyoutHitKind::WifiRadio,
-            wifiOn || m_qsCache.wifiRadioOn, 0, 0);
+            wifiOn || m_qsCache.wifiRadioOn, 0, 0, TrayFlyoutHitKind::WifiPage);
         capsule(cellRect(2, 0, 2, 1), L'\uE702', L"Bluetooth", std::wstring{},
-            TrayFlyoutHitKind::BluetoothRadio, btOn, 2, 1);
-        // Row 1: Boost + Power capsules.
+            TrayFlyoutHitKind::BluetoothRadio, btOn, 2, 1, TrayFlyoutHitKind::BluetoothPage);
+        // Row 1: Boost + Power capsules. The Boost disc runs a boost; the tile
+        // opens the last-run report. Power opens its page from anywhere.
         capsule(cellRect(0, 1, 2, 1), L'\uE945', L"Boost", m_boostStatus, TrayFlyoutHitKind::Boost, false, 1,
-            -1);
+            2, TrayFlyoutHitKind::BoostPage);
         capsule(cellRect(2, 1, 2, 1), L'\uE83F', L"Power", EnergyModeLabel(m_qsCache.powerMode),
-            TrayFlyoutHitKind::Power, false, 0, -1);
+            TrayFlyoutHitKind::Power, false, 0, 3, TrayFlyoutHitKind::None);
         // Row 2: System Tray + VPN circles, Microphone capsule (live meter).
         bool vpnOn = false;
         for (const QsVpnEntry& entry : m_qsCache.vpn) {
@@ -3398,7 +3462,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         // Row 3: Sound slider capsule (4x1).
         sliderCapsule(cellRect(0, 3, 4, 1), tray.volumeMuted ? L'\uE74F' : L'\uE767', L"Sound",
             std::to_wstring(static_cast<int>(std::lround(volume * 100.0F))) + L"%", volume,
-            TrayFlyoutHitKind::VolumeSlider, true, TrayFlyoutHitKind::Sound);
+            TrayFlyoutHitKind::VolumeSlider, true, TrayFlyoutHitKind::Sound, 4);
         // Row 4: Display slider capsule (4x1, brightness).
         const bool brightnessUsable = tray.brightnessAvailable || projected >= 0;
         sliderCapsule(cellRect(0, 4, 4, 1), L'\uE706', L"Display",
@@ -3406,7 +3470,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 ? std::to_wstring(static_cast<int>(std::lround(brightness * 100.0F))) + L"%"
                 : ((m_qsCache.nightKnown && m_qsCache.nightLight) ? std::wstring(L"Night light")
                                                                     : std::wstring(L"On")),
-            brightness, TrayFlyoutHitKind::BrightnessSlider, brightnessUsable, TrayFlyoutHitKind::Display);
+            brightness, TrayFlyoutHitKind::BrightnessSlider, brightnessUsable, TrayFlyoutHitKind::Display, 5);
         // Rows 5-6: CPU/GPU (2x2) and Now Playing (2x2).
         {
             const RECT b = cellRect(0, 5, 2, 2);
@@ -3614,7 +3678,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         text({textLeft, row.top, textRight, row.bottom}, labelFont,
             draw ? FitFlyoutLine(labelFont, title, textW) : title,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, dim ? 150 : 255);
-        push(kind, row, index);
+        if (kind != TrayFlyoutHitKind::None) {
+            push(kind, row, index);
+        }
         y += menuRow;
     };
     // Grey section title with a right chevron that turns down when expanded.
@@ -4000,6 +4066,143 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             hairline();
         }
         menuLink(L"Bluetooth Settings\u2026", kLinkBluetooth);
+    } else if (m_qsPage == QuickSettingsPage::Boost) {
+        // Boost report: what the most recent run closed, freed and turned off,
+        // in the same flat macOS menu style as the Wi-Fi / Bluetooth pages.
+        static const std::wstring kNoTrailing;
+        const bool running = m_boostInFlight.load();
+        const BoostRunReport* run = m_boostReport.has_value() ? &*m_boostReport : nullptr;
+        auto P = [&](float pt) { return static_cast<LONG>(std::lround(pt * scale)); };
+        beginHeader(L"Boost", false, -1, false);
+        hairline();
+        {
+            // Hero: accent bolt disc, headline result and when it ran.
+            const RECT row{padding, y, panelWidth - padding, y + std::max(52L, P(60.0F))};
+            const float radius = static_cast<float>(std::max(16L, P(20.0F)));
+            const float cx = static_cast<float>(row.left + menuInset) + radius;
+            const float cy = 0.5F * static_cast<float>(row.top + row.bottom);
+            const UINT extent = static_cast<UINT>(std::max(14L, P(19.0F)));
+            if (draw) {
+                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, g_qsAccentB, g_qsAccentG,
+                    g_qsAccentR);
+            }
+            icon(static_cast<LONG>(std::lround(cx - static_cast<float>(extent) * 0.5F)),
+                static_cast<LONG>(std::lround(cy - static_cast<float>(extent) * 0.5F)), L'\uE945', extent,
+                onAccentR, onAccentG, onAccentB);
+            std::wstring headline = L"Ready to boost";
+            std::wstring subline = L"Closes idle apps and trims startup to free memory.";
+            if (running) {
+                headline = L"Boosting\u2026";
+                subline = m_boostStatus;
+            } else if (run != nullptr) {
+                headline = run->freedBytes > 0 ? L"Freed " + PerfBoost::FormatMegabytes(run->freedBytes)
+                                               : run->outcome;
+                subline = BoostAgeText(GetTickCount64() - m_boostReportTick);
+            }
+            const LONG textLeft = static_cast<LONG>(std::lround(cx + radius)) + P(12.0F);
+            const LONG textRight = row.right - menuInset;
+            text({textLeft, row.top, textRight, (row.top + row.bottom) / 2L + P(3.0F)}, titleFont, headline,
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            text({textLeft, (row.top + row.bottom) / 2L + P(3.0F), textRight, row.bottom}, statusFont,
+                draw ? FitFlyoutLine(statusFont, subline, std::max(0L, textRight - textLeft)) : subline,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 170);
+            y = row.bottom + gap / 2L;
+        }
+        if (run != nullptr) {
+            // Three stat tiles: memory freed, apps closed, startup apps turned off.
+            int closedCount = 0;
+            for (const BoostReportItem& item : run->closed) {
+                closedCount += item.count;
+            }
+            const std::wstring stats[3][2] = {
+                {run->freedBytes > 0 ? PerfBoost::FormatMegabytes(run->freedBytes) : L"0 MB", L"Freed"},
+                {std::to_wstring(closedCount), closedCount == 1 ? L"App closed" : L"Apps closed"},
+                {std::to_wstring(run->startupDisabled.size()), L"Startup off"},
+            };
+            const LONG statH = std::max(48L, P(54.0F));
+            const LONG statGap = std::max(6L, P(8.0F));
+            const LONG statLeft = padding + menuInset;
+            const LONG statW = (panelWidth - padding - menuInset - statLeft - statGap * 2L) / 3L;
+            for (int index = 0; index < 3; ++index) {
+                const LONG left = statLeft + index * (statW + statGap);
+                const RECT tile{left, y, left + statW, y + statH};
+                if (draw) {
+                    FillSquircleColorPremul(pixels, width, height, tile, ContentSquircleRadius(tile, scale), 0.07F,
+                        inkB, inkG, inkR);
+                }
+                text({tile.left + 4, tile.top + P(6.0F), tile.right - 4, (tile.top + tile.bottom) / 2L + P(4.0F)},
+                    labelFont, stats[index][0], DT_CENTER | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                text({tile.left + 4, (tile.top + tile.bottom) / 2L + P(4.0F), tile.right - 4, tile.bottom - P(4.0F)},
+                    statusFont, stats[index][1], DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 160);
+            }
+            y += statH + gap / 2L;
+            hairline();
+
+            constexpr size_t kMaxClosedRows = 4;
+            constexpr size_t kMaxStartupRows = 3;
+            menuSection(L"Apps closed");
+            if (run->closed.empty()) {
+                menuNote(L"No idle apps needed closing");
+            }
+            for (size_t index = 0; index < std::min(run->closed.size(), kMaxClosedRows); ++index) {
+                const BoostReportItem& item = run->closed[index];
+                menuItem(L'\uE71D', false, false, BoostAppLabel(item),
+                    item.bytes > 0 ? PerfBoost::FormatMegabytes(item.bytes) : kNoTrailing, L'\0',
+                    TrayFlyoutHitKind::None, -1);
+            }
+            if (run->closed.size() > kMaxClosedRows) {
+                text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont,
+                    L"+" + std::to_wstring(run->closed.size() - kMaxClosedRows) + L" more",
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE, 150);
+                y += sectionH;
+            }
+            menuSection(L"Startup apps turned off");
+            if (run->startupDisabled.empty()) {
+                menuNote(L"Startup apps left unchanged");
+            }
+            for (size_t index = 0; index < std::min(run->startupDisabled.size(), kMaxStartupRows); ++index) {
+                menuItem(L'\uE7E8', false, false, run->startupDisabled[index], L"Off", L'\0',
+                    TrayFlyoutHitKind::None, -1);
+            }
+            if (run->startupDisabled.size() > kMaxStartupRows) {
+                text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont,
+                    L"+" + std::to_wstring(run->startupDisabled.size() - kMaxStartupRows) + L" more",
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE, 150);
+                y += sectionH;
+            }
+            hairline();
+
+            menuSection(L"Details");
+            const LONG detailH = std::max(24L, P(28.0F));
+            auto detail = [&](const wchar_t* label, const std::wstring& value) {
+                const LONG left = padding + menuInset;
+                const LONG right = panelWidth - padding - menuInset;
+                const LONG valueW = (right - left) * 3L / 5L;
+                text({left, y, right - valueW, y + detailH}, labelFont, label,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 220);
+                text({right - valueW, y, right, y + detailH}, statusFont, value,
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 160);
+                y += detailH;
+            };
+            detail(L"Result", run->outcome);
+            detail(L"Chosen by", run->method);
+            detail(L"Checked", std::to_wstring(run->processesChecked) +
+                    (run->processesChecked == 1 ? L" app, " : L" apps, ") + std::to_wstring(run->startupChecked) +
+                    L" startup");
+            detail(L"Took", BoostDurationText(run->durationMs));
+            if (!run->note.empty()) {
+                // Fallback / partial-result explanation, up to two wrapped lines.
+                const LONG noteH = sectionH * 2L;
+                text({padding + menuInset, y + 2, panelWidth - padding - menuInset, y + noteH}, statusFont,
+                    run->note, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 150);
+                y += noteH;
+            }
+            hairline();
+        }
+        menuItem(L'\uE945', false, running,
+            running ? std::wstring(L"Boosting\u2026") : std::wstring(run != nullptr ? L"Boost Again" : L"Boost Now"),
+            running ? m_boostStatus : kNoTrailing, L'\0', TrayFlyoutHitKind::Boost, -1);
+        menuLink(L"Startup Apps Settings\u2026", kLinkStartupApps);
     } else {
         beginHeader(L"Display", false, -1, false);
         y += gap;
@@ -4076,6 +4279,10 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
     case TrayFlyoutHitKind::WifiPage:
         // Home Wi-Fi tile (outside the glyph disc). Right-click opens Windows Settings.
         navigate(QuickSettingsPage::Wifi, L"ms-settings:network-wifi");
+        break;
+    case TrayFlyoutHitKind::BoostPage:
+        // Home Boost tile (outside the glyph disc): last-run report.
+        navigate(QuickSettingsPage::Boost, L"ms-settings:startupapps");
         break;
     case TrayFlyoutHitKind::WifiRadio:
         // Home Wi-Fi tile glyph disc: flip the radio like the Bluetooth disc.
@@ -4283,6 +4490,9 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             break;
         case kLinkBluetoothPage:
             OpenQuickSettingsPage(QuickSettingsPage::Bluetooth);
+            break;
+        case kLinkStartupApps:
+            openUri(L"ms-settings:startupapps");
             break;
         default:
             break;

@@ -221,6 +221,18 @@ uint64_t CpuTime100ns(HANDLE process) {
 
 }  // namespace
 
+void MergeBoostReportItem(std::vector<BoostReportItem>& items, const std::wstring& name, uint64_t bytes,
+    int count) {
+    for (BoostReportItem& item : items) {
+        if (EqualInsensitive(item.name, name)) {
+            item.bytes += bytes;
+            item.count += count;
+            return;
+        }
+    }
+    items.push_back({name, bytes, count});
+}
+
 bool PerfBoost::IsProtectedExecutable(const std::wstring& exePath) noexcept {
     try {
         if (exePath.empty()) {
@@ -418,6 +430,7 @@ BoostCloseResult PerfBoost::CloseTargets(const std::vector<BoostProcess>& target
     struct Attempted {
         DWORD pid = 0;
         uint64_t memoryBytes = 0;
+        const std::wstring* name = nullptr;
     };
     std::vector<Attempted> attempted;
 
@@ -434,6 +447,7 @@ BoostCloseResult PerfBoost::CloseTargets(const std::vector<BoostProcess>& target
             if (!target.exePath.empty()) {
                 result.closed += 1;
                 result.freedBytes += target.memoryBytes;
+                MergeBoostReportItem(result.items, target.name, target.memoryBytes);
             }
             continue;
         }
@@ -457,7 +471,7 @@ BoostCloseResult PerfBoost::CloseTargets(const std::vector<BoostProcess>& target
                     PostMessageW(window, WM_CLOSE, 0, 0);
                 }
             }
-            attempted.push_back({target.pid, target.memoryBytes});
+            attempted.push_back({target.pid, target.memoryBytes, &target.name});
             continue;
         }
 
@@ -474,7 +488,7 @@ BoostCloseResult PerfBoost::CloseTargets(const std::vector<BoostProcess>& target
         const BOOL ended = TerminateProcess(terminable, 1);
         CloseHandle(terminable);
         if (ended != FALSE) {
-            attempted.push_back({target.pid, target.memoryBytes});
+            attempted.push_back({target.pid, target.memoryBytes, &target.name});
         }
     }
 
@@ -499,6 +513,7 @@ BoostCloseResult PerfBoost::CloseTargets(const std::vector<BoostProcess>& target
         if (!ProcessStillAlive(attempt.pid, livePids)) {
             result.closed += 1;
             result.freedBytes += attempt.memoryBytes;
+            MergeBoostReportItem(result.items, *attempt.name, attempt.memoryBytes);
         }
     }
     return result;
@@ -855,6 +870,7 @@ BoostStartupResult EndAssociatedProcesses(const std::unordered_set<std::wstring>
             }
             result.ended += 1;
             result.freedBytes += memory;
+            MergeBoostReportItem(result.endedItems, proc.szExeFile, memory);
             continue;
         }
         HANDLE terminable =
@@ -867,6 +883,7 @@ BoostStartupResult EndAssociatedProcesses(const std::unordered_set<std::wstring>
         if (ended != FALSE) {
             result.ended += 1;
             result.freedBytes += memory;
+            MergeBoostReportItem(result.endedItems, proc.szExeFile, memory);
         }
     }
     CloseHandle(snapshot);
@@ -938,6 +955,7 @@ BoostStartupResult PerfBoost::DisableStartupTargets(
             if (DisableStartupApproved(entry.approvedRoot, entry.approvedPath.c_str(),
                     entry.valueName, entry.wowAccess)) {
                 result.disabled += 1;
+                result.disabledNames.push_back(entry.valueName);
             }
             if (!entry.exeName.empty() && entry.exeName.find(L'.') != std::wstring::npos &&
                 !lowerExe.ends_with(L".lnk") && !lowerExe.ends_with(L".cmd") &&
@@ -948,6 +966,7 @@ BoostStartupResult PerfBoost::DisableStartupTargets(
         const BoostStartupResult ended = EndAssociatedProcesses(endExeNames);
         result.ended = ended.ended;
         result.freedBytes = ended.freedBytes;
+        result.endedItems = ended.endedItems;
     } catch (...) {
     }
     return result;

@@ -43,10 +43,38 @@ struct BoostProcess {
     uint64_t ageSeconds = 0;
 };
 
+// One app a boost closed (or startup entry it disabled), merged by name so
+// several processes of the same executable read as one row.
+struct BoostReportItem {
+    std::wstring name;
+    uint64_t bytes = 0;
+    int count = 1;
+};
+
 struct BoostCloseResult {
     int closed = 0;
     uint64_t freedBytes = 0;
+    std::vector<BoostReportItem> items;
 };
+
+// What the most recent boost did, shown on the Quick Settings Boost page.
+struct BoostRunReport {
+    std::wstring outcome;
+    // How targets were chosen ("TypeSafe AI" / "Safe heuristic").
+    std::wstring method;
+    // Why the run fell back or stopped early; empty when nothing went wrong.
+    std::wstring note;
+    uint64_t durationMs = 0;
+    size_t startupChecked = 0;
+    size_t processesChecked = 0;
+    std::vector<BoostReportItem> closed;
+    std::vector<std::wstring> startupDisabled;
+    uint64_t freedBytes = 0;
+};
+
+// Add name/bytes to items, merging case-insensitively with an existing row.
+void MergeBoostReportItem(std::vector<BoostReportItem>& items, const std::wstring& name, uint64_t bytes,
+    int count = 1);
 
 // One Windows startup entry (Run key or Startup folder) eligible for Jev
 // to consider disabling. Registry coordinates stay with the entry so code
@@ -72,6 +100,8 @@ struct BoostStartupResult {
     int ended = 0;
     uint64_t freedBytes = 0;
     bool skippedNoClassifier = false;
+    std::vector<std::wstring> disabledNames;
+    std::vector<BoostReportItem> endedItems;
 };
 
 class PerfBoost {

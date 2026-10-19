@@ -3811,6 +3811,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
     case kBoostResultMessage: {
         std::unique_ptr<BoostReply> reply(reinterpret_cast<BoostReply*>(lParam));
         if (reply != nullptr) {
+            if (reply->report.has_value()) {
+                m_boostReport = std::move(reply->report);
+                m_boostReportTick = GetTickCount64();
+            }
             ApplyBoostResult(reply->status, reply->finished);
         }
         return 0;
@@ -5675,21 +5679,28 @@ void DockApp::RunPerformanceBoost() {
         return;
     }
     m_boostStatus = L"Profiling...";
-    // Status-only: live overlay, never a full PaintOverflowPopup on click.
-    if (IsOverflowOpen()) {
-        m_qsBoostStatusDirty = true;
-        PaintOverflowLiveFast();
-    }
+    // Status-only on Home: live overlay, never a full PaintOverflowPopup on click.
+    RepaintBoostStatus();
 
     const std::wstring apiKey = m_config.TypeSafeApiKey();
     const HWND replyWindow = m_window;
     std::thread([this, apiKey, replyWindow]() {
         auto completed = std::make_shared<std::atomic<bool>>(false);
-        auto postStatus = [this, replyWindow, completed](std::wstring status, bool finished) {
+        // Worker-only until the finished reply copies it to the UI thread.
+        auto report = std::make_shared<BoostRunReport>();
+        report->method = apiKey.empty() ? L"Safe heuristic" : L"TypeSafe AI";
+        const auto started = std::chrono::steady_clock::now();
+        auto postStatus = [this, replyWindow, completed, report, started](std::wstring status, bool finished) {
             if (finished) {
                 completed->store(true);
             }
             auto* reply = new BoostReply{std::move(status), finished};
+            if (finished) {
+                report->outcome = reply->status;
+                report->durationMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+                reply->report = *report;
+            }
             if (replyWindow == nullptr ||
                 PostMessageW(replyWindow, kBoostResultMessage, 0,
                     reinterpret_cast<LPARAM>(reply)) == FALSE) {
@@ -5764,6 +5775,7 @@ void DockApp::RunPerformanceBoost() {
             BoostStartupResult startup{};
             const std::vector<BoostStartupEntry> startupCandidates =
                 PerfBoost::EnumerateStartupCandidates();
+            report->startupChecked = startupCandidates.size();
             if (!startupCandidates.empty()) {
                 std::vector<BoostStartupEntry> startupSelected;
                 if (apiKey.empty()) {
@@ -5799,6 +5811,8 @@ void DockApp::RunPerformanceBoost() {
                         });
                     if (!startupJudged.ok) {
                         Log(L"Boost startup judgment failed: " + startupJudged.error);
+                        report->method = L"Safe heuristic";
+                        report->note = L"TypeSafe was unavailable, so the safe heuristic chose instead.";
                         startupSelected = PerfBoost::SelectStartupHeuristic(startupCandidates);
                     } else {
                         for (const BoostJudgment& judgment : startupJudged.items) {
@@ -5825,6 +5839,11 @@ void DockApp::RunPerformanceBoost() {
                     Log(L"Boost startup: disabled " + std::to_wstring(startup.disabled) +
                         L", ended " + std::to_wstring(startup.ended) + L", freed " +
                         PerfBoost::FormatMegabytes(startup.freedBytes));
+                    report->startupDisabled = startup.disabledNames;
+                    for (const BoostReportItem& item : startup.endedItems) {
+                        MergeBoostReportItem(report->closed, item.name, item.bytes, item.count);
+                    }
+                    report->freedBytes += startup.freedBytes;
                 }
             }
 
@@ -5832,6 +5851,7 @@ void DockApp::RunPerformanceBoost() {
             // slow process snapshot cannot look like a startup hang.
             postStatus(L"Profiling...", false);
             const std::vector<BoostProcess> candidates = PerfBoost::EnumerateClosableCandidates();
+            report->processesChecked = candidates.size();
             if (candidates.empty()) {
                 if (startup.ended > 0) {
                     postStatus(L"Freed " + PerfBoost::FormatMegabytes(startup.freedBytes), true);
@@ -5848,6 +5868,7 @@ void DockApp::RunPerformanceBoost() {
             if (apiKey.empty()) {
                 selected = selectHeuristic(candidates);
                 if (selected.empty() && startup.disabled <= 0 && startup.ended <= 0) {
+                    report->note = L"Without a TypeSafe API key, only idle apps with a window can be closed.";
                     postStatus(L"Need API key", true);
                     return;
                 }
@@ -5882,6 +5903,10 @@ void DockApp::RunPerformanceBoost() {
                 });
                 if (!judged.ok) {
                     Log(L"Boost judgment failed: " + judged.error);
+                    report->method = L"Safe heuristic";
+                    report->note = judged.error.empty()
+                        ? L"TypeSafe was unavailable, so the safe heuristic chose instead."
+                        : judged.error + L" The safe heuristic chose instead.";
                     selected = selectHeuristic(candidates);
                     if (selected.empty() && startup.disabled <= 0 && startup.ended <= 0) {
                         postStatus(L"Unavailable", true);
@@ -5932,6 +5957,17 @@ void DockApp::RunPerformanceBoost() {
             const BoostCloseResult closed =
                 PerfBoost::CloseTargets(selected, allowTerminate);
             const uint64_t freedTotal = closed.freedBytes + startup.freedBytes;
+            for (const BoostReportItem& item : closed.items) {
+                MergeBoostReportItem(report->closed, item.name, item.bytes, item.count);
+            }
+            report->freedBytes = freedTotal;
+            const size_t stayedOpen = selected.size() - std::min(selected.size(),
+                static_cast<size_t>(std::max(0, closed.closed)));
+            if (stayedOpen > 0) {
+                std::wstring stayed = std::to_wstring(stayedOpen) +
+                    (stayedOpen == 1 ? L" selected app stayed open." : L" selected apps stayed open.");
+                report->note = report->note.empty() ? std::move(stayed) : report->note + L" " + stayed;
+            }
             if (closed.closed <= 0 && startup.ended <= 0) {
                 if (startup.disabled > 0) {
                     postStatus(L"Startup cleared", true);
@@ -5945,6 +5981,7 @@ void DockApp::RunPerformanceBoost() {
                 PerfBoost::FormatMegabytes(freedTotal));
             postStatus(L"Freed " + PerfBoost::FormatMegabytes(freedTotal), true);
         } catch (...) {
+            report->note = L"Boost stopped after an unexpected error.";
             postStatus(L"Unavailable", true);
         }
     }).detach();
@@ -5958,10 +5995,23 @@ void DockApp::ApplyBoostResult(const std::wstring& status, bool finished) {
         m_boostStatus = status;
     }
     Log(L"Boost: " + m_boostStatus);
-    if (IsOverflowOpen()) {
-        // Worker status posts used to QueueOverflowPaint -> ~100ms
-        // PaintQuickSettings on the WH_MOUSE_LL thread (cursor hitch every
-        // "Profiling..." / "Closing..." / "Freed N MB"). Live-fast only.
+    RepaintBoostStatus();
+}
+
+void DockApp::RepaintBoostStatus() {
+    if (!IsOverflowOpen()) {
+        return;
+    }
+    if (m_qsPage == QuickSettingsPage::Boost) {
+        // The page lists the run, so it needs a layout pass; coalesced like BT.
+        m_overflowHover = -1;
+        QueueOverflowPaint();
+        return;
+    }
+    // Worker status posts used to QueueOverflowPaint -> ~100ms
+    // PaintQuickSettings on the WH_MOUSE_LL thread (cursor hitch every
+    // "Profiling..." / "Closing..." / "Freed N MB"). Live-fast only.
+    if (m_qsPage == QuickSettingsPage::Home) {
         m_qsBoostStatusDirty = true;
         PaintOverflowLiveFast();
     }
@@ -8691,7 +8741,8 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
         break;
     }
     case TrayFlyoutHitKind::Boost:
-        // Stays open: progress and the result report in the Boost tile itself.
+        // Home glyph disc or the Boost page action. Stays open: progress shows
+        // in the tile status and the report on the Boost page.
         RunPerformanceBoost();
         break;
     case TrayFlyoutHitKind::BluetoothRadio:
@@ -8806,6 +8857,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::WifiPage:
     case TrayFlyoutHitKind::WifiOthers:
     case TrayFlyoutHitKind::BluetoothOthers:
+    case TrayFlyoutHitKind::BoostPage:
         ApplyQuickSettingsCommand(hit, message);
         break;
     case TrayFlyoutHitKind::NotifyIcon:
@@ -8923,6 +8975,7 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::WifiRadio:
     case TrayFlyoutHitKind::WifiPage:
     case TrayFlyoutHitKind::BluetoothPage:
+    case TrayFlyoutHitKind::BoostPage:
         // The tile arrow fades separately (PaintQsTileChevrons); no plate.
         break;
     case TrayFlyoutHitKind::BluetoothRadio:
@@ -8938,10 +8991,17 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
             0.12F);
         break;
     }
+    case TrayFlyoutHitKind::Boost:
+        // Home glyph disc: no plate. The Boost page "Boost Now" row is a menu row.
+        if (m_qsPage != QuickSettingsPage::Boost) {
+            break;
+        }
+        [[fallthrough]];
     case TrayFlyoutHitKind::MoreSettings:
         // Only the macOS style "Wi-Fi Settings..." / "Bluetooth Settings..."
         // menu rows get a plate; other pages keep their bare footer links.
-        if (m_qsPage != QuickSettingsPage::Wifi && m_qsPage != QuickSettingsPage::Bluetooth) {
+        if (hit.kind == TrayFlyoutHitKind::MoreSettings && m_qsPage != QuickSettingsPage::Wifi &&
+            m_qsPage != QuickSettingsPage::Bluetooth && m_qsPage != QuickSettingsPage::Boost) {
             break;
         }
         [[fallthrough]];
@@ -8966,7 +9026,6 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     }
     case TrayFlyoutHitKind::Wifi:
     case TrayFlyoutHitKind::Sound:
-    case TrayFlyoutHitKind::Boost:
     case TrayFlyoutHitKind::Brightness:
     case TrayFlyoutHitKind::Back:
     case TrayFlyoutHitKind::Vpn:
@@ -9009,6 +9068,17 @@ int DockApp::QsChevronTarget() const noexcept {
     case TrayFlyoutHitKind::BluetoothRadio:
     case TrayFlyoutHitKind::BluetoothPage:
         return 1;
+    case TrayFlyoutHitKind::Boost:
+    case TrayFlyoutHitKind::BoostPage:
+        return 2;
+    case TrayFlyoutHitKind::Power:
+        return 3;
+    case TrayFlyoutHitKind::Sound:
+    case TrayFlyoutHitKind::VolumeSlider:
+        return 4;
+    case TrayFlyoutHitKind::Display:
+    case TrayFlyoutHitKind::BrightnessSlider:
+        return 5;
     default:
         return -1;
     }
@@ -9019,7 +9089,7 @@ void DockApp::KickQsChevronFade() noexcept {
         return;
     }
     const int target = QsChevronTarget();
-    for (int tile = 0; tile < 2; ++tile) {
+    for (int tile = 0; tile < static_cast<int>(kQsChevronTiles); ++tile) {
         if (m_qsChevronAlpha[tile] != (tile == target ? 1.0F : 0.0F)) {
             m_qsChevronFadeLastMs = GetTickCount64();
             SetTimer(m_overflowWindow, kQsChevronFadeTimerId, kQsChevronFadeIntervalMs, nullptr);
@@ -9029,10 +9099,10 @@ void DockApp::KickQsChevronFade() noexcept {
 }
 
 void DockApp::ResetQsChevronFade() noexcept {
-    m_qsChevronAlpha[0] = 0.0F;
-    m_qsChevronAlpha[1] = 0.0F;
-    m_qsChevronDrawn[0] = false;
-    m_qsChevronDrawn[1] = false;
+    for (size_t tile = 0; tile < kQsChevronTiles; ++tile) {
+        m_qsChevronAlpha[tile] = 0.0F;
+        m_qsChevronDrawn[tile] = false;
+    }
     if (m_overflowWindow != nullptr) {
         KillTimer(m_overflowWindow, kQsChevronFadeTimerId);
     }
@@ -9093,7 +9163,7 @@ void DockApp::PaintQsChevronFadeFast() {
     RECT dirty{};
     bool haveDirty = false;
     unsigned tiles = 0U;
-    for (size_t tile = 0; tile < 2; ++tile) {
+    for (size_t tile = 0; tile < kQsChevronTiles; ++tile) {
         if (!m_qsChevronDrawn[tile] && m_qsChevronAlpha[tile] <= 0.0F) {
             continue;
         }
@@ -9129,7 +9199,7 @@ void DockApp::StepQsChevronFade() {
     m_qsChevronFadeLastMs = now;
     const int target = QsChevronTarget();
     bool settled = true;
-    for (int tile = 0; tile < 2; ++tile) {
+    for (int tile = 0; tile < static_cast<int>(kQsChevronTiles); ++tile) {
         const float goal = tile == target ? 1.0F : 0.0F;
         float& alpha = m_qsChevronAlpha[tile];
         alpha = goal > alpha ? std::min(goal, alpha + step) : std::max(goal, alpha - step);
@@ -9146,7 +9216,7 @@ unsigned DockApp::ClearQsTileChevrons(RECT* dirty, const RECT* within) noexcept 
         return 0U;
     }
     unsigned cleared = 0U;
-    for (size_t tile = 0; tile < 2; ++tile) {
+    for (size_t tile = 0; tile < kQsChevronTiles; ++tile) {
         if (!m_qsChevronDrawn[tile]) {
             continue;
         }
@@ -9169,7 +9239,7 @@ void DockApp::PaintQsTileChevrons(uint8_t* pixels, int width, int height, unsign
     const bool home = m_qsPage == QuickSettingsPage::Home;
     const int extent = static_cast<int>(m_qsTileChevronExtent);
     const size_t bytes = static_cast<size_t>(std::max(0, extent)) * static_cast<size_t>(std::max(0, extent)) * 4U;
-    for (size_t tile = 0; tile < 2; ++tile) {
+    for (size_t tile = 0; tile < kQsChevronTiles; ++tile) {
         if ((tiles & (1U << tile)) == 0U) {
             continue;
         }
@@ -9265,8 +9335,8 @@ void DockApp::PaintOverflowHoverFast() {
         haveDirty = true;
     }
 
-    RECT chevronDirty[2]{};
-    for (size_t tile = 0; tile < 2; ++tile) {
+    RECT chevronDirty[kQsChevronTiles]{};
+    for (size_t tile = 0; tile < kQsChevronTiles; ++tile) {
         if (m_qsChevronDrawn[tile] || m_qsChevronAlpha[tile] > 0.0F) {
             chevronDirty[tile] = QsChevronGlyphRect(tile);
             restoreRect(chevronDirty[tile]);
