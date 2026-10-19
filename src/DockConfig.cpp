@@ -954,6 +954,7 @@ bool DockConfig::Load() {
     m_lightPanels = false;
     m_handsFree = true;
     m_qsIconColor = kDefaultQsIconColor;
+    m_qsLayout.clear();
     m_lastInstalledVersion.clear();
     m_lastInstalledTime = 0;
     m_lastInstalledAttempts = 0;
@@ -1048,6 +1049,10 @@ bool DockConfig::Load() {
                 m_qsIconColor = static_cast<unsigned>(parsed & 0xFFFFFFU);
             }
         }
+        const auto qsLayout = dockSection->second.find(L"quicksettingslayout");
+        if (qsLayout != dockSection->second.end()) {
+            m_qsLayout = qsLayout->second;
+        }
         const auto lastInstalledVersion =
             dockSection->second.find(L"lastinstalledversion");
         if (lastInstalledVersion != dockSection->second.end()) {
@@ -1129,6 +1134,9 @@ bool DockConfig::Save() const {
         wchar_t colorText[16]{};
         swprintf_s(colorText, L"%06X", m_qsIconColor & 0xFFFFFFU);
         contents << L"QuickSettingsIconColor=" << colorText << L"\n";
+    }
+    if (!m_qsLayout.empty()) {
+        contents << L"QuickSettingsLayout=" << m_qsLayout << L"\n";
     }
     if (!m_lastInstalledVersion.empty()) {
         contents << L"LastInstalledVersion=" << m_lastInstalledVersion << L"\n";
@@ -1301,6 +1309,14 @@ void DockConfig::SetQsIconColor(unsigned rgb) noexcept {
     m_qsIconColor = rgb & 0xFFFFFFU;
 }
 
+const std::wstring& DockConfig::QsLayout() const noexcept {
+    return m_qsLayout;
+}
+
+void DockConfig::SetQsLayout(std::wstring layout) {
+    m_qsLayout = std::move(layout);
+}
+
 std::wstring DockConfig::LastInstalledVersion() const {
     return m_lastInstalledVersion;
 }
@@ -1366,5 +1382,6 @@ void DockConfig::SetDefaults() {
     m_lightPanels = false;
     m_handsFree = true;
     m_qsIconColor = kDefaultQsIconColor;
+    m_qsLayout.clear();
     m_frostAmount = 0.0F;
 }

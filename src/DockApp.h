@@ -162,6 +162,8 @@ private:
     static constexpr UINT_PTR kQsTempsTimerId = 19;
     // Home Wi-Fi / Bluetooth tile arrow fade; runs only while an arrow is fading.
     static constexpr UINT_PTR kQsChevronFadeTimerId = 20;
+    // Home module drag-to-rearrange animation frames (~60 Hz while moving).
+    static constexpr UINT_PTR kQsReorderTimerId = 21;
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
     static constexpr float kQsChevronFadeMs = 140.0F;
     // Home tiles with a hover arrow: Wi-Fi, Bluetooth, Boost, Power, Sound, Display.
@@ -731,6 +733,21 @@ private:
     void RepaintBluetoothStatus();
     // Boost status/report changed: live tile overlay on Home, full repaint on the Boost page.
     void RepaintBoostStatus();
+    // Home module drag-to-rearrange. A press on a module arms a reorder; moving
+    // past the drag threshold snapshots every module over a tile-free glass
+    // backdrop, the module follows the cursor and the others spring into the
+    // nearest gap-free layout. Release settles everything, then saves.
+    void SyncQsModuleOrder();
+    [[nodiscard]] int QsModuleAt(POINT point) const noexcept;
+    [[nodiscard]] RECT QsModuleSlot(size_t module, const QsGridCell& cell) const noexcept;
+    bool BeginQsReorder(int module, POINT cursor);
+    void UpdateQsReorder(POINT cursor);
+    void EndQsReorder(bool commit);
+    void StepQsReorder();
+    void PresentQsReorderFrame();
+    void FinishQsReorder();
+    // Overflow hide: drop reorder state (a released drag still saves).
+    void AbortQsReorder() noexcept;
     HPOWERNOTIFY m_suspendNotify = nullptr;
     HPOWERNOTIFY m_monitorNotify = nullptr;
     bool m_sessionNotifyRegistered = false;
@@ -1048,6 +1065,47 @@ private:
     std::vector<uint8_t> m_qsContentScratch;
     int64_t m_qsMeterPaintedSig = -1;
     int64_t m_qsScrubPaintedSig = -1;
+    // Home module order (dock.ini QuickSettingsLayout) and, from the last Home
+    // layout, each module's window-px rect and the grid origin.
+    QsModuleOrder m_qsOrder = DefaultQsModuleOrder();
+    std::wstring m_qsOrderSource;
+    bool m_qsOrderSynced = false;
+    RECT m_qsModuleRect[kQsModuleCount]{};
+    bool m_qsModuleRectsValid = false;
+    LONG m_qsGridLeft = 0;
+    LONG m_qsGridTop = 0;
+    float m_qsGridScale = 1.0F;
+    // Left press on a Home module, not yet a drag.
+    bool m_qsPressArmed = false;
+    POINT m_qsPressPoint{};
+    int m_qsPressModule = -1;
+    struct QsReorderSprite {
+        // Module pixels premultiplied by shape coverage, plus that coverage.
+        std::vector<uint8_t> bits;
+        std::vector<uint8_t> cover;
+        LONG width = 0;
+        LONG height = 0;
+        float radius = 0.0F;
+    };
+    bool m_qsReorderActive = false;
+    // Released (or cancelled): everything springs home, then FinishQsReorder.
+    bool m_qsReorderDropped = false;
+    // A full repaint was requested mid-drag; run it once the drag finishes.
+    bool m_qsReorderPaintPending = false;
+    int m_qsReorderModule = -1;
+    int m_qsReorderRows = 0;
+    POINT m_qsReorderGrab{};
+    POINT m_qsReorderCursor{};
+    QsModuleOrder m_qsReorderOrder{};
+    QsModuleOrder m_qsReorderStartOrder{};
+    float m_qsReorderPos[kQsModuleCount][2]{};
+    float m_qsReorderVel[kQsModuleCount][2]{};
+    float m_qsReorderLift = 0.0F;
+    QsReorderSprite m_qsReorderSprites[kQsModuleCount];
+    std::vector<uint8_t> m_qsReorderBackdrop;
+    RECT m_qsReorderBounds{};
+    RECT m_qsReorderDirty{};
+    ULONGLONG m_qsReorderLastMs = 0;
     bool m_qsWifiOthersOpen = false;
     bool m_qsBtOthersOpen = false;
     RECT m_qsBtStatusRect{};

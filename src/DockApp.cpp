@@ -2899,8 +2899,12 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         if (app == nullptr) {
             break;
         }
+        if (app->m_qsReorderActive) {
+            return 0;  // settling after a drop: ignore presses on stale hit rects
+        }
         const POINT downPoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const int downHit = app->OverflowHitIndex(downPoint);
+        bool sliderPress = false;
         if (downHit >= 0 && static_cast<size_t>(downHit) < app->m_overflowHits.size()) {
             const TrayFlyoutHit& slider = app->m_overflowHits[static_cast<size_t>(downHit)];
             if (slider.kind == TrayFlyoutHitKind::VolumeSlider ||
@@ -2913,6 +2917,18 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
                 app->m_qsDragBounds = slider.bounds;
                 SetCapture(window);
                 app->ApplyQuickSettingsSlider(slider.kind, slider.bounds, downPoint.x);
+                sliderPress = true;
+            }
+        }
+        // Anywhere else on a Home module arms drag-to-rearrange; a release
+        // before the drag threshold is still an ordinary click.
+        if (!sliderPress) {
+            const int module = app->QsModuleAt(downPoint);
+            if (module >= 0) {
+                app->m_qsPressArmed = true;
+                app->m_qsPressPoint = downPoint;
+                app->m_qsPressModule = module;
+                SetCapture(window);
             }
         }
         return 0;
@@ -2927,6 +2943,30 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
             const POINT dragPoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             app->ApplyQuickSettingsSlider(app->m_qsDragKind, app->m_qsDragBounds, dragPoint.x);
             return 0;
+        }
+        if (app->m_qsReorderActive) {
+            app->UpdateQsReorder(POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+            return 0;
+        }
+        if (app->m_qsPressArmed) {
+            const POINT movePoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            const float dpiScale = static_cast<float>(app->HostDpi() == 0 ? 96U : app->HostDpi()) / 96.0F;
+            const LONG threshold = (std::max)(static_cast<LONG>(GetSystemMetrics(SM_CXDRAG)),
+                static_cast<LONG>(std::lround(6.0F * dpiScale)));
+            if ((wParam & MK_LBUTTON) == 0) {
+                app->m_qsPressArmed = false;
+                ReleaseCapture();
+            } else if (std::abs(movePoint.x - app->m_qsPressPoint.x) > threshold ||
+                std::abs(movePoint.y - app->m_qsPressPoint.y) > threshold) {
+                app->m_qsPressArmed = false;
+                if (app->BeginQsReorder(app->m_qsPressModule, app->m_qsPressPoint)) {
+                    app->UpdateQsReorder(movePoint);
+                    return 0;
+                }
+                ReleaseCapture();
+            } else {
+                return 0;
+            }
         }
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const int hover = app->OverflowHitIndex(point);
@@ -2946,6 +2986,18 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
             break;
         }
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (app->m_qsReorderActive) {
+            if (message == WM_LBUTTONUP && !app->m_qsReorderDropped) {
+                app->UpdateQsReorder(point);
+                app->EndQsReorder(true);
+                ReleaseCapture();
+            }
+            return 0;
+        }
+        if (message == WM_LBUTTONUP && app->m_qsPressArmed) {
+            app->m_qsPressArmed = false;
+            ReleaseCapture();
+        }
         if (message == WM_LBUTTONUP && app->m_qsDragging) {
             const bool moved = app->m_qsDragMoved;
             const TrayFlyoutHitKind dragKind = app->m_qsDragKind;
@@ -2964,6 +3016,16 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         }
         return 0;
     }
+
+    case WM_CAPTURECHANGED:
+        // Lost capture mid-drag (another window took it): snap back.
+        if (app != nullptr) {
+            app->m_qsPressArmed = false;
+            if (app->m_qsReorderActive && !app->m_qsReorderDropped) {
+                app->EndQsReorder(false);
+            }
+        }
+        break;
 
     case WM_KEYDOWN:
         // NOACTIVATE, so this only fires if the popup actually has focus.
@@ -3020,6 +3082,10 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
     case WM_TIMER:
         if (wParam == kQsChevronFadeTimerId && app != nullptr) {
             app->StepQsChevronFade();
+            return 0;
+        }
+        if (wParam == kQsReorderTimerId && app != nullptr) {
+            app->StepQsReorder();
             return 0;
         }
         if (wParam == kEnergySampleTimerId && app != nullptr) {
@@ -6103,6 +6169,11 @@ void DockApp::FinishOverflowHide() noexcept {
     }
     m_overflowVisibility = VisibilityState::Hidden;
     StopQuickSettingsCapture();
+    if (m_overflowWindow != nullptr) {
+        KillTimer(m_overflowWindow, kQsReorderTimerId);
+    }
+    // Before keepHomeFrame: a reorder composite must not be reused on reopen.
+    AbortQsReorder();
     // Keep the last Home present/base/underlay + glass across hide so the next
     // chevron click can UpdateLayeredWindow without a BakeGlassPanel / full
     // Quick Settings rebuild on the UI thread (was the remaining cursor hitch).
@@ -7365,6 +7436,9 @@ bool DockApp::TickLivePopupGlass()
                     PaintSettingsHoverFast();
                 }
             }
+        } else if (done == 1 && overflowOpen && m_qsReorderActive) {
+            // The drag owns the frame; pick the new backdrop up in its rebuild.
+            m_qsReorderPaintPending = true;
         } else if (done == 1 && overflowOpen && !m_overflowBaseBits.empty()) {
             if (glass.size() == m_overflowGlass.size() &&
                 m_overflowGlassSize.cx == m_overflowSize.cx &&
@@ -9091,7 +9165,7 @@ int DockApp::QsChevronTarget() const noexcept {
 }
 
 void DockApp::KickQsChevronFade() noexcept {
-    if (m_overflowWindow == nullptr) {
+    if (m_overflowWindow == nullptr || m_qsReorderActive) {
         return;
     }
     const int target = QsChevronTarget();
@@ -9154,6 +9228,9 @@ RECT DockApp::QsChevronGlyphRect(size_t tile) const noexcept {
 }
 
 void DockApp::PaintQsChevronFadeFast() {
+    if (m_qsReorderActive) {
+        return;
+    }
     POINT origin{};
     LONG caret = m_overflowCaretX;
     if (m_overflowBaseBits.empty() || m_overflowWindow == nullptr ||
@@ -9271,6 +9348,9 @@ void DockApp::PaintQsTileChevrons(uint8_t* pixels, int width, int height, unsign
 }
 
 void DockApp::PaintOverflowHoverFast() {
+    if (m_qsReorderActive) {
+        return;
+    }
     POINT origin{};
     LONG caret = m_overflowCaretX;
     if (m_overflowBaseBits.empty() || m_overflowWindow == nullptr ||
@@ -9398,6 +9478,10 @@ void DockApp::PaintOverflowHoverFast() {
 }
 
 void DockApp::PaintOverflowLiveFast() {
+    if (m_qsReorderActive) {
+        m_qsReorderPaintPending = true;
+        return;
+    }
     POINT origin{};
     LONG caret = m_overflowCaretX;
     if (m_overflowUnderlayBits.empty() || m_overflowWindow == nullptr ||
@@ -9532,6 +9616,11 @@ void DockApp::PaintOverflowLiveFast() {
 }
 
 void DockApp::PaintOverflowPopup() {
+    if (m_qsReorderActive) {
+        // The drag owns the frame; rebuild once it settles.
+        m_qsReorderPaintPending = true;
+        return;
+    }
     ProfileScope scope("PaintOverflowPopup");
     const UINT dpi = HostDpi();
     const float scale = static_cast<float>(dpi) / 96.0F;

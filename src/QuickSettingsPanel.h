@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -21,6 +22,40 @@ enum class QuickSettingsPage : uint8_t {
     Display,
     Boost,
 };
+
+// Home Control Centre modules, in default grid order. The user can drag them
+// into a different order (dock.ini QuickSettingsLayout).
+enum class QsModule : uint8_t {
+    Wifi = 0,
+    Bluetooth,
+    Boost,
+    Power,
+    SystemTray,
+    Vpn,
+    Microphone,
+    Sound,
+    Display,
+    Temps,
+    Media,
+};
+inline constexpr size_t kQsModuleCount = 11;
+using QsModuleOrder = std::array<uint8_t, kQsModuleCount>;
+struct QsGridCell {
+    int col = 0;
+    int row = 0;
+};
+[[nodiscard]] QsModuleOrder DefaultQsModuleOrder() noexcept;
+// Grid footprint of a module in 4-column cells.
+[[nodiscard]] int QsModuleCols(size_t module) noexcept;
+[[nodiscard]] int QsModuleRows(size_t module) noexcept;
+// First-fit flow of `order` into the 4-column grid. False if order is not a
+// permutation of the modules; rows receives the grid height in cells.
+bool PackQsModules(const QsModuleOrder& order, QsGridCell (&cells)[kQsModuleCount], int& rows) noexcept;
+// Comma-separated module names ("wifi,bluetooth,...") for dock.ini.
+[[nodiscard]] std::wstring FormatQsModuleOrder(const QsModuleOrder& order);
+// Parse dock.ini text. Unknown names are ignored, missing modules keep their
+// default relative order; false when the result does not tile the grid.
+[[nodiscard]] bool ParseQsModuleOrder(const std::wstring& text, QsModuleOrder& order);
 
 struct QsNamedId {
     std::wstring id;

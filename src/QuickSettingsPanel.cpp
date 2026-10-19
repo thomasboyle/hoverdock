@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -255,6 +256,35 @@ std::wstring BluetoothConnectedSummary(const BluetoothSnapshot& bt) {
     const std::wstring name = first->name.empty() ? L"device" : first->name;
     const std::wstring more = connected > 1 ? (L" +" + std::to_wstring(connected - 1)) : L"";
     return L"Connected to " + name + more;
+}
+
+constexpr int kQsModuleW[kQsModuleCount] = {2, 2, 2, 2, 1, 1, 2, 4, 4, 2, 2};
+constexpr int kQsModuleH[kQsModuleCount] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2};
+constexpr const wchar_t* kQsModuleNames[kQsModuleCount] = {L"wifi", L"bluetooth", L"boost", L"power", L"tray",
+    L"vpn", L"mic", L"sound", L"display", L"temps", L"media"};
+constexpr int kQsGridCols = 4;
+// The default order tiles 28 cells into 7 full rows; reorders must too.
+constexpr int kQsGridRows = 7;
+
+// One Home grid cell span in panel px: 63pt cells on a 76pt pitch.
+RECT QsGridCellRect(LONG left, LONG top, float scale, int col, int row, int w, int h) noexcept {
+    const float x0 = static_cast<float>(col) * 76.0F;
+    const float x1 = x0 + static_cast<float>(w) * 76.0F - 13.0F;
+    const float y0 = static_cast<float>(row) * 76.0F;
+    const float y1 = y0 + static_cast<float>(h) * 76.0F - 13.0F;
+    return RECT{left + static_cast<LONG>(std::lround(x0 * scale)), top + static_cast<LONG>(std::lround(y0 * scale)),
+        left + static_cast<LONG>(std::lround(x1 * scale)), top + static_cast<LONG>(std::lround(y1 * scale))};
+}
+
+// Corner radius each module's glass shape is baked with (see LayoutQuickSettings).
+float QsModuleRadius(size_t module, const RECT& bounds, float scale) noexcept {
+    if (kQsModuleW[module] == 1) {
+        return 0.5F * static_cast<float>(bounds.right - bounds.left);
+    }
+    if (kQsModuleH[module] == 1) {
+        return 0.5F * static_cast<float>(bounds.bottom - bounds.top);
+    }
+    return static_cast<float>(std::lround(30.0F * scale));
 }
 
 // Boost report app name without the ".exe" suffix, with a "(N)" process count.
@@ -2860,6 +2890,13 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
     for (RECT& chevron : m_qsTileChevron) {
         OffsetRect(&chevron, shadowMargin, shadowMargin);
     }
+    if (m_qsModuleRectsValid) {
+        for (RECT& module : m_qsModuleRect) {
+            OffsetRect(&module, shadowMargin, shadowMargin);
+        }
+        m_qsGridLeft += shadowMargin;
+        m_qsGridTop += shadowMargin;
+    }
     m_overflowGearX += static_cast<int>(shadowMargin);
     m_overflowGearY += static_cast<int>(shadowMargin);
 }
@@ -3073,6 +3110,118 @@ void CcDrawSlider(uint8_t* pixels, int width, int height, RECT track, float leve
 
 }  // namespace dock_detail
 
+QsModuleOrder DefaultQsModuleOrder() noexcept {
+    QsModuleOrder order{};
+    for (size_t index = 0; index < kQsModuleCount; ++index) {
+        order[index] = static_cast<uint8_t>(index);
+    }
+    return order;
+}
+
+int QsModuleCols(size_t module) noexcept {
+    return module < kQsModuleCount ? kQsModuleW[module] : 1;
+}
+
+int QsModuleRows(size_t module) noexcept {
+    return module < kQsModuleCount ? kQsModuleH[module] : 1;
+}
+
+bool PackQsModules(const QsModuleOrder& order, QsGridCell (&cells)[kQsModuleCount], int& rows) noexcept {
+    constexpr int kMaxRows = 32;
+    bool used[kMaxRows][kQsGridCols]{};
+    bool seen[kQsModuleCount]{};
+    rows = 0;
+    for (const uint8_t module : order) {
+        if (module >= kQsModuleCount || seen[module]) {
+            return false;
+        }
+        seen[module] = true;
+        const int w = kQsModuleW[module];
+        const int h = kQsModuleH[module];
+        bool placed = false;
+        for (int row = 0; row + h <= kMaxRows && !placed; ++row) {
+            for (int col = 0; col + w <= kQsGridCols && !placed; ++col) {
+                bool free = true;
+                for (int dy = 0; dy < h && free; ++dy) {
+                    for (int dx = 0; dx < w && free; ++dx) {
+                        free = !used[row + dy][col + dx];
+                    }
+                }
+                if (!free) {
+                    continue;
+                }
+                for (int dy = 0; dy < h; ++dy) {
+                    for (int dx = 0; dx < w; ++dx) {
+                        used[row + dy][col + dx] = true;
+                    }
+                }
+                cells[module] = {col, row};
+                rows = std::max(rows, row + h);
+                placed = true;
+            }
+        }
+        if (!placed) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::wstring FormatQsModuleOrder(const QsModuleOrder& order) {
+    std::wstring text;
+    for (const uint8_t module : order) {
+        if (module >= kQsModuleCount) {
+            continue;
+        }
+        if (!text.empty()) {
+            text += L',';
+        }
+        text += kQsModuleNames[module];
+    }
+    return text;
+}
+
+bool ParseQsModuleOrder(const std::wstring& text, QsModuleOrder& order) {
+    std::vector<uint8_t> parsed;
+    bool seen[kQsModuleCount]{};
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find(L',', start);
+        if (end == std::wstring::npos) {
+            end = text.size();
+        }
+        std::wstring name = text.substr(start, end - start);
+        name.erase(0, name.find_first_not_of(L" \t"));
+        const size_t last = name.find_last_not_of(L" \t");
+        name.erase(last == std::wstring::npos ? 0 : last + 1);
+        for (wchar_t& ch : name) {
+            ch = static_cast<wchar_t>(std::towlower(ch));
+        }
+        for (size_t module = 0; module < kQsModuleCount; ++module) {
+            if (!seen[module] && name == kQsModuleNames[module]) {
+                seen[module] = true;
+                parsed.push_back(static_cast<uint8_t>(module));
+                break;
+            }
+        }
+        start = end + 1;
+    }
+    for (size_t module = 0; module < kQsModuleCount; ++module) {
+        if (!seen[module]) {
+            parsed.push_back(static_cast<uint8_t>(module));
+        }
+    }
+    QsModuleOrder candidate{};
+    std::copy(parsed.begin(), parsed.end(), candidate.begin());
+    QsGridCell cells[kQsModuleCount]{};
+    int rows = 0;
+    if (!PackQsModules(candidate, cells, rows) || rows != kQsGridRows) {
+        return false;
+    }
+    order = candidate;
+    return true;
+}
+
 void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int height, HDC memory,
     float scale, LONG padding, LONG gearSize, LONG headerHeight, HFONT titleFont, HFONT sectionFont,
     HFONT labelFont, HFONT statusFont, LONG& panelWidth, LONG& contentBottom) {
@@ -3091,6 +3240,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         for (RECT& chevron : m_qsTileChevron) {
             chevron = {};
         }
+        m_qsModuleRectsValid = false;
     }
     SetQsAccent(m_config.QsIconColor());
     const bool home = m_qsPage == QuickSettingsPage::Home;
@@ -3282,14 +3432,30 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         auto P = [&](float pt) { return static_cast<LONG>(std::lround(pt * scale)); };
         const LONG gridTop = y + P(10.0F);
         auto cellRect = [&](int col, int row, int w, int h) {
-            const float x0 = static_cast<float>(col) * 76.0F;
-            const float x1 = x0 + static_cast<float>(w) * 76.0F - 13.0F;
-            const float y0 = static_cast<float>(row) * 76.0F;
-            const float y1 = y0 + static_cast<float>(h) * 76.0F - 13.0F;
-            return RECT{padding + static_cast<LONG>(std::lround(x0 * scale)),
-                gridTop + static_cast<LONG>(std::lround(y0 * scale)),
-                padding + static_cast<LONG>(std::lround(x1 * scale)),
-                gridTop + static_cast<LONG>(std::lround(y1 * scale))};
+            return QsGridCellRect(padding, gridTop, scale, col, row, w, h);
+        };
+        // Modules flow into the grid in the user's order (drag to rearrange).
+        // Drawing stays in module order so glass shape indices are stable.
+        SyncQsModuleOrder();
+        QsGridCell cells[kQsModuleCount]{};
+        int gridRows = 0;
+        if (!PackQsModules(m_qsOrder, cells, gridRows)) {
+            m_qsOrder = DefaultQsModuleOrder();
+            static_cast<void>(PackQsModules(m_qsOrder, cells, gridRows));
+        }
+        if (draw) {
+            m_qsGridLeft = padding;
+            m_qsGridTop = gridTop;
+            m_qsGridScale = scale;
+            m_qsModuleRectsValid = true;
+        }
+        auto moduleRect = [&](QsModule module) {
+            const size_t index = static_cast<size_t>(module);
+            const RECT bounds = cellRect(cells[index].col, cells[index].row, kQsModuleW[index], kQsModuleH[index]);
+            if (draw) {
+                m_qsModuleRect[index] = bounds;
+            }
+            return bounds;
         };
         uint64_t inkSigNew = 0;
         struct CcInk {
@@ -3493,15 +3659,15 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         }
         const bool btOn = m_bluetoothSnapshot.radioOn;
         // Row 0: Wi-Fi + Bluetooth capsules.
-        capsule(cellRect(0, 0, 2, 1), L'\uE701', L"Wi-Fi", wifiLabel, TrayFlyoutHitKind::WifiRadio,
+        capsule(moduleRect(QsModule::Wifi), L'\uE701', L"Wi-Fi", wifiLabel, TrayFlyoutHitKind::WifiRadio,
             wifiOn || m_qsCache.wifiRadioOn, 0, 0, TrayFlyoutHitKind::WifiPage);
-        capsule(cellRect(2, 0, 2, 1), L'\uE702', L"Bluetooth", std::wstring{},
+        capsule(moduleRect(QsModule::Bluetooth), L'\uE702', L"Bluetooth", std::wstring{},
             TrayFlyoutHitKind::BluetoothRadio, btOn, 2, 1, TrayFlyoutHitKind::BluetoothPage);
         // Row 1: Boost + Power capsules. The Boost disc runs a boost; the tile
         // opens the last-run report. Power opens its page from anywhere.
-        capsule(cellRect(0, 1, 2, 1), L'\uE945', L"Boost", m_boostStatus, TrayFlyoutHitKind::Boost, false, 1,
+        capsule(moduleRect(QsModule::Boost), L'\uE945', L"Boost", m_boostStatus, TrayFlyoutHitKind::Boost, false, 1,
             2, TrayFlyoutHitKind::BoostPage);
-        capsule(cellRect(2, 1, 2, 1), L'\uE83F', L"Power", EnergyModeLabel(m_qsCache.powerMode),
+        capsule(moduleRect(QsModule::Power), L'\uE83F', L"Power", EnergyModeLabel(m_qsCache.powerMode),
             TrayFlyoutHitKind::Power, false, 0, 3, TrayFlyoutHitKind::None);
         // Row 2: System Tray + VPN circles, Microphone capsule (live meter).
         bool vpnOn = false;
@@ -3511,10 +3677,10 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 break;
             }
         }
-        circle(cellRect(0, 2, 1, 1), L'\uE7F4', TrayFlyoutHitKind::SystemTrayPage, false);
-        circle(cellRect(1, 2, 1, 1), L'\uE72E', TrayFlyoutHitKind::Vpn, vpnOn);
+        circle(moduleRect(QsModule::SystemTray), L'\uE7F4', TrayFlyoutHitKind::SystemTrayPage, false);
+        circle(moduleRect(QsModule::Vpn), L'\uE72E', TrayFlyoutHitKind::Vpn, vpnOn);
         {
-            const RECT b = cellRect(2, 2, 2, 1);
+            const RECT b = moduleRect(QsModule::Microphone);
             const float h = static_cast<float>(b.bottom - b.top);
             const size_t idx = addShape(b, h * 0.5F);
             const CcInk ink = ccInk(idx);
@@ -3543,12 +3709,12 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             push(TrayFlyoutHitKind::Microphone, b);
         }
         // Row 3: Sound slider capsule (4x1).
-        sliderCapsule(cellRect(0, 3, 4, 1), tray.volumeMuted ? L'\uE74F' : L'\uE767', L"Sound",
+        sliderCapsule(moduleRect(QsModule::Sound), tray.volumeMuted ? L'\uE74F' : L'\uE767', L"Sound",
             std::wstring{}, volume,
             TrayFlyoutHitKind::VolumeSlider, true, TrayFlyoutHitKind::Sound, 4);
         // Row 4: Display slider capsule (4x1, brightness).
         const bool brightnessUsable = tray.brightnessAvailable || projected >= 0;
-        sliderCapsule(cellRect(0, 4, 4, 1), L'\uE706', L"Display",
+        sliderCapsule(moduleRect(QsModule::Display), L'\uE706', L"Display",
             brightnessUsable
                 ? std::wstring{}
                 : ((m_qsCache.nightKnown && m_qsCache.nightLight) ? std::wstring(L"Night light")
@@ -3556,7 +3722,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             brightness, TrayFlyoutHitKind::BrightnessSlider, brightnessUsable, TrayFlyoutHitKind::Display, 5);
         // Rows 5-6: CPU/GPU (2x2) and Now Playing (2x2).
         {
-            const RECT b = cellRect(0, 5, 2, 2);
+            const RECT b = moduleRect(QsModule::Temps);
             const size_t idx = addShape(b, static_cast<float>(P(30.0F)));
             const CcInk ink = ccInk(idx);
             if (draw) {
@@ -3595,7 +3761,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             }
         }
         {
-            const RECT b = cellRect(2, 5, 2, 2);
+            const RECT b = moduleRect(QsModule::Media);
             const size_t idx = addShape(b, static_cast<float>(P(30.0F)));
             const CcInk ink = ccInk(idx);
             if (draw) {
@@ -3659,7 +3825,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         if (draw) {
             m_qsCcInkSig = inkSigNew;
         }
-        y = cellRect(0, 5, 2, 2).bottom + padding;
+        y = cellRect(0, std::max(1, gridRows) - 1, 1, 1).bottom + padding;
         contentBottom = y;
     m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
         m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
@@ -4703,4 +4869,471 @@ void DockApp::AdjustCaptureGain(float delta) {
     }
     m_qsCache.stamp = GetTickCount64();
     QueueOverflowPaint();
+}
+
+// ---- Home module drag-to-rearrange ----------------------------------------
+
+void DockApp::SyncQsModuleOrder() {
+    const std::wstring& layout = m_config.QsLayout();
+    if (m_qsOrderSynced && layout == m_qsOrderSource) {
+        return;
+    }
+    m_qsOrderSynced = true;
+    m_qsOrderSource = layout;
+    QsModuleOrder parsed = DefaultQsModuleOrder();
+    if (!layout.empty() && !ParseQsModuleOrder(layout, parsed)) {
+        parsed = DefaultQsModuleOrder();
+    }
+    m_qsOrder = parsed;
+}
+
+int DockApp::QsModuleAt(POINT point) const noexcept {
+    if (!m_qsModuleRectsValid || m_qsPage != QuickSettingsPage::Home) {
+        return -1;
+    }
+    for (size_t module = 0; module < kQsModuleCount; ++module) {
+        const RECT& bounds = m_qsModuleRect[module];
+        if (point.x >= bounds.left && point.x < bounds.right && point.y >= bounds.top && point.y < bounds.bottom) {
+            return static_cast<int>(module);
+        }
+    }
+    return -1;
+}
+
+RECT DockApp::QsModuleSlot(size_t module, const QsGridCell& cell) const noexcept {
+    return QsGridCellRect(m_qsGridLeft, m_qsGridTop, m_qsGridScale, cell.col, cell.row, QsModuleCols(module),
+        QsModuleRows(module));
+}
+
+bool DockApp::BeginQsReorder(int module, POINT cursor) {
+    if (m_qsReorderActive || module < 0 || static_cast<size_t>(module) >= kQsModuleCount ||
+        m_qsPage != QuickSettingsPage::Home || !m_qsModuleRectsValid || m_overflowWindow == nullptr ||
+        m_qsCcDescs.empty()) {
+        return false;
+    }
+    const LONG width = m_overflowPresentSize.cx;
+    const LONG height = m_overflowPresentSize.cy;
+    const size_t bytes = static_cast<size_t>(std::max(0L, width)) * static_cast<size_t>(std::max(0L, height)) * 4U;
+    if (bytes == 0 || m_overflowBaseBits.size() != bytes || m_overflowPresentBits.size() != bytes ||
+        width != m_overflowSize.cx || height != m_overflowSize.cy) {
+        return false;
+    }
+    QsGridCell cells[kQsModuleCount]{};
+    int rows = 0;
+    if (!PackQsModules(m_qsOrder, cells, rows)) {
+        return false;
+    }
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    if (!OverflowScreenOrigin(origin, caret)) {
+        return false;
+    }
+    // Tile-free backdrop: the same panel glass baked with only shape 0. Tile
+    // faces are a fixed colour, so moved snapshots match a real rebake.
+    std::vector<uint8_t> panel(bytes);
+    const std::vector<Renderer::CcShapeDesc> shapes = m_qsCcDescs;
+    m_qsCcDescs.assign(shapes.begin(), shapes.begin() + 1);
+    const bool baked = TryBakePopupGlass(origin, width, height, panel.data(), panel.size(), true, true);
+    m_qsCcDescs = shapes;
+    m_renderer.SetCcShapes(shapes);
+    if (!baked) {
+        Log(L"Quick Settings reorder: panel glass bake unavailable.");
+        return false;
+    }
+
+    const uint8_t* base = m_overflowBaseBits.data();
+    m_qsReorderBackdrop = m_overflowBaseBits;
+    RECT bounds = m_qsModuleRect[0];
+    for (size_t index = 0; index < kQsModuleCount; ++index) {
+        const RECT& rect = m_qsModuleRect[index];
+        bounds.left = std::min(bounds.left, rect.left);
+        bounds.top = std::min(bounds.top, rect.top);
+        bounds.right = std::max(bounds.right, rect.right);
+        bounds.bottom = std::max(bounds.bottom, rect.bottom);
+        QsReorderSprite& sprite = m_qsReorderSprites[index];
+        sprite.width = std::max(0L, rect.right - rect.left);
+        sprite.height = std::max(0L, rect.bottom - rect.top);
+        sprite.radius = QsModuleRadius(index, rect, m_qsGridScale);
+        const size_t count = static_cast<size_t>(sprite.width) * static_cast<size_t>(sprite.height);
+        sprite.bits.assign(count * 4U, 0);
+        sprite.cover.assign(count, 0);
+        // Same rounded-rect SDF and 0.5px AA band as CcGlass.
+        const float hw = 0.5F * static_cast<float>(sprite.width);
+        const float hh = 0.5F * static_cast<float>(sprite.height);
+        const float r = std::min({sprite.radius, hw, hh});
+        for (LONG y = 0; y < sprite.height; ++y) {
+            const LONG sy = rect.top + y;
+            if (sy < 0 || sy >= height) {
+                continue;
+            }
+            const float qy = std::fabs(static_cast<float>(y) + 0.5F - hh) - (hh - r);
+            for (LONG x = 0; x < sprite.width; ++x) {
+                const LONG sx = rect.left + x;
+                if (sx < 0 || sx >= width) {
+                    continue;
+                }
+                const float qx = std::fabs(static_cast<float>(x) + 0.5F - hw) - (hw - r);
+                const float ox = std::max(qx, 0.0F);
+                const float oy = std::max(qy, 0.0F);
+                const float sd = std::sqrt(ox * ox + oy * oy) + std::min(std::max(qx, qy), 0.0F) - r;
+                const float cov = std::clamp(0.5F - sd, 0.0F, 1.0F);
+                const unsigned c = static_cast<unsigned>(std::lround(cov * 255.0F));
+                const size_t at = static_cast<size_t>(y) * static_cast<size_t>(sprite.width) + static_cast<size_t>(x);
+                sprite.cover[at] = static_cast<uint8_t>(c);
+                const uint8_t* src = base + (static_cast<size_t>(sy) * static_cast<size_t>(width) +
+                                                static_cast<size_t>(sx)) * 4U;
+                for (size_t channel = 0; channel < 4U; ++channel) {
+                    sprite.bits[at * 4U + channel] = static_cast<uint8_t>((src[channel] * c + 127U) / 255U);
+                }
+            }
+        }
+        // Backdrop: tile (plus its 1-2px AA ring) replaced by bare panel glass.
+        const LONG ring = 3;
+        for (LONG y = std::max(0L, rect.top - ring); y < std::min(height, rect.bottom + ring); ++y) {
+            const LONG left = std::max(0L, rect.left - ring);
+            const LONG right = std::min(width, rect.right + ring);
+            if (right <= left) {
+                continue;
+            }
+            const size_t offset = (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(left)) * 4U;
+            std::memcpy(m_qsReorderBackdrop.data() + offset, panel.data() + offset,
+                static_cast<size_t>(right - left) * 4U);
+        }
+        m_qsReorderPos[index][0] = static_cast<float>(rect.left);
+        m_qsReorderPos[index][1] = static_cast<float>(rect.top);
+        m_qsReorderVel[index][0] = 0.0F;
+        m_qsReorderVel[index][1] = 0.0F;
+    }
+    m_qsReorderBounds = bounds;
+    // Lift shadow reaches ~10px past a tile; tiles never leave the grid box.
+    const LONG margin = std::max(12L, std::lround(14.0F * m_qsGridScale));
+    m_qsReorderDirty = RECT{std::max(0L, bounds.left - margin), std::max(0L, bounds.top - margin),
+        std::min(width, bounds.right + margin), std::min(height, bounds.bottom + margin)};
+
+    const RECT& grabbed = m_qsModuleRect[static_cast<size_t>(module)];
+    m_qsReorderGrab = POINT{cursor.x - grabbed.left, cursor.y - grabbed.top};
+    m_qsReorderCursor = cursor;
+    m_qsReorderModule = module;
+    m_qsReorderRows = rows;
+    m_qsReorderOrder = m_qsOrder;
+    m_qsReorderStartOrder = m_qsOrder;
+    m_qsReorderLift = 0.0F;
+    m_qsReorderActive = true;
+    m_qsReorderDropped = false;
+    m_qsReorderPaintPending = false;
+    m_qsDragging = false;
+    // Present is rebuilt from base so no hover plate / tile arrow survives.
+    m_overflowHover = -1;
+    m_overflowHoverDirtyValid = false;
+    ResetQsChevronFade();
+    std::memcpy(m_overflowPresentBits.data(), m_overflowBaseBits.data(), bytes);
+    m_overflowLayerDib.contentValid = false;
+    m_qsReorderLastMs = GetTickCount64();
+    SetTimer(m_overflowWindow, kQsReorderTimerId, 16, nullptr);
+    PresentQsReorderFrame();
+    return true;
+}
+
+void DockApp::UpdateQsReorder(POINT cursor) {
+    if (!m_qsReorderActive || m_qsReorderDropped) {
+        return;
+    }
+    m_qsReorderCursor = cursor;
+    const size_t dragged = static_cast<size_t>(m_qsReorderModule);
+    const QsReorderSprite& sprite = m_qsReorderSprites[dragged];
+    // The dragged tile tracks the cursor directly, clamped to the grid box.
+    m_qsReorderPos[dragged][0] = static_cast<float>(std::clamp(cursor.x - m_qsReorderGrab.x,
+        m_qsReorderBounds.left, std::max(m_qsReorderBounds.left, m_qsReorderBounds.right - sprite.width)));
+    m_qsReorderPos[dragged][1] = static_cast<float>(std::clamp(cursor.y - m_qsReorderGrab.y,
+        m_qsReorderBounds.top, std::max(m_qsReorderBounds.top, m_qsReorderBounds.bottom - sprite.height)));
+    const float centreX = m_qsReorderPos[dragged][0] + 0.5F * static_cast<float>(sprite.width);
+    const float centreY = m_qsReorderPos[dragged][1] + 0.5F * static_cast<float>(sprite.height);
+    // Try the dragged module at every position in the order; keep layouts that
+    // still tile the grid without gaps and pick the slot nearest the tile.
+    uint8_t rest[kQsModuleCount - 1]{};
+    size_t restCount = 0;
+    for (const uint8_t module : m_qsReorderOrder) {
+        if (module != dragged) {
+            rest[restCount++] = module;
+        }
+    }
+    auto slotDistance = [&](const QsModuleOrder& order, float& distance) {
+        QsGridCell cells[kQsModuleCount]{};
+        int rows = 0;
+        if (!PackQsModules(order, cells, rows) || rows != m_qsReorderRows) {
+            return false;
+        }
+        const RECT slot = QsModuleSlot(dragged, cells[dragged]);
+        const float dx = 0.5F * static_cast<float>(slot.left + slot.right) - centreX;
+        const float dy = 0.5F * static_cast<float>(slot.top + slot.bottom) - centreY;
+        distance = dx * dx + dy * dy;
+        return true;
+    };
+    float currentDistance = 0.0F;
+    const bool currentValid = slotDistance(m_qsReorderOrder, currentDistance);
+    QsModuleOrder best = m_qsReorderOrder;
+    float bestDistance = currentValid ? currentDistance : std::numeric_limits<float>::max();
+    for (size_t insert = 0; insert <= restCount; ++insert) {
+        QsModuleOrder candidate{};
+        size_t write = 0;
+        for (size_t index = 0; index < restCount; ++index) {
+            if (index == insert) {
+                candidate[write++] = static_cast<uint8_t>(dragged);
+            }
+            candidate[write++] = rest[index];
+        }
+        if (insert == restCount) {
+            candidate[write++] = static_cast<uint8_t>(dragged);
+        }
+        float distance = 0.0F;
+        if (candidate != m_qsReorderOrder && slotDistance(candidate, distance) && distance < bestDistance) {
+            best = candidate;
+            bestDistance = distance;
+        }
+    }
+    // Hysteresis: only move once the new slot is clearly closer (no flicker
+    // between two layouts while the tile sits halfway).
+    const float hysteresis = 12.0F * m_qsGridScale;
+    if (best != m_qsReorderOrder &&
+        (!currentValid || std::sqrt(bestDistance) + hysteresis < std::sqrt(currentDistance))) {
+        m_qsReorderOrder = best;
+    }
+    // Resuming from an idle hold: start the spring clock now, not at the hold.
+    const ULONGLONG now = GetTickCount64();
+    if (now - m_qsReorderLastMs > 50ULL) {
+        m_qsReorderLastMs = now;
+    }
+    SetTimer(m_overflowWindow, kQsReorderTimerId, 16, nullptr);
+    PresentQsReorderFrame();
+}
+
+void DockApp::EndQsReorder(bool commit) {
+    if (!m_qsReorderActive || m_qsReorderDropped) {
+        return;
+    }
+    if (!commit) {
+        m_qsReorderOrder = m_qsReorderStartOrder;
+    }
+    m_qsReorderDropped = true;
+    m_qsReorderLastMs = GetTickCount64();
+    SetTimer(m_overflowWindow, kQsReorderTimerId, 16, nullptr);
+}
+
+void DockApp::StepQsReorder() {
+    if (!m_qsReorderActive || !IsOverflowOpen()) {
+        if (m_overflowWindow != nullptr) {
+            KillTimer(m_overflowWindow, kQsReorderTimerId);
+        }
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    const float dt = std::clamp(static_cast<float>(now - m_qsReorderLastMs) / 1000.0F, 0.0F, 0.05F);
+    m_qsReorderLastMs = now;
+    QsGridCell cells[kQsModuleCount]{};
+    int rows = 0;
+    if (!PackQsModules(m_qsReorderOrder, cells, rows)) {
+        m_qsReorderOrder = m_qsReorderStartOrder;
+        static_cast<void>(PackQsModules(m_qsReorderOrder, cells, rows));
+    }
+    const size_t dragged = static_cast<size_t>(m_qsReorderModule);
+    // Damped springs (~2.8 Hz). Displaced tiles barely overshoot; the dropped
+    // tile is a little looser so it visibly settles into its slot.
+    constexpr float kOmega = 2.0F * 3.14159265F * 2.8F;
+    constexpr float kStep = 1.0F / 240.0F;
+    bool settled = true;
+    for (size_t module = 0; module < kQsModuleCount; ++module) {
+        float* pos = m_qsReorderPos[module];
+        float* vel = m_qsReorderVel[module];
+        const QsReorderSprite& sprite = m_qsReorderSprites[module];
+        if (module == dragged && !m_qsReorderDropped) {
+            pos[0] = static_cast<float>(std::clamp(m_qsReorderCursor.x - m_qsReorderGrab.x, m_qsReorderBounds.left,
+                std::max(m_qsReorderBounds.left, m_qsReorderBounds.right - sprite.width)));
+            pos[1] = static_cast<float>(std::clamp(m_qsReorderCursor.y - m_qsReorderGrab.y, m_qsReorderBounds.top,
+                std::max(m_qsReorderBounds.top, m_qsReorderBounds.bottom - sprite.height)));
+            vel[0] = 0.0F;
+            vel[1] = 0.0F;
+            continue;
+        }
+        const RECT slot = QsModuleSlot(module, cells[module]);
+        const float target[2] = {static_cast<float>(slot.left), static_cast<float>(slot.top)};
+        const float zeta = module == dragged ? 0.62F : 0.8F;
+        for (float remaining = dt; remaining > 0.0F; remaining -= kStep) {
+            const float h = std::min(kStep, remaining);
+            for (int axis = 0; axis < 2; ++axis) {
+                const float accel = kOmega * kOmega * (target[axis] - pos[axis]) - 2.0F * zeta * kOmega * vel[axis];
+                vel[axis] += accel * h;
+                pos[axis] += vel[axis] * h;
+            }
+        }
+        for (int axis = 0; axis < 2; ++axis) {
+            if (std::fabs(target[axis] - pos[axis]) < 0.35F && std::fabs(vel[axis]) < 8.0F) {
+                pos[axis] = target[axis];
+                vel[axis] = 0.0F;
+            } else {
+                settled = false;
+            }
+        }
+    }
+    const float liftGoal = m_qsReorderDropped ? 0.0F : 1.0F;
+    m_qsReorderLift += (liftGoal - m_qsReorderLift) * std::min(1.0F, dt * 14.0F);
+    if (std::fabs(liftGoal - m_qsReorderLift) < 0.02F) {
+        m_qsReorderLift = liftGoal;
+    } else {
+        settled = false;
+    }
+    PresentQsReorderFrame();
+    if (!settled) {
+        return;
+    }
+    if (m_qsReorderDropped) {
+        FinishQsReorder();
+    } else if (m_overflowWindow != nullptr) {
+        // Holding still: idle until the cursor moves again.
+        KillTimer(m_overflowWindow, kQsReorderTimerId);
+    }
+}
+
+void DockApp::PresentQsReorderFrame() {
+    POINT origin{};
+    LONG caret = m_overflowCaretX;
+    const LONG width = m_overflowPresentSize.cx;
+    const LONG height = m_overflowPresentSize.cy;
+    const size_t bytes = static_cast<size_t>(std::max(0L, width)) * static_cast<size_t>(std::max(0L, height)) * 4U;
+    if (!m_qsReorderActive || m_overflowWindow == nullptr || bytes == 0 || m_overflowPresentBits.size() != bytes ||
+        m_qsReorderBackdrop.size() != bytes || !OverflowScreenOrigin(origin, caret)) {
+        return;
+    }
+    m_overflowCaretX = caret;
+    uint8_t* frame = m_overflowPresentBits.data();
+    const RECT dirty = m_qsReorderDirty;
+    for (LONG y = dirty.top; y < dirty.bottom; ++y) {
+        const size_t offset =
+            (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(dirty.left)) * 4U;
+        std::memcpy(frame + offset, m_qsReorderBackdrop.data() + offset,
+            static_cast<size_t>(dirty.right - dirty.left) * 4U);
+    }
+    auto blit = [&](size_t module) {
+        const QsReorderSprite& sprite = m_qsReorderSprites[module];
+        const LONG left = static_cast<LONG>(std::lround(m_qsReorderPos[module][0]));
+        const LONG top = static_cast<LONG>(std::lround(m_qsReorderPos[module][1]));
+        for (LONG y = 0; y < sprite.height; ++y) {
+            const LONG dy = top + y;
+            if (dy < dirty.top || dy >= dirty.bottom) {
+                continue;
+            }
+            for (LONG x = 0; x < sprite.width; ++x) {
+                const LONG dx = left + x;
+                const size_t at = static_cast<size_t>(y) * static_cast<size_t>(sprite.width) + static_cast<size_t>(x);
+                const unsigned c = sprite.cover[at];
+                if (c == 0U || dx < dirty.left || dx >= dirty.right) {
+                    continue;
+                }
+                uint8_t* dst = frame + (static_cast<size_t>(dy) * static_cast<size_t>(width) + static_cast<size_t>(dx)) * 4U;
+                const uint8_t* src = sprite.bits.data() + at * 4U;
+                // Coverage lerp (not src-over): the snapshot already holds the
+                // panel under the tile, so translucent glass is not doubled.
+                const unsigned keep = 255U - c;
+                for (size_t channel = 0; channel < 4U; ++channel) {
+                    dst[channel] = static_cast<uint8_t>(src[channel] + (dst[channel] * keep + 127U) / 255U);
+                }
+            }
+        }
+    };
+    const size_t dragged = static_cast<size_t>(m_qsReorderModule);
+    for (size_t module = 0; module < kQsModuleCount; ++module) {
+        if (module != dragged) {
+            blit(module);
+        }
+    }
+    if (dragged < kQsModuleCount) {
+        const float lift = m_qsReorderLift;
+        if (lift > 0.01F) {
+            // Soft lift shadow: a few widening, fading rounded rects.
+            const QsReorderSprite& sprite = m_qsReorderSprites[dragged];
+            const LONG left = static_cast<LONG>(std::lround(m_qsReorderPos[dragged][0]));
+            const LONG top = static_cast<LONG>(std::lround(m_qsReorderPos[dragged][1]));
+            const LONG drop = static_cast<LONG>(std::lround(4.0F * m_qsGridScale * lift));
+            for (int ring = 1; ring <= 4; ++ring) {
+                const LONG grow = static_cast<LONG>(std::lround(static_cast<float>(ring) * 2.0F * m_qsGridScale));
+                const RECT shade{std::max(dirty.left, left - grow), std::max(dirty.top, top - grow + drop),
+                    std::min(dirty.right, left + sprite.width + grow),
+                    std::min(dirty.bottom, top + sprite.height + grow + drop)};
+                FillSquircleColorPremul(frame, static_cast<int>(width), static_cast<int>(height), shade,
+                    sprite.radius + static_cast<float>(grow), 0.045F * lift, 0, 0, 0);
+            }
+        }
+        blit(dragged);
+    }
+    static_cast<void>(PresentLayeredBits(m_overflowWindow, origin, width, height, frame, bytes, m_overflowLayerDib,
+        &dirty));
+}
+
+void DockApp::FinishQsReorder() {
+    if (m_overflowWindow != nullptr) {
+        KillTimer(m_overflowWindow, kQsReorderTimerId);
+    }
+    const bool changed = m_qsReorderOrder != m_qsOrder;
+    const bool pending = m_qsReorderPaintPending;
+    m_qsReorderActive = false;
+    m_qsReorderDropped = false;
+    m_qsReorderPaintPending = false;
+    m_qsReorderModule = -1;
+    for (QsReorderSprite& sprite : m_qsReorderSprites) {
+        std::vector<uint8_t>().swap(sprite.bits);
+        std::vector<uint8_t>().swap(sprite.cover);
+    }
+    std::vector<uint8_t>().swap(m_qsReorderBackdrop);
+    m_overflowHover = -1;
+    m_overflowHoverDirtyValid = false;
+    if (changed) {
+        m_qsOrder = m_qsReorderOrder;
+        m_qsOrderSource = m_qsOrder == DefaultQsModuleOrder() ? std::wstring{} : FormatQsModuleOrder(m_qsOrder);
+        m_config.SetQsLayout(m_qsOrderSource);
+        ScheduleConfigSave();
+    }
+    if (changed || pending) {
+        // The settled frame already matches the new layout; the rebuild
+        // re-bakes the glass shapes and hit rects behind it.
+        QueueOverflowPaint(false);
+        return;
+    }
+    if (m_overflowBaseBits.size() == m_overflowPresentBits.size()) {
+        m_overflowPresentBits = m_overflowBaseBits;
+        m_overflowLayerDib.contentValid = false;
+        PresentOverflowLayer();
+    }
+}
+
+void DockApp::AbortQsReorder() noexcept {
+    m_qsPressArmed = false;
+    if (!m_qsReorderActive) {
+        return;
+    }
+    if (m_overflowWindow != nullptr) {
+        KillTimer(m_overflowWindow, kQsReorderTimerId);
+    }
+    try {
+        // A released drag is a decision; save it even if the panel closes mid-settle.
+        if (m_qsReorderDropped && m_qsReorderOrder != m_qsOrder) {
+            m_qsOrder = m_qsReorderOrder;
+            m_qsOrderSource = m_qsOrder == DefaultQsModuleOrder() ? std::wstring{} : FormatQsModuleOrder(m_qsOrder);
+            m_config.SetQsLayout(m_qsOrderSource);
+            ScheduleConfigSave();
+        }
+    } catch (...) {
+    }
+    m_qsReorderActive = false;
+    m_qsReorderDropped = false;
+    m_qsReorderPaintPending = false;
+    m_qsReorderModule = -1;
+    for (QsReorderSprite& sprite : m_qsReorderSprites) {
+        std::vector<uint8_t>().swap(sprite.bits);
+        std::vector<uint8_t>().swap(sprite.cover);
+    }
+    std::vector<uint8_t>().swap(m_qsReorderBackdrop);
+    // The present frame is a reorder composite: never reopen with it.
+    std::vector<uint8_t>().swap(m_overflowPresentBits);
+    std::vector<uint8_t>().swap(m_overflowBaseBits);
+    std::vector<uint8_t>().swap(m_overflowUnderlayBits);
+    m_overflowPresentSize = {};
 }
