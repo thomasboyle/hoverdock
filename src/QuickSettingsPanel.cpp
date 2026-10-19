@@ -4421,8 +4421,12 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             if (draw) {
                 m_qsTrayArrowRects.push_back(arrow);
             }
-            // Arrow first so it wins over the row hit.
-            push(TrayFlyoutHitKind::TrayIconOptions, arrow, static_cast<int>(index));
+            // Arrow first so it wins over the row hit. Its click target is
+            // the full row height and well wider than the glyph area, so it
+            // is easy to hit; the glyph itself stays put.
+            const RECT arrowHit{std::max(textLeft, row.right - std::lround(64.0F * scale)), row.top, row.right,
+                row.bottom};
+            push(TrayFlyoutHitKind::TrayIconOptions, arrowHit, static_cast<int>(index));
             push(TrayFlyoutHitKind::NotifyIcon, row, static_cast<int>(index));
             y += rowH;
         }
