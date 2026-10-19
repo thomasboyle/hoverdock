@@ -1234,6 +1234,7 @@ void Renderer::InvalidateBackdrop() noexcept {
     m_backdropDwmFrameValid = false;
     m_backdropDwmFrame = 0;
     m_backdropRefreshRequested = false;
+    m_backdropDirtPending = false;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();
@@ -1747,6 +1748,11 @@ struct StripWatchState {
     RECT desktop{};
     HMONITOR monitor = nullptr;
     ULONGLONG retryAfter = 0;
+    // Dirt maps 1:1 onto desktop coordinates only for an unrotated output.
+    bool identityRotation = false;
+    // Becomes true once a frame of this duplication has been acquired; the
+    // first frame after (re)creation may not account for earlier changes.
+    bool primed = false;
 };
 
 StripWatchState g_stripWatch{};
@@ -1757,6 +1763,8 @@ void ResetStripWatch() noexcept {
     g_stripWatch.monitor = nullptr;
     g_stripWatch.desktop = {};
     g_stripWatch.retryAfter = 0;
+    g_stripWatch.identityRotation = false;
+    g_stripWatch.primed = false;
 }
 
 bool RectsIntersect(const RECT& left, const RECT& right) noexcept {
@@ -1806,6 +1814,8 @@ bool EnsureStripWatch(HMONITOR monitor) {
     g_stripWatch.device.Reset();
     g_stripWatch.monitor = monitor;
     g_stripWatch.desktop = {};
+    g_stripWatch.identityRotation = false;
+    g_stripWatch.primed = false;
 
     ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
@@ -1860,6 +1870,10 @@ bool EnsureStripWatch(HMONITOR monitor) {
     }
     g_stripWatch.desktop = matchDesc.DesktopCoordinates;
     g_stripWatch.retryAfter = 0;
+    DXGI_OUTDUPL_DESC duplicationDesc{};
+    g_stripWatch.duplication->GetDesc(&duplicationDesc);
+    g_stripWatch.identityRotation = duplicationDesc.Rotation == DXGI_MODE_ROTATION_IDENTITY ||
+        duplicationDesc.Rotation == DXGI_MODE_ROTATION_UNSPECIFIED;
     return true;
 }
 
@@ -1873,6 +1887,11 @@ struct DesktopDirtPoll {
     bool fresh = false;
     bool failed = false;
     bool overflow = false;
+    // Complete, correctly mapped dirt for g_stripWatch.desktop: absence of
+    // dirt over a region contained in that output proves its pixels held.
+    bool trusted = false;
+    // The delivered frame carried a desktop image update (not pointer-only).
+    bool imageUpdate = false;
     RECT rects[32]{};
     UINT count = 0;
 };
@@ -1892,10 +1911,13 @@ void PollDesktopDirt(HMONITOR monitor) noexcept {
     const HRESULT acquired =
         g_stripWatch.duplication->AcquireNextFrame(0, &frame, resource.GetAddressOf());
     if (acquired == DXGI_ERROR_WAIT_TIMEOUT) {
+        // No desktop update since the last acquired frame.
+        g_desktopDirt.trusted = g_stripWatch.primed && g_stripWatch.identityRotation;
         return;
     }
     if (FAILED(acquired)) {
         g_stripWatch.duplication.Reset();
+        g_stripWatch.primed = false;
         if (acquired != DXGI_ERROR_ACCESS_LOST) {
             g_stripWatch.retryAfter = GetTickCount64() + 30000ULL;
         }
@@ -1904,6 +1926,12 @@ void PollDesktopDirt(HMONITOR monitor) noexcept {
     }
     resource.Reset();
     g_desktopDirt.fresh = true;
+    g_desktopDirt.imageUpdate = frame.LastPresentTime.QuadPart != 0;
+    bool metadataComplete = true;
+    if (frame.LastPresentTime.QuadPart != 0 && frame.TotalMetadataBufferSize == 0) {
+        // An image update without dirt metadata cannot vouch for any region.
+        metadataComplete = false;
+    }
 
     auto pushRect = [](const RECT& virtualRect) {
         if (g_desktopDirt.count >= 32) {
@@ -1919,7 +1947,9 @@ void PollDesktopDirt(HMONITOR monitor) noexcept {
         dirtyRects, &dirtyBytes);
     if (dirtyHr == DXGI_ERROR_MORE_DATA) {
         g_desktopDirt.overflow = true;
-    } else if (SUCCEEDED(dirtyHr)) {
+    } else if (FAILED(dirtyHr)) {
+        metadataComplete = false;
+    } else {
         const UINT count = dirtyBytes / static_cast<UINT>(sizeof(RECT));
         for (UINT index = 0; index < count; ++index) {
             const RECT& local = dirtyRects[index];
@@ -1937,7 +1967,9 @@ void PollDesktopDirt(HMONITOR monitor) noexcept {
         &moveBytes);
     if (moveHr == DXGI_ERROR_MORE_DATA) {
         g_desktopDirt.overflow = true;
-    } else if (SUCCEEDED(moveHr)) {
+    } else if (FAILED(moveHr)) {
+        metadataComplete = false;
+    } else {
         const UINT count = moveBytes / static_cast<UINT>(sizeof(DXGI_OUTDUPL_MOVE_RECT));
         for (UINT index = 0; index < count; ++index) {
             const RECT& local = moves[index].DestinationRect;
@@ -1950,6 +1982,9 @@ void PollDesktopDirt(HMONITOR monitor) noexcept {
     }
 
     g_stripWatch.duplication->ReleaseFrame();
+    g_desktopDirt.trusted =
+        metadataComplete && g_stripWatch.primed && g_stripWatch.identityRotation;
+    g_stripWatch.primed = true;
 }
 
 StripDirt DirtForRegion(const RECT& region, const RECT* selfExclude = nullptr,
@@ -1975,6 +2010,34 @@ StripDirt DirtForRegion(const RECT& region, const RECT* selfExclude = nullptr,
         ProfileScope::Mark("Renderer::SkipBackdropSelfDirt");
     }
     return StripDirt::Clean;
+}
+
+// Unknown: no usable poll. Quiet: trusted, but no image frame was delivered
+// this tick (a DWM frame may still be in flight; pointer-only frames do not
+// vouch for it). Clean / Dirty: a delivered image frame's accumulated dirt
+// does not / does touch the region.
+enum class StripVerdict { Unknown, Quiet, Clean, Dirty };
+
+// Dock strip gate from this tick's shared poll. Any dirt that touches the strip
+// counts, including the dock's own presents: content behind the glass lands in
+// the same rect, so self-dirt cannot be told apart and is never discarded.
+StripVerdict StripVerdictFor(const RECT& region) noexcept {
+    if (!g_desktopDirt.valid || g_desktopDirt.failed || !g_desktopDirt.trusted ||
+        !RectContainsRect(g_stripWatch.desktop, region)) {
+        return StripVerdict::Unknown;
+    }
+    if (g_desktopDirt.overflow) {
+        return StripVerdict::Dirty;
+    }
+    if (!g_desktopDirt.fresh || !g_desktopDirt.imageUpdate) {
+        return StripVerdict::Quiet;
+    }
+    for (UINT index = 0; index < g_desktopDirt.count; ++index) {
+        if (RectsIntersect(g_desktopDirt.rects[index], region)) {
+            return StripVerdict::Dirty;
+        }
+    }
+    return StripVerdict::Clean;
 }
 
 }  // namespace
@@ -2007,26 +2070,48 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         return false;
     }
 
-    // Sample whenever DWM composes a new frame for this monitor. Dirty-rect
-    // gating froze the plate: the strip is the dock HWND, so every change under
-    // the glass is "inside" that window and was discarded. The timer runs at
-    // the monitor refresh; the RGB hash below still skips the GPU upload when
-    // the pixels behind the glass did not change. cFrame is consumed only after
-    // a successful read so a failed sample is retried on the next tick.
+    // Sample only when something under the strip may have changed. A trusted
+    // duplication poll accumulates dirt between acquires, so a delivered frame
+    // with no dirt over the strip proves the pixels behind the glass held, and
+    // DWM frames from pointer motion or changes elsewhere skip the read. When
+    // no duplication frame was delivered, fall back to sampling every newly
+    // composed DWM frame so a frame still in flight is never sampled late.
+    // The RGB check below still skips the GPU upload when the pixels did not
+    // change. cFrame / pending dirt is consumed only after a successful read
+    // so a failed sample is retried on the next tick.
     uint64_t composedFrame = 0;
     bool haveComposedFrame = false;
     if (m_backdropValid && !m_backdropRefreshRequested) {
+        const StripVerdict verdict = StripVerdictFor(screenRectangle);
+        if (verdict == StripVerdict::Dirty) {
+            m_backdropDirtPending = true;
+        }
         DWM_TIMING_INFO timing{};
         timing.cbSize = sizeof(timing);
         if (SUCCEEDED(DwmGetCompositionTimingInfo(m_window, &timing))) {
-            if (m_backdropDwmFrameValid && timing.cFrame == m_backdropDwmFrame) {
+            composedFrame = timing.cFrame;
+            haveComposedFrame = true;
+        }
+        if (!m_backdropDirtPending) {
+            bool skip = false;
+            if (verdict == StripVerdict::Clean) {
+                // Every frame composed so far is vouched for; later dirt from
+                // a frame still in flight arrives as Dirty on the next poll.
+                if (haveComposedFrame) {
+                    m_backdropDwmFrame = composedFrame;
+                    m_backdropDwmFrameValid = true;
+                }
+                skip = true;
+            } else {
+                skip = haveComposedFrame && m_backdropDwmFrameValid &&
+                    composedFrame == m_backdropDwmFrame;
+            }
+            if (skip) {
                 if (changed != nullptr) {
                     *changed = false;
                 }
                 return true;
             }
-            composedFrame = timing.cFrame;
-            haveComposedFrame = true;
         }
     } else {
         m_backdropRefreshRequested = false;
@@ -2038,6 +2123,7 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         }
     }
     const auto commitComposedFrame = [&]() noexcept {
+        m_backdropDirtPending = false;
         if (haveComposedFrame) {
             m_backdropDwmFrame = composedFrame;
             m_backdropDwmFrameValid = true;
@@ -2064,8 +2150,6 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         !m_backdropValid || sampleDiffs > kBackdropChangeMinSamples;
     if (!meaningfullyChanged) {
         commitComposedFrame();
-        CommitBackdropProbeFromDib();
-        m_backdropHash = HashBackdropPixels();
         if (changed != nullptr) {
             *changed = false;
         }
@@ -2082,10 +2166,8 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         }
     }
     commitComposedFrame();
-    m_backdropHash = HashBackdropPixels();
     m_backdropValid = true;
     CommitBackdropSamplesFromDib();
-    CommitBackdropProbeFromDib();
     ++m_backdropChangeSerial;
     m_lastBackdropSerialBumpMs = GetTickCount64();
     if (changed != nullptr) {
@@ -2805,6 +2887,7 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropDwmFrame = 0;
     m_backdropDwmFrameValid = false;
     m_backdropRefreshRequested = false;
+    m_backdropDirtPending = false;
     m_backdropProbeValid = false;
     m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();

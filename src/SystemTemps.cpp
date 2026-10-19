@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <condition_variable>
 #include <cstdlib>
+#include <cwchar>
 #include <cwctype>
 #include <limits>
 #include <mutex>
@@ -928,39 +929,55 @@ struct HoverDockCpuTempFile {
 };
 #pragma pack(pop)
 
-std::wstring CpuTempPayloadPath() {
-    wchar_t* local = nullptr;
-    std::wstring path;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &local)) &&
-        local != nullptr) {
-        path = local;
-        path += L"\\LiquidGlassDock";
-        CreateDirectoryW(path.c_str(), nullptr);
-        path += L"\\cpu-temp.bin";
+// Resolved once: the elevated helper publishes and the dock reads at ~2 Hz,
+// and a known-folder lookup + CreateDirectory per call dominated that cost.
+const std::wstring& CpuTempPayloadPath() {
+    static const std::wstring path = [] {
+        wchar_t* local = nullptr;
+        std::wstring resolved;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &local)) &&
+            local != nullptr) {
+            resolved = local;
+            resolved += L"\\LiquidGlassDock";
+            CreateDirectoryW(resolved.c_str(), nullptr);
+            resolved += L"\\cpu-temp.bin";
+        }
         CoTaskMemFree(local);
-    }
+        return resolved;
+    }();
     return path;
 }
 
+bool WriteCpuTempTmp(const std::wstring& tmp, const HoverDockCpuTempFile& file) {
+    const HANDLE handle = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    const bool ok = WriteFile(handle, &file, sizeof(file), &written, nullptr) != FALSE &&
+        written == sizeof(file);
+    CloseHandle(handle);
+    return ok;
+}
+
 bool WriteCpuTempFile(const HoverDockCpuTempFile& file) {
-    const std::wstring path = CpuTempPayloadPath();
+    const std::wstring& path = CpuTempPayloadPath();
     if (path.empty()) {
         return false;
     }
     const std::wstring tmp = path + L".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            return false;
-        }
-        out.write(reinterpret_cast<const char*>(&file), sizeof(file));
-        if (!out) {
+    if (!WriteCpuTempTmp(tmp, file)) {
+        // The folder may have been removed since the path was resolved.
+        CreateDirectoryW(path.substr(0, path.find_last_of(L'\\')).c_str(), nullptr);
+        if (!WriteCpuTempTmp(tmp, file)) {
             return false;
         }
     }
-    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    // No write-through: the payload is a live 2 Hz reading, not durable state.
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(path.c_str());
-        if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
             DeleteFileW(tmp.c_str());
             return false;
         }
@@ -969,17 +986,22 @@ bool WriteCpuTempFile(const HoverDockCpuTempFile& file) {
 }
 
 bool ReadCpuTempFile(HoverDockCpuTempFile& out) {
-    const std::wstring path = CpuTempPayloadPath();
+    const std::wstring& path = CpuTempPayloadPath();
     if (path.empty()) {
         return false;
     }
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    const HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
         return false;
     }
     HoverDockCpuTempFile file{};
-    in.read(reinterpret_cast<char*>(&file), sizeof(file));
-    if (!in || file.magic != kCpuTempMagic || file.version != kCpuTempVersion) {
+    DWORD read = 0;
+    const bool ok = ReadFile(handle, &file, sizeof(file), &read, nullptr) != FALSE &&
+        read == sizeof(file);
+    CloseHandle(handle);
+    if (!ok || file.magic != kCpuTempMagic || file.version != kCpuTempVersion) {
         return false;
     }
     out = file;
@@ -2250,13 +2272,18 @@ int RunCpuSensorWorkerImpl() {
         return 2;
     }
 
+    // Readers only need the value plus a stamp younger than kCpuTempFreshMs, so
+    // an unchanged reading is republished on a heartbeat instead of every poll.
+    constexpr ULONGLONG kUnchangedRepublishMs = 2000;
+    static_assert(kUnchangedRepublishMs + 1000 < kCpuTempFreshMs);
+    HoverDockCpuTempFile published{};
+    ULONGLONG publishedAt = 0;
     uint32_t seq = 0;
     for (;;) {
         const double celsius = amdPath ? amd.ReadPackageC() : intel.ReadPackageC();
         HoverDockCpuTempFile file{};
         file.magic = kCpuTempMagic;
         file.version = kCpuTempVersion;
-        file.sequence = ++seq;
         file.cpuPackageC = PlausibleTemp(celsius) ? static_cast<int>(std::lround(celsius)) : -1;
         file.cpuPackageW = -1;  // RAPL / MSR package watts stay on the unelevated Dock path
         file.stampMs = GetTickCount64();
@@ -2266,7 +2293,18 @@ int RunCpuSensorWorkerImpl() {
         } else {
             wcsncpy_s(file.name, L"CPU Package", _TRUNCATE);
         }
-        WriteCpuTempFile(file);
+        const bool same = publishedAt != 0 && file.cpuPackageC == published.cpuPackageC &&
+            file.cpuPackageW == published.cpuPackageW && file.status == published.status &&
+            std::wmemcmp(file.name, published.name, std::size(file.name)) == 0;
+        if (!same || file.stampMs - publishedAt >= kUnchangedRepublishMs) {
+            file.sequence = ++seq;
+            if (WriteCpuTempFile(file)) {
+                published = file;
+                publishedAt = file.stampMs;
+            } else {
+                publishedAt = 0;
+            }
+        }
         Sleep(500);
     }
 }

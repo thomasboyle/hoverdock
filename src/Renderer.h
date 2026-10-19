@@ -299,12 +299,14 @@ private:
     bool m_backdropValid = false;
     uint64_t m_backdropHash = 0;
     uint64_t m_backdropChangeSerial = 0;
-    // Last DWM composed-frame count sampled into the backdrop. A new cFrame
-    // is sampled; an unchanged cFrame skips the read. Dirty rects are not a
-    // gate: the strip is the dock HWND, so they cannot see wallpaper under it.
+    // Last DWM composed-frame count sampled into the backdrop. Fallback gate
+    // when the shared duplication poll cannot vouch for the strip.
     uint64_t m_backdropDwmFrame = 0;
     bool m_backdropDwmFrameValid = false;
     bool m_backdropRefreshRequested = false;
+    // Duplication reported dirt over the strip that no successful sample has
+    // consumed yet (a failed read or upload must retry on the next tick).
+    bool m_backdropDirtPending = false;
     // Sparse probe DIB (width x kBackdropProbeRows) + reference from last commit.
     HDC m_backdropProbeDc = nullptr;
     HBITMAP m_backdropProbeBitmap = nullptr;
