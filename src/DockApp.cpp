@@ -7198,10 +7198,13 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     }
     case SettingsHitKind::CheckNow:
     case SettingsHitKind::PerfProfile: {
-        // Capsule modules: dark wash over the whole shape.
-        SetFlyoutChromeInk(33, 34, 36);
+        // Capsule modules: dark wash in the exact pill (round caps), inset
+        // 1px. A squircle of the same radius bulged past the rounded ends.
         const float h = static_cast<float>(hit.bounds.bottom - hit.bounds.top);
-        FillSquirclePremul(pixels, width, height, hit.bounds, h * 0.5F, 0.10F);
+        const float radius = (std::max)(1.0F, 0.5F * h - 1.0F);
+        FillPillColorPremul(pixels, width, height, static_cast<float>(hit.bounds.left) + 0.5F * h,
+            static_cast<float>(hit.bounds.right) - 0.5F * h, 0.5F * static_cast<float>(hit.bounds.top + hit.bounds.bottom),
+            radius, 0.10F, 36, 34, 33);
         break;
     }
     case SettingsHitKind::QsColorReset:
