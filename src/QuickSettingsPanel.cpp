@@ -3035,6 +3035,9 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
     for (RECT& chevron : m_qsTileChevron) {
         OffsetRect(&chevron, shadowMargin, shadowMargin);
     }
+    for (RECT& area : m_qsTrayArrowRects) {
+        OffsetRect(&area, shadowMargin, shadowMargin);
+    }
     if (m_qsModuleRectsValid) {
         for (RECT& module : m_qsModuleRect) {
             OffsetRect(&module, shadowMargin, shadowMargin);
@@ -3415,6 +3418,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         m_qsModuleRectsValid = false;
         m_qsTrayStatusValid = false;
         m_qsTrayStatusRect = {};
+        m_qsTrayArrowRects.clear();
     }
     SetQsAccent(m_config.QsIconColor());
     const bool home = m_qsPage == QuickSettingsPage::Home;
@@ -4414,10 +4418,17 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 text({textLeft, mid + 1, textRight, row.bottom - 2}, statusFont, status,
                     DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 160);
             }
+            if (draw) {
+                m_qsTrayArrowRects.push_back(arrow);
+            }
             // Arrow first so it wins over the row hit.
             push(TrayFlyoutHitKind::TrayIconOptions, arrow, static_cast<int>(index));
             push(TrayFlyoutHitKind::NotifyIcon, row, static_cast<int>(index));
             y += rowH;
+        }
+        if (draw) {
+            // Keep alphas across rebuilds of the same rows (no re-fade).
+            m_qsTrayArrowAlpha.resize(m_qsTrayArrowRects.size(), 0.0F);
         }
         if (m_overflowIcons.size() > shown) {
             text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont,

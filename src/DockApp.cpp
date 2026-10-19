@@ -9242,32 +9242,11 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     }
     case TrayFlyoutHitKind::NotifyIcon:
     case TrayFlyoutHitKind::TrayIconOptions: {
-        // Full-row plate, plus the Control Centre style arrow that reveals the
-        // item's menu. Hovering the arrow itself adds a round plate behind it.
+        // Full-row plate. The row's menu arrow fades in separately
+        // (PaintQsTrayArrows), like the Home tile arrows.
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         const RECT row = OverflowHoverBounds(hit);
         FillSquirclePremul(pixels, width, height, row, ContentSquircleRadius(row, scale), 0.10F);
-        RECT arrow{};
-        for (const TrayFlyoutHit& other : m_overflowHits) {
-            if (other.kind == TrayFlyoutHitKind::TrayIconOptions && other.index == hit.index) {
-                arrow = other.bounds;
-                break;
-            }
-        }
-        const int extent = static_cast<int>(m_qsTrayArrowExtent);
-        if (arrow.right > arrow.left && extent > 0 &&
-            m_qsTrayArrowGlyph.size() >= static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U) {
-            const float cx = 0.5F * static_cast<float>(arrow.left + arrow.right);
-            const float cy = 0.5F * static_cast<float>(arrow.top + arrow.bottom);
-            if (hit.kind == TrayFlyoutHitKind::TrayIconOptions) {
-                const float radius = (std::min)(0.5F * static_cast<float>(arrow.bottom - arrow.top),
-                    0.5F * static_cast<float>(arrow.right - arrow.left)) - 2.0F * scale;
-                FillPillColorPremul(pixels, width, height, cx, cx, cy, (std::max)(4.0F, radius), 0.12F,
-                    g_flyoutInkB, g_flyoutInkG, g_flyoutInkR);
-            }
-            CompositePremul(pixels, width, height, static_cast<int>(std::lround(cx)) - extent / 2,
-                static_cast<int>(std::lround(cy)) - extent / 2, m_qsTrayArrowGlyph.data(), extent, extent);
-        }
         break;
     }
     case TrayFlyoutHitKind::Wifi:
@@ -9336,12 +9315,55 @@ void DockApp::KickQsChevronFade() noexcept {
         return;
     }
     const int target = QsChevronTarget();
-    for (int tile = 0; tile < static_cast<int>(kQsChevronTiles); ++tile) {
-        if (m_qsChevronAlpha[tile] != (tile == target ? 1.0F : 0.0F)) {
-            m_qsChevronFadeLastMs = GetTickCount64();
-            SetTimer(m_overflowWindow, kQsChevronFadeTimerId, kQsChevronFadeIntervalMs, nullptr);
-            return;
+    bool moving = false;
+    for (int tile = 0; tile < static_cast<int>(kQsChevronTiles) && !moving; ++tile) {
+        moving = m_qsChevronAlpha[tile] != (tile == target ? 1.0F : 0.0F);
+    }
+    const int row = QsTrayArrowTarget();
+    for (size_t index = 0; index < m_qsTrayArrowAlpha.size() && !moving; ++index) {
+        moving = m_qsTrayArrowAlpha[index] != (static_cast<int>(index) == row ? 1.0F : 0.0F);
+    }
+    if (moving) {
+        m_qsChevronFadeLastMs = GetTickCount64();
+        SetTimer(m_overflowWindow, kQsChevronFadeTimerId, kQsChevronFadeIntervalMs, nullptr);
+    }
+}
+
+int DockApp::QsTrayArrowTarget() const noexcept {
+    if (m_qsPage != QuickSettingsPage::SystemTray || m_overflowHover < 0 ||
+        static_cast<size_t>(m_overflowHover) >= m_overflowHits.size()) {
+        return -1;
+    }
+    const TrayFlyoutHit& hit = m_overflowHits[static_cast<size_t>(m_overflowHover)];
+    if (hit.kind != TrayFlyoutHitKind::NotifyIcon && hit.kind != TrayFlyoutHitKind::TrayIconOptions) {
+        return -1;
+    }
+    return hit.index;
+}
+
+void DockApp::PaintQsTrayArrows(uint8_t* pixels, int width, int height) {
+    const int extent = static_cast<int>(m_qsTrayArrowExtent);
+    const size_t bytes = static_cast<size_t>(std::max(0, extent)) * static_cast<size_t>(std::max(0, extent)) * 4U;
+    if (pixels == nullptr || m_qsPage != QuickSettingsPage::SystemTray || extent <= 0 ||
+        m_qsTrayArrowGlyph.size() < bytes) {
+        return;
+    }
+    for (size_t index = 0; index < m_qsTrayArrowRects.size() && index < m_qsTrayArrowAlpha.size(); ++index) {
+        const float alpha = m_qsTrayArrowAlpha[index];
+        if (alpha <= 0.0F) {
+            continue;
         }
+        // Same smoothstep fade as the Home tile arrows.
+        const float eased = alpha * alpha * (3.0F - 2.0F * alpha);
+        const uint32_t factor = static_cast<uint32_t>(std::lround(eased * 256.0F));
+        m_qsTrayArrowScratch.resize(bytes);
+        for (size_t i = 0; i < bytes; ++i) {
+            m_qsTrayArrowScratch[i] = static_cast<uint8_t>((m_qsTrayArrowGlyph[i] * factor) >> 8U);
+        }
+        const RECT& area = m_qsTrayArrowRects[index];
+        const int left = static_cast<int>((area.left + area.right) / 2L) - extent / 2;
+        const int top = static_cast<int>((area.top + area.bottom) / 2L) - extent / 2;
+        CompositePremul(pixels, width, height, left, top, m_qsTrayArrowScratch.data(), extent, extent);
     }
 }
 
@@ -9350,6 +9372,7 @@ void DockApp::ResetQsChevronFade() noexcept {
         m_qsChevronAlpha[tile] = 0.0F;
         m_qsChevronDrawn[tile] = false;
     }
+    std::fill(m_qsTrayArrowAlpha.begin(), m_qsTrayArrowAlpha.end(), 0.0F);
     if (m_overflowWindow != nullptr) {
         KillTimer(m_overflowWindow, kQsChevronFadeTimerId);
     }
@@ -9440,6 +9463,26 @@ void DockApp::PaintQsChevronFadeFast() {
 }
 
 void DockApp::StepQsChevronFade() {
+    if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::SystemTray) {
+        const ULONGLONG now = GetTickCount64();
+        const float step = static_cast<float>(now - m_qsChevronFadeLastMs) / kQsChevronFadeMs;
+        m_qsChevronFadeLastMs = now;
+        const int target = QsTrayArrowTarget();
+        bool settled = true;
+        for (size_t index = 0; index < m_qsTrayArrowAlpha.size(); ++index) {
+            const float goal = static_cast<int>(index) == target ? 1.0F : 0.0F;
+            float& alpha = m_qsTrayArrowAlpha[index];
+            alpha = goal > alpha ? std::min(goal, alpha + step) : std::max(goal, alpha - step);
+            settled = settled && alpha == goal;
+        }
+        if (settled && m_overflowWindow != nullptr) {
+            KillTimer(m_overflowWindow, kQsChevronFadeTimerId);
+        }
+        // Rows carry a hover plate under the arrow, so redraw via the hover
+        // path (restore, plate, arrows) rather than the plate-free tile path.
+        PaintOverflowHoverFast();
+        return;
+    }
     if (!IsOverflowOpen() || m_qsPage != QuickSettingsPage::Home) {
         ResetQsChevronFade();
         return;
@@ -9595,6 +9638,14 @@ void DockApp::PaintOverflowHoverFast() {
             restoreRect(chevronDirty[tile]);
         }
     }
+    // System Tray row arrows: cleared from the arrow-free base before the
+    // hover plate is re-applied, then faded back in on top of it.
+    const bool trayArrows = m_qsPage == QuickSettingsPage::SystemTray && !m_qsTrayArrowRects.empty();
+    if (trayArrows) {
+        for (const RECT& area : m_qsTrayArrowRects) {
+            restoreRect(area);
+        }
+    }
 
     if (m_overflowHover >= 0 && static_cast<size_t>(m_overflowHover) < m_overflowHits.size()) {
         const TrayFlyoutHit& hit = m_overflowHits[static_cast<size_t>(m_overflowHover)];
@@ -9618,6 +9669,17 @@ void DockApp::PaintOverflowHoverFast() {
     }
 
     PaintQsTileChevrons(m_overflowPresentBits.data(), width, height);
+    if (trayArrows) {
+        PaintQsTrayArrows(m_overflowPresentBits.data(), width, height);
+        for (const RECT& area : m_qsTrayArrowRects) {
+            if (!haveDirty) {
+                dirty = area;
+                haveDirty = true;
+            } else {
+                UnionInto(dirty, area);
+            }
+        }
+    }
     for (const RECT& next : chevronDirty) {
         if (next.right <= next.left) {
             continue;
@@ -10071,6 +10133,7 @@ void DockApp::PaintOverflowPopup() {
         m_overflowHoverDirtyValid = true;
     }
     PaintQsTileChevrons(pixels, width, height);
+    PaintQsTrayArrows(pixels, width, height);
     m_overflowPresentBits.resize(bytes);
     std::memcpy(m_overflowPresentBits.data(), pixels, bytes);
     m_overflowPresentSize = m_overflowSize;

@@ -500,6 +500,9 @@ private:
     void ApplyTrayIcons(std::vector<TrayNotifyIcon>&& icons);
     // Hover/dirty extent of a hit: tray option arrows light their whole row.
     [[nodiscard]] RECT OverflowHoverBounds(const TrayFlyoutHit& hit) const noexcept;
+    // Hovered System Tray row (-1 none) and its fading row arrows.
+    [[nodiscard]] int QsTrayArrowTarget() const noexcept;
+    void PaintQsTrayArrows(uint8_t* pixels, int width, int height);
     void ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height,
         const TrayFlyoutHit& hit) const;
     void DestroyOverflowPopup() noexcept;
@@ -1152,6 +1155,11 @@ private:
     // Right-chevron for tray rows, in the page ink (built during layout).
     std::vector<uint8_t> m_qsTrayArrowGlyph;
     UINT m_qsTrayArrowExtent = 0;
+    // Per-row arrow areas (window px) and fade alphas: the same hover fade as
+    // the Home tile arrows, driven by kQsChevronFadeTimerId.
+    std::vector<RECT> m_qsTrayArrowRects;
+    std::vector<float> m_qsTrayArrowAlpha;
+    std::vector<uint8_t> m_qsTrayArrowScratch;
     RECT m_qsBtStatusRect{};
     bool m_qsBtStatusValid = false;
     bool m_qsBtStatusDirty = false;
