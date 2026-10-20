@@ -2605,6 +2605,7 @@ int DockApp::Run() {
     static_cast<void>(m_windows.Refresh());
     static_cast<void>(m_tray.Refresh());
     m_weather.Start(m_window, kWeatherMessage);
+    m_badges.Start(m_window, kBadgeMessage);
     m_bluetooth.Start(m_window, kBluetoothMessage);
     m_bluetooth.SetHandsFree(m_config.HandsFree(), false);
     SetTimer(m_window, kWeatherTimerId, WeatherService::kRefreshIntervalMs, nullptr);
@@ -3667,6 +3668,11 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             EnsureTrayIcons();
             QueueRenderFrame();
         }
+        if (m_badgeIconsApplyPending) {
+            m_badgeIconsApplyPending = false;
+            EnsureBadgeIcons();
+            QueueRenderFrame();
+        }
         return 0;
 
     case kDeferredClickMessage: {
@@ -3930,6 +3936,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         OnWeatherUpdated();
         return 0;
 
+    case kBadgeMessage:
+        OnBadgesUpdated();
+        return 0;
+
     case kBluetoothMessage:
         ApplyBluetoothSnapshot();
         return 0;
@@ -4059,6 +4069,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         KillTimer(window, kWeatherTimerId);
         KillTimer(window, kBluetoothTimerId);
         m_weather.Stop();
+        m_badges.Stop();
         m_bluetooth.Stop();
         StopTaskbarMonitor();
         StopUpdateTimer();
@@ -4578,6 +4589,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
             PostMessageW(m_window, kLayoutApplyMessage, 0, 0);
         }
     }
+    static_cast<void>(RefreshBadgeAssignments());
     if (IsOverflowOpen()) {
         PositionOverflowPopup();
     }
@@ -5148,6 +5160,9 @@ void DockApp::ApplyIconLoad(const IconLoadRequest& request,
         m_trayVisualKey.clear();
         EnsureTrayIcons();
         EnsureTrashIcons();
+        // LoadIcons dropped every atlas key, badge slots included.
+        m_badgeVisualKey.clear();
+        EnsureBadgeIcons();
     } catch (...) {
         m_renderer.CancelIconBatch();
         throw;
@@ -5223,6 +5238,7 @@ void DockApp::AssignIconTextureIndices() {
         m_iconRenderData[index].textureIndex =
             m_renderer.TextureIndexForTarget(SystemTray::TargetForSlot(icon.traySlot));
     }
+    AssignBadgeTextureIndices();
 }
 
 void DockApp::EnsureTrayIcons() {
@@ -5308,6 +5324,278 @@ void DockApp::RefreshTray(bool forceLayout) {
     // Non-blocking: the 1 Hz clock tick must not Present(1)/vsync-wait on the
     // UI thread that services WH_MOUSE_LL (hitch while hovering the dock).
     QueueRenderFrame(false);
+}
+
+// --- Notification badges -----------------------------------------------------
+
+void DockApp::OnBadgesUpdated() {
+    m_badgeSources = m_badges.Snapshot();
+    m_badgeMatchMemo.clear();
+    if (RefreshBadgeAssignments()) {
+        QueueRenderFrame(false);
+    }
+}
+
+bool DockApp::RefreshBadgeAssignments() {
+    std::vector<DockBadge> previous = std::move(m_dockBadges);
+    m_dockBadges.clear();
+    if (!m_badgeSources.empty()) {
+        if (m_badgeMatchMemo.size() > 256U) {
+            m_badgeMatchMemo.clear();
+        }
+        const UINT atlas = m_rendererInitialized ? m_renderer.IconAtlasPixelExtent() : 0U;
+        const size_t appCount = LesserOf(m_iconRenderData.size(), m_displayApps.size());
+        for (size_t index = 0; index < appCount; ++index) {
+            const DockIconRenderData& icon = m_iconRenderData[index];
+            const DisplayApp& entry = m_displayApps[index];
+            if (icon.kind != DockIconKind::App || IsLayoutOnlyTarget(entry.app.target)) {
+                continue;
+            }
+            std::wstring memoKey = entry.app.target;
+            memoKey += L'\x1f';
+            memoKey += std::to_wstring(reinterpret_cast<uintptr_t>(entry.runningWindow));
+            int match = -1;
+            if (const auto memo = m_badgeMatchMemo.find(memoKey); memo != m_badgeMatchMemo.end()) {
+                match = memo->second;
+            } else {
+                for (size_t source = 0; source < m_badgeSources.size(); ++source) {
+                    if (m_windows.MatchesAppUserModelId(entry.app, entry.runningWindow,
+                            m_badgeSources[source].aumid)) {
+                        match = static_cast<int>(source);
+                        break;
+                    }
+                }
+                m_badgeMatchMemo.emplace(std::move(memoKey), match);
+            }
+            if (match < 0) {
+                continue;
+            }
+
+            // macOS proportions: ~0.36 S tall; one digit is a circle, more
+            // digits stretch it into a pill.
+            const std::wstring& text = m_badgeSources[static_cast<size_t>(match)].text;
+            const float iconS = static_cast<float>(icon.bounds.right - icon.bounds.left);
+            LONG height = std::max(12L, std::lround(0.36F * iconS));
+            const float widthScale = text.size() <= 1 ? 1.0F : (text.size() == 2 ? 1.36F : 1.72F);
+            LONG width = std::max(height, std::lround(static_cast<float>(height) * widthScale));
+            if (atlas > 0U) {
+                width = std::min(width, static_cast<LONG>(atlas));
+                height = std::min(height, static_cast<LONG>(atlas));
+            }
+            DockBadge badge;
+            badge.iconIndex = index;
+            badge.text = text;
+            badge.width = width;
+            badge.height = height;
+            badge.textureKey = L"dock:badge:" + std::to_wstring(m_dockBadges.size());
+            m_dockBadges.push_back(std::move(badge));
+        }
+    }
+    AssignBadgeTextureIndices();
+    if (BadgeIconsNeedApply()) {
+        // Raster + atlas upload waits on the GPU: defer like the tray glyphs.
+        m_badgeIconsApplyPending = true;
+        if (m_window != nullptr) {
+            PostMessageW(m_window, kLayoutApplyMessage, 0, 0);
+        }
+    }
+    return !std::ranges::equal(previous, m_dockBadges, [](const DockBadge& left, const DockBadge& right) {
+        return left.iconIndex == right.iconIndex && left.text == right.text &&
+            left.width == right.width && left.height == right.height;
+    });
+}
+
+void DockApp::AssignBadgeTextureIndices() {
+    for (DockBadge& badge : m_dockBadges) {
+        badge.ready = m_rendererInitialized && m_renderer.HasIconForTarget(badge.textureKey);
+        badge.textureIndex = badge.ready ? m_renderer.TextureIndexForTarget(badge.textureKey) : 0U;
+    }
+}
+
+std::wstring DockApp::BadgeIconsKey() const {
+    if (m_dockBadges.empty()) {
+        return {};
+    }
+    std::wstring key = std::to_wstring(m_renderer.IconAtlasPixelExtent());
+    for (const DockBadge& badge : m_dockBadges) {
+        key += L'|';
+        key += badge.text;
+        key += L'@';
+        key += std::to_wstring(badge.width);
+        key += L'x';
+        key += std::to_wstring(badge.height);
+    }
+    return key;
+}
+
+bool DockApp::BadgeIconsNeedApply() const {
+    if (!m_rendererInitialized) {
+        return false;
+    }
+    return BadgeIconsKey() != m_badgeVisualKey ||
+        std::ranges::any_of(m_dockBadges, [](const DockBadge& badge) { return !badge.ready; });
+}
+
+void DockApp::EnsureBadgeIcons() {
+    if (!m_rendererInitialized) {
+        return;
+    }
+    const std::wstring key = BadgeIconsKey();
+    const bool missing = std::ranges::any_of(m_dockBadges, [this](const DockBadge& badge) {
+        return !m_renderer.HasIconForTarget(badge.textureKey);
+    });
+    if (key != m_badgeVisualKey || missing) {
+        m_badgeVisualKey = key;
+        if (!m_dockBadges.empty()) {
+            const UINT atlas = m_renderer.IconAtlasPixelExtent();
+            std::vector<std::wstring> targets;
+            std::vector<std::vector<uint8_t>> pixels;
+            targets.reserve(m_dockBadges.size());
+            pixels.reserve(m_dockBadges.size());
+            for (const DockBadge& badge : m_dockBadges) {
+                targets.push_back(badge.textureKey);
+                pixels.push_back(RasterizeBadge(badge.text, badge.width, badge.height, atlas));
+            }
+            try {
+                m_renderer.UpdateCachedIcons(targets, pixels);
+            } catch (const std::exception&) {
+                Log(L"Badge icon upload failed.");
+            }
+        }
+    }
+    AssignBadgeTextureIndices();
+}
+
+RECT DockApp::BadgeBounds(const RECT& iconBounds, LONG width, LONG height) noexcept {
+    // macOS anchor: badge centre 0.13 S in from the icon's right edge and
+    // 0.15 S down from its top, so it overhangs the corner slightly. Wider
+    // pills grow leftwards from the same right edge.
+    const float iconS = static_cast<float>(iconBounds.right - iconBounds.left);
+    const float half = static_cast<float>(height) * 0.5F;
+    const LONG right = std::lround(static_cast<float>(iconBounds.right) - 0.13F * iconS + half);
+    const LONG top = std::lround(static_cast<float>(iconBounds.top) + 0.15F * iconS - half);
+    return {right - width, top, right, top + height};
+}
+
+std::vector<uint8_t> DockApp::RasterizeBadge(const std::wstring& text, LONG width, LONG height,
+    UINT atlasExtent) {
+    atlasExtent = std::max(1U, atlasExtent);
+    width = std::clamp(width, 1L, static_cast<LONG>(atlasExtent));
+    height = std::clamp(height, 1L, static_cast<LONG>(atlasExtent));
+    std::vector<uint8_t> atlas(static_cast<size_t>(atlasExtent) * atlasExtent * 4U, 0);
+
+    // White label coverage, rendered into a taller scratch strip and then
+    // centred on its measured ink box (GDI line boxes sit digits off-centre).
+    const LONG scratchHeight = height * 2L;
+    std::vector<uint8_t> coverage(static_cast<size_t>(width) * static_cast<size_t>(scratchHeight), 0);
+    LONG shiftX = 0;
+    LONG shiftY = 0;
+    bool hasText = false;
+    if (!text.empty()) {
+        HDC screen = GetDC(nullptr);
+        HDC memory = screen != nullptr ? CreateCompatibleDC(screen) : nullptr;
+        if (screen != nullptr) {
+            ReleaseDC(nullptr, screen);
+        }
+        if (memory != nullptr) {
+            BITMAPINFO info{};
+            info.bmiHeader.biSize = sizeof(info.bmiHeader);
+            info.bmiHeader.biWidth = width;
+            info.bmiHeader.biHeight = -scratchHeight;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+            void* bits = nullptr;
+            HBITMAP bitmap = CreateDIBSection(memory, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (bitmap != nullptr && bits != nullptr) {
+                const HGDIOBJ previousBitmap = SelectObject(memory, bitmap);
+                std::memset(bits, 0, static_cast<size_t>(width) * static_cast<size_t>(scratchHeight) * 4U);
+                const float fontScale = text.size() >= 3 ? 0.60F : 0.68F;
+                const int fontPx = std::max(7, static_cast<int>(std::lround(static_cast<float>(height) * fontScale)));
+                HFONT font = CreateFontW(-fontPx, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                    OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                    DockTextFontFace());
+                const HGDIOBJ previousFont = SelectObject(memory, font);
+                SetBkMode(memory, TRANSPARENT);
+                SetTextColor(memory, RGB(255, 255, 255));
+                RECT box{0, 0, width, scratchHeight};
+                DrawTextW(memory, text.c_str(), static_cast<int>(text.size()), &box,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                GdiFlush();
+
+                const auto* pixels = static_cast<const uint8_t*>(bits);
+                LONG minX = width;
+                LONG minY = scratchHeight;
+                LONG maxX = -1;
+                LONG maxY = -1;
+                for (LONG y = 0; y < scratchHeight; ++y) {
+                    for (LONG x = 0; x < width; ++x) {
+                        const uint8_t value = pixels[(static_cast<size_t>(y) * static_cast<size_t>(width) +
+                            static_cast<size_t>(x)) * 4U + 1U];
+                        coverage[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)] = value;
+                        if (value > 8U) {
+                            minX = std::min(minX, x);
+                            maxX = std::max(maxX, x);
+                            minY = std::min(minY, y);
+                            maxY = std::max(maxY, y);
+                        }
+                    }
+                }
+                if (maxX >= minX && maxY >= minY) {
+                    hasText = true;
+                    shiftX = std::lround((static_cast<float>(width) - static_cast<float>(minX + maxX + 1)) * 0.5F);
+                    shiftY = std::lround((static_cast<float>(height) - static_cast<float>(minY + maxY + 1)) * 0.5F);
+                }
+                SelectObject(memory, previousFont);
+                if (font != nullptr) {
+                    DeleteObject(font);
+                }
+                SelectObject(memory, previousBitmap);
+            }
+            if (bitmap != nullptr) {
+                DeleteObject(bitmap);
+            }
+            DeleteDC(memory);
+        }
+    }
+
+    // macOS system red (#FF3B30) capsule, 1 px analytic AA, premultiplied BGRA.
+    constexpr float kRed[3] = {255.0F, 59.0F, 48.0F};
+    const float halfW = static_cast<float>(width) * 0.5F;
+    const float halfH = static_cast<float>(height) * 0.5F;
+    const float radius = halfH;
+    for (LONG y = 0; y < height; ++y) {
+        for (LONG x = 0; x < width; ++x) {
+            const float px = static_cast<float>(x) + 0.5F;
+            const float py = static_cast<float>(y) + 0.5F;
+            const float qx = std::max(std::abs(px - halfW) - (halfW - radius), 0.0F);
+            const float qy = std::max(std::abs(py - halfH) - (halfH - radius), 0.0F);
+            const float distance = std::sqrt(qx * qx + qy * qy) - radius;
+            const float shape = std::clamp(0.5F - distance, 0.0F, 1.0F);
+            if (shape <= 0.0F) {
+                continue;
+            }
+            float ink = 0.0F;
+            if (hasText) {
+                const LONG sx = x - shiftX;
+                const LONG sy = y - shiftY;
+                if (sx >= 0 && sx < width && sy >= 0 && sy < scratchHeight) {
+                    ink = static_cast<float>(coverage[static_cast<size_t>(sy) * static_cast<size_t>(width) +
+                        static_cast<size_t>(sx)]) / 255.0F;
+                }
+            }
+            uint8_t* out = atlas.data() +
+                (static_cast<size_t>(y) * atlasExtent + static_cast<size_t>(x)) * 4U;
+            const auto channel = [shape, ink](float base) {
+                return static_cast<uint8_t>(std::lround((base * (1.0F - ink) + 255.0F * ink) * shape));
+            };
+            out[0] = channel(kRed[2]);
+            out[1] = channel(kRed[1]);
+            out[2] = channel(kRed[0]);
+            out[3] = static_cast<uint8_t>(std::lround(255.0F * shape));
+        }
+    }
+    return atlas;
 }
 
 // --- Trash / Recycle Bin ----------------------------------------------------
@@ -10608,7 +10896,24 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
         (m_glintTimerRunning && !IsAnimating());
     state.allowBlockingGpuWait = allowBlockingGpuWait && !IsAnimating() && !IsDragActive() &&
         !m_dragSnapAnimating && !m_dropPresentPending;
-    state.icons = m_iconRenderData;
+    if (m_dockBadges.empty()) {
+        state.icons = m_iconRenderData;
+    } else {
+        // Badges draw after every icon so neighbours never cover them; bounds
+        // follow the live icon rect (drag previews move icons between layouts).
+        m_frameIcons.assign(m_iconRenderData.begin(), m_iconRenderData.end());
+        for (const DockBadge& badge : m_dockBadges) {
+            if (!badge.ready || badge.iconIndex >= m_iconRenderData.size()) {
+                continue;
+            }
+            DockIconRenderData data;
+            data.kind = DockIconKind::Badge;
+            data.textureIndex = badge.textureIndex;
+            data.bounds = BadgeBounds(m_iconRenderData[badge.iconIndex].bounds, badge.width, badge.height);
+            m_frameIcons.push_back(data);
+        }
+        state.icons = m_frameIcons;
+    }
     return m_renderer.Render(state);
 }
 
@@ -13522,6 +13827,11 @@ void DockApp::ApplyBackgroundRefresh(UINT generation) {
                 m_iconRenderData[index].running = running;
                 runningVisualChanged = true;
             }
+        }
+        // A window appearing or closing changes which AUMID a dock entry
+        // answers to (unpinned and packaged apps match by window AUMID).
+        if (RefreshBadgeAssignments()) {
+            runningVisualChanged = true;
         }
         if (runningVisualChanged) {
             QueueRenderFrame();

@@ -2,6 +2,7 @@
 
 #include "DockConfig.h"
 #include "InstalledApps.h"
+#include "NotificationBadges.h"
 #include "Renderer.h"
 #include "TypeSafeClient.h"
 #include "LlamaServerClient.h"
@@ -20,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -217,6 +219,8 @@ private:
     static constexpr UINT kQsRefreshResultMessage = WM_APP + 31;
     // Tray icon worker finished: lParam owns a std::vector<TrayNotifyIcon>.
     static constexpr UINT kTrayIconsMessage = WM_APP + 32;
+    // Notification badge set changed (NotificationBadges worker, no payload).
+    static constexpr UINT kBadgeMessage = WM_APP + 33;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -369,6 +373,18 @@ private:
     void AssignIconTextureIndices();
     void EnsureTrayIcons();
     void RefreshTray(bool forceLayout);
+    // Notification badges (red unread counts on app icons).
+    void OnBadgesUpdated();
+    // Re-match badge sources to dock entries; queues the raster upload when the
+    // visuals changed. Returns true when the visible badge set changed.
+    bool RefreshBadgeAssignments();
+    void AssignBadgeTextureIndices();
+    void EnsureBadgeIcons();
+    [[nodiscard]] std::wstring BadgeIconsKey() const;
+    [[nodiscard]] bool BadgeIconsNeedApply() const;
+    [[nodiscard]] static std::vector<uint8_t> RasterizeBadge(const std::wstring& text, LONG width,
+        LONG height, UINT atlasExtent);
+    [[nodiscard]] static RECT BadgeBounds(const RECT& iconBounds, LONG width, LONG height) noexcept;
     void OnWeatherUpdated();
     void ApplyBluetoothSnapshot();
     [[nodiscard]] bool IsWeatherRenderIndex(int index) const noexcept;
@@ -885,6 +901,8 @@ private:
     // set by RebuildLayout when the tray visual key changes, serviced by the
     // same kLayoutApplyMessage handler so layout math stays under 1ms.
     bool m_trayIconsApplyPending = false;
+    // Badge raster upload pending; serviced by the kLayoutApplyMessage handler.
+    bool m_badgeIconsApplyPending = false;
     // Last rect applied by PositionOverlayWindows: skips redundant DWM
     // SetWindowPos round-trips so steady calls cost microseconds.
     bool m_overlayPosValid = false;
@@ -936,6 +954,25 @@ private:
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;
     WeatherService m_weather;
+    NotificationBadges m_badges;
+    struct DockBadge {
+        size_t iconIndex = 0;
+        std::wstring text;
+        LONG width = 0;
+        LONG height = 0;
+        // Atlas key (one slot per visible badge, replaced in place).
+        std::wstring textureKey;
+        UINT textureIndex = 0;
+        bool ready = false;
+    };
+    std::vector<NotificationBadges::Badge> m_badgeSources;
+    std::vector<DockBadge> m_dockBadges;
+    std::wstring m_badgeVisualKey;
+    // (target, window) -> index into m_badgeSources, -1 for no badge. Cleared
+    // when the sources change so RebuildLayout re-matches in O(entries).
+    std::unordered_map<std::wstring, int> m_badgeMatchMemo;
+    // m_iconRenderData plus badge instances; reused so frames do not allocate.
+    std::vector<DockIconRenderData> m_frameIcons;
     BluetoothService m_bluetooth;
     BluetoothSnapshot m_bluetoothSnapshot;
     HWND m_overflowWindow = nullptr;

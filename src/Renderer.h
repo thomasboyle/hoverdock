@@ -27,6 +27,9 @@ enum class DockIconKind : uint8_t {
     Clock = 4,
     Trash = 5,
     Weather = 6,
+    // Notification badge: pre-rasterized at its exact on-screen size and drawn
+    // pixel-exact (shares IconPS's clock path).
+    Badge = 7,
 };
 
 struct DockIconRenderData {

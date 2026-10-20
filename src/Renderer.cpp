@@ -2365,6 +2365,9 @@ bool Renderer::Render(const DockRenderState& state) {
         case DockIconKind::Clock:
             mode = icon.pressed ? 5.0F : 4.0F;
             break;
+        case DockIconKind::Badge:
+            mode = 4.0F;
+            break;
         default:
             mode = icon.pressed ? 1.0F : 0.0F;
             break;

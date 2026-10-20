@@ -1268,6 +1268,55 @@ bool WindowCatalog::MatchWindowAgainstProfile(const PinMatchProfile& profile,
     return false;
 }
 
+bool WindowCatalog::MatchesAppUserModelId(const PinnedApp& app, HWND runningWindow,
+    const std::wstring& aumid) const {
+    if (aumid.empty()) {
+        return false;
+    }
+    const size_t bang = aumid.find(L'!');
+    const std::wstring family = bang == std::wstring::npos ? std::wstring{} : aumid.substr(0, bang);
+
+    if (const PinMatchProfile* profile = ProfileForPin(app); profile != nullptr) {
+        if (!profile->appsFolderAumid.empty() && EqualInsensitive(profile->appsFolderAumid, aumid)) {
+            return true;
+        }
+        if (!family.empty()) {
+            if (!profile->packageFamily.empty() && EqualInsensitive(profile->packageFamily, family)) {
+                return true;
+            }
+            for (const std::wstring& path : profile->normalizedPaths) {
+                if (PathMatchesPackageFamily(path, family)) {
+                    return true;
+                }
+            }
+        }
+    } else if (IsAppsFolderTarget(app.target)) {
+        const std::wstring pinAumid = AppsFolderAumid(app.target);
+        if (EqualInsensitive(pinAumid, aumid) || AumidMatchesPackageFamily(pinAumid, family)) {
+            return true;
+        }
+    } else if (!family.empty() && !IsShellTarget(app.target) &&
+        PathMatchesPackageFamily(CachedNormalizedPathStatic(app.target), family)) {
+        return true;
+    }
+
+    if (runningWindow == nullptr) {
+        return false;
+    }
+    const std::wstring windowAumid = CachedAppUserModelId(runningWindow);
+    if (!windowAumid.empty() &&
+        (EqualInsensitive(windowAumid, aumid) || AumidMatchesPackageFamily(windowAumid, family))) {
+        return true;
+    }
+    if (family.empty()) {
+        return false;
+    }
+    DWORD processId = 0;
+    GetWindowThreadProcessId(runningWindow, &processId);
+    const std::wstring path = processId == 0 ? std::wstring{} : CachedExecutablePath(processId);
+    return !path.empty() && PathMatchesPackageFamily(CachedNormalizedPathStatic(path), family);
+}
+
 const WindowCatalog::PinMatchProfile* WindowCatalog::ProfileForPin(
     const PinnedApp& pin) const noexcept {
     for (const PinMatchProfile& profile : m_pinProfiles) {

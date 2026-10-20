@@ -51,6 +51,11 @@ public:
     [[nodiscard]] bool AddForegroundApplication(std::vector<PinnedApp>& pins) const;
     [[nodiscard]] bool MatchesPin(const PinnedApp& pin, const RunningWindow& window) const;
     [[nodiscard]] bool MatchesAnyPin(const RunningWindow& window) const;
+    // True when a notification/badge published under `aumid` belongs to this
+    // dock entry: exact AppsFolder AUMID, same package family (pin target,
+    // resolved shortcut / launcher paths) or the running window's own AUMID.
+    [[nodiscard]] bool MatchesAppUserModelId(const PinnedApp& app, HWND runningWindow,
+        const std::wstring& aumid) const;
     [[nodiscard]] static bool TargetsMatch(const std::wstring& left, const std::wstring& right);
     [[nodiscard]] static std::wstring ResolveLauncherProcessPath(const PinnedApp& app);
     [[nodiscard]] static std::wstring IconCacheKey(const PinnedApp& app);

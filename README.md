@@ -35,6 +35,7 @@ No Electron. No WebView. No Acrylic hacks. Just a single, fast native executable
 - 🪟 **Real liquid glass.** A custom D3D12 shader delivers frosted blur, refraction, and rim light, sampled from your *actual* wallpaper, so the dock always matches your desktop.
 - ⚡ **Genuinely fast.** Single process, zero allocations during animations, and smooth at 120 Hz.
 - 🧭 **Instantly familiar.** Pinned apps, running apps, drag-to-reorder, and a right-click menu to pin, close, or reveal an app's location.
+- 🔴 **Notification badges.** Unread counts from Teams, Outlook, WhatsApp and any other app that badges its Windows taskbar icon appear on its dock icon, just like macOS. Follows the Windows *Show badges on taskbar apps* setting.
 - 🛟 **Safe by design.** It auto-imports your existing taskbar pins on first run, and restores your taskbar on exit or crash. You can't get locked out.
 - 🤫 **Stays out of your way.** Per-user install (no admin), launch at startup, and silent auto-updates from GitHub Releases.
 

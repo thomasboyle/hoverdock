@@ -35,6 +35,7 @@ add_executable(Dock WIN32
     src/QuickSettingsPanel.cpp
     src/DockConfig.cpp
     src/InstalledApps.cpp
+    src/NotificationBadges.cpp
     src/Renderer.cpp
     src/Startup.cpp
     src/SystemTray.cpp
