@@ -118,6 +118,30 @@ Corpus MakeCorpus(size_t count) {
     return corpus;
 }
 
+// Names packed contiguously in arrival order, like the USN record buffers
+// the MFT reader hands to AddUtf16 (no per-name heap objects).
+struct Packed {
+    std::u16string chars;
+    std::vector<uint32_t> offsets;  // size = count + 1
+    std::vector<uint64_t> ids;
+    std::vector<uint64_t> parents;
+    std::vector<uint8_t> flags;
+};
+
+Packed Pack(const Corpus& corpus, const std::vector<size_t>& arrival) {
+    Packed packed;
+    packed.offsets.reserve(arrival.size() + 1);
+    for (const size_t i : arrival) {
+        packed.offsets.push_back(static_cast<uint32_t>(packed.chars.size()));
+        packed.chars += corpus.names[i];
+        packed.ids.push_back(kFirstId + i);
+        packed.parents.push_back(corpus.parents[i]);
+        packed.flags.push_back(corpus.flags[i]);
+    }
+    packed.offsets.push_back(static_cast<uint32_t>(packed.chars.size()));
+    return packed;
+}
+
 struct Built {
     FileIndex index;
     double ingestMs = 0;
@@ -125,15 +149,15 @@ struct Built {
     double zonesMs = 0;
 };
 
-void Build(const Corpus& corpus, const std::vector<size_t>& arrival, bool reserve, Built& out) {
+void Build(const Corpus& corpus, const Packed& packed, bool reserve, Built& out) {
     auto t = Clock::now();
     const uint8_t v = out.index.AddVolume("C:", kRootId);
     if (reserve) {
         out.index.Reserve(corpus.names.size(), corpus.utf8Bytes);
     }
-    for (const size_t i : arrival) {
-        out.index.AddUtf16(v, kFirstId + i, corpus.parents[i], corpus.flags[i], corpus.names[i].data(),
-            corpus.names[i].size());
+    for (size_t k = 0; k < packed.ids.size(); ++k) {
+        out.index.AddUtf16(v, packed.ids[k], packed.parents[k], packed.flags[k],
+            packed.chars.data() + packed.offsets[k], packed.offsets[k + 1] - packed.offsets[k]);
     }
     out.ingestMs = Ms(t);
     t = Clock::now();
@@ -177,6 +201,7 @@ int main(int argc, char** argv) {
         arrival[i] = i;
     }
     std::shuffle(arrival.begin(), arrival.end(), std::mt19937(99));
+    const Packed packed = Pack(corpus, arrival);
     std::printf("corpus: %zu names, %.1f MB UTF-8, %zu zone markers\n", count,
         static_cast<double>(corpus.utf8Bytes) / 1048576.0, corpus.markers.size());
 
@@ -188,7 +213,7 @@ int main(int argc, char** argv) {
         for (int run = 0; run < 5; ++run) {
             Built built;
             const auto t = Clock::now();
-            Build(corpus, arrival, reserve, built);
+            Build(corpus, packed, reserve, built);
             built.index.ShrinkToFit();
             total.push_back(Ms(t));
             if (run == 4) {
@@ -203,7 +228,7 @@ int main(int argc, char** argv) {
     }
 
     Built built;
-    Build(corpus, arrival, false, built);
+    Build(corpus, packed, false, built);
     built.index.ShrinkToFit();
     FileIndex& index = built.index;
 
