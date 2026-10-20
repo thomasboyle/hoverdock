@@ -1200,12 +1200,17 @@ void DockApp::RefreshSearchApps() {
         auto result = std::make_unique<SearchAppsReply>();
         try {
             m_installedApps.EnsureLoaded();
+            // One row per app name (a pin, a classic copy and a Store package
+            // can all be "Notepad"); the first target wins, as in the dock.
+            std::unordered_set<std::wstring> seen;
             for (LaunchTarget& target : CollectLaunchTargets(displayApps, running)) {
                 if (target.isStart) {
                     continue;
                 }
                 std::wstring name = MakeLaunchCandidate(target).name;
-                if (name.empty()) {
+                std::wstring key = name;
+                CharLowerBuffW(key.data(), static_cast<DWORD>(key.size()));
+                if (name.empty() || !seen.insert(std::move(key)).second) {
                     continue;
                 }
                 result->names.push_back(std::move(name));
