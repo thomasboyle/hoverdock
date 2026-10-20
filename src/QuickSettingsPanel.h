@@ -124,8 +124,6 @@ struct QuickSettingsCache {
     // paints again so the list can fill without blocking the UI thread.
     bool energyPending = false;
     std::wstring energyNote;
-    bool usbSuspend = false;
-    bool usbKnown = false;
     bool hdrOn = false;
     bool hdrSupported = false;
     bool nightLight = false;

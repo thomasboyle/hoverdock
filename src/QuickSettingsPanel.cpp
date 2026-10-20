@@ -104,16 +104,10 @@ constexpr int kLinkDisplayAdvanced = 13;
 constexpr int kToggleWifi = 0;
 constexpr int kToggleMute = 1;
 constexpr int kToggleMic = 2;
-constexpr int kToggleUsb = 3;
 constexpr int kToggleAirplane = 4;
 constexpr int kToggleHdr = 5;
 constexpr int kToggleDarkMode = 6;
 constexpr int kToggleRefreshRate = 7;
-
-const GUID kUsbSubgroup = {
-    0x2a737441, 0x1930, 0x4402, {0x8d, 0x77, 0xb2, 0xbe, 0xbb, 0xa3, 0x08, 0xa3}};
-const GUID kUsbSuspend = {
-    0x48e6b7a6, 0x50f5, 0x4782, {0xa5, 0xd4, 0x53, 0xbb, 0x8f, 0x07, 0xe2, 0x26}};
 
 // Windows keeps the Ultimate Performance source scheme hidden until it is
 // duplicated. The duplicate receives a normal, enumerable scheme GUID.
@@ -1282,7 +1276,6 @@ bool EnsureUltimatePowerScheme(GUID& scheme) {
 void QueryPower(QuickSettingsCache& cache) {
     cache.powerName = L"Balanced";
     cache.powerMode = 1;
-    cache.usbKnown = false;
     GUID* scheme = nullptr;
     if (PowerGetActiveScheme(nullptr, &scheme) != ERROR_SUCCESS || scheme == nullptr) {
         return;
@@ -1299,11 +1292,6 @@ void QueryPower(QuickSettingsCache& cache) {
     if (!name.empty()) {
         cache.powerName = name;
     }
-    DWORD usb = 0;
-    if (PowerReadACValueIndex(nullptr, scheme, &kUsbSubgroup, &kUsbSuspend, &usb) == ERROR_SUCCESS) {
-        cache.usbKnown = true;
-        cache.usbSuspend = usb != 0;
-    }
     LocalFree(scheme);
 }
 
@@ -1319,19 +1307,6 @@ bool SetPowerMode(int mode) {
         scheme = &GUID_MAX_POWER_SAVINGS;
     }
     return PowerSetActiveScheme(nullptr, scheme) == ERROR_SUCCESS;
-}
-
-bool SetUsbSuspend(bool enabled) {
-    GUID* scheme = nullptr;
-    if (PowerGetActiveScheme(nullptr, &scheme) != ERROR_SUCCESS || scheme == nullptr) {
-        return false;
-    }
-    const DWORD value = enabled ? 1U : 0U;
-    const DWORD ac = PowerWriteACValueIndex(nullptr, scheme, &kUsbSubgroup, &kUsbSuspend, value);
-    const DWORD dc = PowerWriteDCValueIndex(nullptr, scheme, &kUsbSubgroup, &kUsbSuspend, value);
-    const DWORD apply = PowerSetActiveScheme(nullptr, scheme);
-    LocalFree(scheme);
-    return ac == ERROR_SUCCESS || dc == ERROR_SUCCESS || apply == ERROR_SUCCESS;
 }
 
 void QueryHdr(QuickSettingsCache& cache) {
@@ -3554,7 +3529,6 @@ bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache) {
         cache.inputName != r.inputName || cache.inputGain != r.inputGain ||
         cache.inputMuted != r.inputMuted || cache.inputNote != r.inputNote ||
         cache.powerName != r.powerName || cache.powerMode != r.powerMode ||
-        cache.usbSuspend != r.usbSuspend || cache.usbKnown != r.usbKnown ||
         cache.hdrOn != r.hdrOn || cache.hdrSupported != r.hdrSupported ||
         cache.nightLight != r.nightLight || cache.nightKnown != r.nightKnown ||
         cache.darkMode != r.darkMode || cache.darkKnown != r.darkKnown ||
@@ -3581,8 +3555,6 @@ bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache) {
     cache.inputNote = r.inputNote;
     cache.powerName = r.powerName;
     cache.powerMode = r.powerMode;
-    cache.usbSuspend = r.usbSuspend;
-    cache.usbKnown = r.usbKnown;
     cache.hdrOn = r.hdrOn;
     cache.hdrSupported = r.hdrSupported;
     cache.nightLight = r.nightLight;
@@ -5392,15 +5364,6 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             menuItem(mode.glyph, m_qsCache.powerMode == mode.mode, false, mode.label, kNoTrailing, 0,
                 TrayFlyoutHitKind::PowerMode, mode.mode);
         }
-        if (m_qsCache.usbKnown) {
-            hairline();
-            const RECT usb{padding, y, panelWidth - padding, y + menuRow};
-            text({usb.left + menuInset, usb.top, usb.right - std::lround(64.0F * scale), usb.bottom}, labelFont,
-                L"USB selective suspend", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            push(TrayFlyoutHitKind::Toggle,
-                toggleRect(usb.top + menuRow / 2L, usb.right - menuInset, m_qsCache.usbSuspend), kToggleUsb);
-            y += menuRow;
-        }
         hairline();
         menuSection(L"Using Significant Energy");
         if (!m_qsCache.energyLive || m_qsCache.energyApps.empty()) {
@@ -6056,11 +6019,6 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
             break;
         case kToggleMic:
             SetCaptureMuted(!m_qsCache.inputMuted);
-            m_qsCache.stamp = 0;
-            QueueOverflowPaint();
-            break;
-        case kToggleUsb:
-            SetUsbSuspend(!m_qsCache.usbSuspend);
             m_qsCache.stamp = 0;
             QueueOverflowPaint();
             break;
