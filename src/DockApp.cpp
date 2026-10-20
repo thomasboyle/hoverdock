@@ -4492,7 +4492,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
             left += dividerSlotWidth + gap;
         } else {
             data.bounds = {left, top, left + iconSize, top + iconSlotHeight};
-            data.running = m_displayApps[index].runningWindow != nullptr;
+            data.running = m_displayApps[index].IsRunning();
             // Start carries the Windows 11 logo artwork (blue gradient, no halo)
             // and Search its own two-tone artwork (charcoal fill + white halo),
             // so they must not be remapped to flat adaptive ink.
@@ -11223,7 +11223,7 @@ std::vector<DockApp::ContextItem> DockApp::BuildContextItems(int icon, DisplayAp
             open.glyph = L'\uE8A7';
             items.push_back(std::move(open));
         } else {
-            const bool running = outApp.runningWindow != nullptr;
+            const bool running = outApp.IsRunning();
             ContextItem pin;
             if (outApp.persistentPinIndex >= 0) {
                 pin.command = kContextUnpin;
@@ -11241,11 +11241,13 @@ std::vector<DockApp::ContextItem> DockApp::BuildContextItems(int icon, DisplayAp
                 end.label = L"End task";
                 end.glyph = L'\uE71A';
                 items.push_back(std::move(end));
-                ContextItem close;
-                close.command = kContextClose;
-                close.label = L"Close window";
-                close.glyph = L'\uE8BB';
-                items.push_back(std::move(close));
+                if (outApp.runningWindow != nullptr) {
+                    ContextItem close;
+                    close.command = kContextClose;
+                    close.label = L"Close window";
+                    close.glyph = L'\uE8BB';
+                    items.push_back(std::move(close));
+                }
             }
             if (outApp.app.target.rfind(L"shell:", 0) != 0) {
                 ContextItem location;
@@ -13491,7 +13493,10 @@ DockApp::RefreshSnapshot DockApp::BuildDisplayAppsSnapshot(const WindowCatalog& 
         if (IsSpecialDockTarget(pin.target) || IsLayoutOnlyTarget(pin.target)) {
             continue;
         }
-        displayApps.push_back({pin, windows.FindWindowFor(pin), static_cast<int>(index)});
+        DockApp::DisplayApp entry{pin, windows.FindWindowFor(pin), static_cast<int>(index)};
+        entry.runningInBackground =
+            entry.runningWindow == nullptr && windows.IsRunningInBackground(pin);
+        displayApps.push_back(std::move(entry));
     }
 
     std::unordered_set<HWND> representedHandles;
@@ -13573,7 +13578,8 @@ DockApp::RefreshSnapshot DockApp::BuildDisplayAppsSnapshot(const WindowCatalog& 
             [](const DockApp::DisplayApp& left, const DockApp::DisplayApp& right) {
                 return left.persistentPinIndex == right.persistentPinIndex &&
                     left.app.target == right.app.target &&
-                    left.runningWindow == right.runningWindow;
+                    left.runningWindow == right.runningWindow &&
+                    left.runningInBackground == right.runningInBackground;
             });
     return snapshot;
 }
@@ -13822,7 +13828,7 @@ void DockApp::ApplyBackgroundRefresh(UINT generation) {
         bool runningVisualChanged = false;
         const size_t iconCount = LesserOf(m_iconRenderData.size(), m_displayApps.size());
         for (size_t index = 0; index < iconCount; ++index) {
-            const bool running = m_displayApps[index].runningWindow != nullptr;
+            const bool running = m_displayApps[index].IsRunning();
             if (m_iconRenderData[index].running != running) {
                 m_iconRenderData[index].running = running;
                 runningVisualChanged = true;

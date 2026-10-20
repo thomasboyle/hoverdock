@@ -1042,9 +1042,15 @@ bool WindowCatalog::Refresh() {
     ProfileScope scope("WindowCatalog::Refresh");
     std::vector<RunningWindow> previous = std::move(m_windows);
     m_windows.clear();
+    // Hidden windows only matter for pins (tray-resident apps), so skip the
+    // candidate gathering entirely when nothing is pinned.
+    std::vector<HiddenWindowCandidate> hiddenCandidates;
+    m_hiddenCandidates = m_pinProfiles.empty() ? nullptr : &hiddenCandidates;
     EnumWindows(&WindowCatalog::EnumerateWindows, reinterpret_cast<LPARAM>(this));
+    m_hiddenCandidates = nullptr;
     std::ranges::sort(m_windows, {}, &RunningWindow::handle);
 
+    bool windowsChanged = true;
     if (!previous.empty()) {
         std::ranges::sort(previous, {}, &RunningWindow::handle);
         // The snapshot comparison ignores enrichment, so a stable window set must
@@ -1054,12 +1060,24 @@ bool WindowCatalog::Refresh() {
         if (WindowsSnapshotEqual(previous, m_windows) &&
             m_enrichedAumid == m_pinMatchingNeedsAumid) {
             m_windows = std::move(previous);
-            return false;
+            windowsChanged = false;
         }
     }
+    if (windowsChanged) {
+        EnrichWindows();
+    }
 
-    EnrichWindows();
-    return true;
+    const std::vector<RunningWindow> previousBackground = std::move(m_backgroundProcesses);
+    m_backgroundProcesses.clear();
+    CollectBackgroundProcesses(hiddenCandidates);
+    const bool backgroundEqual = previousBackground.size() == m_backgroundProcesses.size() &&
+        std::equal(previousBackground.begin(), previousBackground.end(),
+            m_backgroundProcesses.begin(),
+            [](const RunningWindow& left, const RunningWindow& right) {
+                return left.processId == right.processId &&
+                    left.executablePath == right.executablePath;
+            });
+    return windowsChanged || !backgroundEqual;
 }
 
 void WindowCatalog::RebuildPinProfiles(const std::vector<PinnedApp>& pins) {
@@ -1491,12 +1509,14 @@ bool WindowCatalog::EndTask(const PinnedApp& app, HWND preferredWindow) const {
     if (window == nullptr || IsWindow(window) == FALSE) {
         window = FindWindowFor(app);
     }
-    if (window == nullptr) {
-        return false;
-    }
-
     DWORD processId = 0;
-    GetWindowThreadProcessId(window, &processId);
+    if (window != nullptr) {
+        GetWindowThreadProcessId(window, &processId);
+    } else if (const RunningWindow* background = FindBackgroundProcessFor(app);
+               background != nullptr &&
+               CachedExecutablePath(background->processId) == background->executablePath) {
+        processId = background->processId;
+    }
     if (processId == 0 || processId == GetCurrentProcessId()) {
         return false;
     }
@@ -1770,6 +1790,13 @@ std::wstring WindowCatalog::DisplayNameForAppSlow(const PinnedApp& app, HWND run
 BOOL CALLBACK WindowCatalog::EnumerateWindows(HWND window, LPARAM data) {
     auto* catalog = reinterpret_cast<WindowCatalog*>(data);
     if (!IsApplicationWindow(window)) {
+        if (catalog->m_hiddenCandidates != nullptr && IsBackgroundCandidateWindow(window)) {
+            DWORD processId = 0;
+            GetWindowThreadProcessId(window, &processId);
+            if (processId != 0) {
+                catalog->m_hiddenCandidates->push_back({processId, window});
+            }
+        }
         return TRUE;
     }
 
@@ -1783,8 +1810,154 @@ BOOL CALLBACK WindowCatalog::EnumerateWindows(HWND window, LPARAM data) {
         return TRUE;
     }
 
-    catalog->m_windows.push_back({window, path, {}, {}, title});
+    RunningWindow entry{window, path, {}, {}, title};
+    GetWindowThreadProcessId(window, &entry.processId);
+    catalog->m_windows.push_back(std::move(entry));
     return TRUE;
+}
+
+bool WindowCatalog::IsBackgroundCandidateWindow(HWND window) {
+    if (IsWindowVisible(window) != FALSE || GetWindow(window, GW_OWNER) != nullptr) {
+        return false;
+    }
+    const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+    if ((style & WS_CHILD) != 0) {
+        return false;
+    }
+    // Suspended UWP apps leave hidden CoreWindows behind after closing; they
+    // are not tray-resident and are revived by activation, not shown as running.
+    wchar_t className[64]{};
+    if (GetClassNameW(window, className, static_cast<int>(std::size(className))) > 0 &&
+        (wcscmp(className, L"Windows.UI.Core.CoreWindow") == 0 ||
+            wcscmp(className, L"ApplicationFrameWindow") == 0)) {
+        return false;
+    }
+    return true;
+}
+
+void WindowCatalog::CollectBackgroundProcesses(std::vector<HiddenWindowCandidate>& candidates) {
+    if (candidates.empty() || m_pinProfiles.empty()) {
+        return;
+    }
+    std::ranges::sort(candidates, {}, &HiddenWindowCandidate::processId);
+    const auto duplicates = std::ranges::unique(candidates, {}, &HiddenWindowCandidate::processId);
+    candidates.erase(duplicates.begin(), duplicates.end());
+
+    // Pins already lit by a visible window need no background lookup; when
+    // every pin is visible the per-process queries below are skipped.
+    std::vector<const PinMatchProfile*> unmatchedProfiles;
+    unmatchedProfiles.reserve(m_pinProfiles.size());
+    for (const PinMatchProfile& profile : m_pinProfiles) {
+        const bool visible = std::ranges::any_of(m_windows,
+            [this, &profile](const RunningWindow& window) {
+                return MatchWindowAgainstProfile(profile, window);
+            });
+        if (!visible) {
+            unmatchedProfiles.push_back(&profile);
+        }
+    }
+    if (unmatchedProfiles.empty()) {
+        return;
+    }
+
+    const DWORD ownProcessId = GetCurrentProcessId();
+    for (const HiddenWindowCandidate& candidate : candidates) {
+        if (candidate.processId == ownProcessId) {
+            continue;
+        }
+        const bool hasVisibleWindow = std::ranges::any_of(m_windows,
+            [&candidate](const RunningWindow& window) {
+                return window.processId == candidate.processId;
+            });
+        if (hasVisibleWindow) {
+            continue;
+        }
+        const std::wstring path = CachedExecutablePath(candidate.processId);
+        if (path.empty()) {
+            continue;
+        }
+        RunningWindow process{};
+        process.handle = candidate.handle;
+        process.executablePath = path;
+        process.normalizedPath = CachedNormalizedPath(path);
+        process.executableName = FileNameWithoutExtension(path);
+        process.processId = candidate.processId;
+        // The shell and the UWP frame host always own hidden windows; a File
+        // Explorer pin would otherwise read as permanently running.
+        if (EqualInsensitive(process.executableName, L"explorer") ||
+            IsApplicationFrameHostPath(process.normalizedPath)) {
+            continue;
+        }
+        const bool matchesPin = std::ranges::any_of(unmatchedProfiles,
+            [this, &process](const PinMatchProfile* profile) {
+                return MatchWindowAgainstProfile(*profile, process);
+            });
+        if (!matchesPin || IsBackgroundPreloadProcess(candidate.processId)) {
+            continue;
+        }
+        m_backgroundProcesses.push_back(std::move(process));
+    }
+}
+
+const RunningWindow* WindowCatalog::FindBackgroundProcessFor(const PinnedApp& app) const {
+    if (m_backgroundProcesses.empty()) {
+        return nullptr;
+    }
+    const PinMatchProfile* profile = ProfileForPin(app);
+    if (profile == nullptr) {
+        return nullptr;
+    }
+    for (const RunningWindow& process : m_backgroundProcesses) {
+        if (MatchWindowAgainstProfile(*profile, process)) {
+            return &process;
+        }
+    }
+    return nullptr;
+}
+
+bool WindowCatalog::IsRunningInBackground(const PinnedApp& app) const {
+    return FindBackgroundProcessFor(app) != nullptr;
+}
+
+bool WindowCatalog::IsBackgroundPreloadProcess(DWORD processId) {
+    using NtQueryInformationProcessFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static const auto query = reinterpret_cast<NtQueryInformationProcessFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    if (query == nullptr) {
+        return false;
+    }
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process == nullptr) {
+        return false;
+    }
+    // ProcessCommandLineInformation (60) yields a UNICODE_STRING header
+    // followed by the command line; works with limited query access.
+    constexpr ULONG kProcessCommandLineInformation = 60;
+    struct CommandLineString {
+        USHORT length;
+        USHORT maximumLength;
+        PWSTR buffer;
+    };
+    std::vector<BYTE> storage(4096);
+    ULONG needed = 0;
+    LONG status = query(process, kProcessCommandLineInformation, storage.data(),
+        static_cast<ULONG>(storage.size()), &needed);
+    if (status < 0 && needed > storage.size() && needed <= 1U << 20U) {
+        storage.resize(needed);
+        status = query(process, kProcessCommandLineInformation, storage.data(),
+            static_cast<ULONG>(storage.size()), &needed);
+    }
+    CloseHandle(process);
+    if (status < 0) {
+        return false;
+    }
+    const auto* commandLine = reinterpret_cast<const CommandLineString*>(storage.data());
+    if (commandLine->buffer == nullptr || commandLine->length == 0) {
+        return false;
+    }
+    const std::wstring_view text(commandLine->buffer, commandLine->length / sizeof(wchar_t));
+    return text.find(L"--no-startup-window") != std::wstring_view::npos ||
+        text.find(L" --type=") != std::wstring_view::npos;
 }
 
 bool WindowCatalog::IsApplicationWindow(HWND window) {

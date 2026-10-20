@@ -54,6 +54,12 @@ private:
         PinnedApp app;
         HWND runningWindow = nullptr;
         int persistentPinIndex = -1;
+        // Pinned app alive with no visible window (minimised to the tray).
+        bool runningInBackground = false;
+
+        [[nodiscard]] bool IsRunning() const noexcept {
+            return runningWindow != nullptr || runningInBackground;
+        }
     };
 
     struct RefreshSnapshot {

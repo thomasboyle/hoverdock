@@ -26,6 +26,10 @@ public:
     [[nodiscard]] const std::vector<RunningWindow>& RunningWindows() const noexcept;
     [[nodiscard]] bool IsRunning(const PinnedApp& app) const;
     [[nodiscard]] HWND FindWindowFor(const PinnedApp& app) const;
+    // Pinned apps whose process is alive with only hidden top-level windows,
+    // i.e. "closed" to the system tray. They have no window to activate but
+    // are still running, so the dock keeps their running dot lit.
+    [[nodiscard]] bool IsRunningInBackground(const PinnedApp& app) const;
     // Every live window matching the pin, topmost first. Fresh z-order walk
     // (not the handle-sorted snapshot) so a just-opened second window is
     // seen immediately. Unpinned running entries (target = exe path, no pin
@@ -76,8 +80,23 @@ private:
         std::wstring packageFamily;
     };
 
+    struct HiddenWindowCandidate {
+        DWORD processId = 0;
+        HWND handle = nullptr;
+    };
+
     static BOOL CALLBACK EnumerateWindows(HWND window, LPARAM data);
     static bool IsApplicationWindow(HWND window);
+    static bool IsBackgroundCandidateWindow(HWND window);
+    // Resolves the hidden-window candidates gathered by EnumerateWindows into
+    // m_backgroundProcesses: one entry per process that matches a pin and has
+    // no visible application window. Only pins are considered, so tray-only
+    // helpers never add new dock entries.
+    void CollectBackgroundProcesses(std::vector<HiddenWindowCandidate>& candidates);
+    [[nodiscard]] const RunningWindow* FindBackgroundProcessFor(const PinnedApp& app) const;
+    // Chromium-family background preloads (Edge Startup Boost, child
+    // --type= processes) keep hidden windows without the app being open.
+    static bool IsBackgroundPreloadProcess(DWORD processId);
     // PID-validated executable path: OpenProcess + QueryFullProcessImageName
     // costs ~30-100us per window, dominating Refresh. Cache by PID, validated
     // against process creation time so recycled PIDs never serve stale paths.
@@ -118,6 +137,8 @@ private:
     [[nodiscard]] std::wstring CachedNormalizedPath(const std::wstring& path);
 
     std::vector<RunningWindow> m_windows;
+    std::vector<RunningWindow> m_backgroundProcesses;
+    std::vector<HiddenWindowCandidate>* m_hiddenCandidates = nullptr;
     std::vector<PinMatchProfile> m_pinProfiles;
     std::vector<PinnedApp> m_cachedPinProfileSources;
     bool m_pinMatchingNeedsAumid = false;
