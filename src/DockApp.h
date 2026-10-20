@@ -542,8 +542,6 @@ private:
     [[nodiscard]] bool IsTrayRenderIndex(int index) const noexcept;
     [[nodiscard]] int AppSlotCount() const noexcept;
     void UpdatePrimaryMonitor();
-    // Windows system (taskbar) theme -> m_lightChrome. True when it changed.
-    bool RefreshChromeAppearance() noexcept;
     [[nodiscard]] bool AdoptMonitorForCursor(POINT cursor);
     [[nodiscard]] UINT HostDpi() const noexcept;
     void NoteHostRefreshHz() noexcept;
@@ -855,9 +853,6 @@ private:
     float m_glintTargetStrength = 0.0F;
     double m_glintLastTickAt = 0.0;
     bool m_glintTimerRunning = false;
-    // Windows "default Windows mode" is Light (SystemUsesLightTheme): dock
-    // chrome uses dark ink on a light plate, like the macOS menu bar.
-    bool m_lightChrome = false;
     bool m_suppressDragUntilRelease = false;
     bool m_launchClickInProgress = false;
     std::wstring m_pressedTarget;

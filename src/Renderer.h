@@ -41,7 +41,6 @@ struct DockIconRenderData {
     DockIconKind kind = DockIconKind::App;
     TraySlot traySlot = TraySlot::Overflow;
     UINT textureIndex = 0;
-    // Monochrome chrome glyph drawn in the system-appearance chrome ink.
     bool adaptiveInk = false;
 };
 
@@ -61,13 +60,6 @@ struct DockRenderState {
     float glintY = 0.0F;
     float glintStrength = 0.0F;
     bool showDevBounds = false;
-    // macOS "Show menu bar background": a frosted plate behind the tray,
-    // weather and clock (dock-client px), tinted for the system appearance.
-    // Chrome ink follows the same appearance, never the wallpaper.
-    bool chromePlate = false;
-    RECT chromePlateRect{};
-    float chromePlateRadius = 0.0F;
-    bool lightChrome = false;
     bool allowBlockingGpuWait = true;
     bool skipIfGpuBusy = false;
     std::span<const DockIconRenderData> icons;
@@ -164,6 +156,9 @@ public:
     void CancelLiveGlassPanelBake() noexcept;
     // Increments only when CaptureBackdrop uploads new pixels (desktop changed).
     [[nodiscard]] uint64_t BackdropChangeSerial() const noexcept { return m_backdropChangeSerial; }
+    // Same wallpaper-luma cut as AdaptiveChromeInk in Shaders.hlsl so Quick /
+    // Dock Settings text matches Start/Search/clock chrome on the dock.
+    void SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const noexcept;
     void Flush();
 
     [[nodiscard]] HANDLE FrameLatencyWaitableObject() const noexcept;
@@ -191,9 +186,7 @@ private:
         float scene0[4]{};
         float scene1[4]{};
         float scene2[4]{};
-        float scene3[4]{};
-        float scene4[4]{};
-        std::byte padding[176]{};
+        std::byte padding[208]{};
     };
 
     struct IconInstanceConstants {

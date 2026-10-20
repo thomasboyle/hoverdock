@@ -9,8 +9,6 @@ cbuffer FrameData : register(b0)
     float4 scene0; // output width, output height, glass alpha, dock scale
     float4 scene1; // fx bitmask | icon count, DPI scale, dev bounds, backdrop valid
     float4 scene2; // pointer glint x, y (output px), strength 0..1, unused
-    float4 scene3; // dock: chrome plate rect left, top, right, bottom (output px)
-    float4 scene4; // dock: chrome plate on, light appearance, corner radius px, unused
 };
 
 struct IconInstance
@@ -1005,22 +1003,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     {
         alpha = mask * 0.8;
     }
-    float3 premultiplied = color * alpha;
-    // Dock chrome plate (macOS "Show menu bar background"): frosted tint for
-    // the system appearance behind the tray / weather / clock, so their ink
-    // keeps contrast on any wallpaper.
-    if (!isPanel && labelFace < 0.5 && scene4.x > 0.5)
-    {
-        const float2 plateCenter = (scene3.xy + scene3.zw) * 0.5;
-        const float2 plateHalf = max((scene3.zw - scene3.xy) * 0.5, float2(1.0, 1.0));
-        const float plateDistance = SdSquircleBox(pixel - plateCenter, plateHalf, scene4.z);
-        const bool lightPlate = scene4.y > 0.5;
-        const float k = saturate(0.5 - plateDistance) * mask * (lightPlate ? 0.62 : 0.58);
-        const float3 tint = lightPlate ? float3(0.97, 0.97, 0.98) : float3(0.06, 0.06, 0.07);
-        premultiplied = tint * k + premultiplied * (1.0 - k);
-        alpha = k + alpha * (1.0 - k);
-    }
-    return float4(premultiplied, alpha);
+    return float4(color * alpha, alpha);
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,18 +1160,24 @@ float4 BlurHPS2(VertexOutput input) : SV_Target
 // Chrome ink on the same face tonemap domain as GlassPS:
 // face = lerp(OVER_BLACK, OVER_WHITE, backdropLuma); ink inverts that so glyphs
 // stay contrasted on both dark and light plates.
-// Dock chrome (clock, tray glyphs) follows the system appearance like the
-// macOS menu bar with "Show menu bar background": dark ink on a light frosted
-// plate in Light mode, white ink on a dark one in Dark mode. It never flips
-// with the wallpaper; the plate (GlassPS) supplies the contrast.
-float3 ChromeInk()
+float3 AdaptiveChromeInk(float2 outputSize)
 {
-    return scene4.y > 0.5 ? float3(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B) / 255.0 : float3(0.97, 0.97, 0.98);
-}
-
-float GlyphCoverage(float4 s)
-{
-    return max(s.a, max(s.r, max(s.g, s.b)));
+    // Hard cut on wallpaper luma (ignore frosted plate — it sits mid-grey and
+    // wrongly pulled ink dark on black desks). Dark desk -> light chrome.
+    const float3 darkInk = float3(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B) / 255.0;
+    const float3 lightInk = float3(0.96, 0.96, 0.97);
+    if (scene1.w < 0.5)
+    {
+        return lightInk;
+    }
+    // Average a few samples across the dock window so one bright pixel cannot
+    // tip the whole chrome set dark.
+    float acc = 0.0;
+    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.20, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
+    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.50, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
+    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.80, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
+    const float wallpaperLuma = saturate(acc / 3.0);
+    return wallpaperLuma < 0.50 ? lightInk : darkInk;
 }
 
 float4 IconPS(VertexOutput input) : SV_Target
@@ -1226,8 +1215,9 @@ float4 IconPS(VertexOutput input) : SV_Target
         float a = sampledClock.a;
         if (adaptiveInk)
         {
-            const float coverage = GlyphCoverage(sampledClock);
-            rgb = ChromeInk() * coverage;
+            const float coverage = max(a, max(rgb.r, max(rgb.g, rgb.b)));
+            const float3 ink = AdaptiveChromeInk(outputSize);
+            rgb = ink * coverage;
             a = coverage;
         }
         return float4(rgb * clockBrightness, a * clockBrightness);
@@ -1246,8 +1236,9 @@ float4 IconPS(VertexOutput input) : SV_Target
 
     if (adaptiveInk)
     {
-        const float coverage = GlyphCoverage(sampled);
-        color = ChromeInk() * coverage * iconBrightness;
+        const float coverage = max(alpha, max(sampled.r, max(sampled.g, sampled.b)));
+        const float3 ink = AdaptiveChromeInk(outputSize);
+        color = ink * coverage * iconBrightness;
         alpha = coverage * iconBrightness;
     }
 
