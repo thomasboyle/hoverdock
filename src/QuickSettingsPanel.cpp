@@ -4269,7 +4269,10 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     auto beginHeader = [&](const wchar_t* title, bool gear, int toggleIndex, bool toggleOn) {
         if (m_qsPage != QuickSettingsPage::Home) {
             const RECT back{padding, y, padding + headerHeight, y + headerHeight};
-            text(back, titleFont, L"\u2190", DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
+            // Mirror of the Home tile expand chevron (\uE76C), header-sized.
+            const LONG backExtent = std::max(12L, std::lround(16.0F * scale));
+            icon(back.left + (headerHeight - backExtent) / 2L, back.top + (headerHeight - backExtent) / 2L,
+                L'\uE76B', static_cast<UINT>(backExtent), inkR, inkG, inkB);
             push(TrayFlyoutHitKind::Back, back);
         }
         LONG rightLimit = panelWidth - padding;
