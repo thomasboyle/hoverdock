@@ -395,6 +395,9 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
             if (newlyActive != app->m_window && newlyActive != app->m_inputWindow) {
                 app->CloseSearch();
             }
+        } else if (app->IsSearchOpen()) {
+            app->m_searchCaretVisible = true;
+            app->PaintSearch();  // caret appears with focus
         }
         return 0;
 

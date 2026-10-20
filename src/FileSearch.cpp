@@ -27,7 +27,7 @@ constexpr DWORD kJournalBufferBytes = 256U << 10;
 constexpr uint32_t kMaxChunkBytes = 4U << 20;
 constexpr DWORD kHelperConnectTimeoutMs = 30000;
 constexpr DWORD kPipeReadTimeoutMs = 60000;
-constexpr DWORD kActivePollMs = 1000;
+constexpr DWORD kActivePollMs = 250;
 constexpr DWORD kIdlePollMs = 30000;
 constexpr DWORD kRetryBuildMs = 5U * 60U * 1000U;
 constexpr DWORD kJournalReasons = USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_RENAME_NEW_NAME |
@@ -561,7 +561,8 @@ void ApplyZoneMarkers(FileIndex& index, const std::vector<VolumeSlot>& volumes) 
         {&FOLDERID_RoamingAppData, filesearch::Zone::AppData},
         {&FOLDERID_LocalAppData, filesearch::Zone::AppData},
         {&FOLDERID_LocalAppDataLow, filesearch::Zone::AppData},
-        {&FOLDERID_ProgramData, filesearch::Zone::AppData},
+        // Hidden in Explorer; full of package caches and container layers.
+        {&FOLDERID_ProgramData, filesearch::Zone::Hidden},
         // Start menu shortcuts are listed as apps already.
         {&FOLDERID_StartMenu, filesearch::Zone::AppData},
         {&FOLDERID_CommonStartMenu, filesearch::Zone::AppData},
@@ -612,6 +613,9 @@ struct JournalStart {
     int64_t nextUsn = 0;
 };
 
+// All-or-nothing: a token that can read some volumes but not others (e.g. a
+// filtered admin) must fall through to the helper rather than silently
+// indexing only part of the disk.
 bool BuildFromMftInProcess(BuildContext& ctx, std::vector<JournalStart>& journals) {
     bool any = false;
     for (const wchar_t letter : FixedNtfsVolumes()) {
@@ -637,6 +641,9 @@ bool BuildFromMftInProcess(BuildContext& ctx, std::vector<JournalStart>& journal
         if (opened) {
             ctx.index.FinishVolume(volume);
             any = any || ok;
+        }
+        if (!ok && (error == ERROR_ACCESS_DENIED || error == ERROR_PRIVILEGE_NOT_HELD)) {
+            return false;
         }
     }
     return any;

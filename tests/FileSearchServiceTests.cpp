@@ -112,16 +112,22 @@ int Child() {
     const auto status = service.GetStatus();
     std::printf("child: indexed=%d mode=%s entries=%zu buildMs=%.0f canEnableMft=%d\n", indexed ? 1 : 0,
         ModeName(status.mode), status.entries, status.buildMs, status.canEnableMft ? 1 : 0);
+    size_t found = 0;
     if (status.mode == FileSearchMode::Mft) {
         HWND window = MessageWindow();
         double ms = 0.0;
         auto reply = RunQuery(service, window, L"notepad.exe", ms);
-        std::printf("child: 'notepad.exe' files=%zu searchMs=%.2f\n", reply ? reply->files.size() : 0,
-            reply ? reply->searchMs : -1.0);
+        found = reply ? reply->files.size() : 0;
+        std::printf("child: 'notepad.exe' files=%zu searchMs=%.2f\n", found, reply ? reply->searchMs : -1.0);
         DestroyWindow(window);
     }
     service.Stop();
-    return status.mode == FileSearchMode::Mft ? 0 : 2;
+    // The system drive must be fully indexed, not just whatever volume the
+    // restricted token happened to be able to open.
+    if (status.mode != FileSearchMode::Mft) {
+        return 2;
+    }
+    return status.entries > 100000 && found > 0 ? 0 : 3;
 }
 
 // Runs this exe as a non-admin (Safer "normal user") child: the dock's usual
@@ -302,7 +308,8 @@ int wmain(int argc, wchar_t** argv) {
     std::printf("helper path: RegisterMftTask -> %d\n", registered);
     CHECK(registered == 0);
     const int child = RunNonAdminChild();
-    std::printf("helper path: non-admin child exit=%d (0 = indexed via helper, 2 = folder fallback)\n", child);
+    std::printf("helper path: non-admin child exit=%d (0 = full index via helper, 2 = folder fallback, "
+                "3 = partial index)\n", child);
     CHECK(child == 0);
     const std::wstring remove = L"schtasks.exe /Delete /F /TN \"HoverdockMftIndex-" + sid + L"\"";
     _wsystem(remove.c_str());
