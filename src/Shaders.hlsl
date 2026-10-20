@@ -1160,24 +1160,62 @@ float4 BlurHPS2(VertexOutput input) : SV_Target
 // Chrome ink on the same face tonemap domain as GlassPS:
 // face = lerp(OVER_BLACK, OVER_WHITE, backdropLuma); ink inverts that so glyphs
 // stay contrasted on both dark and light plates.
-float3 AdaptiveChromeInk(float2 outputSize)
+// Dock chrome (clock, tray glyphs) sits on glass over arbitrary wallpaper.
+// Rather than flipping dark/light ink with the backdrop, use one light ink
+// lifted by a soft dark halo (the macOS / iOS wallpaper-text treatment), so it
+// reads on light, dark and busy backgrounds alike. Colour icons (weather) get
+// the same halo.
+static const float3 kDockChromeInk = float3(0.97, 0.97, 0.98);
+static const float kDockHaloAlpha = 0.55;
+static const float2 kHaloDirs[8] = {
+    float2(1.0, 0.0), float2(0.7071, 0.7071), float2(0.0, 1.0), float2(-0.7071, 0.7071),
+    float2(-1.0, 0.0), float2(-0.7071, -0.7071), float2(0.0, -1.0), float2(0.7071, -0.7071)
+};
+
+float GlyphCoverage(float4 s)
 {
-    // Hard cut on wallpaper luma (ignore frosted plate — it sits mid-grey and
-    // wrongly pulled ink dark on black desks). Dark desk -> light chrome.
-    const float3 darkInk = float3(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B) / 255.0;
-    const float3 lightInk = float3(0.96, 0.96, 0.97);
-    if (scene1.w < 0.5)
-    {
-        return lightInk;
-    }
-    // Average a few samples across the dock window so one bright pixel cannot
-    // tip the whole chrome set dark.
+    return max(s.a, max(s.r, max(s.g, s.b)));
+}
+
+// Blurred coverage on two rings (r/2, r) around the pixel, shifted up by a
+// third of r so the halo falls slightly below the glyph like a drop shadow.
+float HaloLoad(int2 texel, int layer, int2 size, float radius)
+{
     float acc = 0.0;
-    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.20, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
-    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.50, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
-    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.80, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
-    const float wallpaperLuma = saturate(acc / 3.0);
-    return wallpaperLuma < 0.50 ? lightInk : darkInk;
+    [unroll] for (int ring = 1; ring <= 2; ++ring)
+    {
+        [unroll] for (int k = 0; k < 8; ++k)
+        {
+            const float2 offset = kHaloDirs[k] * (radius * 0.5 * (float)ring) - float2(0.0, radius * 0.33);
+            const int2 t = texel + int2(round(offset));
+            const bool inside = t.x >= 0 && t.y >= 0 && t.x < size.x && t.y < size.y;
+            acc += inside ? GlyphCoverage(iconTexture.Load(int4(t, layer, 0))) : 0.0;
+        }
+    }
+    return acc / 16.0;
+}
+
+float HaloSample(float2 uv, float layer, float2 sizePx, float radius)
+{
+    float acc = 0.0;
+    [unroll] for (int ring = 1; ring <= 2; ++ring)
+    {
+        [unroll] for (int k = 0; k < 8; ++k)
+        {
+            const float2 offset = kHaloDirs[k] * (radius * 0.5 * (float)ring) - float2(0.0, radius * 0.33);
+            const float2 t = uv + offset / sizePx;
+            const bool inside = all(t >= 0.0) && all(t <= 1.0);
+            acc += inside ? GlyphCoverage(iconTexture.SampleLevel(linearClamp, float3(t, layer), 0)) : 0.0;
+        }
+    }
+    return acc / 16.0;
+}
+
+// Premultiplied composite of a black halo under (rgb, a).
+void ApplyHalo(inout float3 rgb, inout float a, float blurred)
+{
+    const float halo = saturate(blurred * 1.8) * kDockHaloAlpha;
+    a = a + halo * (1.0 - a);
 }
 
 float4 IconPS(VertexOutput input) : SV_Target
@@ -1186,6 +1224,7 @@ float4 IconPS(VertexOutput input) : SV_Target
     const uint metaZ = (uint)(icon.iconMeta.z + 0.5);
     const bool dragged = (metaZ & 1u) != 0u;
     const bool adaptiveInk = (metaZ & 2u) != 0u;
+    const bool contrastHalo = (metaZ & 4u) != 0u;
     const float2 outputSize = max(scene0.xy, float2(1.0, 1.0));
 
     if (icon.iconMeta.y > 1.5 && icon.iconMeta.y < 3.5)
@@ -1215,19 +1254,30 @@ float4 IconPS(VertexOutput input) : SV_Target
         float a = sampledClock.a;
         if (adaptiveInk)
         {
-            const float coverage = max(a, max(rgb.r, max(rgb.g, rgb.b)));
-            const float3 ink = AdaptiveChromeInk(outputSize);
-            rgb = ink * coverage;
+            const float coverage = GlyphCoverage(sampledClock);
+            rgb = kDockChromeInk * coverage;
             a = coverage;
+        }
+        if (contrastHalo && inside)
+        {
+            const float radius = max(1.0, icon.iconRect.w / 14.0);
+            ApplyHalo(rgb, a, HaloLoad(texel, (int)input.textureIndex, int2(icon.iconRect.zw), radius));
         }
         return float4(rgb * clockBrightness, a * clockBrightness);
     }
 
     const float contentHeightRatio = saturate(icon.iconRect.z / max(icon.iconRect.w, 1.0));
     float4 sampled = float4(0.0, 0.0, 0.0, 0.0);
+    float haloBlur = 0.0;
     if (input.uv.y <= contentHeightRatio) {
         const float2 iconUv = float2(input.uv.x, input.uv.y / max(contentHeightRatio, 0.001));
         sampled = iconTexture.Sample(linearClamp, float3(saturate(iconUv), input.textureIndex));
+        if (contrastHalo)
+        {
+            // Content is square (iconRect.z px each way).
+            const float side = max(icon.iconRect.z, 1.0);
+            haloBlur = HaloSample(saturate(iconUv), input.textureIndex, float2(side, side), max(1.0, side / 14.0));
+        }
     }
 
     const float iconBrightness = icon.iconMeta.y > 0.5 && !dragged ? 0.5 : 1.0;
@@ -1236,10 +1286,15 @@ float4 IconPS(VertexOutput input) : SV_Target
 
     if (adaptiveInk)
     {
-        const float coverage = max(alpha, max(sampled.r, max(sampled.g, sampled.b)));
-        const float3 ink = AdaptiveChromeInk(outputSize);
-        color = ink * coverage * iconBrightness;
+        const float coverage = GlyphCoverage(sampled);
+        color = kDockChromeInk * coverage * iconBrightness;
         alpha = coverage * iconBrightness;
+    }
+    if (contrastHalo)
+    {
+        float haloAlpha = alpha / max(iconBrightness, 0.001);
+        ApplyHalo(color, haloAlpha, haloBlur);
+        alpha = haloAlpha * iconBrightness;
     }
 
     if (icon.iconMeta.x > 0.5 && contentHeightRatio < 0.98 && input.uv.y > contentHeightRatio) {

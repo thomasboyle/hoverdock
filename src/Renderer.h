@@ -41,7 +41,11 @@ struct DockIconRenderData {
     DockIconKind kind = DockIconKind::App;
     TraySlot traySlot = TraySlot::Overflow;
     UINT textureIndex = 0;
+    // Monochrome chrome glyph drawn in the fixed light chrome ink.
     bool adaptiveInk = false;
+    // Soft dark shadow halo so the glyph reads on any wallpaper (clock, tray
+    // glyphs, weather) without flipping ink with the backdrop.
+    bool contrastHalo = false;
 };
 
 struct DockRenderState {
@@ -156,9 +160,6 @@ public:
     void CancelLiveGlassPanelBake() noexcept;
     // Increments only when CaptureBackdrop uploads new pixels (desktop changed).
     [[nodiscard]] uint64_t BackdropChangeSerial() const noexcept { return m_backdropChangeSerial; }
-    // Same wallpaper-luma cut as AdaptiveChromeInk in Shaders.hlsl so Quick /
-    // Dock Settings text matches Start/Search/clock chrome on the dock.
-    void SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const noexcept;
     void Flush();
 
     [[nodiscard]] HANDLE FrameLatencyWaitableObject() const noexcept;

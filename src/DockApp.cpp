@@ -843,7 +843,7 @@ HFONT CreateFlyoutFont(int pixelHeight, int weight) {
         DockTextFontFace());
 }
 
-// Active flyout chrome ink (mirrors AdaptiveChromeInk). Set once per menu paint.
+// Active flyout chrome ink. Set once per menu paint.
 uint8_t g_flyoutInkR = DOCK_INK_R;
 uint8_t g_flyoutInkG = DOCK_INK_G;
 uint8_t g_flyoutInkB = DOCK_INK_B;
@@ -857,8 +857,8 @@ void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept {
     g_flyoutInkB = b;
 }
 
-// AdaptiveChromeInk cut (dark ink over a light face) measured on the baked
-// glass so glyphs follow whatever the panel actually sits over.
+// Dark ink over a light face, measured on the baked panel glass so flyout
+// glyphs follow whatever the panel actually sits over.
 void SetFlyoutChromeInkForGlass(const uint8_t* pixels, int width, int height) noexcept {
     constexpr int kGrid = 8;
     constexpr float kLightFaceLuma = 0.55F;
@@ -4538,6 +4538,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         data.kind = DockIconKind::Tray;
         data.traySlot = slot;
         data.adaptiveInk = true;
+        data.contrastHalo = true;
         data.bounds = {left, trayTop, left + trayGlyph, trayTop + trayGlyph};
         m_iconRenderData.push_back(data);
         left += trayGlyph + trayGap;
@@ -4555,6 +4556,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         DockIconRenderData weather;
         weather.kind = DockIconKind::Weather;
         weather.adaptiveInk = false;
+        weather.contrastHalo = true;
         weather.bounds = {left, weatherTop, left + weatherSize, weatherTop + weatherSize};
         m_iconRenderData.push_back(weather);
         left += weatherSize + weatherGap;
@@ -4563,6 +4565,7 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     clock.kind = DockIconKind::Clock;
     clock.traySlot = TraySlot::Clock;
     clock.adaptiveInk = true;
+    clock.contrastHalo = true;
     clock.bounds = {left, clockTop, left + clockWidth, clockTop + clockHeight};
     m_iconRenderData.push_back(clock);
 
