@@ -284,6 +284,36 @@ void TestParallelMatchesSerial() {
             std::printf("  query '%s': index=%zu brute=%zu\n", q, state.lastMatchCount, brute);
         }
     }
+    // Fan-out (> 200k names, 4 threads) with the narrowing / resume cache:
+    // every keystroke equals the full ranking, and repeats narrow.
+    for (const char* q : {"abc de", "fgh", "a b", "x-q", "j 1", "de fg"}) {
+        SearchState typing;
+        std::string typed;
+        for (const char c : std::string(q)) {
+            typed.push_back(c);
+            const auto viaState = index.Search(typed, 50, &typing, 4);
+            const auto fresh = index.Search(typed, 10000000, nullptr, 1);
+            bool same = viaState.size() == std::min<size_t>(50, fresh.size());
+            for (size_t i = 0; same && i < viaState.size(); ++i) {
+                same = viaState[i].entry == fresh[i].entry && viaState[i].score == fresh[i].score;
+            }
+            CHECK(same);
+            if (!same) {
+                std::printf("  fan-out typing '%s' differs (incremental=%d)\n", typed.c_str(),
+                    typing.lastWasIncremental ? 1 : 0);
+            }
+        }
+        const bool narrowable = typing.valid;
+        const size_t recorded = typing.slots.size();
+        const auto again = index.Search(std::string(q) + " ", 50, &typing, 4);
+        static_cast<void>(again);
+        // Narrowing is skipped by design for large match sets (NarrowingCap).
+        CHECK(typing.lastWasIncremental || !narrowable || recorded >= std::max<size_t>(index.EntryCount() / 64, 4096));
+        if (!typing.lastWasIncremental) {
+            std::printf("  note: '%s' repeat not narrowed (valid=%d recorded=%zu of %zu)\n", q, narrowable ? 1 : 0,
+                recorded, index.EntryCount());
+        }
+    }
 }
 
 void TestUnicodeMatching() {

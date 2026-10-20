@@ -946,8 +946,8 @@ struct ScanContext {
     uint16_t queryKey = 0;
     bool queryHasDot = false;
     size_t slotCount = 0;
-    // Narrowing only pays for small match sets (see Search): stop recording
-    // past this many (one cap for the whole query, across scan phases).
+    // Narrowing only pays for small match sets (see NarrowingCap): stop
+    // recording past it (one cap for the whole query, across scan phases).
     size_t recordCap = 0;
     // Upper bound of the query-dependent score part with all tokens at
     // position 0: without (tokenCeiling) and with (ceilingHead) the
@@ -960,6 +960,13 @@ struct ScanContext {
 };
 
 enum class SlotResult { NoMatch, Matched, Scored };
+
+// Re-scoring a recorded match (random access, full token checks) costs
+// about as much as SIMD-scanning ~70 names (MEASURED: ~40 ns vs ~0.55 ns),
+// so narrowing beats a fresh scan only below ~1/64 of the names.
+size_t NarrowingCap(size_t slotCount) noexcept {
+    return std::max<size_t>(slotCount / 64, 4096);
+}
 
 // Exact ceiling for one name: tokens at position 0, whole-name bonus only
 // when the length allows it (exact name, or stem ending in '.').
@@ -1282,7 +1289,7 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
     ctx.queryKey = FoldedKey(query.folded);
     ctx.queryHasDot = query.folded.find('.') != std::string::npos;
     ctx.slotCount = m_slotEntry.size();
-    ctx.recordCap = ctx.slotCount / 8 + 1;
+    ctx.recordCap = NarrowingCap(ctx.slotCount);
     ctx.tokenCeiling = static_cast<int>(query.tokens.size()) * kTokenCeiling;
     ctx.ceilingHead = ctx.tokenCeiling + kWholeNameCeiling;
     ctx.shared = &shared;
@@ -1303,7 +1310,7 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
     const bool incremental = state != nullptr && state->valid && state->generation == m_generation &&
         !state->folded.empty() && query.folded.size() >= state->folded.size() &&
         query.folded.compare(0, state->folded.size(), state->folded) == 0 &&
-        state->slots.size() < ctx.slotCount / 8 && state->resumeSlot <= sortedEnd;
+        state->slots.size() < NarrowingCap(ctx.slotCount) && state->resumeSlot <= sortedEnd;
     if (incremental) {
         matches.reserve(state->slots.size());
         for (const uint32_t slot : state->slots) {
@@ -1362,6 +1369,7 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
             std::vector<size_t> partCounts(workers, 0);
             std::vector<TopN> partTops(workers, TopN(limit));
             std::vector<uint8_t> partCut(workers, 0);
+            std::vector<uint32_t> partFirstCut(workers, sortedEnd);
             std::vector<std::thread> pool;
             pool.reserve(workers - 1);
             auto run = [&](unsigned w) {
@@ -1374,8 +1382,12 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
                     const auto s0 = static_cast<uint32_t>(probeEnd + first);
                     const auto s1 = static_cast<uint32_t>(std::min<uint64_t>(sortedEnd, s0 + uint64_t{chunk}));
                     bool chunkCut = false;
-                    ScanSlots(ctx, s0, s1, true, partMatches[w], partCounts[w], partTops[w], chunkCut);
-                    partWasCut = partWasCut || chunkCut;
+                    uint32_t chunkCutAt = s1;
+                    ScanSlots(ctx, s0, s1, true, partMatches[w], partCounts[w], partTops[w], chunkCut, &chunkCutAt);
+                    if (chunkCut) {
+                        partWasCut = true;
+                        partFirstCut[w] = std::min(partFirstCut[w], chunkCutAt);
+                    }
                 }
                 partCut[w] = partWasCut ? 1 : 0;
             };
@@ -1394,8 +1406,18 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
                     top.Offer(hit);
                 }
             }
-            // Chunks cut independently: the covered set is not a prefix.
-            resumable = !cut;
+            if (cut) {
+                // Every chunk before the earliest cut point was scanned in
+                // full, so that point bounds the covered ranked prefix.
+                // Matches recorded past it come from partial chunks: drop
+                // them (the resumed scan revisits those slots), but keep the
+                // matches from before probeEnd and the unsorted tail.
+                covered = *std::min_element(partFirstCut.begin(), partFirstCut.end());
+                const bool complete = matches.size() == matchCount;
+                std::erase_if(matches, [&](uint32_t slot) { return slot >= covered && slot < sortedEnd; });
+                matchCount = matches.size();
+                resumable = complete;
+            }
         }
     }
     if (!incremental) {
