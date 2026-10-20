@@ -48,8 +48,7 @@ constexpr DWORD kPairTimeoutMs = 180000;
 // Round 1: event-driven link waits (fallback poll quantum + bounds).
 constexpr DWORD kLinkPollMs = 50;
 constexpr DWORD kDisconnectWaitMs = 3000;   // measured ACL down 150 ms median (IOCTL only)
-constexpr DWORD kPageLinkWaitMs = 5000;     // measured link-up 1.6 s median, 4.1 s max
-constexpr DWORD kPageErrorGraceMs = 1500;   // link may still come up after an L2CAP error
+constexpr DWORD kPageLinkWaitMs = 6000;     // measured link-up 1.6 s median, 4.1 s max (+ margin: decides fail-fast)
 constexpr DWORD kToggleLinkWaitMs = 5000;   // after the toggle has returned
 constexpr DWORD kToggleTotalWaitMs = 12000; // round 2: toggle median 6.13 s, link up inside it
 constexpr DWORD kDisconnectGuardMs = 2000;  // round 3: late KS / HFP re-pages at 0.45-1.7 s
@@ -57,7 +56,11 @@ constexpr DWORD kTaskJoinMs = 7000;         // bounded wait for a previous servi
 constexpr DWORD kTaskChainWaitMs = 15000;   // helper thread waits for its predecessor
 // KSPROPSETID_BtAudio (shared/ksmedia.h, 7FA06C40-B8F6-4C7E-8556-E8C33A12E54D).
 constexpr GUID kKsPropSetBtAudio = {0x7fa06c40, 0xb8f6, 0x4c7e, {0x85, 0x56, 0xe8, 0xc3, 0x3a, 0x12, 0xe5, 0x4d}};
-constexpr ULONG kKsPropOneShotReconnect = 0; // KSPROPERTY_ONESHOT_RECONNECT
+constexpr ULONG kKsPropOneShotReconnect = 0;  // KSPROPERTY_ONESHOT_RECONNECT
+constexpr ULONG kKsPropOneShotDisconnect = 1; // KSPROPERTY_ONESHOT_DISCONNECT
+// Graceful audio disconnect: profiles close and the ACL usually drops within
+// ~1 s; past this the link is forced down with the disconnect IOCTL.
+constexpr DWORD kKsDisconnectWaitMs = 2000;
 constexpr ULONG kKsPropertyTypeGet = 0x00000001; // KSPROPERTY_TYPE_GET
 constexpr int kMaxRefreshRetries = 3;
 constexpr DWORD kRefreshRetryMs = 1500;
@@ -65,9 +68,17 @@ constexpr size_t kMaxPaired = 6;
 constexpr size_t kMaxDiscovered = 4;
 constexpr size_t kMaxTracked = 32;
 
+// Discovery watcher: the selector shape BluetoothDevice / BluetoothLEDevice
+// GetDeviceSelectorFromPairingState(false) produce. The IssueInquiry terms
+// make Windows actively scan (classic inquiry + LE active scan); without them
+// only devices another scanner (Settings) had already found ever appeared.
 constexpr wchar_t kBluetoothAqs[] =
-    L"(System.Devices.Aep.ProtocolId:=\"{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\" OR "
-    L"System.Devices.Aep.ProtocolId:=\"{bb7bb05e-5972-42b5-94fc-76eaa7084d49}\")";
+    L"(System.Devices.Aep.ProtocolId:=\"{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\" AND "
+    L"(System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#False OR "
+    L"System.Devices.Aep.Bluetooth.IssueInquiry:=System.StructuredQueryType.Boolean#True)) OR "
+    L"(System.Devices.Aep.ProtocolId:=\"{bb7bb05e-5972-42b5-94fc-76eaa7084d49}\" AND "
+    L"(System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#False OR "
+    L"System.Devices.Aep.Bluetooth.Le.IssueInquiry:=System.StructuredQueryType.Boolean#True))";
 
 #ifndef FILE_DEVICE_BLUETOOTH
 #define FILE_DEVICE_BLUETOOTH 0x00000041
@@ -736,32 +747,31 @@ DWORD WINAPI ServiceTaskThread(LPVOID param) {
     return 0;
 }
 
-// Round 3 (1): ask the Bluetooth audio KS filter to reconnect. This is the
-// documented KSPROPSETID_BtAudio / KSPROPERTY_ONESHOT_RECONNECT path the
-// Windows audio stack uses for A2DP/HFP endpoints; it pages the device and
-// brings up the profile without changing any service state. The filter is
-// found via the render endpoint whose connector points at a BTHENUM filter
-// interface containing this device address. Worker thread (COM MTA via
-// RoInitialize) only.
-HRESULT KsReconnect(uint64_t address) {
-    ProfileScope profileScope("Bluetooth::KsReconnect");
+// KSPROPSETID_BtAudio one-shot connect / disconnect: the documented path the
+// Windows audio stack (Sound settings "Connect" / "Disconnect") uses for
+// Bluetooth headsets. Each BT audio driver (A2DP sink, Hands-Free) exposes a
+// KS filter; the filter is found from an audio endpoint whose connector points
+// at a BTHENUM filter interface containing the device address. A one-shot
+// disconnect closes the profiles gracefully, so the headset does not treat it
+// as link loss and auto-reconnect, and a later one-shot reconnect pages it
+// reliably. Worker thread (COM MTA via RoInitialize) only.
+std::vector<std::wstring> FindBtAudioFilters(uint64_t address) {
+    ProfileScope profileScope("Bluetooth::FindBtAudioFilters");
+    std::vector<std::wstring> filters;
     wchar_t addressText[16]{};
     std::swprintf(addressText, std::size(addressText), L"%012llX", static_cast<unsigned long long>(address));
     ComPtr<IMMDeviceEnumerator> enumerator;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
-    if (FAILED(hr)) {
-        ProfileScope::Mark("Bluetooth::KsReconnect no MMDeviceEnumerator");
-        return hr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator)))) {
+        ProfileScope::Mark("Bluetooth::FindBtAudioFilters no MMDeviceEnumerator");
+        return filters;
     }
     ComPtr<IMMDeviceCollection> endpoints;
-    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATEMASK_ALL, &endpoints);
-    if (FAILED(hr) || endpoints == nullptr) {
-        return FAILED(hr) ? hr : E_FAIL;
+    // Render and capture: the Hands-Free filter may only back a capture endpoint.
+    if (FAILED(enumerator->EnumAudioEndpoints(eAll, DEVICE_STATEMASK_ALL, &endpoints)) || endpoints == nullptr) {
+        return filters;
     }
     UINT endpointCount = 0;
     endpoints->GetCount(&endpointCount);
-    HRESULT last = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-    int filtersTried = 0;
     for (UINT index = 0; index < endpointCount; ++index) {
         ComPtr<IMMDevice> endpoint;
         ComPtr<IDeviceTopology> topology;
@@ -782,39 +792,57 @@ HRESULT KsReconnect(uint64_t address) {
             if (FAILED(connector->GetDeviceIdConnectedTo(&filterId)) || filterId == nullptr) {
                 continue;
             }
-            const std::wstring filter(filterId);
+            std::wstring filter(filterId);
             CoTaskMemFree(filterId);
-            if (!ContainsInsensitive(filter, addressText) || !ContainsInsensitive(filter, L"BTH")) {
-                continue;
-            }
-            ComPtr<IMMDevice> filterDevice;
-            ComPtr<IKsControl> control;
-            if (FAILED(enumerator->GetDevice(filter.c_str(), &filterDevice)) || filterDevice == nullptr ||
-                FAILED(filterDevice->Activate(__uuidof(IKsControl), CLSCTX_ALL, nullptr,
-                    reinterpret_cast<void**>(control.GetAddressOf()))) ||
-                control == nullptr) {
-                ProfileScope::Mark("Bluetooth::KsReconnect filter not activatable");
-                continue;
-            }
-            ++filtersTried;
-            KSPROPERTY property{};
-            property.Set = kKsPropSetBtAudio;
-            property.Id = kKsPropOneShotReconnect;
-            property.Flags = kKsPropertyTypeGet;
-            ULONG returned = 0;
-            last = control->KsProperty(&property, sizeof(property), nullptr, 0, &returned);
-            char text[96]{};
-            std::snprintf(text, sizeof(text), "Bluetooth::KsReconnect hr=0x%08lX", static_cast<unsigned long>(last));
-            ProfileScope::Mark(text);
-            if (SUCCEEDED(last)) {
-                return last;
+            if (ContainsInsensitive(filter, addressText) && ContainsInsensitive(filter, L"BTH") &&
+                std::find(filters.begin(), filters.end(), filter) == filters.end()) {
+                filters.push_back(std::move(filter));
             }
         }
     }
-    if (filtersTried == 0) {
-        ProfileScope::Mark("Bluetooth::KsReconnect no BT audio filter for device");
+    char text[80]{};
+    std::snprintf(text, sizeof(text), "Bluetooth::FindBtAudioFilters count=%zu", filters.size());
+    ProfileScope::Mark(text);
+    return filters;
+}
+
+// One-shot `propertyId` on every filter; returns how many accepted it.
+int KsOneShot(const std::vector<std::wstring>& filters, ULONG propertyId) {
+    ProfileScope profileScope(propertyId == kKsPropOneShotDisconnect ? "Bluetooth::KsDisconnect"
+                                                                     : "Bluetooth::KsReconnect");
+    if (filters.empty()) {
+        return 0;
     }
-    return last;
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator)))) {
+        return 0;
+    }
+    int accepted = 0;
+    for (const std::wstring& filter : filters) {
+        ComPtr<IMMDevice> filterDevice;
+        ComPtr<IKsControl> control;
+        if (FAILED(enumerator->GetDevice(filter.c_str(), &filterDevice)) || filterDevice == nullptr ||
+            FAILED(filterDevice->Activate(__uuidof(IKsControl), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(control.GetAddressOf()))) ||
+            control == nullptr) {
+            ProfileScope::Mark("Bluetooth::KsOneShot filter not activatable");
+            continue;
+        }
+        KSPROPERTY property{};
+        property.Set = kKsPropSetBtAudio;
+        property.Id = propertyId;
+        property.Flags = kKsPropertyTypeGet;
+        ULONG returned = 0;
+        const HRESULT hr = control->KsProperty(&property, sizeof(property), nullptr, 0, &returned);
+        char text[96]{};
+        std::snprintf(text, sizeof(text), "Bluetooth::KsOneShot %s hr=0x%08lX",
+            propertyId == kKsPropOneShotDisconnect ? "disconnect" : "reconnect", static_cast<unsigned long>(hr));
+        ProfileScope::Mark(text);
+        if (SUCCEEDED(hr)) {
+            ++accepted;
+        }
+    }
+    return accepted;
 }
 
 const wchar_t* PairFailureText(
@@ -916,6 +944,24 @@ struct BluetoothService::Impl {
     EventRegistrationToken updatedToken{};
     EventRegistrationToken removedToken{};
     EventRegistrationToken completedToken{};
+    // Watcher callbacks run on thread-pool threads. They only queue events
+    // here (guarded by watchMutex) and wake the worker, which owns `paired` /
+    // `discovered`; mutating those from callbacks raced the worker's jobs.
+    struct WatchEvent {
+        enum class Kind : uint8_t { Added, Updated, Removed, Completed };
+        Kind kind = Kind::Added;
+        uint64_t generation = 0;
+        ComPtr<ABI::Windows::Devices::Enumeration::IDeviceInformation> info;
+        ComPtr<ABI::Windows::Devices::Enumeration::IDeviceInformationUpdate> update;
+    };
+    std::mutex watchMutex;
+    std::vector<WatchEvent> watchInbox;
+    // Worker-only: every endpoint the watcher reported, kept so a later
+    // update (an LE name arriving after the first advertisement) is applied
+    // with IDeviceInformation::Update and the device re-evaluated.
+    std::map<std::wstring, ComPtr<ABI::Windows::Devices::Enumeration::IDeviceInformation>> candidates;
+    // Worker-only: BT audio KS filter ids per device address.
+    std::map<uint64_t, std::vector<std::wstring>> ksFilters;
 
     void Track(IAsyncInfo* info) {
         std::lock_guard<std::mutex> lock(asyncMutex);
@@ -1078,10 +1124,26 @@ struct BluetoothService::Impl {
                     }
                 }
             }
-            if (job.kind == JobKind::Connect || job.kind == JobKind::Disconnect) {
+            const bool discoveryJob = job.kind == JobKind::StartDiscovery || job.kind == JobKind::StopDiscovery;
+            if (discoveryJob || job.kind == JobKind::Pair) {
+                if (discoveryJob) {
+                    // Newest scan intent wins (expand / collapse in quick succession).
+                    std::erase_if(queue, [](const Job& pending) {
+                        return pending.kind == JobKind::StartDiscovery || pending.kind == JobKind::StopDiscovery;
+                    });
+                }
+                // Like Connect: never wait behind a paired-list refresh.
+                if (inflightActive && inflightKind == JobKind::Refresh && cancelJob != nullptr) {
+                    SetEvent(cancelJob);
+                    ProfileScope::Mark("Bluetooth::Supersede preempt refresh (discovery/pair)");
+                }
+            }
+            if (job.kind == JobKind::Connect || job.kind == JobKind::Disconnect || discoveryJob ||
+                job.kind == JobKind::Pair) {
                 const auto at = std::find_if(queue.begin(), queue.end(), [](const Job& pending) {
                     return pending.kind != JobKind::Connect && pending.kind != JobKind::Disconnect &&
                         pending.kind != JobKind::Pair && pending.kind != JobKind::SetRadio &&
+                        pending.kind != JobKind::StartDiscovery && pending.kind != JobKind::StopDiscovery &&
                         pending.kind != JobKind::Quit;
                 });
                 if (at != queue.end()) {
@@ -1841,6 +1903,11 @@ struct BluetoothService::Impl {
             // Wait out a callback that already passed the generation check.
             std::lock_guard<std::mutex> callbackLock(callbackMutex);
         }
+        {
+            std::lock_guard<std::mutex> inboxLock(watchMutex);
+            watchInbox.clear();
+        }
+        candidates.clear();
         ComPtr<ABI::Windows::Devices::Enumeration::IDeviceWatcher> current = watcher;
         watcher.Reset();
         if (current == nullptr) {
@@ -1880,54 +1947,57 @@ struct BluetoothService::Impl {
             return false;
         }
         const uint64_t generation = watchGeneration.load();
+        // Queue for the worker (DrainWatchEvents); never touch device lists here.
+        const auto post = [this, generation](WatchEvent event) {
+            std::lock_guard<std::mutex> callbackLock(callbackMutex);
+            if (generation != watchGeneration.load() || wake == nullptr) {
+                return;
+            }
+            event.generation = generation;
+            {
+                std::lock_guard<std::mutex> inboxLock(watchMutex);
+                watchInbox.push_back(std::move(event));
+            }
+            SetEvent(wake);
+        };
         auto added = Microsoft::WRL::Callback<AddedHandler>(
-            [this, generation](ABI::Windows::Devices::Enumeration::IDeviceWatcher*,
+            [post](ABI::Windows::Devices::Enumeration::IDeviceWatcher*,
                 ABI::Windows::Devices::Enumeration::IDeviceInformation* info) -> HRESULT {
-                std::lock_guard<std::mutex> callbackLock(callbackMutex);
-                if (generation != watchGeneration.load() || info == nullptr) {
-                    return S_OK;
+                if (info != nullptr) {
+                    WatchEvent event;
+                    event.kind = WatchEvent::Kind::Added;
+                    event.info = info;
+                    post(std::move(event));
                 }
-                NoteDevice(info, false);
-                Publish();
                 return S_OK;
             });
         auto updated = Microsoft::WRL::Callback<UpdatedHandler>(
-            [this, generation](ABI::Windows::Devices::Enumeration::IDeviceWatcher*,
+            [post](ABI::Windows::Devices::Enumeration::IDeviceWatcher*,
                 ABI::Windows::Devices::Enumeration::IDeviceInformationUpdate* update) -> HRESULT {
-                std::lock_guard<std::mutex> callbackLock(callbackMutex);
-                if (generation != watchGeneration.load() || update == nullptr) {
-                    return S_OK;
+                if (update != nullptr) {
+                    WatchEvent event;
+                    event.kind = WatchEvent::Kind::Updated;
+                    event.update = update;
+                    post(std::move(event));
                 }
-                ApplyUpdate(update);
-                Publish();
                 return S_OK;
             });
         auto removed = Microsoft::WRL::Callback<UpdatedHandler>(
-            [this, generation](ABI::Windows::Devices::Enumeration::IDeviceWatcher*,
+            [post](ABI::Windows::Devices::Enumeration::IDeviceWatcher*,
                 ABI::Windows::Devices::Enumeration::IDeviceInformationUpdate* update) -> HRESULT {
-                std::lock_guard<std::mutex> callbackLock(callbackMutex);
-                if (generation != watchGeneration.load() || update == nullptr) {
-                    return S_OK;
-                }
-                HSTRING idValue = nullptr;
-                if (SUCCEEDED(update->get_Id(&idValue))) {
-                    RemoveId(HStringToWide(idValue));
-                    WindowsDeleteString(idValue);
-                    Publish();
+                if (update != nullptr) {
+                    WatchEvent event;
+                    event.kind = WatchEvent::Kind::Removed;
+                    event.update = update;
+                    post(std::move(event));
                 }
                 return S_OK;
             });
         auto completed = Microsoft::WRL::Callback<StoppedHandler>(
-            [this, generation](ABI::Windows::Devices::Enumeration::IDeviceWatcher*, IInspectable*) -> HRESULT {
-                std::lock_guard<std::mutex> callbackLock(callbackMutex);
-                if (generation != watchGeneration.load()) {
-                    return S_OK;
-                }
-                enumerationCompleted = true;
-                if (discovering && discovered.empty()) {
-                    hint = L"Put the device in pairing mode";
-                }
-                Publish();
+            [post](ABI::Windows::Devices::Enumeration::IDeviceWatcher*, IInspectable*) -> HRESULT {
+                WatchEvent event;
+                event.kind = WatchEvent::Kind::Completed;
+                post(std::move(event));
                 return S_OK;
             });
         if (added == nullptr || updated == nullptr || removed == nullptr || completed == nullptr) {
@@ -1944,6 +2014,72 @@ struct BluetoothService::Impl {
         }
         watcher = std::move(created);
         return true;
+    }
+
+    // Worker: apply queued watcher events, then publish once.
+    void DrainWatchEvents() {
+        std::vector<WatchEvent> events;
+        {
+            std::lock_guard<std::mutex> inboxLock(watchMutex);
+            events.swap(watchInbox);
+        }
+        if (events.empty()) {
+            return;
+        }
+        const uint64_t generation = watchGeneration.load();
+        for (WatchEvent& event : events) {
+            if (event.generation != generation) {
+                continue;
+            }
+            switch (event.kind) {
+            case WatchEvent::Kind::Added: {
+                HSTRING idValue = nullptr;
+                if (SUCCEEDED(event.info->get_Id(&idValue))) {
+                    candidates[HStringToWide(idValue)] = event.info;
+                    WindowsDeleteString(idValue);
+                }
+                NoteDevice(event.info.Get(), false);
+                break;
+            }
+            case WatchEvent::Kind::Updated: {
+                HSTRING idValue = nullptr;
+                if (FAILED(event.update->get_Id(&idValue))) {
+                    break;
+                }
+                const std::wstring id = HStringToWide(idValue);
+                WindowsDeleteString(idValue);
+                const auto found = candidates.find(id);
+                if (found != candidates.end() && found->second != nullptr &&
+                    SUCCEEDED(found->second->Update(event.update.Get()))) {
+                    // Re-evaluate: a name or CanPair may only arrive now.
+                    NoteDevice(found->second.Get(), false);
+                } else {
+                    ApplyUpdate(event.update.Get());
+                }
+                break;
+            }
+            case WatchEvent::Kind::Removed: {
+                HSTRING idValue = nullptr;
+                if (SUCCEEDED(event.update->get_Id(&idValue))) {
+                    const std::wstring id = HStringToWide(idValue);
+                    WindowsDeleteString(idValue);
+                    candidates.erase(id);
+                    // Only unpaired results leave; paired rows come from refreshes.
+                    discovered.erase(std::remove_if(discovered.begin(), discovered.end(),
+                                         [&](const RadioDevice& device) { return device.id == id; }),
+                        discovered.end());
+                }
+                break;
+            }
+            case WatchEvent::Kind::Completed:
+                enumerationCompleted = true;
+                if (discovering && discovered.empty()) {
+                    hint = L"Put the device in pairing mode";
+                }
+                break;
+            }
+        }
+        Publish();
     }
 
     bool ConnectLe(uint64_t address) {
@@ -2183,92 +2319,44 @@ struct BluetoothService::Impl {
         }
     }
 
-    // Diagnostic / secondary page: L2CAP PSM 0x19 via Winsock. Round 2 saw
-    // an immediate connect error in 17/19 jobs; the code is now logged and
-    // an immediate error returns at once (no 1.5 s grace).
-    LinkWait L2capPage(uint64_t address) {
-        ProfileScope profileScope("Bluetooth::L2capPage");
-        WSADATA wsa{};
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-            return LinkWait::Timeout;
+    // One-shot on the device's cached BT audio filters; re-discovers them
+    // (audio endpoint topology walk) when none are cached or none accepted.
+    int KsAudioOneShot(uint64_t address, ULONG propertyId) {
+        if (address == 0) {
+            return 0;
         }
-        char text[112]{};
-        LinkWait result = LinkWait::Timeout;
-        const SOCKET sock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_L2CAP);
-        if (sock == INVALID_SOCKET) {
-            std::snprintf(text, sizeof(text), "Bluetooth::PageAudio socket error wsa=%d", WSAGetLastError());
-            ProfileScope::Mark(text);
-            WSACleanup();
-            return result;
-        }
-        const WSAEVENT pageReady = WSACreateEvent();
-        if (pageReady != WSA_INVALID_EVENT && WSAEventSelect(sock, pageReady, FD_CONNECT) == 0) {
-            SOCKADDR_BTH remote{};
-            remote.addressFamily = AF_BTH;
-            remote.btAddr = address;
-            remote.serviceClassId = ServiceUuid(0x110B);
-            remote.port = 0x0019;
-            if (connect(sock, reinterpret_cast<SOCKADDR*>(&remote), sizeof(remote)) != 0) {
-                const int error = WSAGetLastError();
-                if (error != WSAEWOULDBLOCK) {
-                    std::snprintf(text, sizeof(text), "Bluetooth::PageAudio connect error wsa=%d", error);
-                    ProfileScope::Mark("Bluetooth::PageAudio connect error");
-                    ProfileScope::Mark(text);
-                } else {
-                    ProfileScope::Mark("Bluetooth::PageAudio l2cap pending");
-                    result = WaitLink(address, true, kPageLinkWaitMs, pageReady);
-                    if (result == LinkWait::Extra) {
-                        WSANETWORKEVENTS network{};
-                        int code = -1;
-                        if (WSAEnumNetworkEvents(sock, pageReady, &network) == 0 &&
-                            (network.lNetworkEvents & FD_CONNECT) != 0) {
-                            code = network.iErrorCode[FD_CONNECT_BIT];
-                        }
-                        std::snprintf(text, sizeof(text), "Bluetooth::PageAudio l2cap result wsa=%d", code);
-                        ProfileScope::Mark(text);
-                        ProfileScope::Mark(code == 0 ? "Bluetooth::PageAudio l2cap connected"
-                                                     : "Bluetooth::PageAudio l2cap error");
-                        result = WaitLink(address, true, code == 0 ? kPageLinkWaitMs : kPageErrorGraceMs);
-                    }
-                }
-            } else {
-                ProfileScope::Mark("Bluetooth::PageAudio l2cap connected");
-                result = WaitLink(address, true, kPageLinkWaitMs);
+        const auto cached = ksFilters.find(address);
+        if (cached != ksFilters.end() && !cached->second.empty()) {
+            const int accepted = KsOneShot(cached->second, propertyId);
+            if (accepted > 0) {
+                return accepted;
             }
-        } else {
-            ProfileScope::Mark("Bluetooth::PageAudio socket setup failed");
+            ProfileScope::Mark("Bluetooth::KsOneShot cached filters failed, re-finding");
         }
-        closesocket(sock);
-        if (pageReady != WSA_INVALID_EVENT) {
-            WSACloseEvent(pageReady);
-        }
-        WSACleanup();
-        return result;
+        std::vector<std::wstring> filters = FindBtAudioFilters(address);
+        const int accepted = KsOneShot(filters, propertyId);
+        ksFilters[address] = std::move(filters);
+        return accepted;
     }
 
-    // P2 page. 1) KS one-shot reconnect on the device's BT audio filter;
-    // 2) L2CAP PSM 0x19 (diagnostic, fails fast). No SetServiceState here.
-    LinkWait PageAudio(uint64_t address) {
+    // Audio page: KS one-shot reconnect on every BT audio driver of the device
+    // (A2DP and Hands-Free), then an event-driven wait for the link.
+    LinkWait PageAudio(uint64_t address, bool& requested) {
         ProfileScope profileScope("Bluetooth::PageAudio");
-        const HRESULT ks = KsReconnect(address);
-        if (SUCCEEDED(ks)) {
-            ProfileScope::Mark("Bluetooth::PageAudio branch=ks");
-            const LinkWait waited = WaitLink(address, true, kPageLinkWaitMs);
-            if (waited == LinkWait::Cancelled) {
-                // The reconnect request is already in the driver and still
-                // completes; the superseding Disconnect's guard re-drops it.
-                ProfileScope::Mark("Bluetooth::Connect cancelled after KS reconnect");
-            }
-            if (waited != LinkWait::Timeout) {
-                return waited;
-            }
+        requested = KsAudioOneShot(address, kKsPropOneShotReconnect) > 0;
+        if (!requested) {
+            ProfileScope::Mark("Bluetooth::PageAudio no KS filter accepted reconnect");
+            return JobCancelled() ? LinkWait::Cancelled : LinkWait::Timeout;
+        }
+        const LinkWait waited = WaitLink(address, true, kPageLinkWaitMs);
+        if (waited == LinkWait::Cancelled) {
+            // The reconnect request is already in the driver and still
+            // completes; the superseding Disconnect's guard re-drops it.
+            ProfileScope::Mark("Bluetooth::Connect cancelled after KS reconnect");
+        } else if (waited == LinkWait::Timeout) {
             ProfileScope::Mark("Bluetooth::PageAudio ks no link");
         }
-        if (JobCancelled()) {
-            return LinkWait::Cancelled;
-        }
-        ProfileScope::Mark("Bluetooth::PageAudio branch=l2cap");
-        return L2capPage(address);
+        return waited;
     }
 
     // P2 connect. Audio: KS reconnect page, then (only if no link) ONE A2DP
@@ -2289,6 +2377,11 @@ struct BluetoothService::Impl {
         });
         if (AnyRadioConnected(address)) {
             ProfileScope::Mark("Bluetooth::Connect already up");
+            if (audio) {
+                // Link up but audio may be detached (e.g. only AVRCP up):
+                // a one-shot reconnect attaches A2DP / HFP; no-op otherwise.
+                static_cast<void>(KsAudioOneShot(address, kKsPropOneShotReconnect));
+            }
             return LinkWait::Reached;
         }
         if (!audio) {
@@ -2330,12 +2423,20 @@ struct BluetoothService::Impl {
                 }
             }
         }
-        const LinkWait paged = PageAudio(address);
+        bool requested = false;
+        const LinkWait paged = PageAudio(address, requested);
         if (paged != LinkWait::Timeout) {
             return paged; // Reached or Cancelled
         }
         if (JobCancelled()) {
             return LinkWait::Cancelled;
+        }
+        if (requested) {
+            // The audio stack accepted the reconnect and paged the device but
+            // it never answered (off / out of range): a service toggle pages
+            // the same way, so report the failure now instead of ~12 s later.
+            ProfileScope::Mark("Bluetooth::Connect paged, no answer");
+            return LinkWait::Timeout;
         }
         ProfileScope::Mark("Bluetooth::Connect page failed, A2DP toggle");
         ProfileScope::Mark("Bluetooth::Connect branch=toggle");
@@ -2378,6 +2479,39 @@ struct BluetoothService::Impl {
             return LinkWait::Reached;
         }
         return waited;
+    }
+
+    // Audio devices: graceful KS one-shot disconnect of every profile so the
+    // headset does not treat it as link loss (and auto-reconnect), and the
+    // next one-shot reconnect pages cleanly. Falls back to / finishes with
+    // the ACL disconnect IOCTL when no filter accepts or the link stays up.
+    LinkWait DisconnectDevice(uint64_t address) {
+        if (address == 0) {
+            return LinkWait::Timeout;
+        }
+        bool audio = false;
+        ForEachRadio([&](HANDLE radio) {
+            BLUETOOTH_DEVICE_INFO info{};
+            if (!LoadDeviceInfo(radio, address, info)) {
+                return false;
+            }
+            audio = UsesAudio(radio, info);
+            return true;
+        });
+        if (audio) {
+            if (lastTask != nullptr && !lastTask->Done() && lastTask->address == address) {
+                lastTask->cancel.store(true);
+                ProfileScope::Mark("Bluetooth::Disconnect cancel running service task");
+            }
+            if (KsAudioOneShot(address, kKsPropOneShotDisconnect) > 0) {
+                const LinkWait waited = WaitLink(address, false, kKsDisconnectWaitMs);
+                if (waited != LinkWait::Timeout) {
+                    return waited;
+                }
+                ProfileScope::Mark("Bluetooth::Disconnect KS left link up, forcing ACL down");
+            }
+        }
+        return DisconnectClassic(address);
     }
 
     // After a disconnect was published: if a superseded service task was
@@ -2722,7 +2856,7 @@ struct BluetoothService::Impl {
                 address = ParseBluetoothAddress(copy.id);
             }
             bool audio = false;
-            const LinkWait outcome = connect ? ConnectDevice(copy, audio) : DisconnectClassic(address);
+            const LinkWait outcome = connect ? ConnectDevice(copy, audio) : DisconnectDevice(address);
             const bool ok = outcome == LinkWait::Reached;
             const bool cancelled = outcome == LinkWait::Cancelled;
             if (connect && ok) {
@@ -2822,8 +2956,13 @@ struct BluetoothService::Impl {
                 hint == L"More devices are in range") {
                 hint.clear();
             }
-            RefreshPaired();
             Publish();
+            {
+                // Pick up anything paired meanwhile, as an ordinary queued job.
+                Job refresh{JobKind::Refresh, false, {}};
+                refresh.forcePaired = true;
+                Enqueue(std::move(refresh));
+            }
             break;
         case JobKind::Pair: {
             pairing.store(true);
@@ -2935,6 +3074,7 @@ struct BluetoothService::Impl {
             Publish();
         }
         while (running.load()) {
+            DrainWatchEvents();
             // One job at a time so a newer Connect/Disconnect can still
             // supersede queued jobs (P3) and cancel the in-flight one.
             Job job;
