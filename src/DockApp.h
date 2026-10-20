@@ -11,6 +11,7 @@
 #include "Bluetooth.h"
 #include "QuickSettingsPanel.h"
 #include "Weather.h"
+#include "SpeedTest.h"
 #include "PerfProfiler.h"
 #include "PerfBoost.h"
 
@@ -229,6 +230,8 @@ private:
     static constexpr UINT kTrayIconsMessage = WM_APP + 32;
     // Notification badge set changed (NotificationBadges worker, no payload).
     static constexpr UINT kBadgeMessage = WM_APP + 33;
+    // Speed test progress / result (SpeedTestService, ~5 Hz while running).
+    static constexpr UINT kSpeedTestMessage = WM_APP + 34;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -279,6 +282,8 @@ private:
         QsEditControls,
         // System Tray page row arrow: opens the item's menu (its right-click).
         TrayIconOptions,
+        // Wi-Fi page "Run Speed Test" row.
+        SpeedTest,
     };
 
     struct TrayFlyoutHit {
@@ -978,6 +983,7 @@ private:
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;
     WeatherService m_weather;
+    SpeedTestService m_speedTest;
     NotificationBadges m_badges;
     struct DockBadge {
         size_t iconIndex = 0;

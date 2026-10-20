@@ -2789,6 +2789,31 @@ QsLiveChange RefreshQuickSettingsMedia(QuickSettingsCache& cache) {
     return QsLiveChange::None;
 }
 
+// "245 Mbps", "8.4 Mbps", "1.25 Gbps"; en dash when unmeasured.
+std::wstring FormatMbps(double mbps) {
+    if (mbps < 0.0) {
+        return L"\u2013";
+    }
+    wchar_t buffer[32]{};
+    if (mbps >= 1000.0) {
+        swprintf_s(buffer, L"%.2f Gbps", mbps / 1000.0);
+    } else if (mbps >= 10.0) {
+        swprintf_s(buffer, L"%.0f Mbps", mbps);
+    } else {
+        swprintf_s(buffer, L"%.1f Mbps", mbps);
+    }
+    return buffer;
+}
+
+std::wstring FormatPingMs(double ms) {
+    if (ms < 0.0) {
+        return L"\u2013";
+    }
+    wchar_t buffer[32]{};
+    swprintf_s(buffer, L"%.0f ms", ms);
+    return buffer;
+}
+
 std::wstring FormatMediaTime(int64_t ms) {
     const int64_t total = std::max<int64_t>(0, ms) / 1000;
     wchar_t buffer[32]{};
@@ -5188,6 +5213,34 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 hairline();
             }
         }
+        // Internet speed test (any connection, so outside the radio block).
+        {
+            const SpeedTestService::Snapshot speed = m_speedTest.GetSnapshot();
+            const bool testing = m_speedTest.Running();
+            menuSection(L"Speed Test");
+            if (testing) {
+                const wchar_t* phase = speed.phase == SpeedTestService::Phase::Upload ? L"Testing upload\u2026"
+                    : speed.phase == SpeedTestService::Phase::Download                ? L"Testing download\u2026"
+                                                                                      : L"Testing latency\u2026";
+                const std::wstring live = speed.liveValue < 0.0 ? std::wstring{}
+                    : speed.phase == SpeedTestService::Phase::Latency ? FormatPingMs(speed.liveValue)
+                                                                       : FormatMbps(speed.liveValue);
+                menuItem(L'\uEC4A', true, false, phase, live, L'\0', TrayFlyoutHitKind::None, -1);
+            } else {
+                const bool failed = speed.phase == SpeedTestService::Phase::Failed;
+                const bool haveResult = speed.phase == SpeedTestService::Phase::Done;
+                menuItem(L'\uEC4A', false, false, haveResult || failed ? L"Run Again" : L"Run Speed Test",
+                    failed ? speed.error : std::wstring{}, L'\0', TrayFlyoutHitKind::SpeedTest, 0);
+            }
+            if (!testing && speed.phase == SpeedTestService::Phase::Done) {
+                const std::wstring results = L"\u2193 " + FormatMbps(speed.downloadMbps) + L"     \u2191 " +
+                    FormatMbps(speed.uploadMbps) + L"     Ping " + FormatPingMs(speed.pingMs);
+                text({padding + menuInset, y, panelWidth - padding - menuInset, y + menuRow}, labelFont, results,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                y += menuRow;
+            }
+            hairline();
+        }
         menuLink(L"Wi-Fi Settings\u2026", kLinkWifi);
     } else if (m_qsPage == QuickSettingsPage::Vpn) {
         beginHeader(L"VPN", false, -1, false);
@@ -5895,6 +5948,12 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
     case TrayFlyoutHitKind::BoostPage:
         // Home Boost tile (outside the glyph disc): last-run report.
         navigate(QuickSettingsPage::Boost, L"ms-settings:startupapps");
+        break;
+    case TrayFlyoutHitKind::SpeedTest:
+        if (!m_speedTest.Running() && m_window != nullptr) {
+            m_speedTest.Run(m_window, kSpeedTestMessage);
+        }
+        QueueOverflowPaint();
         break;
     case TrayFlyoutHitKind::RefreshRate: {
         const int hz = hit.index;

@@ -3954,6 +3954,13 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         ApplyBluetoothSnapshot();
         return 0;
 
+    case kSpeedTestMessage:
+        // Progress only matters while the Wi-Fi page shows it.
+        if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Wifi) {
+            QueueOverflowPaint();
+        }
+        return 0;
+
     case kOpenStartMenuMessage:
         // Legacy async entry: OpenStartMenuFromDock now sends synchronously.
         // Keep the handler as a no-broadcast fallback so any in-flight message
@@ -9356,6 +9363,7 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
     case TrayFlyoutHitKind::BluetoothOthers:
     case TrayFlyoutHitKind::BoostPage:
     case TrayFlyoutHitKind::RefreshRate:
+    case TrayFlyoutHitKind::SpeedTest:
         ApplyQuickSettingsCommand(hit, message);
         break;
     case TrayFlyoutHitKind::TrayIconOptions:
@@ -9523,6 +9531,7 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         }
         [[fallthrough]];
     case TrayFlyoutHitKind::PowerMode:
+    case TrayFlyoutHitKind::SpeedTest:
     case TrayFlyoutHitKind::WifiNetwork:
     case TrayFlyoutHitKind::WifiOthers:
     case TrayFlyoutHitKind::BluetoothOthers:

@@ -50,6 +50,7 @@ add_executable(Dock WIN32
     src/PerfBoost.cpp
     src/PerfProfiler.cpp
     src/RecycleBin.cpp
+    src/SpeedTest.cpp
 )
 
 file(GLOB _dock_media_headers
