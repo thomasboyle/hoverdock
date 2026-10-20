@@ -529,6 +529,20 @@ void FileIndex::FinishVolume(uint8_t volume) {
     ++m_generation;
 }
 
+bool FileIndex::AddAlias(uint8_t volume, uint64_t id, uint64_t parentId, uint8_t flags, std::string_view nameUtf8) {
+    if (volume >= m_volumes.size()) {
+        return false;
+    }
+    const uint32_t parent = Find(volume, parentId);
+    const uint32_t existing = Find(volume, id);
+    if (parent == kNone || (existing != kNone && m_parent[existing] == parent)) {
+        return false;
+    }
+    static_cast<void>(NewEntry(volume, parent, flags, nameUtf8));
+    ++m_generation;
+    return true;
+}
+
 // ---- updates ----------------------------------------------------------------
 
 void FileIndex::Upsert(uint8_t volume, uint64_t id, uint64_t parentId, uint8_t flags, std::string_view nameUtf8) {

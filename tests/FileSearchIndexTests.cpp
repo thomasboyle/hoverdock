@@ -162,6 +162,17 @@ void TestUpdates() {
     index.Upsert(0, 300, 102, 0, "Again.txt");
     CHECK(Names(index, index.Search("again", 10)).size() == 1);
 
+    // Hard-link alias: second name under another directory.
+    CHECK(index.AddAlias(0, 204, 111, 0, "Mail.exe"));       // Program Files\Mail\Mail.exe also in System32
+    CHECK(!index.AddAlias(0, 204, 131, 0, "Mail.exe"));      // same directory as the record: no alias
+    CHECK(!index.AddAlias(0, 204, 55555, 0, "Mail.exe"));    // unknown parent
+    index.RecomputeZones();
+    bool sawAlias = false;
+    for (const Hit& hit : index.Search("mail.exe", 10)) {
+        sawAlias = sawAlias || index.Path(hit.entry) == "C:\\Windows\\System32\\Mail.exe";
+    }
+    CHECK(sawAlias);
+
     // Unknown parent: never indexed; moving out of scope removes.
     const size_t before = index.EntryCount();
     index.Upsert(0, 400, 77777, 0, "elsewhere.txt");

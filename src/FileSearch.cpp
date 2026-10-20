@@ -884,6 +884,53 @@ bool BuildFromCrawl(BuildContext& ctx, std::vector<JournalStart>& journals) {
     return any;
 }
 
+// MFT enumeration reports one name per record, so system files hard-linked
+// into WinSxS can surface only under WinSxS. Re-list the few directories
+// people actually look for and add their link names as aliases.
+void AddSystemLinkAliases(FileIndex& index, const std::vector<VolumeSlot>& volumes) {
+    const std::wstring windows = KnownFolder(FOLDERID_Windows);
+    const wchar_t letter = DriveLetterOf(windows);
+    const auto slot = std::find_if(volumes.begin(), volumes.end(), [letter](const VolumeSlot& v) {
+        return v.letter == letter;
+    });
+    if (windows.empty() || slot == volumes.end()) {
+        return;
+    }
+    std::vector<BYTE> buffer(64U << 10);
+    for (const std::wstring& directory : {windows, KnownFolder(FOLDERID_System), KnownFolder(FOLDERID_SystemX86)}) {
+        uint64_t directoryId = 0;
+        if (directory.empty() || !FileIdOf(directory, directoryId)) {
+            continue;
+        }
+        Handle handle(CreateFileW(directory.c_str(), FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+        if (!handle.Valid()) {
+            continue;
+        }
+        FILE_INFO_BY_HANDLE_CLASS infoClass = FileIdBothDirectoryRestartInfo;
+        while (GetFileInformationByHandleEx(handle.Get(), infoClass, buffer.data(),
+                   static_cast<DWORD>(buffer.size())) != FALSE) {
+            infoClass = FileIdBothDirectoryInfo;
+            size_t offset = 0;
+            for (;;) {
+                const auto* entry = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(buffer.data() + offset);
+                if ((entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                    std::string name;
+                    filesearch::AppendUtf8(name, reinterpret_cast<const char16_t*>(entry->FileName),
+                        entry->FileNameLength / sizeof(wchar_t));
+                    static_cast<void>(index.AddAlias(slot->volume, static_cast<uint64_t>(entry->FileId.QuadPart),
+                        directoryId, FlagsFromAttributes(entry->FileAttributes), name));
+                }
+                if (entry->NextEntryOffset == 0) {
+                    break;
+                }
+                offset += entry->NextEntryOffset;
+            }
+        }
+    }
+}
+
 void FillMetadata(FileSearchItem& item) {
     WIN32_FILE_ATTRIBUTE_DATA data{};
     if (GetFileAttributesExW(item.path.c_str(), GetFileExInfoStandard, &data) != FALSE) {
@@ -1019,6 +1066,9 @@ bool FileSearchService::BuildIndex(std::unique_ptr<FileIndex>& index, std::vecto
     }
     if (!built) {
         return false;
+    }
+    if (mode == FileSearchMode::Mft) {
+        AddSystemLinkAliases(*index, volumes);
     }
     ApplyZoneMarkers(*index, volumes);
     index->RecomputeZones();

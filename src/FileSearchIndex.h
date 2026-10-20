@@ -86,6 +86,11 @@ public:
     // Resolves parent links of everything added since AddVolume. Records whose
     // parent never appeared are orphans and become Zone::Excluded.
     void FinishVolume(uint8_t volume);
+    // Extra name for an already indexed record under another directory (NTFS
+    // hard link: MFT enumeration reports one name per record). Aliases are not
+    // tracked by the journal; they are rebuilt with the index. Returns false
+    // when the parent is not indexed or the record already sits there.
+    bool AddAlias(uint8_t volume, uint64_t id, uint64_t parentId, uint8_t flags, std::string_view nameUtf8);
 
     // ---- incremental updates (USN journal) -----------------------------------
     // Create, rename or move. A record whose parent is not indexed is ignored
