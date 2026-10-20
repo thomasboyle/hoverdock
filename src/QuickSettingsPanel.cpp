@@ -3342,7 +3342,7 @@ void DrawTempLines(uint8_t* pixels, int width, int height, const RECT& area, con
     LONG top = (area.top + area.bottom - lineH * static_cast<LONG>(lines.size())) / 2L;
     for (const std::wstring& line : lines) {
         DrawFlyoutText(pixels, width, height, {area.left, top, area.right, top + lineH}, font,
-            FitFlyoutLine(font, line, areaW), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            FitFlyoutLine(font, line, areaW), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
         top += lineH;
     }
 }
