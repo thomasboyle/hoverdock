@@ -3,6 +3,7 @@
 #include <Windows.h>
 
 #include <string>
+#include <vector>
 
 // CPU / GPU temperatures and package/board watts for the Quick Settings home
 // tile. All sensor I/O (WMI, PDH, NVML, nvidia-smi, PawnIO, shared memory) runs
@@ -49,6 +50,16 @@
 // GPU board watts: NVML nvmlDeviceGetPowerUsage (mW) or ADL PM log / OD6.
 // On pre-Turing NVIDIA cards (GTX 1070 Ti / Pascal) NVML is entire-board
 // draw -- the same figure nvidia-smi reports as power.draw ("entire board").
+// One physical GPU with a readable sensor (NVML device or ADL adapter).
+struct GpuTempsReading {
+    // Whole degrees Celsius / watts, or -1 when that sensor is unavailable.
+    int celsius = -1;
+    int watts = -1;
+    bool discrete = true;
+
+    bool operator==(const GpuTempsReading&) const = default;
+};
+
 struct SystemTempsReading {
     // Whole degrees Celsius, or -1 when no trustworthy sensor is available.
     int cpuC = -1;
@@ -56,6 +67,10 @@ struct SystemTempsReading {
     // Whole watts (package / board), or -1 when unavailable.
     int cpuW = -1;
     int gpuW = -1;
+    // Every GPU with a sensor, discrete first (gpuC / gpuW above are the
+    // primary/hottest pick). A single fallback entry (LibreHardwareMonitor,
+    // nvidia-smi) when no per-device API answered.
+    std::vector<GpuTempsReading> gpus;
     // Human-readable source of each value ("LibreHardwareMonitor", "NVML", ...).
     std::wstring cpuSource;
     std::wstring gpuSource;

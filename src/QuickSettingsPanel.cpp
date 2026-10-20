@@ -263,10 +263,12 @@ std::wstring BluetoothConnectedSummary(const BluetoothSnapshot& bt) {
     return L"Connected to " + name + more;
 }
 
-constexpr int kQsModuleW[kQsModuleCount] = {2, 2, 2, 2, 2, 2, 4, 4, 2, 2};
-constexpr int kQsModuleH[kQsModuleCount] = {1, 1, 1, 1, 1, 1, 1, 1, 2, 2};
+// Default flow: CPU (2x1) and Media (2x2) share rows 5-6 with GPU (2x1)
+// filling the slot under CPU, so the grid still tiles 7 full rows.
+constexpr int kQsModuleW[kQsModuleCount] = {2, 2, 2, 2, 2, 2, 4, 4, 2, 2, 2};
+constexpr int kQsModuleH[kQsModuleCount] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1};
 constexpr const wchar_t* kQsModuleNames[kQsModuleCount] = {L"wifi", L"bluetooth", L"boost", L"power", L"tray",
-    L"mic", L"sound", L"display", L"temps", L"media"};
+    L"mic", L"sound", L"display", L"temps", L"media", L"gpu"};
 constexpr int kQsGridCols = 4;
 // The default order tiles 28 cells into 7 full rows; reorders must too.
 constexpr int kQsGridRows = 7;
@@ -3241,76 +3243,83 @@ const std::vector<uint8_t>& MediaArtRaster(const std::shared_ptr<const std::vect
     return raster;
 }
 
-// Outline thermometer (stem capsule + bulb) with a filled bulb and mercury
-// column, stroked to match the Fluent glyphs on the neighbouring tiles. No
-// Segoe Fluent/MDL2 thermometer glyph exists, so it is drawn from an SDF.
-void FillThermometerPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float top,
-    float extent, float stroke, uint8_t red, uint8_t green, uint8_t blue) {
-    if (dest == nullptr || extent < 4.0F) {
-        return;
-    }
-    const float bulbR = extent * 0.25F;
-    const float stemR = extent * 0.14F;
-    const float bulbCy = top + extent - bulbR;
-    const float stemTop = top + stemR;
-    const float half = stroke * 0.5F;
-    const float dotR = std::max(1.0F, bulbR - stroke * 1.7F);
-    const float columnR = std::max(0.7F, stroke * 0.55F);
-    const float columnTop = top + extent * 0.38F;
-    const int left = static_cast<int>(std::floor(cx - bulbR - 2.0F));
-    const int right = static_cast<int>(std::ceil(cx + bulbR + 2.0F));
-    const int y0 = static_cast<int>(std::floor(top - 2.0F));
-    const int y1 = static_cast<int>(std::ceil(top + extent + 2.0F));
-    const int boxW = right - left;
-    const int boxH = y1 - y0;
-    if (boxW <= 0 || boxH <= 0) {
-        return;
-    }
-    std::vector<uint8_t> glyph(static_cast<size_t>(boxW) * static_cast<size_t>(boxH) * 4U, 0);
-    for (int y = 0; y < boxH; ++y) {
-        for (int x = 0; x < boxW; ++x) {
-            const float px = static_cast<float>(left + x) + 0.5F;
-            const float py = static_cast<float>(y0 + y) + 0.5F;
-            const float dx = px - cx;
-            const float stemY = std::clamp(py, stemTop, bulbCy);
-            const float outline = std::min(std::hypot(dx, py - stemY) - stemR, std::hypot(dx, py - bulbCy) - bulbR);
-            const float colY = std::clamp(py, columnTop, bulbCy);
-            const float fill = std::min(std::hypot(dx, py - bulbCy) - dotR, std::hypot(dx, py - colY) - columnR);
-            const float ring = std::clamp(half + 0.5F - std::fabs(outline), 0.0F, 1.0F);
-            const float core = std::clamp(0.5F - fill, 0.0F, 1.0F);
-            const float coverage = std::max(ring, core);
-            if (coverage <= 0.0F) {
-                continue;
-            }
-            uint8_t* out = glyph.data() + (static_cast<size_t>(y) * static_cast<size_t>(boxW) + static_cast<size_t>(x)) * 4U;
-            out[0] = static_cast<uint8_t>(std::lround(static_cast<float>(blue) * coverage));
-            out[1] = static_cast<uint8_t>(std::lround(static_cast<float>(green) * coverage));
-            out[2] = static_cast<uint8_t>(std::lround(static_cast<float>(red) * coverage));
-            out[3] = static_cast<uint8_t>(std::lround(255.0F * coverage));
-        }
-    }
-    CompositePremul(dest, destWidth, destHeight, left, y0, glyph.data(), boxW, boxH);
-}
-
-std::wstring TempPowerText(int celsius, int watts) {
-    // Two lines when both values exist so the narrow CPU/GPU columns can show
-    // the full reading (single-line "XX°C · YYW" clipped on the home row).
+// Home CPU / GPU tile line: "CPU: 32°C | 35W". A missing value is dropped;
+// neither -> "CPU: –".
+std::wstring TempPowerLine(const std::wstring& label, int celsius, int watts) {
+    std::wstring out = label + L": ";
     if (celsius < 0 && watts < 0) {
-        return std::wstring(L"-");
+        return out + L"\u2013";
     }
-    std::wstring out;
     if (celsius >= 0) {
-        out += std::to_wstring(celsius);
-        out += L"°C";
+        out += std::to_wstring(celsius) + L"\u00B0C";
     }
     if (watts >= 0) {
-        if (!out.empty()) {
-            out += L'\n';
+        if (celsius >= 0) {
+            out += L" | ";
         }
-        out += std::to_wstring(watts);
-        out += L'W';
+        out += std::to_wstring(watts) + L"W";
     }
     return out;
+}
+
+// One line per GPU ("GPU 1: ...") for up to three; with more, the last line
+// covers the rest (hottest temperature, summed watts). A single GPU is "GPU".
+std::vector<std::wstring> GpuTempLines(const std::vector<QsGpuTemp>& gpus) {
+    if (gpus.size() <= 1) {
+        const QsGpuTemp only = gpus.empty() ? QsGpuTemp{} : gpus.front();
+        return {TempPowerLine(L"GPU", only.celsius, only.watts)};
+    }
+    std::vector<std::wstring> lines;
+    const size_t shown = gpus.size() > 3U ? 2U : gpus.size();
+    for (size_t index = 0; index < shown; ++index) {
+        lines.push_back(TempPowerLine(L"GPU " + std::to_wstring(index + 1U), gpus[index].celsius,
+            gpus[index].watts));
+    }
+    if (gpus.size() > 3U) {
+        int hottest = -1;
+        int total = -1;
+        for (size_t index = shown; index < gpus.size(); ++index) {
+            hottest = std::max(hottest, gpus[index].celsius);
+            if (gpus[index].watts >= 0) {
+                total = std::max(total, 0) + gpus[index].watts;
+            }
+        }
+        lines.push_back(TempPowerLine(L"GPU " + std::to_wstring(shown + 1U) + L"\u2013" +
+            std::to_wstring(gpus.size()), hottest, total));
+    }
+    return lines;
+}
+
+// Temperature lines centred in `area`: the label font when every line fits
+// (at most two lines), else the status font, character-ellipsized if needed.
+void DrawTempLines(uint8_t* pixels, int width, int height, const RECT& area, const std::vector<std::wstring>& lines,
+    HFONT labelFace, HFONT statusFace) {
+    if (lines.empty()) {
+        return;
+    }
+    const LONG areaW = area.right - area.left;
+    HFONT font = statusFace != nullptr ? statusFace : labelFace;
+    if (labelFace != nullptr && lines.size() <= 2U) {
+        bool fits = true;
+        for (const std::wstring& line : lines) {
+            fits = fits && MeasureFlyoutLine(labelFace, line) <= areaW - 2L;
+        }
+        if (fits) {
+            font = labelFace;
+        }
+    }
+    LOGFONTW logFont{};
+    if (font == nullptr || GetObjectW(font, sizeof(logFont), &logFont) == 0) {
+        return;
+    }
+    const LONG em = std::max(1L, std::abs(logFont.lfHeight));
+    const LONG lineH = em + em * 2L / 5L;
+    LONG top = (area.top + area.bottom - lineH * static_cast<LONG>(lines.size())) / 2L;
+    for (const std::wstring& line : lines) {
+        DrawFlyoutText(pixels, width, height, {area.left, top, area.right, top + lineH}, font,
+            FitFlyoutLine(font, line, areaW), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+        top += lineH;
+    }
 }
 
 }  // namespace
@@ -3660,21 +3669,20 @@ bool ApplyQuickSettingsTemps(QuickSettingsCache& cache) {
     constexpr ULONGLONG kStaleMs = 60000;
     SystemTempsReading reading;
     int cpu = -1;
-    int gpu = -1;
     int cpuW = -1;
-    int gpuW = -1;
+    std::vector<QsGpuTemp> gpus;
     if (LatestSystemTemps(reading) && GetTickCount64() - reading.stamp <= kStaleMs) {
         cpu = reading.cpuC;
-        gpu = reading.gpuC;
         cpuW = reading.cpuW;
-        gpuW = reading.gpuW;
+        gpus.reserve(reading.gpus.size());
+        for (const GpuTempsReading& gpu : reading.gpus) {
+            gpus.push_back({gpu.celsius, gpu.watts});
+        }
     }
-    const bool changed = cpu != cache.cpuTempC || gpu != cache.gpuTempC ||
-        cpuW != cache.cpuWatts || gpuW != cache.gpuWatts;
+    const bool changed = cpu != cache.cpuTempC || cpuW != cache.cpuWatts || gpus != cache.gpus;
     cache.cpuTempC = cpu;
-    cache.gpuTempC = gpu;
     cache.cpuWatts = cpuW;
-    cache.gpuWatts = gpuW;
+    cache.gpus = std::move(gpus);
     return changed;
 }
 
@@ -4121,17 +4129,17 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
         m_overflowLabelFont != nullptr) {
         // Values live outside the underlay so a new reading presents only
         // these two rects (PaintOverflowLiveFast) instead of a full rebuild.
+        // Each tile has its own adaptive ink (separate glass shapes).
         const uint8_t savedR = g_flyoutInkR;
         const uint8_t savedG = g_flyoutInkG;
         const uint8_t savedB = g_flyoutInkB;
         SetFlyoutChromeInk(m_qsTempsInkR, m_qsTempsInkG, m_qsTempsInkB);
-        HFONT valueFont =
-            m_overflowStatusFont != nullptr ? m_overflowStatusFont : m_overflowLabelFont;
-        constexpr UINT format = DT_LEFT | DT_TOP | DT_WORDBREAK;
-        DrawFlyoutText(pixels, width, height, m_qsTempCpuRect, valueFont,
-            TempPowerText(m_qsCache.cpuTempC, m_qsCache.cpuWatts), format, 255);
-        DrawFlyoutText(pixels, width, height, m_qsTempGpuRect, valueFont,
-            TempPowerText(m_qsCache.gpuTempC, m_qsCache.gpuWatts), format, 255);
+        DrawTempLines(pixels, width, height, m_qsTempCpuRect,
+            {TempPowerLine(L"CPU", m_qsCache.cpuTempC, m_qsCache.cpuWatts)}, m_overflowLabelFont,
+            m_overflowStatusFont);
+        SetFlyoutChromeInk(m_qsTempsGpuInkR, m_qsTempsGpuInkG, m_qsTempsGpuInkB);
+        DrawTempLines(pixels, width, height, m_qsTempGpuRect, GpuTempLines(m_qsCache.gpus), m_overflowLabelFont,
+            m_overflowStatusFont);
         SetFlyoutChromeInk(savedR, savedG, savedB);
     }
     // Gate like temps: LiveFast meter ticks must not redraw Boost without
@@ -4875,44 +4883,24 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                                                                     : std::wstring(L"On")),
             brightness, TrayFlyoutHitKind::BrightnessSlider, brightnessUsable, TrayFlyoutHitKind::Display, 5);
         // Rows 5-6: CPU/GPU (2x2) and Now Playing (2x2).
-        {
-            const RECT b = moduleRect(QsModule::Temps);
-            const size_t idx = addShape(b, static_cast<float>(P(30.0F)));
+        // CPU and GPU tiles (2x1 each). The reading lines ("CPU: 32°C | 35W",
+        // one line per GPU) are live overlays (PaintQsLiveOverlays), so a new
+        // sensor poll presents only these rects.
+        auto tempsTile = [&](QsModule module, RECT& valueRect, uint8_t& outR, uint8_t& outG, uint8_t& outB) {
+            const RECT b = moduleRect(module);
+            const size_t idx = addShape(b, static_cast<float>(b.bottom - b.top) * 0.5F);
             const CcInk ink = ccInk(idx);
             if (draw) {
-                SetFlyoutChromeInk(ink.r, ink.g, ink.b);
+                valueRect = {b.left + P(16.0F), b.top + P(4.0F), b.right - P(16.0F), b.bottom - P(4.0F)};
+                outR = ink.r;
+                outG = ink.g;
+                outB = ink.b;
             }
-            const LONG inset = P(16.0F);
-            const float glyphH = static_cast<float>(P(24.0F));
-            if (draw) {
-                FillThermometerPremul(pixels, width, height, static_cast<float>(b.left + inset) + glyphH * 0.25F,
-                    static_cast<float>(b.top + inset), glyphH, std::max(1.0F, 1.1F * scale), ink.r, ink.g,
-                    ink.b);
-            }
-            const LONG colW = (b.right - b.left - inset * 2L) / 2L;
-            const LONG labelTop = b.top + P(50.0F);
-            const LONG labelH = P(20.0F);
-            const LONG valueH = P(38.0F);
-            const RECT cpuLabel{b.left + inset, labelTop, b.left + inset + colW, labelTop + labelH};
-            const RECT gpuLabel{b.left + inset + colW, labelTop, b.right - inset, labelTop + labelH};
-            const RECT cpuValue{cpuLabel.left, cpuLabel.bottom, cpuLabel.right, cpuLabel.bottom + valueH};
-            const RECT gpuValue{gpuLabel.left, gpuLabel.bottom, gpuLabel.right, gpuLabel.bottom + valueH};
-            text(cpuLabel, labelFont, L"CPU", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-            text(gpuLabel, labelFont, L"GPU", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-            if (draw) {
-                m_qsTempCpuRect = cpuValue;
-                m_qsTempGpuRect = gpuValue;
-                m_qsTempsValid = true;
-                m_qsTempsInkR = ink.r;
-                m_qsTempsInkG = ink.g;
-                m_qsTempsInkB = ink.b;
-            }
-            HFONT valueFont = statusFont != nullptr ? statusFont : labelFont;
-            constexpr UINT valueFormat = DT_LEFT | DT_TOP | DT_WORDBREAK;
-            if (!m_qsPaintUnderlayPass) {
-                text(cpuValue, valueFont, TempPowerText(m_qsCache.cpuTempC, m_qsCache.cpuWatts), valueFormat, 255);
-                text(gpuValue, valueFont, TempPowerText(m_qsCache.gpuTempC, m_qsCache.gpuWatts), valueFormat, 255);
-            }
+        };
+        tempsTile(QsModule::Temps, m_qsTempCpuRect, m_qsTempsInkR, m_qsTempsInkG, m_qsTempsInkB);
+        tempsTile(QsModule::Gpu, m_qsTempGpuRect, m_qsTempsGpuInkR, m_qsTempsGpuInkG, m_qsTempsGpuInkB);
+        if (draw) {
+            m_qsTempsValid = true;
         }
         {
             // Now Playing (2x2), after the macOS Control Centre module: artwork

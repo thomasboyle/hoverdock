@@ -1116,6 +1116,9 @@ private:
     uint8_t m_qsTempsInkR = 0;
     uint8_t m_qsTempsInkG = 0;
     uint8_t m_qsTempsInkB = 0;
+    uint8_t m_qsTempsGpuInkR = 0;
+    uint8_t m_qsTempsGpuInkG = 0;
+    uint8_t m_qsTempsGpuInkB = 0;
     // Boost tile status line lives outside the underlay (like temps) so
     // ApplyBoostResult can present via PaintOverflowLiveFast without a
     // ~100ms PaintOverflowPopup on the WH_MOUSE_LL thread.

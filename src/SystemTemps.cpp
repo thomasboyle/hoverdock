@@ -381,6 +381,33 @@ struct NvmlSource {
         return best;
     }
 
+    // Per-device temperature + board watts, appended in NVML index order.
+    void ReadAll(std::vector<GpuTempsReading>& out) {
+        if (!tried) {
+            Load();
+        }
+        if (temperature == nullptr) {
+            return;
+        }
+        for (Device device : devices) {
+            GpuTempsReading gpu;
+            unsigned int value = 0;
+            if (temperature(device, 0, &value) == 0 && PlausibleTemp(static_cast<double>(value))) {
+                gpu.celsius = static_cast<int>(value);
+            }
+            unsigned int milliwatts = 0;
+            if (powerUsage != nullptr && powerUsage(device, &milliwatts) == 0) {
+                const double watts = static_cast<double>(milliwatts) / 1000.0;
+                if (PlausibleWatts(watts)) {
+                    gpu.watts = static_cast<int>(std::lround(watts));
+                }
+            }
+            if (gpu.celsius >= 0 || gpu.watts >= 0) {
+                out.push_back(gpu);
+            }
+        }
+    }
+
     // Watts for the entire board on pre-Turing GPUs (GTX 1070 Ti / Pascal):
     // nvmlDeviceGetPowerUsage matches nvidia-smi power.draw ("entire board").
     // Turing+ may report GPU-only here; MODULE-scope APIs are not in this
@@ -435,6 +462,7 @@ struct AdlGpuSource {
     using MainDestroyFn = int (__stdcall*)(void*);
     using NumberOfAdaptersFn = int (__stdcall*)(void*, int*);
     using AdapterActiveGetFn = int (__stdcall*)(void*, int, int*);
+    using AdapterIdGetFn = int (__stdcall*)(void*, int, int*);
     using AsicFamilyTypeGetFn = int (__stdcall*)(void*, int, int*, int*);
     using OverdriveCapsFn = int (__stdcall*)(void*, int, int*, int*, int*);
     using QueryPmLogFn = int (__stdcall*)(void*, int, AdlPmLogDataOutput*);
@@ -456,6 +484,10 @@ struct AdlGpuSource {
     AsicFamilyTypeGetFn asicFamily = nullptr;
     std::vector<int> adapterIndices;
     std::vector<bool> adapterDiscrete;
+    // Physical adapter per logical index: ADL lists one index per display
+    // output, so one card can appear several times. 0 when unknown (all
+    // adapters are then treated as one GPU).
+    std::vector<int> adapterIds;
     bool tried = false;
     bool hasDiscrete = false;
     int failures = 0;
@@ -475,6 +507,7 @@ struct AdlGpuSource {
         }
         adapterIndices.clear();
         adapterDiscrete.clear();
+        adapterIds.clear();
         queryPmLog = nullptr;
         od5Temp = nullptr;
         od6Power = nullptr;
@@ -499,6 +532,7 @@ struct AdlGpuSource {
             GetProcAddress(module, "ADL2_Adapter_NumberOfAdapters_Get"));
         const auto activeGet =
             reinterpret_cast<AdapterActiveGetFn>(GetProcAddress(module, "ADL2_Adapter_Active_Get"));
+        const auto idGet = reinterpret_cast<AdapterIdGetFn>(GetProcAddress(module, "ADL2_Adapter_ID_Get"));
         asicFamily = reinterpret_cast<AsicFamilyTypeGetFn>(
             GetProcAddress(module, "ADL2_Adapter_ASICFamilyType_Get"));
         odCaps = reinterpret_cast<OverdriveCapsFn>(GetProcAddress(module, "ADL2_Overdrive_Caps"));
@@ -575,8 +609,13 @@ struct AdlGpuSource {
             if (!usable) {
                 continue;
             }
+            int adapterId = 0;
+            if (idGet == nullptr || idGet(context, index, &adapterId) != kAdlOk) {
+                adapterId = 0;
+            }
             adapterIndices.push_back(index);
             adapterDiscrete.push_back(discrete);
+            adapterIds.push_back(adapterId);
             if (discrete) {
                 hasDiscrete = true;
             }
@@ -700,6 +739,43 @@ struct AdlGpuSource {
             }
             if (PlausibleTemp(tempC) || PlausibleWatts(powerW)) {
                 return;
+            }
+        }
+    }
+
+    // One entry per physical adapter (hottest / highest reading among its
+    // logical indices), appended in adapter order.
+    void ReadAll(std::vector<GpuTempsReading>& out) const {
+        if (context == nullptr || adapterIndices.empty()) {
+            return;
+        }
+        const size_t first = out.size();
+        std::vector<int> ids;
+        for (size_t i = 0; i < adapterIndices.size(); ++i) {
+            const int adapter = adapterIndices[i];
+            double t = kNaN;
+            double p = kNaN;
+            ReadPmLog(adapter, t, p);
+            if (!PlausibleTemp(t)) {
+                ReadOd5Temp(adapter, t);
+            }
+            if (!PlausibleWatts(p)) {
+                ReadOd6Power(adapter, p);
+            }
+            const int celsius = PlausibleTemp(t) ? static_cast<int>(std::lround(t)) : -1;
+            const int watts = PlausibleWatts(p) ? static_cast<int>(std::lround(p)) : -1;
+            if (celsius < 0 && watts < 0) {
+                continue;
+            }
+            const auto known = std::find(ids.begin(), ids.end(), adapterIds[i]);
+            if (known == ids.end()) {
+                ids.push_back(adapterIds[i]);
+                out.push_back({celsius, watts, static_cast<bool>(adapterDiscrete[i])});
+            } else {
+                GpuTempsReading& gpu = out[first + static_cast<size_t>(known - ids.begin())];
+                gpu.celsius = std::max(gpu.celsius, celsius);
+                gpu.watts = std::max(gpu.watts, watts);
+                gpu.discrete = gpu.discrete || adapterDiscrete[i];
             }
         }
     }
@@ -2148,6 +2224,21 @@ struct Sensors {
         reading.gpuC = PlausibleTemp(gpuTemp) ? static_cast<int>(std::lround(gpuTemp)) : -1;
         reading.cpuW = PlausibleWatts(cpuPower) ? static_cast<int>(std::lround(cpuPower)) : -1;
         reading.gpuW = PlausibleWatts(gpuPower) ? static_cast<int>(std::lround(gpuPower)) : -1;
+
+        // Per-GPU list for multi-GPU systems: NVML devices and ADL adapters.
+        nvml.ReadAll(reading.gpus);
+        adl.ReadAll(reading.gpus);
+        if (reading.gpus.size() == 1) {
+            // Single GPU: fill a missing value from the fallback chain above
+            // (e.g. NVML temperature + nvidia-smi power).
+            GpuTempsReading& only = reading.gpus.front();
+            only.celsius = only.celsius >= 0 ? only.celsius : reading.gpuC;
+            only.watts = only.watts >= 0 ? only.watts : reading.gpuW;
+        } else if (reading.gpus.empty() && (reading.gpuC >= 0 || reading.gpuW >= 0)) {
+            reading.gpus.push_back({reading.gpuC, reading.gpuW, true});
+        }
+        std::stable_partition(reading.gpus.begin(), reading.gpus.end(),
+            [](const GpuTempsReading& gpu) { return gpu.discrete; });
         reading.stamp = GetTickCount64();
         return reading;
     }
@@ -2210,7 +2301,7 @@ void WorkerMain() {
             std::lock_guard<std::mutex> lock(bridge.mutex);
             const bool changed = !bridge.published || bridge.latest.cpuC != reading.cpuC ||
                 bridge.latest.gpuC != reading.gpuC || bridge.latest.cpuW != reading.cpuW ||
-                bridge.latest.gpuW != reading.gpuW;
+                bridge.latest.gpuW != reading.gpuW || bridge.latest.gpus != reading.gpus;
             bridge.latest = std::move(reading);
             bridge.published = true;
             if (changed) {

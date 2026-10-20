@@ -36,10 +36,13 @@ enum class QsModule : uint8_t {
     Microphone,
     Sound,
     Display,
+    // CPU temperature / watts tile (2x1; dock.ini name "temps" for layouts
+    // saved when it was the combined CPU+GPU 2x2 module).
     Temps,
     Media,
+    Gpu,
 };
-inline constexpr size_t kQsModuleCount = 10;
+inline constexpr size_t kQsModuleCount = 11;
 using QsModuleOrder = std::array<uint8_t, kQsModuleCount>;
 struct QsGridCell {
     int col = 0;
@@ -88,6 +91,14 @@ enum class QsPowerLevel : uint8_t {
 
 // One app row on the Power page: power usage above Moderate, held in the list
 // with hysteresis so rows do not flicker between samples.
+// One GPU on the Home GPU tile. Whole degrees C / watts; -1 = unavailable.
+struct QsGpuTemp {
+    int celsius = -1;
+    int watts = -1;
+
+    bool operator==(const QsGpuTemp&) const = default;
+};
+
 struct QsEnergyApp {
     std::wstring name;
     // Executable path for the row icon (empty if the process is protected).
@@ -141,11 +152,11 @@ struct QuickSettingsCache {
     std::wstring refreshMonitor;
     int refreshWidth = 0;
     int refreshHeight = 0;
-    // Home temperature tile. Whole degrees C / watts; -1 shows an em dash.
+    // Home CPU / GPU tiles. Whole degrees C / watts; -1 shows a dash. One
+    // entry per GPU with a sensor, discrete first.
     int cpuTempC = -1;
-    int gpuTempC = -1;
     int cpuWatts = -1;
-    int gpuWatts = -1;
+    std::vector<QsGpuTemp> gpus;
     // Set when WASAPI capture cannot be opened (permission, missing device).
     std::wstring inputNote;
     // Now Playing, copied from the GSMTC media worker's snapshot (no IPC on
