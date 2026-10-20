@@ -44,6 +44,7 @@
 #include <cwctype>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -2042,6 +2043,32 @@ void WakeMedia(unsigned bits) {
     media.wake.notify_one();
 }
 
+// Bounded, null-safe wait for a WinRT async call. A player that stalls
+// mid-toggle must not wedge the worker (and every later click) forever.
+template <typename Async>
+auto MediaAwait(const Async& operation, uint32_t limitMs) -> decltype(operation.GetResults()) {
+    using Result = decltype(operation.GetResults());
+    bool completed = false;
+    if (operation) {
+        completed = operation.wait_for(std::chrono::milliseconds(limitMs)) ==
+            winrt::Windows::Foundation::AsyncStatus::Completed;
+        if (!completed) {
+            try {
+                operation.Cancel();
+            } catch (...) {
+            }
+        }
+    }
+    if (!completed) {
+        if constexpr (std::is_same_v<Result, bool>) {
+            return false;
+        } else {
+            return Result{nullptr};
+        }
+    }
+    return operation.GetResults();
+}
+
 // Short app label from the session AUMID ("Spotify.exe", "MSEdge",
 // "308046B0AF4A39CB" for Firefox, "Publisher.App_hash!App" for packaged apps).
 std::wstring MediaAppName(const std::wstring& aumid) {
@@ -2115,9 +2142,17 @@ std::wstring MediaAumid(const MediaSession& session) {
     }
 }
 
+// GSMTC getters can return null objects while a player tears its session
+// down (Spotify / Chromium on rapid play-pause). Calling through a null
+// projection is an access violation that catch (...) cannot stop, so every
+// WinRT result below is null-checked before use.
 MediaStatus MediaStatusOf(const MediaSession& session) {
     try {
-        return session.GetPlaybackInfo().PlaybackStatus();
+        if (!session) {
+            return MediaStatus::Closed;
+        }
+        const auto info = session.GetPlaybackInfo();
+        return info ? info.PlaybackStatus() : MediaStatus::Closed;
     } catch (...) {
         return MediaStatus::Closed;
     }
@@ -2143,7 +2178,14 @@ MediaSession PickMediaSession(const MediaManager& manager, const std::wstring& s
     MediaSession paused{nullptr};
     MediaSession first{nullptr};
     try {
-        for (const MediaSession& session : manager.GetSessions()) {
+        const auto sessions = manager.GetSessions();
+        if (!sessions) {
+            return current;
+        }
+        for (const MediaSession& session : sessions) {
+            if (!session) {
+                continue;
+            }
             const MediaStatus status = MediaStatusOf(session);
             if (status == MediaStatus::Closed) {
                 continue;
@@ -2214,7 +2256,14 @@ void UnhookMediaSessions(std::vector<MediaHook>& hooks) {
 void HookMediaSessions(const MediaManager& manager, std::vector<MediaHook>& hooks) {
     UnhookMediaSessions(hooks);
     try {
-        for (const MediaSession& session : manager.GetSessions()) {
+        const auto sessions = manager.GetSessions();
+        if (!sessions) {
+            return;
+        }
+        for (const MediaSession& session : sessions) {
+            if (!session) {
+                continue;
+            }
             MediaHook hook;
             hook.session = session;
             try {
@@ -2240,8 +2289,14 @@ std::shared_ptr<const std::vector<uint8_t>> DecodeMediaArt(
     if (!reference) {
         return nullptr;
     }
-    const auto stream = reference.OpenReadAsync().get();
-    const imaging::BitmapDecoder decoder = imaging::BitmapDecoder::CreateAsync(stream).get();
+    const auto stream = MediaAwait(reference.OpenReadAsync(), 3000);
+    if (!stream) {
+        return nullptr;
+    }
+    const imaging::BitmapDecoder decoder = MediaAwait(imaging::BitmapDecoder::CreateAsync(stream), 3000);
+    if (!decoder) {
+        return nullptr;
+    }
     const uint32_t sourceW = decoder.OrientedPixelWidth();
     const uint32_t sourceH = decoder.OrientedPixelHeight();
     if (sourceW == 0 || sourceH == 0) {
@@ -2256,11 +2311,14 @@ std::shared_ptr<const std::vector<uint8_t>> DecodeMediaArt(
     transform.ScaledHeight(scaledH);
     transform.InterpolationMode(imaging::BitmapInterpolationMode::Fant);
     transform.Bounds(imaging::BitmapBounds{(scaledW - target) / 2U, (scaledH - target) / 2U, target, target});
-    const imaging::PixelDataProvider data = decoder
-        .GetPixelDataAsync(imaging::BitmapPixelFormat::Bgra8, imaging::BitmapAlphaMode::Premultiplied,
+    const imaging::PixelDataProvider data = MediaAwait(
+        decoder.GetPixelDataAsync(imaging::BitmapPixelFormat::Bgra8, imaging::BitmapAlphaMode::Premultiplied,
             transform, imaging::ExifOrientationMode::RespectExifOrientation,
-            imaging::ColorManagementMode::ColorManageToSRgb)
-        .get();
+            imaging::ColorManagementMode::ColorManageToSRgb),
+        3000);
+    if (!data) {
+        return nullptr;
+    }
     const winrt::com_array<uint8_t> bytes = data.DetachPixelData();
     if (bytes.size() != static_cast<size_t>(target) * static_cast<size_t>(target) * 4U) {
         return nullptr;
@@ -2290,16 +2348,23 @@ struct MediaRead {
 
 void ReadMediaPlayback(const MediaSession& session, MediaRead& read) {
     const auto info = session.GetPlaybackInfo();
+    if (!info) {
+        read.state.have = false;
+        read.state.playing = false;
+        return;
+    }
     const MediaStatus status = info.PlaybackStatus();
     // Changing = track switch in progress; keep the last state so the glyph
     // does not flicker between tracks.
     read.state.playing = status == MediaStatus::Playing || (status == MediaStatus::Changing && read.state.playing);
     read.state.have = status != MediaStatus::Closed;
     const auto controls = info.Controls();
-    read.state.canPrev = controls.IsPreviousEnabled();
-    read.state.canNext = controls.IsNextEnabled();
-    read.canToggle = controls.IsPlayPauseToggleEnabled();
-    read.state.canPlayPause = read.canToggle || controls.IsPlayEnabled() || controls.IsPauseEnabled();
+    if (controls) {
+        read.state.canPrev = controls.IsPreviousEnabled();
+        read.state.canNext = controls.IsNextEnabled();
+        read.canToggle = controls.IsPlayPauseToggleEnabled();
+        read.state.canPlayPause = read.canToggle || controls.IsPlayEnabled() || controls.IsPauseEnabled();
+    }
     double rate = 1.0;
     try {
         const auto reported = info.PlaybackRate();
@@ -2313,6 +2378,9 @@ void ReadMediaPlayback(const MediaSession& session, MediaRead& read) {
 
 void ReadMediaTimeline(const MediaSession& session, MediaRead& read) {
     const auto timeline = session.GetTimelineProperties();
+    if (!timeline) {
+        return;
+    }
     int64_t start = timeline.StartTime().count();
     int64_t end = timeline.EndTime().count();
     if (end <= start) {
@@ -2343,7 +2411,7 @@ void ReadMediaTimeline(const MediaSession& session, MediaRead& read) {
 }
 
 void ReadMediaProps(const MediaSession& session, MediaRead& read, bool fromEvent) {
-    const auto props = session.TryGetMediaPropertiesAsync().get();
+    const auto props = MediaAwait(session.TryGetMediaPropertiesAsync(), 2000);
     if (!props) {
         return;
     }
@@ -2370,7 +2438,8 @@ void ReadMediaProps(const MediaSession& session, MediaRead& read, bool fromEvent
     }
     std::shared_ptr<const std::vector<uint8_t>> art;
     try {
-        art = DecodeMediaArt(props.Thumbnail());
+        const auto thumbnail = props.Thumbnail();
+        art = thumbnail ? DecodeMediaArt(thumbnail) : nullptr;
     } catch (...) {
         art = nullptr;
     }
@@ -2408,22 +2477,23 @@ void RunMediaRequests(const MediaSession& session, const MediaRead& read, const 
         try {
             switch (request.command) {
             case MediaCommand::Previous:
-                static_cast<void>(session.TrySkipPreviousAsync().get());
+                static_cast<void>(MediaAwait(session.TrySkipPreviousAsync(), 2000));
                 break;
             case MediaCommand::Next:
-                static_cast<void>(session.TrySkipNextAsync().get());
+                static_cast<void>(MediaAwait(session.TrySkipNextAsync(), 2000));
                 break;
             case MediaCommand::TogglePlay:
                 if (read.canToggle || !read.state.canPlayPause) {
-                    static_cast<void>(session.TryTogglePlayPauseAsync().get());
+                    static_cast<void>(MediaAwait(session.TryTogglePlayPauseAsync(), 2000));
                 } else if (MediaStatusOf(session) == MediaStatus::Playing) {
-                    static_cast<void>(session.TryPauseAsync().get());
+                    static_cast<void>(MediaAwait(session.TryPauseAsync(), 2000));
                 } else {
-                    static_cast<void>(session.TryPlayAsync().get());
+                    static_cast<void>(MediaAwait(session.TryPlayAsync(), 2000));
                 }
                 break;
             case MediaCommand::Seek:
-                static_cast<void>(session.TryChangePlaybackPositionAsync(read.startTicks + request.position).get());
+                static_cast<void>(
+                    MediaAwait(session.TryChangePlaybackPositionAsync(read.startTicks + request.position), 2000));
                 break;
             }
         } catch (...) {
@@ -2491,7 +2561,7 @@ void MediaWorker() {
     }
     MediaManager manager{nullptr};
     try {
-        manager = MediaManager::RequestAsync().get();
+        manager = MediaAwait(MediaManager::RequestAsync(), 10000);
     } catch (...) {
         manager = nullptr;
     }

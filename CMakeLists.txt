@@ -135,6 +135,7 @@ target_link_libraries(Dock PRIVATE
     UIAutomationCore
     wbemuuid
     pdh
+    dbghelp
 )
 
 set(DOCK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.hlsl")

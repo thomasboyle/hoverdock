@@ -2,8 +2,11 @@
 #include "SystemTemps.h"
 
 #include <Windows.h>
+#include <DbgHelp.h>
+#include <ShlObj.h>
 #include <Shellapi.h>
 
+#include <cstdlib>
 #include <exception>
 #include <string>
 
@@ -18,9 +21,61 @@ bool HasArg(int argc, LPWSTR* argv, const wchar_t* flag) {
     return false;
 }
 
+// Minidump to %LOCALAPPDATA%\Hoverdock\Crashes so a crash (access
+// violation, std::terminate) leaves evidence instead of a silent exit.
+void WriteCrashDump(EXCEPTION_POINTERS* exception) noexcept {
+    static volatile LONG writing = 0;
+    if (InterlockedExchange(&writing, 1) != 0) {
+        return;
+    }
+    PWSTR base = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)) || base == nullptr) {
+        return;
+    }
+    wchar_t directory[MAX_PATH]{};
+    swprintf_s(directory, L"%s\\Hoverdock", base);
+    CoTaskMemFree(base);
+    CreateDirectoryW(directory, nullptr);
+    wcscat_s(directory, L"\\Crashes");
+    CreateDirectoryW(directory, nullptr);
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t path[MAX_PATH]{};
+    swprintf_s(path, L"%s\\Dock-%s-%04u%02u%02u-%02u%02u%02u-%lu.dmp", directory, L"" DOCK_VERSION_STRING,
+        static_cast<unsigned>(now.wYear), static_cast<unsigned>(now.wMonth), static_cast<unsigned>(now.wDay),
+        static_cast<unsigned>(now.wHour), static_cast<unsigned>(now.wMinute), static_cast<unsigned>(now.wSecond),
+        GetCurrentProcessId());
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    MINIDUMP_EXCEPTION_INFORMATION info{};
+    info.ThreadId = GetCurrentThreadId();
+    info.ExceptionPointers = exception;
+    info.ClientPointers = FALSE;
+    MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo),
+        exception != nullptr ? &info : nullptr, nullptr, nullptr);
+    CloseHandle(file);
+}
+
+LONG WINAPI CrashFilter(EXCEPTION_POINTERS* exception) {
+    WriteCrashDump(exception);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void InstallCrashDumps() noexcept {
+    SetUnhandledExceptionFilter(&CrashFilter);
+    std::set_terminate([] {
+        WriteCrashDump(nullptr);
+        std::abort();
+    });
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    InstallCrashDumps();
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv != nullptr) {
