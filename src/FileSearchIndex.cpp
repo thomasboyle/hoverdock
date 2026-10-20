@@ -1115,7 +1115,7 @@ void ScanWholeNameCandidates(const ScanContext& ctx, uint32_t slot, uint32_t s1,
 // remaining slot could enter the top-N without a whole-name bonus, and the
 // rest is checked by ScanWholeNameCandidates.
 void ScanSlots(const ScanContext& ctx, uint32_t s0, uint32_t s1, bool sorted, std::vector<uint32_t>& matches,
-    size_t& matchCount, TopN& top, bool& cut) {
+    size_t& matchCount, TopN& top, bool& cut, uint32_t* cutAt = nullptr) {
     if (s0 >= s1) {
         return;
     }
@@ -1124,6 +1124,9 @@ void ScanSlots(const ScanContext& ctx, uint32_t s0, uint32_t s1, bool sorted, st
         const int32_t threshold = SharedThreshold(ctx, top);
         if (threshold != INT32_MIN && ctx.tokenCeiling + ctx.slotBase[s0] < threshold) {
             cut = true;
+            if (cutAt != nullptr) {
+                *cutAt = s0;
+            }
             ScanWholeNameCandidates(ctx, s0, s1, top);
             return;
         }
@@ -1156,6 +1159,9 @@ void ScanSlots(const ScanContext& ctx, uint32_t s0, uint32_t s1, bool sorted, st
         const int32_t threshold = SharedThreshold(ctx, top);
         if (sorted && threshold != INT32_MIN && ctx.tokenCeiling + base < threshold) {
             cut = true;
+            if (cutAt != nullptr) {
+                *cutAt = slot;
+            }
             ScanWholeNameCandidates(ctx, slot, s1, top);
             return end;
         }
@@ -1284,12 +1290,19 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
     size_t matchCount = 0;
     bool cut = false;
     TopN top(limit);
+    const auto slotCount = static_cast<uint32_t>(ctx.slotCount);
+    const uint32_t sortedEnd = std::min(m_sortedEnd, slotCount);
+    // `matches` holds every match in ranked slots [0, covered) plus the
+    // unsorted tail; a later query that extends this one narrows them and
+    // resumes the ranked scan at `covered` (its matches are a subset).
+    uint32_t covered = sortedEnd;
+    bool resumable = true;
     // Narrow the previous result when this query extends it, unless that
     // result is so large a SIMD rescan is cheaper than per-name checks.
     const bool incremental = state != nullptr && state->valid && state->generation == m_generation &&
         !state->folded.empty() && query.folded.size() >= state->folded.size() &&
         query.folded.compare(0, state->folded.size(), state->folded) == 0 &&
-        state->slots.size() < ctx.slotCount / 8;
+        state->slots.size() < ctx.slotCount / 8 && state->resumeSlot <= sortedEnd;
     if (incremental) {
         matches.reserve(state->slots.size());
         for (const uint32_t slot : state->slots) {
@@ -1300,25 +1313,30 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
                 ++matchCount;
                 if (result == SlotResult::Scored) {
                     top.Offer(hit);
+                    Publish(ctx, top);
                 }
             }
         }
-    } else {
-        const auto slotCount = static_cast<uint32_t>(ctx.slotCount);
-        const uint32_t sortedEnd = std::min(m_sortedEnd, slotCount);
+    }
+    // Ranked scan of [begin, sortedEnd): everything for a fresh query, the
+    // part past the previous early exit for a narrowed one.
+    const uint32_t begin = incremental ? state->resumeSlot : 0;
+    if (begin < sortedEnd) {
         unsigned workers = std::max(1U, threads);
-        if (sortedEnd < 200000U) {
+        if (sortedEnd - begin < 200000U) {
             workers = 1;
         }
         // Probe the best-ranked slots on this thread first: most queries
         // fill the top-N there and stop, so threads would only add start-up
         // cost. Fan out over the rest only when the probe did not finish.
-        const uint32_t probeEnd = workers == 1 ? sortedEnd : sortedEnd / 64;
-        ScanSlots(ctx, 0, probeEnd, true, matches, matchCount, top, cut);
+        const uint32_t probeEnd = workers == 1 ? sortedEnd : begin + (sortedEnd - begin) / 64;
+        uint32_t cutAt = sortedEnd;
+        ScanSlots(ctx, begin, probeEnd, true, matches, matchCount, top, cut, &cutAt);
         if (cut) {
             // The probe's bonus-only phase stopped at probeEnd; the order is
             // monotonic across the whole sorted region, so continue it there.
             ScanWholeNameCandidates(ctx, probeEnd, sortedEnd, top);
+            covered = cutAt;
         } else if (probeEnd < sortedEnd && [&] {
                        // Top-N already full: the threshold bounds where the
                        // scan must stop. Close by => stay on this thread.
@@ -1330,7 +1348,8 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
                            [&](int16_t base) { return ctx.tokenCeiling + base >= threshold; });
                        return static_cast<uint32_t>(stop - ctx.slotBase) - probeEnd <= sortedEnd / 8;
                    }()) {
-            ScanSlots(ctx, probeEnd, sortedEnd, true, matches, matchCount, top, cut);
+            ScanSlots(ctx, probeEnd, sortedEnd, true, matches, matchCount, top, cut, &cutAt);
+            covered = cut ? cutAt : sortedEnd;
         } else if (probeEnd < sortedEnd) {
             // Workers pull chunks in ranked order, so every thread works on the
             // best remaining names and the shared threshold rises early;
@@ -1374,8 +1393,13 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
                     top.Offer(hit);
                 }
             }
+            // Chunks cut independently: the covered set is not a prefix.
+            resumable = !cut;
         }
-        // Names added since the last reorder (journal) are unsorted: scan all.
+    }
+    if (!incremental) {
+        // Names added since the last reorder (journal) are unsorted: scan all
+        // (a narrowed query already re-checked their recorded matches).
         bool unused = false;
         ScanSlots(ctx, sortedEnd, slotCount, false, matches, matchCount, top, unused);
     }
@@ -1388,9 +1412,9 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
         state->lastMatchCountExact = !cut;
         state->folded = query.folded;
         state->generation = m_generation;
-        // Cut or truncated lists cannot be narrowed; the next query rescans
-        // (cheaply: the cut means the top-N filled early).
-        state->valid = !cut && matches.size() == matchCount;
+        // Truncated lists (or a non-prefix cut) cannot be narrowed.
+        state->valid = resumable && matches.size() == matchCount;
+        state->resumeSlot = covered;
         state->slots = std::move(matches);
     }
     return result;

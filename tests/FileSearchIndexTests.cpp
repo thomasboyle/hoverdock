@@ -371,7 +371,7 @@ void TestTopNIsPrefixOfFullRanking() {
                 index.Flags(entry) ^ (i % 5 == 0 ? kFlagHidden : 0), name);
         }
     }
-    for (const char* q : {"a", "re", "report", "mail a", "e", "x", "alpha beta", "zz"}) {
+    for (const char* q : {"a", "re", "report", "mail a", "e", "x", "alpha beta", "zz", "report a 1", "data.t"}) {
         const std::vector<Hit> full = index.Search(q, 10000000, nullptr, 1);
         for (const size_t limit : {1U, 7U, 50U, 400U}) {
             for (const unsigned threads : {1U, 4U}) {
@@ -386,19 +386,26 @@ void TestTopNIsPrefixOfFullRanking() {
                 }
             }
         }
-        // Typing with the narrowing cache gives the same head.
-        SearchState state;
-        std::string typed;
-        std::vector<Hit> last;
-        for (const char c : std::string(q)) {
-            typed.push_back(c);
-            last = index.Search(typed, 50, &state, 4);
+        // Typing with the narrowing / resume cache gives the same head at
+        // every keystroke (cut scans resume where the previous one stopped).
+        for (const unsigned threads : {1U, 4U}) {
+            SearchState state;
+            std::string typed;
+            for (const char c : std::string(q)) {
+                typed.push_back(c);
+                const std::vector<Hit> viaState = index.Search(typed, 50, &state, threads);
+                const std::vector<Hit> fresh = index.Search(typed, 10000000, nullptr, 1);
+                bool same = viaState.size() == std::min<size_t>(50, fresh.size());
+                for (size_t i = 0; same && i < viaState.size(); ++i) {
+                    same = viaState[i].entry == fresh[i].entry && viaState[i].score == fresh[i].score;
+                }
+                CHECK(same);
+                if (!same) {
+                    std::printf("  typing '%s' threads %u differs (incremental=%d)\n", typed.c_str(), threads,
+                        state.lastWasIncremental ? 1 : 0);
+                }
+            }
         }
-        bool same = last.size() == std::min<size_t>(50, full.size());
-        for (size_t i = 0; same && i < last.size(); ++i) {
-            same = last[i].entry == full[i].entry && last[i].score == full[i].score;
-        }
-        CHECK(same);
     }
 }
 

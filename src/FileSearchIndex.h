@@ -65,7 +65,8 @@ class FileIndex;
 struct SearchState {
     std::string folded;
     uint64_t generation = ~0ULL;
-    std::vector<uint32_t> slots;   // every slot that matched `folded`
+    std::vector<uint32_t> slots;   // every match in ranked slots [0, resumeSlot) + the unsorted tail
+    uint32_t resumeSlot = 0;       // where the ranked scan stopped early (end when complete)
     bool valid = false;
     // Diagnostics from the last Search call.
     bool lastWasIncremental = false;
