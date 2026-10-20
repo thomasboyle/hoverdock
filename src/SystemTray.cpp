@@ -1933,6 +1933,25 @@ std::vector<TrayNotifyIcon> EnumerateShellButtons(bool assignIcons = true) {
     return icons;
 }
 
+// Explorer stores tray executables relative to a known folder:
+// "{F38BF404-1D43-42F2-9305-67DE0B28FC23}\explorer.exe" is %WINDIR%\explorer.exe.
+std::wstring ResolveKnownFolderPath(std::wstring path) {
+    constexpr size_t kGuidLength = 38;
+    if (path.size() <= kGuidLength || path[0] != L'{' || path[kGuidLength - 1] != L'}') {
+        return path;
+    }
+    GUID folderId{};
+    if (FAILED(CLSIDFromString(path.substr(0, kGuidLength).c_str(), &folderId))) {
+        return path;
+    }
+    PWSTR folder = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(folderId, KF_FLAG_DONT_VERIFY, nullptr, &folder)) && folder != nullptr) {
+        path = std::wstring(folder) + path.substr(kGuidLength);
+    }
+    CoTaskMemFree(folder);
+    return path;
+}
+
 // Receives Explorer's notification-item list. Explorer calls Notify once per
 // known item, synchronously inside RegisterCallback (the same mechanism the
 // Settings "Other system tray icons" page and Chromium use).
@@ -1980,8 +1999,8 @@ public:
             icon.id = item->uID;
             icon.guid = item->guidItem;
             icon.preference = static_cast<int>(item->dwPreference);
-            icon.executablePath = item->pszExeName != nullptr ? item->pszExeName : L"";
-            if (icon.executablePath.empty()) {
+            icon.executablePath = ResolveKnownFolderPath(item->pszExeName != nullptr ? item->pszExeName : L"");
+            if (icon.executablePath.empty() || icon.executablePath[0] == L'{') {
                 icon.executablePath = ProcessImagePath(pid);
             }
             icon.exeName = FileStem(icon.executablePath);

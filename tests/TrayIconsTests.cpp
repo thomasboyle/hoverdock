@@ -121,6 +121,10 @@ int wmain(int argc, wchar_t** argv) {
             icon.shellButton ? 1 : 0);
     }
     CHECK(found != nullptr);
+    for (const TrayNotifyIcon& icon : icons) {
+        // Known-folder GUID prefixes from Explorer are resolved to real paths.
+        CHECK(icon.executablePath.empty() || icon.executablePath[0] != L'{');
+    }
     if (found != nullptr) {
         CHECK(found->id == kProbeId);
         CHECK(found->icon != nullptr);
