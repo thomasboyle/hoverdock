@@ -164,6 +164,8 @@ private:
     static constexpr UINT_PTR kUpdateTimerId = 8;
     static constexpr UINT_PTR kCursorWatchTimerId = 9;
     static constexpr UINT_PTR kGlintTimerId = 15;
+    // Adaptive chrome ink crossfade (macOS menu bar black/white switch).
+    static constexpr UINT_PTR kChromeInkTimerId = 22;
     static constexpr UINT_PTR kBluetoothTimerId = 16;
     static constexpr UINT_PTR kEnergySampleTimerId = 17;
     static constexpr UINT_PTR kQsLiveTimerId = 18;
@@ -569,6 +571,10 @@ private:
     void HandlePointer(POINT cursor);
     void UpdateGlintTarget(POINT cursor);
     void TickGlint();
+    // Re-measure the desktop behind the tray + clock group and start the
+    // black/white ink crossfade when it crosses the hysteresis band.
+    void UpdateChromeInkTarget();
+    void TickChromeInk();
     void StopGlint() noexcept;
     void HandleContextMenu(POINT screenPoint);
     [[nodiscard]] std::vector<ContextItem> BuildContextItems(int icon, DisplayApp& outApp,
@@ -853,6 +859,13 @@ private:
     float m_glintTargetStrength = 0.0F;
     double m_glintLastTickAt = 0.0;
     bool m_glintTimerRunning = false;
+    // Adaptive chrome ink: 0 = white ink, 1 = black ink. m_chromeInk eases
+    // toward m_chromeInkTarget; unknown until the first backdrop sample.
+    float m_chromeInk = 0.0F;
+    float m_chromeInkTarget = 0.0F;
+    bool m_chromeInkKnown = false;
+    bool m_chromeInkTimerRunning = false;
+    double m_chromeInkLastTickAt = 0.0;
     bool m_suppressDragUntilRelease = false;
     bool m_launchClickInProgress = false;
     std::wstring m_pressedTarget;

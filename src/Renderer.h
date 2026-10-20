@@ -60,6 +60,9 @@ struct DockRenderState {
     float glintY = 0.0F;
     float glintStrength = 0.0F;
     bool showDevBounds = false;
+    // Adaptive chrome ink, macOS menu bar style: 0 = white ink (dark backdrop),
+    // 1 = black ink (light backdrop); in between while crossfading.
+    float chromeDarkInk = 0.0F;
     bool allowBlockingGpuWait = true;
     bool skipIfGpuBusy = false;
     std::span<const DockIconRenderData> icons;
@@ -156,9 +159,9 @@ public:
     void CancelLiveGlassPanelBake() noexcept;
     // Increments only when CaptureBackdrop uploads new pixels (desktop changed).
     [[nodiscard]] uint64_t BackdropChangeSerial() const noexcept { return m_backdropChangeSerial; }
-    // Same wallpaper-luma cut as AdaptiveChromeInk in Shaders.hlsl so Quick /
-    // Dock Settings text matches Start/Search/clock chrome on the dock.
-    void SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const noexcept;
+    // Mean luma (0..1, Rec.709 on sRGB) of the captured desktop directly
+    // behind `region` (dock-client px). False until a backdrop is captured.
+    bool SampleBackdropLuma(const RECT& region, float& luma) const noexcept;
     void Flush();
 
     [[nodiscard]] HANDLE FrameLatencyWaitableObject() const noexcept;
@@ -186,7 +189,8 @@ private:
         float scene0[4]{};
         float scene1[4]{};
         float scene2[4]{};
-        std::byte padding[208]{};
+        float scene3[4]{};
+        std::byte padding[192]{};
     };
 
     struct IconInstanceConstants {

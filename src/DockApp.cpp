@@ -3996,6 +3996,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             PumpCursorWatch();
         } else if (wParam == kGlintTimerId) {
             TickGlint();
+        } else if (wParam == kChromeInkTimerId) {
+            TickChromeInk();
         } else if (wParam == kBackdropTimerId) {
             OnBackdropTick();
         } else if (wParam == kPerfOpenSettingsTimerId) {
@@ -10916,6 +10918,8 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
         state.glintStrength = m_glintStrength;
     }
     state.showDevBounds = m_config.ShowDevBounds();
+    UpdateChromeInkTarget();
+    state.chromeDarkInk = m_chromeInk;
     // Glint easing frames are cosmetic: drop one rather than wait on the GPU
     // (the settle frame in TickGlint is allowed to wait).
     state.skipIfGpuBusy = m_dropPresentPending || (IsDragActive() && !m_dragSnapAnimating) ||
@@ -11184,6 +11188,72 @@ void DockApp::TickGlint() {
         IsWindowVisible(m_hoverLabelWindow) != FALSE) {
         UpdateHoverLabel(true);
     }
+}
+
+void DockApp::UpdateChromeInkTarget() {
+    // macOS Tahoe menu bar: items over a light backdrop turn black, over a
+    // dark one white, judged on what is directly behind that part of the bar
+    // (not the whole bar), with hysteresis so mid-grey does not flicker, and
+    // a short crossfade. Here the region is the tray glyphs + clock.
+    RECT region{};
+    bool any = false;
+    for (const DockIconRenderData& icon : m_iconRenderData) {
+        if (!icon.adaptiveInk || (icon.kind != DockIconKind::Tray && icon.kind != DockIconKind::Clock)) {
+            continue;
+        }
+        if (!any) {
+            region = icon.bounds;
+            any = true;
+        } else {
+            region.left = (std::min)(region.left, icon.bounds.left);
+            region.top = (std::min)(region.top, icon.bounds.top);
+            region.right = (std::max)(region.right, icon.bounds.right);
+            region.bottom = (std::max)(region.bottom, icon.bounds.bottom);
+        }
+    }
+    float luma = 0.0F;
+    if (!any || !m_renderer.SampleBackdropLuma(region, luma)) {
+        return;
+    }
+    constexpr float kToBlack = 0.58F;
+    constexpr float kToWhite = 0.42F;
+    if (!m_chromeInkKnown) {
+        // First sample: snap, no fade-in from the wrong ink.
+        m_chromeInkTarget = luma >= 0.5F ? 1.0F : 0.0F;
+        m_chromeInk = m_chromeInkTarget;
+        m_chromeInkKnown = true;
+        return;
+    }
+    if (luma >= kToBlack) {
+        m_chromeInkTarget = 1.0F;
+    } else if (luma <= kToWhite) {
+        m_chromeInkTarget = 0.0F;
+    }
+    if (m_chromeInk != m_chromeInkTarget && !m_chromeInkTimerRunning && m_window != nullptr) {
+        m_chromeInkLastTickAt = QpcSeconds();
+        m_chromeInkTimerRunning = true;
+        SetTimer(m_window, kChromeInkTimerId, kGlintIntervalMs, nullptr);
+    }
+}
+
+void DockApp::TickChromeInk() {
+    const double now = QpcSeconds();
+    const float dt = static_cast<float>(std::clamp(now - m_chromeInkLastTickAt, 0.0, 0.1));
+    m_chromeInkLastTickAt = now;
+    // Linear 0.25 s ramp; the shader applies smoothstep for an ease-in-out.
+    constexpr float kFadeSeconds = 0.25F;
+    const float step = dt / kFadeSeconds;
+    if (m_chromeInk < m_chromeInkTarget) {
+        m_chromeInk = (std::min)(m_chromeInkTarget, m_chromeInk + step);
+    } else {
+        m_chromeInk = (std::max)(m_chromeInkTarget, m_chromeInk - step);
+    }
+    if (m_chromeInk == m_chromeInkTarget || m_visibility != VisibilityState::Visible) {
+        m_chromeInk = m_chromeInkTarget;
+        KillTimer(m_window, kChromeInkTimerId);
+        m_chromeInkTimerRunning = false;
+    }
+    QueueRenderFrame(false);
 }
 
 void DockApp::StopGlint() noexcept {

@@ -2232,6 +2232,10 @@ bool Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene2[1] = state.glintY;
     frame.mappedConstants->scene2[2] = state.glintStrength;
     frame.mappedConstants->scene2[3] = 0.0F;
+    frame.mappedConstants->scene3[0] = std::clamp(state.chromeDarkInk, 0.0F, 1.0F);
+    frame.mappedConstants->scene3[1] = 0.0F;
+    frame.mappedConstants->scene3[2] = 0.0F;
+    frame.mappedConstants->scene3[3] = 0.0F;
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3850,35 +3854,36 @@ bool Renderer::EnsurePanelGlassResources(UINT width, UINT height)
     return CreatePanelGlassResourcesExact(width, height);
 }
 
-void Renderer::SampleAdaptiveChromeInk(uint8_t& r, uint8_t& g, uint8_t& b) const noexcept {
-    // Mirror AdaptiveChromeInk: invalid backdrop -> light chrome; else hard cut
-    // on average wallpaper luma across three mid-row samples.
-    r = DOCK_CHROME_INK_R;
-    g = DOCK_CHROME_INK_G;
-    b = DOCK_CHROME_INK_B;
-    if (!m_backdropValid || m_backdropDibPixels == nullptr || m_width < 2 ||
-        m_height < 2) {
-        return;
+bool Renderer::SampleBackdropLuma(const RECT& region, float& luma) const noexcept {
+    if (!m_backdropValid || m_backdropDibPixels == nullptr || m_width < 2 || m_height < 2) {
+        return false;
     }
-    auto sampleLuma = [this](float u, float v) -> float {
-        const UINT x = (std::min)(m_width - 1U,
-            static_cast<UINT>(u * static_cast<float>(m_width - 1U)));
-        const UINT y = (std::min)(m_height - 1U,
-            static_cast<UINT>(v * static_cast<float>(m_height - 1U)));
-        const uint8_t* p =
-            m_backdropDibPixels + (static_cast<size_t>(y) * m_width + x) * 4U;
-        // DIB is BGRA; Rec.709 luma matches the shader's rgb dot.
-        return (0.0722F * static_cast<float>(p[0]) + 0.7152F * static_cast<float>(p[1]) +
-                   0.2126F * static_cast<float>(p[2])) /
-            255.0F;
-    };
-    const float wallpaperLuma =
-        (sampleLuma(0.20F, 0.50F) + sampleLuma(0.50F, 0.50F) + sampleLuma(0.80F, 0.50F)) / 3.0F;
-    if (wallpaperLuma >= 0.50F) {
-        r = DOCK_INK_R;
-        g = DOCK_INK_G;
-        b = DOCK_INK_B;
+    const LONG left = (std::max)(0L, region.left);
+    const LONG top = (std::max)(0L, region.top);
+    const LONG right = (std::min)(static_cast<LONG>(m_width), region.right);
+    const LONG bottom = (std::min)(static_cast<LONG>(m_height), region.bottom);
+    if (right <= left || bottom <= top) {
+        return false;
     }
+    // 12 x 4 grid across the region: enough to average out text/edges in a
+    // window behind the dock without scanning every pixel each frame.
+    constexpr int kCols = 12;
+    constexpr int kRows = 4;
+    float sum = 0.0F;
+    for (int row = 0; row < kRows; ++row) {
+        const LONG y = top + (bottom - top) * (2 * row + 1) / (2 * kRows);
+        for (int col = 0; col < kCols; ++col) {
+            const LONG x = left + (right - left) * (2 * col + 1) / (2 * kCols);
+            const uint8_t* p = m_backdropDibPixels +
+                (static_cast<size_t>(y) * m_width + static_cast<size_t>(x)) * 4U;
+            // DIB is BGRA.
+            sum += (0.0722F * static_cast<float>(p[0]) + 0.7152F * static_cast<float>(p[1]) +
+                       0.2126F * static_cast<float>(p[2])) /
+                255.0F;
+        }
+    }
+    luma = sum / static_cast<float>(kCols * kRows);
+    return true;
 }
 
 // Control Centre shapes -> panel instance buffer (two slots per shape) and the

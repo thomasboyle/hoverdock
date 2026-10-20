@@ -9,6 +9,7 @@ cbuffer FrameData : register(b0)
     float4 scene0; // output width, output height, glass alpha, dock scale
     float4 scene1; // fx bitmask | icon count, DPI scale, dev bounds, backdrop valid
     float4 scene2; // pointer glint x, y (output px), strength 0..1, unused
+    float4 scene3; // dock: chrome ink darkness 0 (white) .. 1 (black), unused x3
 };
 
 struct IconInstance
@@ -1160,24 +1161,58 @@ float4 BlurHPS2(VertexOutput input) : SV_Target
 // Chrome ink on the same face tonemap domain as GlassPS:
 // face = lerp(OVER_BLACK, OVER_WHITE, backdropLuma); ink inverts that so glyphs
 // stay contrasted on both dark and light plates.
-float3 AdaptiveChromeInk(float2 outputSize)
+// Adaptive chrome ink, macOS menu bar style: black over a light backdrop,
+// white over a dark one. DockApp measures the desktop directly behind the
+// tray + clock group, applies hysteresis and crossfades scene3.x over ~0.25 s.
+float3 ChromeInk()
 {
-    // Hard cut on wallpaper luma (ignore frosted plate — it sits mid-grey and
-    // wrongly pulled ink dark on black desks). Dark desk -> light chrome.
     const float3 darkInk = float3(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B) / 255.0;
     const float3 lightInk = float3(0.96, 0.96, 0.97);
-    if (scene1.w < 0.5)
-    {
-        return lightInk;
-    }
-    // Average a few samples across the dock window so one bright pixel cannot
-    // tip the whole chrome set dark.
+    const float t = saturate(scene3.x);
+    return lerp(lightInk, darkInk, t * t * (3.0 - 2.0 * t));
+}
+
+float GlyphCoverage(float4 s)
+{
+    return max(s.a, max(s.r, max(s.g, s.b)));
+}
+
+static const float2 kShadowDirs[8] = {
+    float2(1.0, 0.0), float2(0.7071, 0.7071), float2(0.0, 1.0), float2(-0.7071, 0.7071),
+    float2(-1.0, 0.0), float2(-0.7071, -0.7071), float2(0.0, -1.0), float2(0.7071, -0.7071)
+};
+
+// macOS gives white menu bar items a faint soft shadow (none on black ones).
+// Blurred coverage on a ring around the pixel, shifted so it falls ~1 px down.
+float ShadowLoad(int2 texel, int layer, int2 size, float radius)
+{
     float acc = 0.0;
-    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.20, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
-    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.50, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
-    acc += dot(backdropTexture.SampleLevel(linearClamp, float2(0.80, 0.50), 0).rgb, float3(0.2126, 0.7152, 0.0722));
-    const float wallpaperLuma = saturate(acc / 3.0);
-    return wallpaperLuma < 0.50 ? lightInk : darkInk;
+    [unroll] for (int k = 0; k < 8; ++k)
+    {
+        const int2 t = texel + int2(round(kShadowDirs[k] * radius - float2(0.0, radius)));
+        const bool inside = t.x >= 0 && t.y >= 0 && t.x < size.x && t.y < size.y;
+        acc += inside ? GlyphCoverage(iconTexture.Load(int4(t, layer, 0))) : 0.0;
+    }
+    return acc / 8.0;
+}
+
+float ShadowSample(float2 uv, float layer, float side, float radius)
+{
+    float acc = 0.0;
+    [unroll] for (int k = 0; k < 8; ++k)
+    {
+        const float2 t = uv + (kShadowDirs[k] * radius - float2(0.0, radius)) / side;
+        const bool inside = all(t >= 0.0) && all(t <= 1.0);
+        acc += inside ? GlyphCoverage(iconTexture.SampleLevel(linearClamp, float3(t, layer), 0)) : 0.0;
+    }
+    return acc / 8.0;
+}
+
+// Premultiplied black shadow under (rgb, a), faded out as the ink turns black.
+void ApplyChromeShadow(inout float a, float blurred)
+{
+    const float shadow = saturate(blurred * 1.5) * 0.28 * (1.0 - saturate(scene3.x));
+    a = a + shadow * (1.0 - a);
 }
 
 float4 IconPS(VertexOutput input) : SV_Target
@@ -1216,9 +1251,13 @@ float4 IconPS(VertexOutput input) : SV_Target
         if (adaptiveInk)
         {
             const float coverage = max(a, max(rgb.r, max(rgb.g, rgb.b)));
-            const float3 ink = AdaptiveChromeInk(outputSize);
-            rgb = ink * coverage;
+            rgb = ChromeInk() * coverage;
             a = coverage;
+            if (inside && scene3.x < 0.999)
+            {
+                ApplyChromeShadow(a, ShadowLoad(texel, (int)input.textureIndex, int2(icon.iconRect.zw),
+                    max(1.0, icon.iconRect.w / 28.0)));
+            }
         }
         return float4(rgb * clockBrightness, a * clockBrightness);
     }
@@ -1237,9 +1276,16 @@ float4 IconPS(VertexOutput input) : SV_Target
     if (adaptiveInk)
     {
         const float coverage = max(alpha, max(sampled.r, max(sampled.g, sampled.b)));
-        const float3 ink = AdaptiveChromeInk(outputSize);
-        color = ink * coverage * iconBrightness;
-        alpha = coverage * iconBrightness;
+        color = ChromeInk() * coverage * iconBrightness;
+        float shaded = coverage;
+        if (input.uv.y <= contentHeightRatio && scene3.x < 0.999)
+        {
+            // Content is square (iconRect.z px each way).
+            const float side = max(icon.iconRect.z, 1.0);
+            const float2 iconUv = saturate(float2(input.uv.x, input.uv.y / max(contentHeightRatio, 0.001)));
+            ApplyChromeShadow(shaded, ShadowSample(iconUv, input.textureIndex, side, max(1.0, side / 18.0)));
+        }
+        alpha = shaded * iconBrightness;
     }
 
     if (icon.iconMeta.x > 0.5 && contentHeightRatio < 0.98 && input.uv.y > contentHeightRatio) {
