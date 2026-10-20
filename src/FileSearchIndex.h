@@ -5,11 +5,14 @@
 // from the NTFS MFT (FSCTL_ENUM_USN_DATA) and keeps it live from the USN
 // change journal. Not thread-safe: the owner serialises writers vs readers.
 //
-// Layout (struct-of-arrays, ~10 B/entry + ~8 B/slot + UTF-8 names):
+// Layout (struct-of-arrays, ~10 B/entry + ~12 B/slot + UTF-8 names):
 //   entries  stable ids; parent links, flags, zone, current name slot
-//   slots    names in one contiguous '\0'-separated UTF-8 buffer, in
-//            insertion order, so a query is one linear SIMD scan
-//   renames append a fresh slot; dead slots are compacted lazily.
+//   slots    names in one contiguous '\0'-separated UTF-8 buffer, ordered by
+//            a precomputed static score (zone, kind, length, depth), so a
+//            query is one linear SIMD scan that stops as soon as no later
+//            name can enter the top-N
+//   renames append a fresh (unsorted) slot; RecomputeZones / compaction
+//   re-sort and drop dead slots.
 
 #include <cstddef>
 #include <cstdint>
@@ -67,6 +70,9 @@ struct SearchState {
     // Diagnostics from the last Search call.
     bool lastWasIncremental = false;
     size_t lastMatchCount = 0;
+    // False when the scan stopped early because no remaining name could
+    // enter the top-N (the count is then a lower bound).
+    bool lastMatchCountExact = true;
 };
 
 class FileIndex {
@@ -142,23 +148,29 @@ private:
     };
 
     static uint64_t Record(uint64_t id) noexcept { return id & 0x0000FFFFFFFFFFFFULL; }
-    uint32_t NewEntry(uint8_t volume, uint32_t parent, uint8_t flags, std::string_view name);
+    uint32_t NewEntry(uint32_t parent, uint8_t flags, std::string_view name);
     uint32_t AppendSlot(uint32_t entry, std::string_view name);
     void MapRecord(Volume& volume, uint64_t record, uint32_t entry);
     [[nodiscard]] uint8_t ZoneForNew(uint32_t parent, uint8_t flags, std::string_view name,
         bool parentIsRoot) const noexcept;
+    // Query-independent score part (zone, kind, length, depth); INT16_MIN
+    // for excluded or deleted entries.
+    [[nodiscard]] int16_t BaseScore(uint32_t entry, std::string_view name, int depth) const noexcept;
+    void Reorder();
 
     // entries
     std::vector<uint32_t> m_parent;
     std::vector<uint32_t> m_slot;
     std::vector<uint8_t> m_flags;
     std::vector<uint8_t> m_zone;
-    std::vector<uint8_t> m_volume;
     // build-time only: unresolved parent record per pending entry
     std::vector<uint64_t> m_pendingParent;
     // slots
     std::vector<uint32_t> m_slotStart;  // size = slots + 1 (sentinel = m_names.size())
     std::vector<uint32_t> m_slotEntry;  // kNone when dead
+    std::vector<int16_t> m_slotBase;    // static score per slot (see BaseScore)
+    std::vector<uint16_t> m_slotKey;    // hash of the folded stem (whole-name / stem bonus lookup)
+    uint32_t m_sortedEnd = 0;           // slots [0, m_sortedEnd) are in descending base order
     std::string m_names;                // name bytes + '\0' per slot
     size_t m_deadNameBytes = 0;
 

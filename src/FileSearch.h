@@ -130,7 +130,8 @@ private:
     mutable std::shared_mutex m_indexLock;
     std::unique_ptr<filesearch::FileIndex> m_index;
     filesearch::FileIndex m_apps;
-    std::vector<Journal> m_journals;  // index thread only
+    std::vector<Journal> m_journals;      // index thread only
+    std::vector<BYTE> m_journalBuffer;    // index thread only
 
     std::thread m_indexThread;
     std::thread m_searchThread;

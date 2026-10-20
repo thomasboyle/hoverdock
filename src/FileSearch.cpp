@@ -1125,7 +1125,9 @@ bool FileSearchService::PollJournals() {
         std::string name;
     };
     std::vector<Update> updates;
-    std::vector<BYTE> buffer(kJournalBufferBytes);
+    // Reused across polls (4/s while Search is open).
+    std::vector<BYTE>& buffer = m_journalBuffer;
+    buffer.resize(kJournalBufferBytes);
     bool healthy = true;
     for (Journal& journal : m_journals) {
         READ_USN_JOURNAL_DATA_V0 read{};

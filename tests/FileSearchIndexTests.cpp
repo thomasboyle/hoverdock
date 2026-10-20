@@ -254,9 +254,11 @@ void TestParallelMatchesSerial() {
             same = serial[i].entry == parallel[i].entry && serial[i].score == parallel[i].score;
         }
         CHECK(same);
-        // Cross-check the SIMD scan against a brute-force case-insensitive find.
+        // Cross-check the SIMD scan against a brute-force case-insensitive find
+        // (unbounded limit: the scan never stops early, so the count is exact).
         SearchState state;
-        static_cast<void>(index.Search(q, 1, &state));
+        static_cast<void>(index.Search(q, 1000000, &state));
+        CHECK(state.lastMatchCountExact);
         size_t brute = 0;
         const std::vector<std::string> parts = Split(FoldUtf8(q));
         for (uint64_t i = 0; i < kCount; ++i) {
@@ -349,6 +351,25 @@ void TestTopNIsPrefixOfFullRanking() {
     for (uint64_t i = 0; i < 2000; ++i) {
         index.Upsert(v, 1000 + (i * 53) % kCount, directories[i % directories.size()],
             (i % 9 == 0) ? kFlagDirectory : 0, std::string("renamed report a ") + std::to_string(i));
+    }
+    // Moves without a rename (same name, new parent/zone), deletes and
+    // revivals: static scores change for slots inside the sorted region.
+    const uint64_t userFolder = directories[1];
+    index.SetZoneMarker(v, userFolder, Zone::UserFolder);
+    for (uint64_t i = 0; i < 3000; ++i) {
+        const uint64_t id = 1000 + (i * 97 + 11) % kCount;
+        const uint32_t entry = index.Find(v, id);
+        if (entry == FileIndex::kNone || (index.Flags(entry) & kFlagDirectory) != 0) {
+            continue;
+        }
+        const std::string name(index.Name(entry));
+        if (i % 3 == 0) {
+            index.Remove(v, id);
+            index.Upsert(v, id, userFolder, 0, name);         // revived in a better place
+        } else {
+            index.Upsert(v, id, i % 2 ? userFolder : directories[(i * 7) % directories.size()],
+                index.Flags(entry) ^ (i % 5 == 0 ? kFlagHidden : 0), name);
+        }
     }
     for (const char* q : {"a", "re", "report", "mail a", "e", "x", "alpha beta", "zz"}) {
         const std::vector<Hit> full = index.Search(q, 10000000, nullptr, 1);
