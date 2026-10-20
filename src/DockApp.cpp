@@ -32,6 +32,7 @@
 #include <ctime>
 #include <malloc.h>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <fstream>
 #include <functional>
@@ -2506,6 +2507,19 @@ DockApp::DockApp(HINSTANCE instance)
     // OleInitialize (superset of CoInitializeEx STA) is required for the Trash
     // IDropTarget (RegisterDragDrop) while keeping the existing STA model.
     m_comResult = OleInitialize(nullptr);
+    static_cast<void>(RefreshChromeAppearance());
+}
+
+bool DockApp::RefreshChromeAppearance() noexcept {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const bool light = RegGetValueW(HKEY_CURRENT_USER,
+                           L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                           L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS &&
+        value != 0;
+    const bool changed = light != m_lightChrome;
+    m_lightChrome = light;
+    return changed;
 }
 
 DockApp::~DockApp() {
@@ -3556,6 +3570,14 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         HideTaskbar();
         return 0;
 
+    case WM_SETTINGCHANGE:
+        // Light/Dark system theme switch: re-tint the chrome plate and ink.
+        if (lParam != 0 && std::wcscmp(reinterpret_cast<const wchar_t*>(lParam), L"ImmersiveColorSet") == 0 &&
+            RefreshChromeAppearance()) {
+            QueueRenderFrame();
+        }
+        break;
+
     case WM_POWERBROADCAST:
         return HandlePowerBroadcast(wParam, lParam);
 
@@ -4538,7 +4560,6 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         data.kind = DockIconKind::Tray;
         data.traySlot = slot;
         data.adaptiveInk = true;
-        data.contrastHalo = true;
         data.bounds = {left, trayTop, left + trayGlyph, trayTop + trayGlyph};
         m_iconRenderData.push_back(data);
         left += trayGlyph + trayGap;
@@ -4556,7 +4577,6 @@ void DockApp::RebuildLayout(bool reloadIcons) {
         DockIconRenderData weather;
         weather.kind = DockIconKind::Weather;
         weather.adaptiveInk = false;
-        weather.contrastHalo = true;
         weather.bounds = {left, weatherTop, left + weatherSize, weatherTop + weatherSize};
         m_iconRenderData.push_back(weather);
         left += weatherSize + weatherGap;
@@ -4565,7 +4585,6 @@ void DockApp::RebuildLayout(bool reloadIcons) {
     clock.kind = DockIconKind::Clock;
     clock.traySlot = TraySlot::Clock;
     clock.adaptiveInk = true;
-    clock.contrastHalo = true;
     clock.bounds = {left, clockTop, left + clockWidth, clockTop + clockHeight};
     m_iconRenderData.push_back(clock);
 
@@ -10919,6 +10938,37 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
         state.glintStrength = m_glintStrength;
     }
     state.showDevBounds = m_config.ShowDevBounds();
+    // Chrome plate behind the tray glyphs, weather and clock, from the live
+    // icon rects so it follows layout animations.
+    {
+        RECT plate{};
+        bool any = false;
+        for (const DockIconRenderData& icon : m_iconRenderData) {
+            if (icon.kind != DockIconKind::Tray && icon.kind != DockIconKind::Weather &&
+                icon.kind != DockIconKind::Clock) {
+                continue;
+            }
+            if (!any) {
+                plate = icon.bounds;
+                any = true;
+            } else {
+                plate.left = (std::min)(plate.left, icon.bounds.left);
+                plate.top = (std::min)(plate.top, icon.bounds.top);
+                plate.right = (std::max)(plate.right, icon.bounds.right);
+                plate.bottom = (std::max)(plate.bottom, icon.bounds.bottom);
+            }
+        }
+        if (any && plate.bottom > plate.top) {
+            const LONG height = plate.bottom - plate.top;
+            const LONG padX = (std::max)(4L, height * 22L / 100L);
+            const LONG padY = (std::max)(1L, height * 6L / 100L);
+            InflateRect(&plate, padX, padY);
+            state.chromePlate = true;
+            state.chromePlateRect = plate;
+            state.chromePlateRadius = static_cast<float>(plate.bottom - plate.top) * 0.32F;
+        }
+        state.lightChrome = m_lightChrome;
+    }
     // Glint easing frames are cosmetic: drop one rather than wait on the GPU
     // (the settle frame in TickGlint is allowed to wait).
     state.skipIfGpuBusy = m_dropPresentPending || (IsDragActive() && !m_dragSnapAnimating) ||

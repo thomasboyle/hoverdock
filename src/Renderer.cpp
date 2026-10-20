@@ -2232,6 +2232,14 @@ bool Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene2[1] = state.glintY;
     frame.mappedConstants->scene2[2] = state.glintStrength;
     frame.mappedConstants->scene2[3] = 0.0F;
+    frame.mappedConstants->scene3[0] = static_cast<float>(state.chromePlateRect.left);
+    frame.mappedConstants->scene3[1] = static_cast<float>(state.chromePlateRect.top);
+    frame.mappedConstants->scene3[2] = static_cast<float>(state.chromePlateRect.right);
+    frame.mappedConstants->scene3[3] = static_cast<float>(state.chromePlateRect.bottom);
+    frame.mappedConstants->scene4[0] = state.chromePlate ? 1.0F : 0.0F;
+    frame.mappedConstants->scene4[1] = state.lightChrome ? 1.0F : 0.0F;
+    frame.mappedConstants->scene4[2] = state.chromePlateRadius;
+    frame.mappedConstants->scene4[3] = 0.0F;
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -2373,9 +2381,8 @@ bool Renderer::Render(const DockRenderState& state) {
             break;
         }
         instance.iconMeta[1] = mode;
-        // z: bit0 = dragged, bit1 = chrome ink (fixed light), bit2 = contrast halo.
-        instance.iconMeta[2] = (icon.dragged ? 1.0F : 0.0F) + (icon.adaptiveInk ? 2.0F : 0.0F) +
-            (icon.contrastHalo ? 4.0F : 0.0F);
+        // z: bit0 = dragged, bit1 = chrome ink (system appearance, scene4.y).
+        instance.iconMeta[2] = (icon.dragged ? 1.0F : 0.0F) + (icon.adaptiveInk ? 2.0F : 0.0F);
         const UINT safeIconCount = std::max(m_iconCount, 1U);
         instance.iconMeta[3] = static_cast<float>(std::min(icon.textureIndex, safeIconCount - 1));
     }

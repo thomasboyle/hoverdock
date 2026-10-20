@@ -9,6 +9,8 @@ cbuffer FrameData : register(b0)
     float4 scene0; // output width, output height, glass alpha, dock scale
     float4 scene1; // fx bitmask | icon count, DPI scale, dev bounds, backdrop valid
     float4 scene2; // pointer glint x, y (output px), strength 0..1, unused
+    float4 scene3; // dock: chrome plate rect left, top, right, bottom (output px)
+    float4 scene4; // dock: chrome plate on, light appearance, corner radius px, unused
 };
 
 struct IconInstance
@@ -1003,7 +1005,22 @@ float4 GlassPS(VertexOutput input) : SV_Target
     {
         alpha = mask * 0.8;
     }
-    return float4(color * alpha, alpha);
+    float3 premultiplied = color * alpha;
+    // Dock chrome plate (macOS "Show menu bar background"): frosted tint for
+    // the system appearance behind the tray / weather / clock, so their ink
+    // keeps contrast on any wallpaper.
+    if (!isPanel && labelFace < 0.5 && scene4.x > 0.5)
+    {
+        const float2 plateCenter = (scene3.xy + scene3.zw) * 0.5;
+        const float2 plateHalf = max((scene3.zw - scene3.xy) * 0.5, float2(1.0, 1.0));
+        const float plateDistance = SdSquircleBox(pixel - plateCenter, plateHalf, scene4.z);
+        const bool lightPlate = scene4.y > 0.5;
+        const float k = saturate(0.5 - plateDistance) * mask * (lightPlate ? 0.62 : 0.58);
+        const float3 tint = lightPlate ? float3(0.97, 0.97, 0.98) : float3(0.06, 0.06, 0.07);
+        premultiplied = tint * k + premultiplied * (1.0 - k);
+        alpha = k + alpha * (1.0 - k);
+    }
+    return float4(premultiplied, alpha);
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,62 +1177,18 @@ float4 BlurHPS2(VertexOutput input) : SV_Target
 // Chrome ink on the same face tonemap domain as GlassPS:
 // face = lerp(OVER_BLACK, OVER_WHITE, backdropLuma); ink inverts that so glyphs
 // stay contrasted on both dark and light plates.
-// Dock chrome (clock, tray glyphs) sits on glass over arbitrary wallpaper.
-// Rather than flipping dark/light ink with the backdrop, use one light ink
-// lifted by a soft dark halo (the macOS / iOS wallpaper-text treatment), so it
-// reads on light, dark and busy backgrounds alike. Colour icons (weather) get
-// the same halo.
-static const float3 kDockChromeInk = float3(0.97, 0.97, 0.98);
-static const float kDockHaloAlpha = 0.55;
-static const float2 kHaloDirs[8] = {
-    float2(1.0, 0.0), float2(0.7071, 0.7071), float2(0.0, 1.0), float2(-0.7071, 0.7071),
-    float2(-1.0, 0.0), float2(-0.7071, -0.7071), float2(0.0, -1.0), float2(0.7071, -0.7071)
-};
+// Dock chrome (clock, tray glyphs) follows the system appearance like the
+// macOS menu bar with "Show menu bar background": dark ink on a light frosted
+// plate in Light mode, white ink on a dark one in Dark mode. It never flips
+// with the wallpaper; the plate (GlassPS) supplies the contrast.
+float3 ChromeInk()
+{
+    return scene4.y > 0.5 ? float3(DOCK_INK_R, DOCK_INK_G, DOCK_INK_B) / 255.0 : float3(0.97, 0.97, 0.98);
+}
 
 float GlyphCoverage(float4 s)
 {
     return max(s.a, max(s.r, max(s.g, s.b)));
-}
-
-// Blurred coverage on two rings (r/2, r) around the pixel, shifted up by a
-// third of r so the halo falls slightly below the glyph like a drop shadow.
-float HaloLoad(int2 texel, int layer, int2 size, float radius)
-{
-    float acc = 0.0;
-    [unroll] for (int ring = 1; ring <= 2; ++ring)
-    {
-        [unroll] for (int k = 0; k < 8; ++k)
-        {
-            const float2 offset = kHaloDirs[k] * (radius * 0.5 * (float)ring) - float2(0.0, radius * 0.33);
-            const int2 t = texel + int2(round(offset));
-            const bool inside = t.x >= 0 && t.y >= 0 && t.x < size.x && t.y < size.y;
-            acc += inside ? GlyphCoverage(iconTexture.Load(int4(t, layer, 0))) : 0.0;
-        }
-    }
-    return acc / 16.0;
-}
-
-float HaloSample(float2 uv, float layer, float2 sizePx, float radius)
-{
-    float acc = 0.0;
-    [unroll] for (int ring = 1; ring <= 2; ++ring)
-    {
-        [unroll] for (int k = 0; k < 8; ++k)
-        {
-            const float2 offset = kHaloDirs[k] * (radius * 0.5 * (float)ring) - float2(0.0, radius * 0.33);
-            const float2 t = uv + offset / sizePx;
-            const bool inside = all(t >= 0.0) && all(t <= 1.0);
-            acc += inside ? GlyphCoverage(iconTexture.SampleLevel(linearClamp, float3(t, layer), 0)) : 0.0;
-        }
-    }
-    return acc / 16.0;
-}
-
-// Premultiplied composite of a black halo under (rgb, a).
-void ApplyHalo(inout float3 rgb, inout float a, float blurred)
-{
-    const float halo = saturate(blurred * 1.8) * kDockHaloAlpha;
-    a = a + halo * (1.0 - a);
 }
 
 float4 IconPS(VertexOutput input) : SV_Target
@@ -1224,7 +1197,6 @@ float4 IconPS(VertexOutput input) : SV_Target
     const uint metaZ = (uint)(icon.iconMeta.z + 0.5);
     const bool dragged = (metaZ & 1u) != 0u;
     const bool adaptiveInk = (metaZ & 2u) != 0u;
-    const bool contrastHalo = (metaZ & 4u) != 0u;
     const float2 outputSize = max(scene0.xy, float2(1.0, 1.0));
 
     if (icon.iconMeta.y > 1.5 && icon.iconMeta.y < 3.5)
@@ -1255,29 +1227,17 @@ float4 IconPS(VertexOutput input) : SV_Target
         if (adaptiveInk)
         {
             const float coverage = GlyphCoverage(sampledClock);
-            rgb = kDockChromeInk * coverage;
+            rgb = ChromeInk() * coverage;
             a = coverage;
-        }
-        if (contrastHalo && inside)
-        {
-            const float radius = max(1.0, icon.iconRect.w / 14.0);
-            ApplyHalo(rgb, a, HaloLoad(texel, (int)input.textureIndex, int2(icon.iconRect.zw), radius));
         }
         return float4(rgb * clockBrightness, a * clockBrightness);
     }
 
     const float contentHeightRatio = saturate(icon.iconRect.z / max(icon.iconRect.w, 1.0));
     float4 sampled = float4(0.0, 0.0, 0.0, 0.0);
-    float haloBlur = 0.0;
     if (input.uv.y <= contentHeightRatio) {
         const float2 iconUv = float2(input.uv.x, input.uv.y / max(contentHeightRatio, 0.001));
         sampled = iconTexture.Sample(linearClamp, float3(saturate(iconUv), input.textureIndex));
-        if (contrastHalo)
-        {
-            // Content is square (iconRect.z px each way).
-            const float side = max(icon.iconRect.z, 1.0);
-            haloBlur = HaloSample(saturate(iconUv), input.textureIndex, float2(side, side), max(1.0, side / 14.0));
-        }
     }
 
     const float iconBrightness = icon.iconMeta.y > 0.5 && !dragged ? 0.5 : 1.0;
@@ -1287,14 +1247,8 @@ float4 IconPS(VertexOutput input) : SV_Target
     if (adaptiveInk)
     {
         const float coverage = GlyphCoverage(sampled);
-        color = kDockChromeInk * coverage * iconBrightness;
+        color = ChromeInk() * coverage * iconBrightness;
         alpha = coverage * iconBrightness;
-    }
-    if (contrastHalo)
-    {
-        float haloAlpha = alpha / max(iconBrightness, 0.001);
-        ApplyHalo(color, haloAlpha, haloBlur);
-        alpha = haloAlpha * iconBrightness;
     }
 
     if (icon.iconMeta.x > 0.5 && contentHeightRatio < 0.98 && input.uv.y > contentHeightRatio) {

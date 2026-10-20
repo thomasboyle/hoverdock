@@ -41,11 +41,8 @@ struct DockIconRenderData {
     DockIconKind kind = DockIconKind::App;
     TraySlot traySlot = TraySlot::Overflow;
     UINT textureIndex = 0;
-    // Monochrome chrome glyph drawn in the fixed light chrome ink.
+    // Monochrome chrome glyph drawn in the system-appearance chrome ink.
     bool adaptiveInk = false;
-    // Soft dark shadow halo so the glyph reads on any wallpaper (clock, tray
-    // glyphs, weather) without flipping ink with the backdrop.
-    bool contrastHalo = false;
 };
 
 struct DockRenderState {
@@ -64,6 +61,13 @@ struct DockRenderState {
     float glintY = 0.0F;
     float glintStrength = 0.0F;
     bool showDevBounds = false;
+    // macOS "Show menu bar background": a frosted plate behind the tray,
+    // weather and clock (dock-client px), tinted for the system appearance.
+    // Chrome ink follows the same appearance, never the wallpaper.
+    bool chromePlate = false;
+    RECT chromePlateRect{};
+    float chromePlateRadius = 0.0F;
+    bool lightChrome = false;
     bool allowBlockingGpuWait = true;
     bool skipIfGpuBusy = false;
     std::span<const DockIconRenderData> icons;
@@ -187,7 +191,9 @@ private:
         float scene0[4]{};
         float scene1[4]{};
         float scene2[4]{};
-        std::byte padding[208]{};
+        float scene3[4]{};
+        float scene4[4]{};
+        std::byte padding[176]{};
     };
 
     struct IconInstanceConstants {
