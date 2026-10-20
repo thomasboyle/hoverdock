@@ -1913,7 +1913,9 @@ struct ShellButtonCollector {
     }
 };
 
-std::vector<TrayNotifyIcon> EnumerateShellButtons() {
+int ShellButtonMatchScore(const std::wstring& stored, const std::wstring& current);
+
+std::vector<TrayNotifyIcon> EnumerateShellButtons(bool assignIcons = true) {
     std::vector<TrayNotifyIcon> icons;
     ShellButtonCollector collector;
     if (!collector.Open()) {
@@ -1925,8 +1927,112 @@ std::vector<TrayNotifyIcon> EnumerateShellButtons() {
         FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr), L"DesktopWindowContentBridge");
     collector.Collect(trayBridge, icons);
     collector.Collect(overflowBridge, icons);
-    AssignShellIcons(icons);
+    if (assignIcons) {
+        AssignShellIcons(icons);
+    }
     return icons;
+}
+
+// Receives Explorer's notification-item list. Explorer calls Notify once per
+// known item, synchronously inside RegisterCallback (the same mechanism the
+// Settings "Other system tray icons" page and Chromium use).
+class TrayItemCollector final : public INotificationCB {
+public:
+    std::vector<TrayNotifyIcon> items;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
+        if (object == nullptr) {
+            return E_POINTER;
+        }
+        if (riid == IID_IUnknown || riid == __uuidof(INotificationCB)) {
+            *object = static_cast<INotificationCB*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+    // Stack-owned for the duration of one enumeration.
+    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+    HRESULT STDMETHODCALLTYPE Notify(ULONG /*event*/, NOTIFYITEM* item) override {
+        if (item == nullptr) {
+            return S_OK;
+        }
+        try {
+            // Explorer also reports remembered icons of apps that are not
+            // running (no live owner window): those are not in the tray.
+            if (item->hWnd == nullptr || IsWindow(item->hWnd) == FALSE) {
+                return S_OK;
+            }
+            DWORD pid = 0;
+            GetWindowThreadProcessId(item->hWnd, &pid);
+            if (pid == GetCurrentProcessId()) {
+                return S_OK;
+            }
+            const auto same = [item](const TrayNotifyIcon& known) {
+                return known.window == item->hWnd && known.id == item->uID;
+            };
+            const auto existing = std::ranges::find_if(items, same);
+            TrayNotifyIcon icon;
+            icon.window = item->hWnd;
+            icon.id = item->uID;
+            icon.guid = item->guidItem;
+            icon.preference = static_cast<int>(item->dwPreference);
+            icon.executablePath = item->pszExeName != nullptr ? item->pszExeName : L"";
+            if (icon.executablePath.empty()) {
+                icon.executablePath = ProcessImagePath(pid);
+            }
+            icon.exeName = FileStem(icon.executablePath);
+            std::wstring tip = TrimEdges(item->pszTip != nullptr ? item->pszTip : L"");
+            const size_t line = tip.find_first_of(L"\r\n");
+            icon.tip = TrimEdges(line == std::wstring::npos ? tip : tip.substr(0, line));
+            if (icon.tip.empty()) {
+                icon.tip = PrettyTrayName(icon.executablePath);
+            }
+            // The live tray glyph (shows state such as unread or sync).
+            icon.icon = item->hIcon != nullptr ? CopyIcon(item->hIcon) : nullptr;
+            if (icon.icon == nullptr) {
+                icon.icon = ExtractExeIcon(icon.executablePath, 64);
+            }
+            if (existing != items.end()) {
+                *existing = std::move(icon);
+            } else {
+                items.push_back(std::move(icon));
+            }
+        } catch (...) {
+        }
+        return S_OK;
+    }
+};
+
+// Every notification icon Explorer knows about, visible or in the hidden
+// overflow. The UI Automation view below only sees buttons the taskbar has
+// realized; with the taskbar hidden, the overflow island usually never is.
+std::vector<TrayNotifyIcon> EnumerateTrayNotifyItems() {
+    TrayItemCollector collector;
+    IUnknown* unknown = nullptr;
+    if (FAILED(CoCreateInstance(kClsidTrayNotify, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&unknown))) ||
+        unknown == nullptr) {
+        return {};
+    }
+    ITrayNotifyWin8* trayWin8 = nullptr;
+    ITrayNotify* tray = nullptr;
+    if (SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&trayWin8))) && trayWin8 != nullptr) {
+        ULONG cookie = 0;
+        if (SUCCEEDED(trayWin8->RegisterCallback(&collector, &cookie))) {
+            trayWin8->UnregisterCallback(&cookie);
+        }
+        trayWin8->Release();
+    } else if (SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&tray))) && tray != nullptr) {
+        if (SUCCEEDED(tray->RegisterCallback(&collector))) {
+            tray->RegisterCallback(nullptr);
+        }
+        tray->Release();
+    }
+    unknown->Release();
+    return std::move(collector.items);
 }
 
 std::vector<TrayNotifyIcon> EnumerateHostIcons() {
@@ -1956,9 +2062,39 @@ std::vector<TrayNotifyIcon> EnumerateHostIcons() {
 }
 
 std::vector<TrayNotifyIcon> SystemTray::EnumerateNotifyIcons() const {
-    // Windows 11 keeps the notification icons in a hidden XAML island. Read
-    // those buttons directly so Quick Settings can host the tray itself.
-    std::vector<TrayNotifyIcon> icons = EnumerateShellButtons();
+    // Complete list from Explorer (includes hidden overflow icons), linked to
+    // the taskbar's XAML buttons where those exist so clicks go through the
+    // real icon. Buttons the list did not report are kept as well.
+    std::vector<TrayNotifyIcon> icons = EnumerateTrayNotifyItems();
+    std::vector<TrayNotifyIcon> buttons = EnumerateShellButtons(false);
+    std::vector<TrayNotifyIcon> unmatched;
+    for (TrayNotifyIcon& button : buttons) {
+        TrayNotifyIcon* best = nullptr;
+        int bestScore = 0;
+        for (TrayNotifyIcon& icon : icons) {
+            if (icon.shellButton) {
+                continue;
+            }
+            const int score = ShellButtonMatchScore(button.shellName, icon.tip);
+            const int needed = static_cast<int>(std::min<size_t>(12, icon.tip.size()));
+            if (score > bestScore && (score >= 100000 || (needed > 0 && score >= needed))) {
+                best = &icon;
+                bestScore = score;
+            }
+        }
+        if (best != nullptr) {
+            best->shellButton = true;
+            best->shellName = button.shellName;
+        } else {
+            unmatched.push_back(std::move(button));
+        }
+    }
+    if (!unmatched.empty()) {
+        AssignShellIcons(unmatched);
+        for (TrayNotifyIcon& button : unmatched) {
+            icons.push_back(std::move(button));
+        }
+    }
     if (!icons.empty()) {
         return icons;
     }

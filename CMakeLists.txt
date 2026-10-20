@@ -197,6 +197,7 @@ set_property(TARGET Dock PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_D
 #   FileSearchIndexTests   portable index unit tests (also build off-Windows)
 #   FileSearchIndexBench   query benchmark at real-volume scale
 #   FileSearchServiceTests real-disk MFT/journal/helper integration (elevated)
+#   TrayIconsTests         system tray detection against the live shell
 option(DOCK_BUILD_TESTS "Build the Search engine tests" OFF)
 if(DOCK_BUILD_TESTS)
     enable_testing()
@@ -212,6 +213,10 @@ if(DOCK_BUILD_TESTS)
     add_dock_test(FileSearchServiceTests tests/FileSearchServiceTests.cpp src/FileSearch.cpp
         src/FileSearchIndex.cpp)
     target_link_libraries(FileSearchServiceTests PRIVATE taskschd ole32 oleaut32 shell32 advapi32)
+    # System tray detection against the live shell (a child adds a real icon).
+    add_dock_test(TrayIconsTests tests/TrayIconsTests.cpp src/SystemTray.cpp)
+    target_link_libraries(TrayIconsTests PRIVATE ole32 oleaut32 shell32 user32 gdi32 advapi32 dwmapi
+        powrprof wlanapi dxva2 UIAutomationCore propsys shlwapi)
     add_test(NAME FileSearchIndexTests COMMAND FileSearchIndexTests)
 endif()
 
