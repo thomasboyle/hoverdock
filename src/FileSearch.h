@@ -52,6 +52,8 @@ struct FileSearchReply {
     std::vector<FileSearchItem> apps;
     std::vector<FileSearchItem> files;
     double searchMs = 0.0;
+    // Second reply for the same request: `files` now carry size/date.
+    bool metadata = false;
     bool indexing = false;
     size_t indexedEntries = 0;
 };

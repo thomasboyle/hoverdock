@@ -569,8 +569,20 @@ void ApplyZoneMarkers(FileIndex& index, const std::vector<VolumeSlot>& volumes) 
         {&FOLDERID_ProgramFiles, filesearch::Zone::ProgramFiles},
         {&FOLDERID_ProgramFilesX86, filesearch::Zone::ProgramFiles},
     };
+    std::vector<std::pair<std::wstring, filesearch::Zone>> paths;
     for (const Marker& marker : markers) {
-        const std::wstring path = KnownFolder(*marker.folder);
+        paths.emplace_back(KnownFolder(*marker.folder), marker.zone);
+    }
+    // Component store and installer caches: thousands of duplicate copies of
+    // system files (WinSxS alone mirrors most of System32).
+    const std::wstring windows = KnownFolder(FOLDERID_Windows);
+    if (!windows.empty()) {
+        for (const wchar_t* sub : {L"\\WinSxS", L"\\servicing", L"\\Installer", L"\\assembly",
+                 L"\\SoftwareDistribution", L"\\Prefetch", L"\\Temp"}) {
+            paths.emplace_back(windows + sub, filesearch::Zone::Hidden);
+        }
+    }
+    for (const auto& [path, zone] : paths) {
         const wchar_t letter = DriveLetterOf(path);
         uint64_t id = 0;
         if (letter == L'\0' || !FileIdOf(path, id)) {
@@ -578,7 +590,7 @@ void ApplyZoneMarkers(FileIndex& index, const std::vector<VolumeSlot>& volumes) 
         }
         for (const VolumeSlot& slot : volumes) {
             if (slot.letter == letter) {
-                index.SetZoneMarker(slot.volume, id, marker.zone);
+                index.SetZoneMarker(slot.volume, id, zone);
             }
         }
     }
@@ -1003,6 +1015,7 @@ bool FileSearchService::BuildIndex(std::unique_ptr<FileIndex>& index, std::vecto
     }
     ApplyZoneMarkers(*index, volumes);
     index->RecomputeZones();
+    index->ShrinkToFit();
 
     journals.clear();
     for (const JournalStart& start : starts) {
@@ -1218,28 +1231,40 @@ void FileSearchService::SearchThread() {
         }
         reply->searchMs =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-        // Size / date for the rows the panel shows (outside the index lock).
-        for (FileSearchItem& item : reply->files) {
-            if (item.kind == FileSearchItem::Kind::File) {
-                FillMetadata(item);
-            }
-        }
         {
             std::lock_guard lock(m_statusLock);
             reply->indexing = m_status.indexing;
         }
-        // A newer request already waiting makes this reply stale: skip it.
-        bool superseded = false;
-        {
+        const auto superseded = [this] {
             std::lock_guard lock(m_requestLock);
-            superseded = m_hasRequest;
-        }
-        if (superseded || request.reply == nullptr) {
+            return m_hasRequest;
+        };
+        const auto post = [&request](std::unique_ptr<FileSearchReply> message) {
+            FileSearchReply* raw = message.release();
+            if (PostMessageW(request.reply, request.message, 0, reinterpret_cast<LPARAM>(raw)) == FALSE) {
+                delete raw;
+            }
+        };
+        // Names first: size/date need file-system round trips (cold disks,
+        // cloud placeholders), which must never delay the results.
+        if (superseded() || request.reply == nullptr) {
             continue;
         }
-        FileSearchReply* raw = reply.release();
-        if (PostMessageW(request.reply, request.message, 0, reinterpret_cast<LPARAM>(raw)) == FALSE) {
-            delete raw;
+        auto details = std::make_unique<FileSearchReply>(*reply);
+        post(std::move(reply));
+        details->metadata = true;
+        bool interrupted = false;
+        for (FileSearchItem& item : details->files) {
+            if (superseded()) {
+                interrupted = true;
+                break;
+            }
+            if (item.kind == FileSearchItem::Kind::File) {
+                FillMetadata(item);
+            }
+        }
+        if (!interrupted) {
+            post(std::move(details));
         }
     }
 }

@@ -196,6 +196,24 @@ std::wstring FriendlyLocation(const std::wstring& path) {
     return parent;
 }
 
+// "Type · size · modified · folder" (size/date once the metadata reply lands).
+std::wstring FileSubtitle(const FileSearchItem& item) {
+    const bool folder = item.kind == FileSearchItem::Kind::Folder;
+    std::wstring subtitle = TypeName(item.name, folder);
+    if (item.haveMetadata) {
+        subtitle += L" \u00B7 " + FormatSize(item.size);
+        const std::wstring when = FormatTime(item.modified);
+        if (!when.empty()) {
+            subtitle += L" \u00B7 " + when;
+        }
+    }
+    const std::wstring location = FriendlyLocation(item.path);
+    if (!location.empty()) {
+        subtitle += L" \u00B7 " + location;
+    }
+    return subtitle;
+}
+
 std::wstring UrlEncode(const std::wstring& text) {
     std::string utf8;
     filesearch::AppendUtf8(utf8, reinterpret_cast<const char16_t*>(text.data()), text.size());
@@ -1006,6 +1024,26 @@ void DockApp::ApplySearchReply(std::unique_ptr<FileSearchReply> reply) {
     if (reply == nullptr || reply->requestId != m_searchRequestId || !IsSearchOpen()) {
         return;
     }
+    if (reply->metadata) {
+        // Same rows, now with size / modified time: refresh subtitles only.
+        bool changed = false;
+        for (const FileSearchItem& item : reply->files) {
+            if (!item.haveMetadata) {
+                continue;
+            }
+            for (SearchRow& row : m_searchRows) {
+                if (row.kind == SearchRow::Kind::File && row.path == item.path) {
+                    row.subtitle = FileSubtitle(item);
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (changed) {
+            PaintSearch();
+        }
+        return;
+    }
     if (reply->searchMs > 50.0) {
         Log(L"Search slow query ms=" + std::to_wstring(reply->searchMs) + L" entries=" +
             std::to_wstring(reply->indexedEntries));
@@ -1031,19 +1069,7 @@ void DockApp::ApplySearchReply(std::unique_ptr<FileSearchReply> reply) {
         row.kind = folder ? SearchRow::Kind::Folder : SearchRow::Kind::File;
         row.title = item.name;
         row.path = item.path;
-        std::wstring subtitle = TypeName(item.name, folder);
-        if (item.haveMetadata) {
-            subtitle += L" \u00B7 " + FormatSize(item.size);
-            const std::wstring when = FormatTime(item.modified);
-            if (!when.empty()) {
-                subtitle += L" \u00B7 " + when;
-            }
-        }
-        const std::wstring location = FriendlyLocation(item.path);
-        if (!location.empty()) {
-            subtitle += L" \u00B7 " + location;
-        }
-        row.subtitle = std::move(subtitle);
+        row.subtitle = FileSubtitle(item);
         row.iconSource = item.path;
         if (folder) {
             row.iconKey = L"folder";

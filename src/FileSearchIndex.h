@@ -94,6 +94,8 @@ public:
     void Remove(uint8_t volume, uint64_t id);
     // Rebuilds the name buffer when dead slots waste > 25% (and > 4 MB).
     void CompactIfWasteful();
+    // Releases build-time over-allocation (vector growth slack).
+    void ShrinkToFit();
 
     // ---- zones -----------------------------------------------------------------
     // Marks a directory (by file id) with an explicit zone; RecomputeZones
@@ -120,6 +122,8 @@ public:
     [[nodiscard]] uint8_t Flags(uint32_t entry) const noexcept { return m_flags[entry]; }
     [[nodiscard]] Zone ZoneOf(uint32_t entry) const noexcept { return static_cast<Zone>(m_zone[entry]); }
     [[nodiscard]] uint32_t Find(uint8_t volume, uint64_t id) const noexcept;
+    // Directory levels below the volume root (capped).
+    [[nodiscard]] int Depth(uint32_t entry) const noexcept;
 
 private:
     struct Volume {

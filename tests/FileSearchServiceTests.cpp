@@ -203,15 +203,23 @@ int wmain(int argc, wchar_t** argv) {
 
     // Known system file is found with its full path.
     double ms = 0.0;
+    // A known system file resolves to a full path that exists. (MFT
+    // enumeration reports one name per hard-linked file, so which of the
+    // System32 / WinSxS links appears is up to NTFS.)
     auto reply = RunQuery(service, window, L"notepad.exe", ms);
-    CHECK(reply != nullptr);
-    if (reply != nullptr) {
-        wchar_t windows[MAX_PATH]{};
-        GetWindowsDirectoryW(windows, MAX_PATH);
-        CHECK(Contains(*reply, std::wstring(windows) + L"\\System32\\notepad.exe") ||
-            Contains(*reply, std::wstring(windows) + L"\\notepad.exe"));
-        CHECK(!reply->apps.empty() && reply->apps.front().name == L"Notepad");
+    CHECK(reply != nullptr && !reply->files.empty());
+    if (reply != nullptr && !reply->files.empty()) {
+        const FileSearchItem& top = reply->files.front();
+        std::printf("top 'notepad.exe': %ls\n", top.path.c_str());
+        CHECK(_wcsicmp(top.name.c_str(), L"notepad.exe") == 0);
+        CHECK(GetFileAttributesW(top.path.c_str()) != INVALID_FILE_ATTRIBUTES);
+        CHECK(top.path.find(L"\\WinSxS\\") == std::wstring::npos ||
+            std::ranges::all_of(reply->files, [](const FileSearchItem& item) {
+                return item.path.find(L"\\WinSxS\\") != std::wstring::npos;
+            }));
     }
+    reply = RunQuery(service, window, L"notepad", ms);
+    CHECK(reply != nullptr && !reply->apps.empty() && reply->apps.front().name == L"Notepad");
 
     // Latency per query (search thread time and post/round trip).
     const wchar_t* queries[] = {L"a", L"re", L"mail", L"notepad", L"system32", L"visual studio", L"zzqxv",

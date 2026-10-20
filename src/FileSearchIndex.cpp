@@ -627,6 +627,29 @@ void FileIndex::CompactIfWasteful() {
     ++m_generation;
 }
 
+void FileIndex::ShrinkToFit() {
+    m_parent.shrink_to_fit();
+    m_slot.shrink_to_fit();
+    m_flags.shrink_to_fit();
+    m_zone.shrink_to_fit();
+    m_volume.shrink_to_fit();
+    m_slotStart.shrink_to_fit();
+    m_slotEntry.shrink_to_fit();
+    m_names.shrink_to_fit();
+    for (Volume& v : m_volumes) {
+        v.byRecord.shrink_to_fit();
+    }
+}
+
+int FileIndex::Depth(uint32_t entry) const noexcept {
+    int depth = 0;
+    while (m_parent[entry] != entry && depth < 64) {
+        entry = m_parent[entry];
+        ++depth;
+    }
+    return depth;
+}
+
 // ---- zones --------------------------------------------------------------------
 
 void FileIndex::SetZoneMarker(uint8_t volume, uint64_t id, Zone zone) {
@@ -833,6 +856,8 @@ static SlotResult ScoreSlot(const ScanContext& ctx, const FileIndex& index, uint
         score += 400;
     }
     score -= static_cast<int>(std::min<size_t>(name.size(), 120)) * 2;
+    // Prefer shallow paths among equal names (C:\\Tools\\x over deep copies).
+    score -= std::max(0, index.Depth(entry) - 3) * 12;
     score += kindBonus + ZoneBonus(zone);
     hit.entry = entry;
     hit.score = score;
