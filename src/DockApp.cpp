@@ -9608,6 +9608,8 @@ int DockApp::QsChevronTarget() const noexcept {
         return 5;
     case TrayFlyoutHitKind::SystemTrayPage:
         return 6;
+    case TrayFlyoutHitKind::Microphone:
+        return 7;
     default:
         return -1;
     }

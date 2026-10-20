@@ -175,8 +175,8 @@ private:
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
     static constexpr float kQsChevronFadeMs = 140.0F;
     // Home tiles with a hover arrow: Wi-Fi, Bluetooth, Boost, Power, Sound,
-    // Display, System Tray.
-    static constexpr size_t kQsChevronTiles = 7;
+    // Display, System Tray, Mic.
+    static constexpr size_t kQsChevronTiles = 8;
     // Pointer glint easing cadence (~60 Hz); the timer only runs while the
     // glint is still converging on the cursor, so an idle dock costs nothing.
     static constexpr UINT kGlintIntervalMs = 16;

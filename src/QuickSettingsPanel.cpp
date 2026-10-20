@@ -4872,7 +4872,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 SetFlyoutChromeInk(ink.r, ink.g, ink.b);
             }
             const LONG textL = static_cast<LONG>(std::lround(cx + disc * 0.5F)) + P(9.0F);
-            const LONG textR = b.right - P(14.0F);
+            // Leave the right edge for the hover arrow (tile 7), like the capsules.
+            const LONG textR = b.right - P(22.0F);
             text({textL, cy - P(22.0F), textR, cy - P(2.0F)}, labelFont, L"Mic",
                 DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             const LONG barH = std::max(4L, P(5.0F));
@@ -4886,6 +4887,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 PaintMicPillMeter(pixels, width, height, meter, 0.0F, ink.r, ink.g, ink.b);
             }
             push(TrayFlyoutHitKind::Microphone, b);
+            tileChevron(7, {std::max(b.left, b.right - P(24.0F)), b.top, b.right, b.bottom}, ink);
         }
         // Row 3: Sound slider capsule (4x1).
         sliderCapsule(moduleRect(QsModule::Sound), tray.volumeMuted ? L'\uE74F' : L'\uE767', L"Sound",
