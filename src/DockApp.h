@@ -413,6 +413,8 @@ private:
     void OpenSettingsPage(const wchar_t* uri);
     void ProjectBrightness(int percent);
     void ApplyQuickSettingsSlider(TrayFlyoutHitKind kind, const RECT& track, LONG x);
+    // Send the scrub-drag preview as one GSMTC seek (button up / lost capture).
+    void CommitQuickSettingsMediaSeek();
     void AdjustCaptureGain(float delta);
     void ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message);
     void DrainBrightnessWheel();
@@ -510,11 +512,14 @@ private:
     void PaintQsChevronFadeFast();
     // Signatures of what the live meter / scrub would draw; equal means no pixel change.
     void QsLiveSignatures(int64_t& meter, int64_t& scrub) const noexcept;
+    // Now Playing time line ("1:23 / 3:45"); -1 when the media module is not laid out.
+    int64_t QsMediaTimeSignature() const noexcept;
     // Meter/scrub-only present from underlay via UpdateLayeredWindowIndirect.
     void PaintOverflowLiveFast();
     void PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
         bool includeTemps = true, bool includeBoost = true, bool includeBluetooth = true,
-        bool includeMeter = true, bool includeScrub = true, bool includeTray = true) const;
+        bool includeMeter = true, bool includeScrub = true, bool includeTray = true,
+        bool includeMediaTime = true) const;
     // "N items" for the Home System Tray tile ("..." until the first scan).
     [[nodiscard]] std::wstring TrayItemCountText() const;
     // Scan tray icons (UI Automation) on a worker; kTrayIconsMessage applies.
@@ -1086,7 +1091,14 @@ private:
     RECT m_qsMeterRect{};
     RECT m_qsScrubRect{};
     bool m_qsMeterValid = false;
+    // Now Playing live elements (valid with m_qsScrubValid): m_qsScrubRect is
+    // the drawn scrub track, m_qsMediaLiveRect the scrub + transport rows a
+    // live present restores, m_qsMediaTimeRect the time line beside the art,
+    // and the transport hit rects' centres place the prev/play/next glyphs.
     bool m_qsScrubValid = false;
+    RECT m_qsMediaLiveRect{};
+    RECT m_qsMediaTimeRect{};
+    RECT m_qsMediaTransportRect[3]{};
     // Home temperature tile value rects (live overlay) and the ink they were
     // laid out with, so a fast present matches the full paint exactly.
     RECT m_qsTempCpuRect{};
@@ -1129,6 +1141,7 @@ private:
     std::vector<uint8_t> m_qsContentScratch;
     int64_t m_qsMeterPaintedSig = -1;
     int64_t m_qsScrubPaintedSig = -1;
+    int64_t m_qsMediaTimePaintedSig = -1;
     // Home module order (dock.ini QuickSettingsLayout) and, from the last Home
     // layout, each module's window-px rect and the grid origin.
     QsModuleOrder m_qsOrder = DefaultQsModuleOrder();

@@ -3011,6 +3011,9 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
             if (!moved) {
                 app->ApplyQuickSettingsSlider(dragKind, dragBounds, point.x);
             }
+            if (dragKind == TrayFlyoutHitKind::MediaSeek) {
+                app->CommitQuickSettingsMediaSeek();
+            }
             return 0;
         }
         const int hit = app->OverflowHitIndex(point);
@@ -3024,6 +3027,11 @@ LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPA
         // Lost capture mid-drag (another window took it): snap back.
         if (app != nullptr) {
             app->m_qsPressArmed = false;
+            if (app->m_qsDragging && app->m_qsDragKind == TrayFlyoutHitKind::MediaSeek) {
+                app->m_qsDragging = false;
+                app->m_qsDragMoved = false;
+                app->CommitQuickSettingsMediaSeek();
+            }
             if (app->m_qsReorderActive && !app->m_qsReorderDropped) {
                 app->EndQsReorder(false);
             }
@@ -6511,6 +6519,7 @@ void DockApp::FinishOverflowHide() noexcept {
     m_qsPage = QuickSettingsPage::Home;
     m_qsReturn = QuickSettingsPage::Home;
     m_qsDragging = false;
+    m_qsCache.mediaScrubPreview = -1.0F;
     // The kept Home frame must not reopen with a half-faded tile arrow.
     ClearQsTileChevrons(nullptr);
     ResetQsChevronFade();
@@ -6533,6 +6542,8 @@ void DockApp::FinishOverflowHide() noexcept {
         m_qsTrayStatusRect = {};
         m_qsMeterRect = {};
         m_qsScrubRect = {};
+        m_qsMediaLiveRect = {};
+        m_qsMediaTimeRect = {};
         m_qsTempCpuRect = {};
         m_qsTempGpuRect = {};
         m_qsBoostStatusRect = {};
@@ -9558,9 +9569,12 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::MediaSeek:
         break;
     case TrayFlyoutHitKind::MediaTransport: {
-        const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
-        FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
-            0.10F);
+        // Hit rects are wide thirds of the module; the plate is a disc on the glyph.
+        const LONG side = (std::min)(hit.bounds.right - hit.bounds.left, hit.bounds.bottom - hit.bounds.top);
+        const LONG cx = (hit.bounds.left + hit.bounds.right) / 2L;
+        const LONG cy = (hit.bounds.top + hit.bounds.bottom) / 2L;
+        const RECT plate{cx - side / 2L, cy - side / 2L, cx + side / 2L, cy + side / 2L};
+        FillSquirclePremul(pixels, width, height, plate, static_cast<float>(side) * 0.5F, 0.10F);
         break;
     }
     default:
@@ -10053,6 +10067,8 @@ void DockApp::PaintOverflowLiveFast() {
     QsLiveSignatures(meterSig, scrubSig);
     const bool meter = m_qsMeterValid && meterSig != m_qsMeterPaintedSig;
     const bool scrub = m_qsScrubValid && scrubSig != m_qsScrubPaintedSig;
+    const int64_t mediaTimeSig = QsMediaTimeSignature();
+    const bool mediaTime = m_qsScrubValid && mediaTimeSig != m_qsMediaTimePaintedSig;
     // Temperature values only when a new reading arrived; mic-meter frames
     // leave those rects (and their text) untouched.
     const bool temps = m_qsTempsValid && m_qsTempsDirty;
@@ -10064,7 +10080,7 @@ void DockApp::PaintOverflowLiveFast() {
     const bool tray = m_qsTrayStatusValid && m_qsTrayStatusDirty;
     m_qsTrayStatusDirty = false;
 
-    RECT targets[7]{};
+    RECT targets[8]{};
     size_t targetCount = 0;
     auto target = [&](bool use, const RECT& rect) {
         if (use) {
@@ -10072,7 +10088,8 @@ void DockApp::PaintOverflowLiveFast() {
         }
     };
     target(meter, m_qsMeterRect);
-    target(scrub, m_qsScrubRect);
+    target(scrub, m_qsMediaLiveRect);
+    target(mediaTime, m_qsMediaTimeRect);
     target(temps, m_qsTempCpuRect);
     target(temps, m_qsTempGpuRect);
     target(boost, m_qsBoostStatusRect);
@@ -10108,12 +10125,15 @@ void DockApp::PaintOverflowLiveFast() {
     // otherwise meter ticks would DrawFlyoutText over existing glyphs
     // (fake-bold regression from PR #26).
     PaintQsLiveOverlays(m_overflowPresentBits.data(), width, height, scale, temps, boost, bluetooth, meter, scrub,
-        tray);
+        tray, mediaTime);
     if (meter) {
         m_qsMeterPaintedSig = meterSig;
     }
     if (scrub) {
         m_qsScrubPaintedSig = scrubSig;
+    }
+    if (mediaTime) {
+        m_qsMediaTimePaintedSig = mediaTimeSig;
     }
     if (m_overflowBaseBits.size() == m_overflowPresentBits.size()) {
         // Keep base in sync so hover-fast restores still show live meters.
@@ -10405,6 +10425,7 @@ void DockApp::PaintOverflowPopup() {
     std::memcpy(m_overflowUnderlayBits.data(), pixels, bytes);
     PaintQsLiveOverlays(pixels, width, height, scale);
     QsLiveSignatures(m_qsMeterPaintedSig, m_qsScrubPaintedSig);
+    m_qsMediaTimePaintedSig = QsMediaTimeSignature();
 
     m_overflowBaseBits.resize(bytes);
     std::memcpy(m_overflowBaseBits.data(), pixels, bytes);

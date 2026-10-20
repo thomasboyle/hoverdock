@@ -21,14 +21,20 @@
 #pragma warning(disable : 4458 4996 26495)
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Graphics.Imaging.h>
 #include <winrt/Windows.Media.Control.h>
+#include <winrt/Windows.Storage.Streams.h>
 #pragma warning(pop)
 
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
+#include <condition_variable>
+#include <cstdlib>
+#include <memory>
 #include <limits>
 #include <cstdint>
 #include <cstring>
@@ -37,6 +43,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace dock_detail {
@@ -1767,295 +1774,831 @@ using MediaManager = winrt::Windows::Media::Control::GlobalSystemMediaTransportC
 using MediaSession = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession;
 using MediaStatus = winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus;
 
-struct MediaBridge {
-    std::mutex mutex;
-    MediaManager manager{nullptr};
-    MediaSession session{nullptr};
-    bool requestPending = false;
-    bool propsPending = false;
-    std::wstring title;
-    std::wstring artist;
-    bool have = false;
-    bool playing = false;
-    float progress = 0.0F;
-    ULONGLONG lastSessionQuery = 0;
-    ULONGLONG lastProgressQuery = 0;
+// GSMTC runs on one MTA worker that owns every WinRT object. Session, playback,
+// metadata and timeline events wake it; it publishes a plain snapshot that the
+// UI thread copies without any cross-process call. Positions are anchored to a
+// GetTickCount64 stamp and extrapolated on the UI side, because Spotify and
+// browsers only report the timeline on play/pause/seek.
+constexpr unsigned kMediaDirtySessions = 1U;
+constexpr unsigned kMediaDirtyPlayback = 2U;
+constexpr unsigned kMediaDirtyProps = 4U;
+constexpr unsigned kMediaDirtyTimeline = 8U;
+constexpr unsigned kMediaDirtyAll = 15U;
+constexpr int64_t kMediaTicksPerMs = 10000;
+constexpr int64_t kMediaTicksPerSecond = 10000000;
+constexpr ULONGLONG kMediaPollMs = 1000;
+constexpr ULONGLONG kMediaPropsPollMs = 4000;
+constexpr ULONGLONG kMediaDemandMs = 3000;
+constexpr ULONGLONG kMediaHoldMs = 2500;
+constexpr int kMediaArtPx = 192;
+
+enum class MediaCommand : uint8_t {
+    Previous = 0,
+    TogglePlay = 1,
+    Next = 2,
+    Seek = 3,
 };
 
-MediaBridge g_media;
+struct MediaRequest {
+    MediaCommand command = MediaCommand::TogglePlay;
+    int64_t position = 0;
+};
+
+struct MediaState {
+    bool have = false;
+    bool playing = false;
+    bool canPrev = false;
+    bool canNext = false;
+    bool canPlayPause = false;
+    std::wstring title;
+    std::wstring artist;
+    std::wstring album;
+    std::wstring app;
+    // Position (100 ns ticks from the timeline start) as of anchorMs.
+    int64_t positionTicks = 0;
+    int64_t durationTicks = 0;
+    ULONGLONG anchorMs = 0;
+    double rate = 1.0;
+    uint64_t artGen = 0;
+    std::shared_ptr<const std::vector<uint8_t>> art;
+};
+
+struct MediaBridge {
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool started = false;
+    // RequestAsync failed (no GSMTC): transport falls back to media keys.
+    bool unavailable = false;
+    bool sleeping = false;
+    unsigned dirty = 0;
+    std::vector<MediaRequest> requests;
+    ULONGLONG demandMs = 0;
+    uint64_t gen = 1;
+    MediaState state;
+    // Optimistic UI: a click shows its result at once and the worker's
+    // snapshots cannot revert it until the app confirms or the hold expires.
+    ULONGLONG playHoldUntil = 0;
+    bool playHoldValue = false;
+    ULONGLONG positionHoldUntil = 0;
+    bool positionHoldSkip = false;
+};
+
+// Leaked on purpose: the detached worker may still touch it during exit.
+MediaBridge& Media() {
+    static MediaBridge* bridge = new MediaBridge();
+    return *bridge;
+}
 
 std::wstring WideFromHstring(const winrt::hstring& value) {
     return std::wstring(value.c_str());
 }
 
-void EnsureWinRt() {
-    static bool ready = false;
-    if (ready) {
-        return;
+int64_t MediaPositionAt(const MediaState& state, ULONGLONG nowMs) noexcept {
+    int64_t position = state.positionTicks;
+    if (state.playing && nowMs > state.anchorMs) {
+        position += static_cast<int64_t>(
+            static_cast<double>(nowMs - state.anchorMs) * static_cast<double>(kMediaTicksPerMs) * state.rate);
     }
-    try {
-        winrt::init_apartment(winrt::apartment_type::single_threaded);
-        ready = true;
-    } catch (const winrt::hresult_error&) {
-        ready = true;
+    if (state.durationTicks > 0) {
+        position = std::min(position, state.durationTicks);
     }
+    return std::max<int64_t>(position, 0);
 }
 
-void EnsureMediaManager() {
-    EnsureWinRt();
-    bool start = false;
+void WakeMedia(unsigned bits) {
+    MediaBridge& media = Media();
     {
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        start = !g_media.manager && !g_media.requestPending;
-        if (start) {
-            g_media.requestPending = true;
+        std::lock_guard<std::mutex> lock(media.mutex);
+        media.dirty |= bits;
+    }
+    media.wake.notify_one();
+}
+
+// Short app label from the session AUMID ("Spotify.exe", "MSEdge",
+// "308046B0AF4A39CB" for Firefox, "Publisher.App_hash!App" for packaged apps).
+std::wstring MediaAppName(const std::wstring& aumid) {
+    if (aumid.empty()) {
+        return {};
+    }
+    const std::wstring lower = Lower(aumid);
+    struct Known {
+        const wchar_t* needle;
+        const wchar_t* name;
+    };
+    static constexpr Known kKnown[] = {
+        {L"spotify", L"Spotify"},
+        {L"msedge", L"Edge"},
+        {L"chrome", L"Chrome"},
+        {L"firefox", L"Firefox"},
+        {L"308046b0af4a39cb", L"Firefox"},
+        {L"brave", L"Brave"},
+        {L"opera", L"Opera"},
+        {L"vivaldi", L"Vivaldi"},
+        {L"thebrowsercompany.arc", L"Arc"},
+        {L"zunemusic", L"Media Player"},
+        {L"zunevideo", L"Films & TV"},
+        {L"applemusic", L"Apple Music"},
+        {L"itunes", L"iTunes"},
+        {L"amazonmusic", L"Amazon Music"},
+        {L"tidal", L"TIDAL"},
+        {L"deezer", L"Deezer"},
+        {L"vlc", L"VLC"},
+        {L"foobar2000", L"foobar2000"},
+        {L"musicbee", L"MusicBee"},
+        {L"aimp", L"AIMP"},
+        {L"discord", L"Discord"},
+    };
+    for (const Known& known : kKnown) {
+        if (lower.find(known.needle) != std::wstring::npos) {
+            return known.name;
         }
     }
-    if (!start) {
-        return;
+    std::wstring name = aumid;
+    const size_t bang = name.find(L'!');
+    if (bang != std::wstring::npos) {
+        name.resize(bang);
     }
+    const size_t slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        name.erase(0, slash + 1);
+    }
+    if (name.size() > 4 && Lower(name.substr(name.size() - 4)) == L".exe") {
+        name.resize(name.size() - 4);
+    }
+    const size_t family = name.find(L'_');
+    if (family != std::wstring::npos && family > 0) {
+        name.resize(family);
+    }
+    const size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot + 1 < name.size()) {
+        name.erase(0, dot + 1);
+    }
+    if (!name.empty()) {
+        name[0] = static_cast<wchar_t>(std::towupper(name[0]));
+    }
+    return name;
+}
+
+std::wstring MediaAumid(const MediaSession& session) {
     try {
-        auto operation = MediaManager::RequestAsync();
-        operation.Completed([](auto const& async, winrt::Windows::Foundation::AsyncStatus status) {
-            MediaManager created{nullptr};
-            if (status == winrt::Windows::Foundation::AsyncStatus::Completed) {
-                try {
-                    created = async.GetResults();
-                } catch (const winrt::hresult_error&) {
-                    created = nullptr;
-                }
-            }
-            std::lock_guard<std::mutex> lock(g_media.mutex);
-            g_media.manager = created;
-            g_media.requestPending = false;
-        });
-    } catch (const winrt::hresult_error&) {
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        g_media.requestPending = false;
+        return WideFromHstring(session.SourceAppUserModelId());
+    } catch (...) {
+        return {};
     }
 }
 
-MediaSession PickMediaSession(const MediaManager& manager) {
+MediaStatus MediaStatusOf(const MediaSession& session) {
+    try {
+        return session.GetPlaybackInfo().PlaybackStatus();
+    } catch (...) {
+        return MediaStatus::Closed;
+    }
+}
+
+// Playing beats paused; the last shown app is sticky so pausing Spotify does
+// not flip the module to an idle browser tab (and back on the next poll).
+MediaSession PickMediaSession(const MediaManager& manager, const std::wstring& sticky) {
     MediaSession current{nullptr};
-    MediaSession playing{nullptr};
-    MediaSession paused{nullptr};
     try {
         current = manager.GetCurrentSession();
-    } catch (const winrt::hresult_error&) {
+    } catch (...) {
         current = nullptr;
     }
-    auto playingOf = [](const MediaSession& session) {
-        try {
-            return session.GetPlaybackInfo().PlaybackStatus();
-        } catch (const winrt::hresult_error&) {
-            return MediaStatus::Closed;
-        }
-    };
-    if (current && playingOf(current) == MediaStatus::Playing) {
+    const std::wstring currentId = current ? MediaAumid(current) : std::wstring{};
+    if (current && MediaStatusOf(current) == MediaStatus::Playing &&
+        (sticky.empty() || currentId == sticky)) {
         return current;
     }
+    MediaSession stickyAny{nullptr};
+    MediaSession stickyPlaying{nullptr};
+    MediaSession playing{nullptr};
+    MediaSession paused{nullptr};
+    MediaSession first{nullptr};
     try {
         for (const MediaSession& session : manager.GetSessions()) {
-            const MediaStatus status = playingOf(session);
-            if (status == MediaStatus::Playing && !playing) {
-                playing = session;
+            const MediaStatus status = MediaStatusOf(session);
+            if (status == MediaStatus::Closed) {
+                continue;
+            }
+            const bool isSticky = !sticky.empty() && MediaAumid(session) == sticky;
+            if (!first) {
+                first = session;
+            }
+            if (status == MediaStatus::Playing) {
+                if (isSticky && !stickyPlaying) {
+                    stickyPlaying = session;
+                }
+                if (!playing) {
+                    playing = session;
+                }
             } else if (status == MediaStatus::Paused && !paused) {
                 paused = session;
             }
+            if (isSticky && !stickyAny) {
+                stickyAny = session;
+            }
         }
-    } catch (const winrt::hresult_error&) {
+    } catch (...) {
+    }
+    if (stickyPlaying) {
+        return stickyPlaying;
+    }
+    if (current && MediaStatusOf(current) == MediaStatus::Playing) {
+        return current;
     }
     if (playing) {
         return playing;
     }
+    if (stickyAny) {
+        return stickyAny;
+    }
     if (current) {
         return current;
     }
-    return paused;
+    return paused ? paused : first;
 }
 
-void RequestMediaProperties(const MediaSession& session) {
-    {
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        if (g_media.propsPending) {
-            return;
+struct MediaHook {
+    MediaSession session{nullptr};
+    winrt::event_token playback{};
+    winrt::event_token props{};
+    winrt::event_token timeline{};
+};
+
+void UnhookMediaSessions(std::vector<MediaHook>& hooks) {
+    for (MediaHook& hook : hooks) {
+        try {
+            if (hook.playback.value != 0) {
+                hook.session.PlaybackInfoChanged(hook.playback);
+            }
+            if (hook.props.value != 0) {
+                hook.session.MediaPropertiesChanged(hook.props);
+            }
+            if (hook.timeline.value != 0) {
+                hook.session.TimelinePropertiesChanged(hook.timeline);
+            }
+        } catch (...) {
         }
-        g_media.propsPending = true;
     }
+    hooks.clear();
+}
+
+void HookMediaSessions(const MediaManager& manager, std::vector<MediaHook>& hooks) {
+    UnhookMediaSessions(hooks);
     try {
-        auto operation = session.TryGetMediaPropertiesAsync();
-        operation.Completed([](auto const& async, winrt::Windows::Foundation::AsyncStatus status) {
-            std::wstring title;
-            std::wstring artist;
-            bool have = false;
-            if (status == winrt::Windows::Foundation::AsyncStatus::Completed) {
-                try {
-                    auto props = async.GetResults();
-                    title = WideFromHstring(props.Title());
-                    artist = WideFromHstring(props.Artist());
-                    if (artist.empty()) {
-                        artist = WideFromHstring(props.AlbumArtist());
-                    }
-                    have = !title.empty() || !artist.empty();
-                } catch (const winrt::hresult_error&) {
-                    have = false;
+        for (const MediaSession& session : manager.GetSessions()) {
+            MediaHook hook;
+            hook.session = session;
+            try {
+                hook.playback = session.PlaybackInfoChanged(
+                    [](auto&&, auto&&) { WakeMedia(kMediaDirtyPlayback); });
+                hook.props = session.MediaPropertiesChanged(
+                    [](auto&&, auto&&) { WakeMedia(kMediaDirtyProps); });
+                hook.timeline = session.TimelinePropertiesChanged(
+                    [](auto&&, auto&&) { WakeMedia(kMediaDirtyTimeline); });
+            } catch (...) {
+            }
+            hooks.push_back(std::move(hook));
+        }
+    } catch (...) {
+    }
+}
+
+// Album art, centre-cropped to a square (YouTube frames are 16:9) and decoded
+// to premultiplied BGRA at kMediaArtPx. The UI box-filters it to the module.
+std::shared_ptr<const std::vector<uint8_t>> DecodeMediaArt(
+    const winrt::Windows::Storage::Streams::IRandomAccessStreamReference& reference) {
+    namespace imaging = winrt::Windows::Graphics::Imaging;
+    if (!reference) {
+        return nullptr;
+    }
+    const auto stream = reference.OpenReadAsync().get();
+    const imaging::BitmapDecoder decoder = imaging::BitmapDecoder::CreateAsync(stream).get();
+    const uint32_t sourceW = decoder.OrientedPixelWidth();
+    const uint32_t sourceH = decoder.OrientedPixelHeight();
+    if (sourceW == 0 || sourceH == 0) {
+        return nullptr;
+    }
+    constexpr uint32_t target = static_cast<uint32_t>(kMediaArtPx);
+    const double fit = static_cast<double>(target) / static_cast<double>(std::min(sourceW, sourceH));
+    const uint32_t scaledW = std::max(target, static_cast<uint32_t>(std::lround(sourceW * fit)));
+    const uint32_t scaledH = std::max(target, static_cast<uint32_t>(std::lround(sourceH * fit)));
+    imaging::BitmapTransform transform;
+    transform.ScaledWidth(scaledW);
+    transform.ScaledHeight(scaledH);
+    transform.InterpolationMode(imaging::BitmapInterpolationMode::Fant);
+    transform.Bounds(imaging::BitmapBounds{(scaledW - target) / 2U, (scaledH - target) / 2U, target, target});
+    const imaging::PixelDataProvider data = decoder
+        .GetPixelDataAsync(imaging::BitmapPixelFormat::Bgra8, imaging::BitmapAlphaMode::Premultiplied,
+            transform, imaging::ExifOrientationMode::RespectExifOrientation,
+            imaging::ColorManagementMode::ColorManageToSRgb)
+        .get();
+    const winrt::com_array<uint8_t> bytes = data.DetachPixelData();
+    if (bytes.size() != static_cast<size_t>(target) * static_cast<size_t>(target) * 4U) {
+        return nullptr;
+    }
+    return std::make_shared<std::vector<uint8_t>>(bytes.begin(), bytes.end());
+}
+
+// Worker-only counter; a new value tells the UI to re-raster the art.
+uint64_t NextMediaArtGen() noexcept {
+    static uint64_t counter = 0;
+    return ++counter;
+}
+
+// Worker-side read of the chosen session.
+struct MediaRead {
+    MediaState state;
+    int64_t startTicks = 0;
+    bool canToggle = false;
+    // Apps that move Position without LastUpdatedTime would be extrapolated
+    // twice; detect that once per session and stop compensating.
+    int64_t lastRawPosition = -1;
+    int64_t lastStamp = -1;
+    bool staleStamp = false;
+    std::wstring artKey;
+    bool artLoaded = false;
+};
+
+void ReadMediaPlayback(const MediaSession& session, MediaRead& read) {
+    const auto info = session.GetPlaybackInfo();
+    const MediaStatus status = info.PlaybackStatus();
+    // Changing = track switch in progress; keep the last state so the glyph
+    // does not flicker between tracks.
+    read.state.playing = status == MediaStatus::Playing || (status == MediaStatus::Changing && read.state.playing);
+    read.state.have = status != MediaStatus::Closed;
+    const auto controls = info.Controls();
+    read.state.canPrev = controls.IsPreviousEnabled();
+    read.state.canNext = controls.IsNextEnabled();
+    read.canToggle = controls.IsPlayPauseToggleEnabled();
+    read.state.canPlayPause = read.canToggle || controls.IsPlayEnabled() || controls.IsPauseEnabled();
+    double rate = 1.0;
+    try {
+        const auto reported = info.PlaybackRate();
+        if (reported) {
+            rate = reported.Value();
+        }
+    } catch (...) {
+    }
+    read.state.rate = (rate > 0.0 && rate <= 16.0) ? rate : 1.0;
+}
+
+void ReadMediaTimeline(const MediaSession& session, MediaRead& read) {
+    const auto timeline = session.GetTimelineProperties();
+    int64_t start = timeline.StartTime().count();
+    int64_t end = timeline.EndTime().count();
+    if (end <= start) {
+        start = std::min(start, timeline.MinSeekTime().count());
+        end = timeline.MaxSeekTime().count();
+    }
+    const int64_t raw = timeline.Position().count();
+    const int64_t stamp = timeline.LastUpdatedTime().time_since_epoch().count();
+    if (read.lastRawPosition >= 0 && raw != read.lastRawPosition && stamp == read.lastStamp) {
+        read.staleStamp = true;
+    }
+    read.lastRawPosition = raw;
+    read.lastStamp = stamp;
+    int64_t position = raw - start;
+    if (read.state.playing && !read.staleStamp && stamp > 0) {
+        const int64_t age = (winrt::clock::now() - timeline.LastUpdatedTime()).count();
+        if (age > 0 && age < 3600LL * kMediaTicksPerSecond) {
+            position += static_cast<int64_t>(static_cast<double>(age) * read.state.rate);
+        }
+    }
+    read.startTicks = start;
+    read.state.durationTicks = std::max<int64_t>(0, end - start);
+    if (read.state.durationTicks > 0) {
+        position = std::min(position, read.state.durationTicks);
+    }
+    read.state.positionTicks = std::max<int64_t>(0, position);
+    read.state.anchorMs = GetTickCount64();
+}
+
+void ReadMediaProps(const MediaSession& session, MediaRead& read, bool fromEvent) {
+    const auto props = session.TryGetMediaPropertiesAsync().get();
+    if (!props) {
+        return;
+    }
+    std::wstring title = WideFromHstring(props.Title());
+    std::wstring artist = WideFromHstring(props.Artist());
+    std::wstring album = WideFromHstring(props.AlbumTitle());
+    if (artist.empty()) {
+        artist = WideFromHstring(props.AlbumArtist());
+    }
+    // Spotify and Chromium publish an empty set mid track change; keep the
+    // previous labels until the real metadata lands.
+    if (title.empty() && artist.empty()) {
+        return;
+    }
+    std::wstring key = title + L'\x1F' + artist + L'\x1F' + album;
+    const bool newTrack = key != read.artKey;
+    read.state.title = std::move(title);
+    read.state.artist = std::move(artist);
+    read.state.album = std::move(album);
+    // Browsers attach artwork in a second metadata update, so an event on the
+    // same track re-reads it; polls only retry tracks that had none.
+    if (!newTrack && read.artLoaded && !fromEvent) {
+        return;
+    }
+    std::shared_ptr<const std::vector<uint8_t>> art;
+    try {
+        art = DecodeMediaArt(props.Thumbnail());
+    } catch (...) {
+        art = nullptr;
+    }
+    const bool same = art && read.state.art && *art == *read.state.art;
+    if (!same && (newTrack || art)) {
+        read.state.art = std::move(art);
+        read.state.artGen = NextMediaArtGen();
+    }
+    read.artKey = std::move(key);
+    read.artLoaded = read.state.art != nullptr;
+}
+
+void SendMediaKeyFor(MediaCommand command) {
+    switch (command) {
+    case MediaCommand::Previous:
+        SendMediaKey(VK_MEDIA_PREV_TRACK);
+        break;
+    case MediaCommand::Next:
+        SendMediaKey(VK_MEDIA_NEXT_TRACK);
+        break;
+    case MediaCommand::TogglePlay:
+        SendMediaKey(VK_MEDIA_PLAY_PAUSE);
+        break;
+    case MediaCommand::Seek:
+        break;
+    }
+}
+
+void RunMediaRequests(const MediaSession& session, const MediaRead& read, const std::vector<MediaRequest>& requests) {
+    for (const MediaRequest& request : requests) {
+        if (!session) {
+            SendMediaKeyFor(request.command);
+            continue;
+        }
+        try {
+            switch (request.command) {
+            case MediaCommand::Previous:
+                static_cast<void>(session.TrySkipPreviousAsync().get());
+                break;
+            case MediaCommand::Next:
+                static_cast<void>(session.TrySkipNextAsync().get());
+                break;
+            case MediaCommand::TogglePlay:
+                if (read.canToggle || !read.state.canPlayPause) {
+                    static_cast<void>(session.TryTogglePlayPauseAsync().get());
+                } else if (MediaStatusOf(session) == MediaStatus::Playing) {
+                    static_cast<void>(session.TryPauseAsync().get());
+                } else {
+                    static_cast<void>(session.TryPlayAsync().get());
                 }
+                break;
+            case MediaCommand::Seek:
+                static_cast<void>(session.TryChangePlaybackPositionAsync(read.startTicks + request.position).get());
+                break;
             }
-            std::lock_guard<std::mutex> lock(g_media.mutex);
-            if (have) {
-                g_media.title = std::move(title);
-                g_media.artist = std::move(artist);
-            }
-            g_media.propsPending = false;
-        });
-    } catch (const winrt::hresult_error&) {
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        g_media.propsPending = false;
-    }
-}
-
-float ReadMediaProgress(const MediaSession& session) noexcept {
-    try {
-        const auto timeline = session.GetTimelineProperties();
-        const auto start = timeline.StartTime().count();
-        const auto end = timeline.EndTime().count();
-        const auto position = timeline.Position().count();
-        const auto span = end - start;
-        if (span <= 0) {
-            return 0.0F;
+        } catch (...) {
+            SendMediaKeyFor(request.command);
         }
-        return std::clamp(static_cast<float>(position - start) / static_cast<float>(span), 0.0F, 1.0F);
-    } catch (const winrt::hresult_error&) {
-        return 0.0F;
     }
 }
 
-void PublishMedia(QuickSettingsCache& cache) {
-    std::lock_guard<std::mutex> lock(g_media.mutex);
-    cache.mediaTitle = g_media.title;
-    cache.mediaArtist = g_media.artist;
-    cache.mediaHave = g_media.have;
-    cache.mediaPlaying = g_media.playing;
-    cache.mediaProgress = g_media.progress;
+void PublishMediaRead(const MediaRead& read, bool haveSession) {
+    MediaBridge& media = Media();
+    MediaState next = haveSession ? read.state : MediaState{};
+    if (!haveSession) {
+        next.anchorMs = GetTickCount64();
+    }
+    std::lock_guard<std::mutex> lock(media.mutex);
+    MediaState& current = media.state;
+    const ULONGLONG now = GetTickCount64();
+    if (media.playHoldUntil != 0) {
+        if (now >= media.playHoldUntil || !next.have || next.playing == media.playHoldValue) {
+            media.playHoldUntil = 0;
+        } else {
+            next.playing = current.playing;
+            next.positionTicks = current.positionTicks;
+            next.anchorMs = current.anchorMs;
+        }
+    }
+    if (media.positionHoldUntil != 0) {
+        const int64_t reported = MediaPositionAt(next, now);
+        const bool landed = media.positionHoldSkip
+            ? reported < 5 * kMediaTicksPerSecond
+            : std::llabs(reported - MediaPositionAt(current, now)) < 2 * kMediaTicksPerSecond;
+        if (now >= media.positionHoldUntil || !next.have || landed) {
+            media.positionHoldUntil = 0;
+        } else {
+            next.positionTicks = current.positionTicks;
+            next.anchorMs = current.anchorMs;
+        }
+    }
+    // Re-anchoring every poll would bump the generation each second; only a
+    // real jump (seek, drift, new track) moves the anchor.
+    const bool moved = next.playing != current.playing ||
+        std::llabs(MediaPositionAt(next, now) - MediaPositionAt(current, now)) > 250LL * kMediaTicksPerMs ||
+        std::fabs(next.rate - current.rate) > 0.001;
+    const bool changed = moved || next.have != current.have || next.canPrev != current.canPrev ||
+        next.canNext != current.canNext || next.canPlayPause != current.canPlayPause ||
+        next.durationTicks != current.durationTicks || next.title != current.title ||
+        next.artist != current.artist || next.album != current.album || next.app != current.app ||
+        next.artGen != current.artGen;
+    if (!changed) {
+        return;
+    }
+    if (!moved) {
+        next.positionTicks = current.positionTicks;
+        next.anchorMs = current.anchorMs;
+    }
+    current = std::move(next);
+    ++media.gen;
 }
 
-void QueryMediaSession() {
-    EnsureMediaManager();
+void MediaWorker() {
+    MediaBridge& media = Media();
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+    }
     MediaManager manager{nullptr};
-    {
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        manager = g_media.manager;
+    try {
+        manager = MediaManager::RequestAsync().get();
+    } catch (...) {
+        manager = nullptr;
     }
     if (!manager) {
+        std::lock_guard<std::mutex> lock(media.mutex);
+        media.unavailable = true;
+        ++media.gen;
         return;
     }
     try {
-        MediaSession session = PickMediaSession(manager);
-        if (!session) {
-            std::lock_guard<std::mutex> lock(g_media.mutex);
-            g_media.session = nullptr;
-            g_media.have = false;
-            g_media.playing = false;
-            g_media.progress = 0.0F;
-            g_media.title.clear();
-            g_media.artist.clear();
-        } else {
-            const MediaStatus status = session.GetPlaybackInfo().PlaybackStatus();
-            const bool playing = status == MediaStatus::Playing;
-            std::wstring source;
-            try {
-                source = WideFromHstring(session.SourceAppUserModelId());
-            } catch (const winrt::hresult_error&) {
-                source.clear();
+        static_cast<void>(
+            manager.CurrentSessionChanged([](auto&&, auto&&) { WakeMedia(kMediaDirtyPlayback); }));
+        static_cast<void>(manager.SessionsChanged(
+            [](auto&&, auto&&) { WakeMedia(kMediaDirtySessions | kMediaDirtyPlayback); }));
+    } catch (...) {
+    }
+    std::vector<MediaHook> hooks;
+    MediaSession session{nullptr};
+    std::wstring sessionId;
+    MediaRead read;
+    ULONGLONG lastPoll = 0;
+    ULONGLONG lastProps = 0;
+    unsigned bits = kMediaDirtyAll;
+    std::vector<MediaRequest> requests;
+    for (;;) {
+        bool demand = false;
+        if (bits == 0) {
+            std::unique_lock<std::mutex> lock(media.mutex);
+            for (;;) {
+                const ULONGLONG now = GetTickCount64();
+                demand = media.demandMs != 0 && now - media.demandMs < kMediaDemandMs;
+                if (media.dirty != 0 || !media.requests.empty()) {
+                    break;
+                }
+                // Safety poll only while Quick Settings is open: corrects drift
+                // and catches apps that skip events. Closed = events only.
+                if (!demand) {
+                    media.sleeping = true;
+                    media.wake.wait(lock);
+                    media.sleeping = false;
+                    continue;
+                }
+                if (now - lastPoll >= kMediaPollMs) {
+                    break;
+                }
+                media.wake.wait_for(
+                    lock, std::chrono::milliseconds(static_cast<long long>(kMediaPollMs - (now - lastPoll))));
             }
-            {
-                std::lock_guard<std::mutex> lock(g_media.mutex);
-                g_media.session = session;
-                g_media.playing = playing;
-                g_media.have = true;
-                if (g_media.title.empty() && !source.empty()) {
-                    g_media.artist = source;
+            bits = std::exchange(media.dirty, 0U);
+            requests.swap(media.requests);
+        }
+        const ULONGLONG now = GetTickCount64();
+        bool propsEvent = (bits & kMediaDirtyProps) != 0;
+        if (demand && now - lastPoll >= kMediaPollMs) {
+            bits |= kMediaDirtyPlayback | kMediaDirtyTimeline;
+            if (now - lastProps >= kMediaPropsPollMs) {
+                bits |= kMediaDirtyProps;
+            }
+        }
+        try {
+            if (!requests.empty()) {
+                RunMediaRequests(session, read, requests);
+                requests.clear();
+                bits |= kMediaDirtyPlayback | kMediaDirtyTimeline;
+            }
+            if ((bits & kMediaDirtySessions) != 0) {
+                HookMediaSessions(manager, hooks);
+            }
+            if ((bits & (kMediaDirtySessions | kMediaDirtyPlayback)) != 0 || !session) {
+                MediaSession picked = PickMediaSession(manager, sessionId);
+                if (!picked) {
+                    session = nullptr;
+                    sessionId.clear();
+                    read = MediaRead{};
+                } else {
+                    std::wstring pickedId = MediaAumid(picked);
+                    if (!session || pickedId != sessionId) {
+                        read = MediaRead{};
+                        read.state.artGen = NextMediaArtGen();
+                        read.state.app = MediaAppName(pickedId);
+                        sessionId = std::move(pickedId);
+                        bits |= kMediaDirtyProps | kMediaDirtyTimeline | kMediaDirtyPlayback;
+                        propsEvent = true;
+                    } else if (winrt::get_abi(picked) != winrt::get_abi(session)) {
+                        // Same app, different tab/window: metadata may differ.
+                        bits |= kMediaDirtyProps | kMediaDirtyTimeline;
+                    }
+                    session = picked;
                 }
             }
-            RequestMediaProperties(session);
+            if (session) {
+                if ((bits & (kMediaDirtyPlayback | kMediaDirtyTimeline)) != 0) {
+                    ReadMediaPlayback(session, read);
+                }
+                if ((bits & kMediaDirtyProps) != 0) {
+                    ReadMediaProps(session, read, propsEvent);
+                    lastProps = now;
+                }
+                if ((bits & (kMediaDirtyPlayback | kMediaDirtyTimeline)) != 0) {
+                    ReadMediaTimeline(session, read);
+                }
+            }
+        } catch (...) {
         }
-    } catch (const winrt::hresult_error&) {
+        if ((bits & (kMediaDirtyPlayback | kMediaDirtyTimeline)) != 0) {
+            lastPoll = now;
+        }
+        PublishMediaRead(read, static_cast<bool>(session));
+        bits = 0;
     }
 }
 
-void QueryMediaProgress() {
-    MediaSession session{nullptr};
+void StartMediaWatch() {
+    MediaBridge& media = Media();
     {
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        session = g_media.session;
-    }
-    if (!session) {
-        return;
-    }
-    const float progress = ReadMediaProgress(session);
-    std::lock_guard<std::mutex> lock(g_media.mutex);
-    g_media.progress = progress;
-}
-
-void QueryMedia(QuickSettingsCache& cache, bool forceSession = false, bool forceProgress = false) {
-    const ULONGLONG now = GetTickCount64();
-    bool doSession = forceSession;
-    bool doProgress = forceProgress;
-    {
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        if (!doSession && (g_media.lastSessionQuery == 0 || now - g_media.lastSessionQuery >= 1000ULL)) {
-            doSession = true;
+        std::lock_guard<std::mutex> lock(media.mutex);
+        if (media.started) {
+            return;
         }
-        if (!doProgress && (g_media.lastProgressQuery == 0 || now - g_media.lastProgressQuery >= 200ULL)) {
-            doProgress = true;
-        }
-    }
-    if (doSession) {
-        QueryMediaSession();
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        g_media.lastSessionQuery = now;
-    }
-    if (doProgress) {
-        QueryMediaProgress();
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        g_media.lastProgressQuery = now;
-    }
-    PublishMedia(cache);
-}
-
-void ControlMediaSession(int command) {
-    MediaSession session{nullptr};
-    {
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        session = g_media.session;
-    }
-    if (!session) {
-        if (command == 0) {
-            SendMediaKey(VK_MEDIA_PREV_TRACK);
-        } else if (command == 2) {
-            SendMediaKey(VK_MEDIA_NEXT_TRACK);
-        } else {
-            SendMediaKey(VK_MEDIA_PLAY_PAUSE);
-        }
-        return;
+        media.started = true;
     }
     try {
-        if (command == 0) {
-            session.TrySkipPreviousAsync();
-        } else if (command == 2) {
-            session.TrySkipNextAsync();
+        std::thread([] {
+            try {
+                MediaWorker();
+            } catch (...) {
+            }
+        }).detach();
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(media.mutex);
+        media.unavailable = true;
+    }
+}
+
+// Transport click from the UI thread. Updates the snapshot optimistically so
+// the glyph flips on this frame; the worker issues the GSMTC call.
+void ControlMediaSession(int command) {
+    StartMediaWatch();
+    MediaBridge& media = Media();
+    const MediaCommand action = command == 0 ? MediaCommand::Previous
+        : (command == 2 ? MediaCommand::Next : MediaCommand::TogglePlay);
+    bool keys = false;
+    {
+        std::lock_guard<std::mutex> lock(media.mutex);
+        if (media.unavailable) {
+            keys = true;
         } else {
-            session.TryTogglePlayPauseAsync();
-        }
-    } catch (const winrt::hresult_error&) {
-        if (command == 0) {
-            SendMediaKey(VK_MEDIA_PREV_TRACK);
-        } else if (command == 2) {
-            SendMediaKey(VK_MEDIA_NEXT_TRACK);
-        } else {
-            SendMediaKey(VK_MEDIA_PLAY_PAUSE);
+            MediaState& state = media.state;
+            const ULONGLONG now = GetTickCount64();
+            if (state.have && action == MediaCommand::TogglePlay && state.canPlayPause) {
+                state.positionTicks = MediaPositionAt(state, now);
+                state.anchorMs = now;
+                state.playing = !state.playing;
+                media.playHoldValue = state.playing;
+                media.playHoldUntil = now + kMediaHoldMs;
+                ++media.gen;
+            } else if (state.have && ((action == MediaCommand::Next && state.canNext) ||
+                                         (action == MediaCommand::Previous && state.canPrev))) {
+                state.positionTicks = 0;
+                state.anchorMs = now;
+                media.positionHoldSkip = true;
+                media.positionHoldUntil = now + kMediaHoldMs;
+                ++media.gen;
+            }
+            media.requests.push_back({action, 0});
         }
     }
+    if (keys) {
+        SendMediaKeyFor(action);
+    } else {
+        media.wake.notify_one();
+    }
+}
+
+// Copy the latest snapshot into the UI cache (no IPC) and re-derive the
+// extrapolated position. Labels = metadata/art changed (full rebuild);
+// MetersOnly = transport state, time or scrub moved (live present only).
+QsLiveChange RefreshQuickSettingsMedia(QuickSettingsCache& cache) {
+    StartMediaWatch();
+    MediaBridge& media = Media();
+    const ULONGLONG now = GetTickCount64();
+    const bool beforePlaying = cache.mediaPlaying;
+    const unsigned beforeFlags = (cache.mediaCanPrev ? 1U : 0U) | (cache.mediaCanNext ? 2U : 0U) |
+        (cache.mediaCanPlayPause ? 4U : 0U);
+    const int64_t beforeElapsed = cache.mediaElapsedMs / 1000;
+    const int64_t beforeDuration = cache.mediaDurationMs / 1000;
+    const int beforeProgress = static_cast<int>(std::lround(cache.mediaProgress * 4000.0F));
+    bool labels = false;
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> lock(media.mutex);
+        media.demandMs = now;
+        wake = media.sleeping;
+        if (media.gen != cache.mediaGen) {
+            const MediaState& state = media.state;
+            labels = cache.mediaHave != state.have || cache.mediaTitle != state.title ||
+                cache.mediaArtist != state.artist || cache.mediaAlbum != state.album ||
+                cache.mediaApp != state.app || cache.mediaArtGen != state.artGen;
+            cache.mediaHave = state.have;
+            cache.mediaPlaying = state.playing;
+            cache.mediaCanPrev = state.canPrev;
+            cache.mediaCanNext = state.canNext;
+            cache.mediaCanPlayPause = state.canPlayPause;
+            if (labels) {
+                cache.mediaTitle = state.title;
+                cache.mediaArtist = state.artist;
+                cache.mediaAlbum = state.album;
+                cache.mediaApp = state.app;
+                cache.mediaArtGen = state.artGen;
+                cache.mediaArt = state.art;
+            }
+            cache.mediaPositionTicks = state.positionTicks;
+            cache.mediaAnchorMs = state.anchorMs;
+            cache.mediaRate = state.rate;
+            cache.mediaDurationTicks = state.durationTicks;
+            cache.mediaGen = media.gen;
+        }
+    }
+    if (wake) {
+        media.wake.notify_one();
+    }
+    MediaState anchor;
+    anchor.playing = cache.mediaPlaying;
+    anchor.positionTicks = cache.mediaPositionTicks;
+    anchor.anchorMs = cache.mediaAnchorMs;
+    anchor.rate = cache.mediaRate;
+    anchor.durationTicks = cache.mediaDurationTicks;
+    const int64_t duration = cache.mediaHave ? cache.mediaDurationTicks : 0;
+    int64_t position = cache.mediaHave ? MediaPositionAt(anchor, now) : 0;
+    if (duration > 0 && cache.mediaScrubPreview >= 0.0F) {
+        position = static_cast<int64_t>(static_cast<double>(duration) * cache.mediaScrubPreview);
+    }
+    cache.mediaDurationMs = duration / kMediaTicksPerMs;
+    cache.mediaElapsedMs = position / kMediaTicksPerMs;
+    cache.mediaProgress = duration > 0
+        ? std::clamp(static_cast<float>(static_cast<double>(position) / static_cast<double>(duration)), 0.0F, 1.0F)
+        : 0.0F;
+    if (labels) {
+        return QsLiveChange::Labels;
+    }
+    const unsigned flags = (cache.mediaCanPrev ? 1U : 0U) | (cache.mediaCanNext ? 2U : 0U) |
+        (cache.mediaCanPlayPause ? 4U : 0U);
+    if (cache.mediaPlaying != beforePlaying || flags != beforeFlags ||
+        cache.mediaElapsedMs / 1000 != beforeElapsed || cache.mediaDurationMs / 1000 != beforeDuration ||
+        static_cast<int>(std::lround(cache.mediaProgress * 4000.0F)) != beforeProgress) {
+        return QsLiveChange::MetersOnly;
+    }
+    return QsLiveChange::None;
+}
+
+std::wstring FormatMediaTime(int64_t ms) {
+    const int64_t total = std::max<int64_t>(0, ms) / 1000;
+    wchar_t buffer[32]{};
+    if (total >= 3600) {
+        swprintf_s(buffer, L"%lld:%02lld:%02lld", total / 3600, (total / 60) % 60, total % 60);
+    } else {
+        swprintf_s(buffer, L"%lld:%02lld", total / 60, total % 60);
+    }
+    return buffer;
+}
+
+// Media module time line: "1:23 / 3:45" (elapsed only if that is too wide).
+std::wstring MediaTimeText(const QuickSettingsCache& cache, HFONT font, LONG width) {
+    if (!cache.mediaHave) {
+        return {};
+    }
+    if (cache.mediaDurationMs <= 0) {
+        return cache.mediaPlaying ? L"Playing" : L"Paused";
+    }
+    const std::wstring elapsed = FormatMediaTime(cache.mediaElapsedMs);
+    std::wstring full = elapsed + L" / " + FormatMediaTime(cache.mediaDurationMs);
+    if (font == nullptr || MeasureFlyoutLine(font, full) <= width) {
+        return full;
+    }
+    return elapsed;
 }
 
 int MeterBucket(float peak) noexcept {
@@ -2275,104 +2818,214 @@ void FillSoftDisc(uint8_t* dest, int destWidth, int destHeight, float cx, float 
     }
 }
 
-void FillAlbumDisc(uint8_t* dest, int destWidth, int destHeight, float cx, float cy, float radius) {
-    if (dest == nullptr || radius <= 1.0F) {
+// Anti-aliased convex polygon (3-4 vertices, either winding) with rounded
+// corners: every edge is pulled in by `corner`, then the SDF is re-inflated.
+void FillRoundedPolygonPremul(uint8_t* dest, int destWidth, int destHeight, const float* xs, const float* ys,
+    int count, float corner, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
+    if (dest == nullptr || count < 3 || count > 4 || alpha <= 0.0F) {
         return;
     }
-    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - 2.0F)));
-    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 2.0F)));
-    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 2.0F)));
-    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 2.0F)));
-    constexpr float aa = 1.2F;
-    const float diameter = std::max(1.0F, radius * 2.0F);
+    float centerX = 0.0F;
+    float centerY = 0.0F;
+    for (int index = 0; index < count; ++index) {
+        centerX += xs[index];
+        centerY += ys[index];
+    }
+    centerX /= static_cast<float>(count);
+    centerY /= static_cast<float>(count);
+    float normalX[4]{};
+    float normalY[4]{};
+    float offset[4]{};
+    for (int index = 0; index < count; ++index) {
+        const int next = (index + 1) % count;
+        const float edgeX = xs[next] - xs[index];
+        const float edgeY = ys[next] - ys[index];
+        const float length = std::sqrt(edgeX * edgeX + edgeY * edgeY);
+        if (length < 1e-4F) {
+            return;
+        }
+        float outX = edgeY / length;
+        float outY = -edgeX / length;
+        if ((centerX - xs[index]) * outX + (centerY - ys[index]) * outY > 0.0F) {
+            outX = -outX;
+            outY = -outY;
+        }
+        normalX[index] = outX;
+        normalY[index] = outY;
+        offset[index] = outX * xs[index] + outY * ys[index] - corner;
+    }
+    float innerX[4]{};
+    float innerY[4]{};
+    for (int index = 0; index < count; ++index) {
+        const int previous = (index + count - 1) % count;
+        const float det = normalX[previous] * normalY[index] - normalY[previous] * normalX[index];
+        if (std::fabs(det) < 1e-6F) {
+            return;
+        }
+        innerX[index] = (offset[previous] * normalY[index] - normalY[previous] * offset[index]) / det;
+        innerY[index] = (normalX[previous] * offset[index] - offset[previous] * normalX[index]) / det;
+    }
+    float minX = xs[0];
+    float maxX = xs[0];
+    float minY = ys[0];
+    float maxY = ys[0];
+    for (int index = 1; index < count; ++index) {
+        minX = std::min(minX, xs[index]);
+        maxX = std::max(maxX, xs[index]);
+        minY = std::min(minY, ys[index]);
+        maxY = std::max(maxY, ys[index]);
+    }
+    const int left = std::max(0, static_cast<int>(std::floor(minX - 1.5F)));
+    const int right = std::min(destWidth, static_cast<int>(std::ceil(maxX + 1.5F)));
+    const int top = std::max(0, static_cast<int>(std::floor(minY - 1.5F)));
+    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(maxY + 1.5F)));
+    if (right <= left || bottom <= top) {
+        return;
+    }
+    std::vector<uint8_t> row(static_cast<size_t>(right - left) * 4U);
     for (int y = top; y < bottom; ++y) {
         const float py = static_cast<float>(y) + 0.5F;
-        const float v = std::clamp((py - (cy - radius)) / diameter, 0.0F, 1.0F);
         for (int x = left; x < right; ++x) {
             const float px = static_cast<float>(x) + 0.5F;
-            const float dx = px - cx;
-            const float dy = py - cy;
-            const float dist = std::sqrt(dx * dx + dy * dy);
-            const float coverage = 1.0F - std::clamp((dist - radius) / aa + 0.5F, 0.0F, 1.0F);
-            if (coverage <= 0.0F) {
-                continue;
+            float inside = -1e9F;
+            for (int index = 0; index < count; ++index) {
+                inside = std::max(inside, normalX[index] * px + normalY[index] * py - offset[index]);
             }
-            const float u = std::clamp((px - (cx - radius)) / diameter, 0.0F, 1.0F);
-            // Stand-in for the mock's circular sunset: navy sky, warm horizon,
-            // ridge line, and a dark reflection. Not the source photo.
-            float red = 0.0F;
-            float green = 0.0F;
-            float blue = 0.0F;
-            if (v < 0.22F) {
-                const float t = v / 0.22F;
-                red = 18.0F + t * 40.0F;
-                green = 16.0F + t * 10.0F;
-                blue = 48.0F + t * 36.0F;
-            } else if (v < 0.48F) {
-                const float t = (v - 0.22F) / 0.26F;
-                red = 58.0F + t * 150.0F;
-                green = 26.0F + t * 40.0F;
-                blue = 84.0F + t * 40.0F;
-            } else if (v < 0.62F) {
-                const float t = (v - 0.48F) / 0.14F;
-                red = 208.0F + t * 40.0F;
-                green = 66.0F + t * 70.0F;
-                blue = 124.0F - t * 70.0F;
-            } else {
-                red = 36.0F;
-                green = 22.0F;
-                blue = 32.0F;
-            }
-            if (v < 0.28F) {
-                const unsigned h = static_cast<unsigned>(x * 374761393 + y * 668265263);
-                const unsigned n = (h ^ (h >> 13)) * 1274126177U;
-                if ((n & 1023U) > 1008U) {
-                    red = green = blue = 230.0F;
+            float distance = inside;
+            if (inside > 0.0F) {
+                distance = 1e9F;
+                for (int index = 0; index < count; ++index) {
+                    const int next = (index + 1) % count;
+                    const float segX = innerX[next] - innerX[index];
+                    const float segY = innerY[next] - innerY[index];
+                    const float lengthSq = std::max(1e-6F, segX * segX + segY * segY);
+                    const float t = std::clamp(
+                        ((px - innerX[index]) * segX + (py - innerY[index]) * segY) / lengthSq, 0.0F, 1.0F);
+                    const float dx = px - (innerX[index] + segX * t);
+                    const float dy = py - (innerY[index] + segY * t);
+                    distance = std::min(distance, std::sqrt(dx * dx + dy * dy));
                 }
             }
-            const float sunDx = u - 0.50F;
-            const float sunDy = (v - 0.575F) * 1.15F;
-            const float sun = std::sqrt(sunDx * sunDx + sunDy * sunDy);
-            if (sun < 0.055F) {
-                red = 255.0F;
-                green = 214.0F;
-                blue = 150.0F;
-            } else if (sun < 0.16F && v < 0.70F) {
-                const float g = 1.0F - (sun - 0.055F) / 0.105F;
-                red = red * (1.0F - g) + 255.0F * g;
-                green = green * (1.0F - g) + 140.0F * g;
-                blue = blue * (1.0F - g) + 70.0F * g;
-            }
-            const float ridge = 0.60F + 0.040F * std::sin(u * 10.5F) + 0.028F * std::sin(u * 18.0F + 1.1F);
-            if (v > ridge && v < 0.74F) {
-                const float depth = std::clamp((v - ridge) / 0.08F, 0.0F, 1.0F);
-                red = 28.0F + (1.0F - depth) * 50.0F;
-                green = 18.0F + (1.0F - depth) * 16.0F;
-                blue = 36.0F + (1.0F - depth) * 20.0F;
-            }
-            if (v >= 0.74F) {
-                const float t = (v - 0.74F) / 0.26F;
-                red = 70.0F - t * 48.0F;
-                green = 28.0F - t * 16.0F;
-                blue = 48.0F - t * 28.0F;
-                if (std::fabs(u - 0.50F) < 0.015F + (1.0F - t) * 0.01F) {
-                    red = 220.0F;
-                    green = 130.0F;
-                    blue = 80.0F;
+            const float coverage = std::clamp(0.5F - (distance - corner), 0.0F, 1.0F) * alpha;
+            uint8_t* pixel = row.data() + static_cast<size_t>(x - left) * 4U;
+            pixel[0] = static_cast<uint8_t>(std::lround(static_cast<float>(blue) * coverage));
+            pixel[1] = static_cast<uint8_t>(std::lround(static_cast<float>(green) * coverage));
+            pixel[2] = static_cast<uint8_t>(std::lround(static_cast<float>(red) * coverage));
+            pixel[3] = static_cast<uint8_t>(std::lround(255.0F * coverage));
+        }
+        CompositePremul(dest, destWidth, destHeight, left, y, row.data(), right - left, 1);
+    }
+}
+
+enum class MediaGlyph : uint8_t {
+    Previous,
+    Play,
+    Pause,
+    Next,
+};
+
+// Filled macOS-style transport glyphs (Segoe icons are outline/thin at this
+// size). `unit` is px per pt.
+void PaintMediaGlyph(uint8_t* dest, int destWidth, int destHeight, MediaGlyph glyph, float cx, float cy,
+    float unit, float alpha, uint8_t red, uint8_t green, uint8_t blue) {
+    switch (glyph) {
+    case MediaGlyph::Play: {
+        const float xs[3] = {cx - 6.0F * unit, cx - 6.0F * unit, cx + 8.5F * unit};
+        const float ys[3] = {cy - 8.5F * unit, cy + 8.5F * unit, cy};
+        FillRoundedPolygonPremul(dest, destWidth, destHeight, xs, ys, 3, 1.6F * unit, alpha, blue, green, red);
+        break;
+    }
+    case MediaGlyph::Pause:
+        for (int bar = 0; bar < 2; ++bar) {
+            const float barLeft = cx + (bar == 0 ? -7.0F : 2.0F) * unit;
+            const float barRight = barLeft + 5.0F * unit;
+            const float xs[4] = {barLeft, barRight, barRight, barLeft};
+            const float ys[4] = {cy - 8.5F * unit, cy - 8.5F * unit, cy + 8.5F * unit, cy + 8.5F * unit};
+            FillRoundedPolygonPremul(dest, destWidth, destHeight, xs, ys, 4, 1.4F * unit, alpha, blue, green,
+                red);
+        }
+        break;
+    case MediaGlyph::Previous:
+    case MediaGlyph::Next: {
+        const float direction = glyph == MediaGlyph::Next ? 1.0F : -1.0F;
+        for (int part = 0; part < 2; ++part) {
+            const float base = cx + direction * (part == 0 ? -11.0F : 0.0F) * unit;
+            const float tip = base + direction * 11.0F * unit;
+            const float xs[3] = {base, base, tip};
+            const float ys[3] = {cy - 7.0F * unit, cy + 7.0F * unit, cy};
+            FillRoundedPolygonPremul(dest, destWidth, destHeight, xs, ys, 3, 1.3F * unit, alpha, blue, green,
+                red);
+        }
+        break;
+    }
+    }
+}
+
+// Album art box-filtered from kMediaArtPx to `extent` with rounded corners.
+// Cached by generation: hover and live presents never re-filter it.
+const std::vector<uint8_t>& MediaArtRaster(const std::shared_ptr<const std::vector<uint8_t>>& art, uint64_t gen,
+    int extent, float corner) {
+    static std::vector<uint8_t> raster;
+    static uint64_t rasterGen = 0;
+    static int rasterExtent = 0;
+    static float rasterCorner = -1.0F;
+    constexpr int sourceExtent = kMediaArtPx;
+    if (!art || extent <= 0 ||
+        art->size() != static_cast<size_t>(sourceExtent) * static_cast<size_t>(sourceExtent) * 4U) {
+        raster.clear();
+        rasterGen = 0;
+        return raster;
+    }
+    if (rasterGen == gen && rasterExtent == extent && rasterCorner == corner && !raster.empty()) {
+        return raster;
+    }
+    rasterGen = gen;
+    rasterExtent = extent;
+    rasterCorner = corner;
+    raster.assign(static_cast<size_t>(extent) * static_cast<size_t>(extent) * 4U, 0);
+    const std::vector<uint8_t>& source = *art;
+    const float step = static_cast<float>(sourceExtent) / static_cast<float>(extent);
+    const float half = static_cast<float>(extent) * 0.5F;
+    auto span = [&](int index, int& from, int& to) {
+        from = std::min(sourceExtent - 1, static_cast<int>(std::floor(static_cast<float>(index) * step)));
+        to = std::max(from + 1, std::min(sourceExtent, static_cast<int>(std::ceil(static_cast<float>(index + 1) * step))));
+    };
+    for (int y = 0; y < extent; ++y) {
+        int sy0 = 0;
+        int sy1 = 0;
+        span(y, sy0, sy1);
+        const float qy = std::fabs(static_cast<float>(y) + 0.5F - half) - (half - corner);
+        for (int x = 0; x < extent; ++x) {
+            int sx0 = 0;
+            int sx1 = 0;
+            span(x, sx0, sx1);
+            uint32_t sum[4]{};
+            for (int sy = sy0; sy < sy1; ++sy) {
+                const uint8_t* src = source.data() +
+                    (static_cast<size_t>(sy) * static_cast<size_t>(sourceExtent) + static_cast<size_t>(sx0)) * 4U;
+                for (int sx = sx0; sx < sx1; ++sx, src += 4) {
+                    sum[0] += src[0];
+                    sum[1] += src[1];
+                    sum[2] += src[2];
+                    sum[3] += src[3];
                 }
             }
-            const float edge = std::clamp(dist / radius, 0.0F, 1.0F);
-            const float shade = 1.0F - 0.18F * edge * edge;
-            const float srcA = coverage;
-            uint8_t pixel[4] = {
-                static_cast<uint8_t>(std::lround(std::clamp(blue * shade, 0.0F, 255.0F) * srcA)),
-                static_cast<uint8_t>(std::lround(std::clamp(green * shade, 0.0F, 255.0F) * srcA)),
-                static_cast<uint8_t>(std::lround(std::clamp(red * shade, 0.0F, 255.0F) * srcA)),
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-            };
-            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
+            const float samples = static_cast<float>((sy1 - sy0) * (sx1 - sx0));
+            const float qx = std::fabs(static_cast<float>(x) + 0.5F - half) - (half - corner);
+            const float outsideX = std::max(qx, 0.0F);
+            const float outsideY = std::max(qy, 0.0F);
+            const float sd = std::sqrt(outsideX * outsideX + outsideY * outsideY) +
+                std::min(std::max(qx, qy), 0.0F) - corner;
+            const float weight = std::clamp(0.5F - sd, 0.0F, 1.0F) / samples;
+            uint8_t* out = raster.data() + (static_cast<size_t>(y) * static_cast<size_t>(extent) +
+                static_cast<size_t>(x)) * 4U;
+            for (int channel = 0; channel < 4; ++channel) {
+                out[channel] = static_cast<uint8_t>(
+                    std::min(255L, std::lround(static_cast<float>(sum[channel]) * weight)));
+            }
         }
     }
+    return raster;
 }
 
 // Outline thermometer (stem capsule + bulb) with a filled bulb and mercury
@@ -2499,26 +3152,25 @@ void BlitIcon(uint8_t* pixels, int width, int height, HDC memory, HICON icon, in
 
 void SeekQuickSettingsMedia(float level) noexcept {
     level = std::clamp(level, 0.0F, 1.0F);
-    MediaSession session{nullptr};
-    {
-        std::lock_guard<std::mutex> lock(g_media.mutex);
-        session = g_media.session;
-        g_media.progress = level;
-    }
-    if (!session) {
-        return;
-    }
+    MediaBridge& media = Media();
     try {
-        const auto timeline = session.GetTimelineProperties();
-        const auto start = timeline.StartTime().count();
-        const auto end = timeline.EndTime().count();
-        const auto span = end - start;
-        if (span <= 0) {
-            return;
+        {
+            std::lock_guard<std::mutex> lock(media.mutex);
+            MediaState& state = media.state;
+            if (media.unavailable || !state.have || state.durationTicks <= 0) {
+                return;
+            }
+            const ULONGLONG now = GetTickCount64();
+            const int64_t target = std::llround(static_cast<double>(state.durationTicks) * level);
+            state.positionTicks = target;
+            state.anchorMs = now;
+            media.positionHoldSkip = false;
+            media.positionHoldUntil = now + kMediaHoldMs;
+            ++media.gen;
+            media.requests.push_back({MediaCommand::Seek, target});
         }
-        const auto target = start + static_cast<int64_t>(std::llround(static_cast<double>(span) * level));
-        session.TryChangePlaybackPositionAsync(target);
-    } catch (const winrt::hresult_error&) {
+        media.wake.notify_one();
+    } catch (...) {
     }
 }
 
@@ -2768,11 +3420,6 @@ bool ApplyQuickSettingsTemps(QuickSettingsCache& cache) {
 QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
     const int beforeBucket = MeterBucket(cache.inputPeak);
     const float prevPeak = cache.inputPeak;
-    const std::wstring beforeTitle = cache.mediaTitle;
-    const std::wstring beforeArtist = cache.mediaArtist;
-    const bool beforeHave = cache.mediaHave;
-    const bool beforePlaying = cache.mediaPlaying;
-    const int beforeProgress = static_cast<int>(std::lround(cache.mediaProgress * 48.0F));
     const std::wstring beforeNote = cache.inputNote;
 
     // Mic peak comes from the ~25 Hz background pump; UI only publishes it.
@@ -2800,14 +3447,11 @@ QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
         cache.inputPeak = smooth;
     }
 
-    // GSMTC: session ~1 Hz, scrub/progress ~5 Hz.
-    QueryMedia(cache, false, false);
+    // GSMTC snapshot from the media worker: no WinRT IPC on the UI thread.
+    const QsLiveChange media = RefreshQuickSettingsMedia(cache);
 
-    const bool labels = cache.mediaTitle != beforeTitle || cache.mediaArtist != beforeArtist ||
-        cache.mediaHave != beforeHave || cache.mediaPlaying != beforePlaying ||
-        cache.inputNote != beforeNote;
-    const bool meters = MeterBucket(cache.inputPeak) != beforeBucket ||
-        static_cast<int>(std::lround(cache.mediaProgress * 48.0F)) != beforeProgress;
+    const bool labels = media == QsLiveChange::Labels || cache.inputNote != beforeNote;
+    const bool meters = MeterBucket(cache.inputPeak) != beforeBucket || media == QsLiveChange::MetersOnly;
     if (labels) {
         return QsLiveChange::Labels;
     }
@@ -2852,9 +3496,8 @@ void DockApp::RefreshQuickSettingsCache() {
             RequestQuickSettingsTemps(m_overflowWindow, kQsTempsResultMessage);
         }
     }
-    // Publish last GSMTC snapshot only - session/scrub polls stay on the live
-    // timer so opening never blocks on WinRT media IPC.
-    PublishMedia(m_qsCache);
+    // Latest GSMTC snapshot from the media worker (starts it on first open).
+    static_cast<void>(RefreshQuickSettingsMedia(m_qsCache));
     EnsureQuickSettingsCaptureAsync();
     m_qsCache.stamp = now;
 }
@@ -2975,10 +3618,30 @@ void DockApp::ApplyQuickSettingsSlider(TrayFlyoutHitKind kind, const RECT& track
         return;
     }
     if (kind == TrayFlyoutHitKind::MediaSeek) {
-        SeekQuickSettingsMedia(level);
-        m_qsCache.mediaProgress = level;
-        QueueOverflowPaint();
+        // Preview only while dragging (one live-rect present per move); the
+        // seek is sent once on release so the player is not flooded.
+        if (!m_qsCache.mediaHave || m_qsCache.mediaDurationMs <= 0) {
+            return;
+        }
+        const RECT& bar = m_qsScrubValid ? m_qsScrubRect : track;
+        const float radius = static_cast<float>(bar.bottom - bar.top) * 0.5F;
+        const float left = static_cast<float>(bar.left) + radius;
+        const float right = std::max(left + 1.0F, static_cast<float>(bar.right) - radius);
+        m_qsCache.mediaScrubPreview = std::clamp((static_cast<float>(x) - left) / (right - left), 0.0F, 1.0F);
+        static_cast<void>(RefreshQuickSettingsMedia(m_qsCache));
+        PaintOverflowLiveFast();
     }
+}
+
+void DockApp::CommitQuickSettingsMediaSeek() {
+    const float level = m_qsCache.mediaScrubPreview;
+    m_qsCache.mediaScrubPreview = -1.0F;
+    if (level < 0.0F) {
+        return;
+    }
+    SeekQuickSettingsMedia(level);
+    static_cast<void>(RefreshQuickSettingsMedia(m_qsCache));
+    PaintOverflowLiveFast();
 }
 
 void DockApp::MeasureQuickSettings(float scale, LONG padding, LONG gearSize, LONG headerHeight,
@@ -3018,6 +3681,11 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
     }
     if (m_qsScrubValid) {
         OffsetRect(&m_qsScrubRect, shadowMargin, shadowMargin);
+        OffsetRect(&m_qsMediaLiveRect, shadowMargin, shadowMargin);
+        OffsetRect(&m_qsMediaTimeRect, shadowMargin, shadowMargin);
+        for (RECT& button : m_qsMediaTransportRect) {
+            OffsetRect(&button, shadowMargin, shadowMargin);
+        }
     }
     if (m_qsTempsValid) {
         OffsetRect(&m_qsTempCpuRect, shadowMargin, shadowMargin);
@@ -3078,13 +3746,35 @@ void DockApp::QsLiveSignatures(int64_t& meter, int64_t& scrub) const noexcept {
         // Quarter-pixel knob position: finer motion is below the AA edge step.
         const float span = static_cast<float>(std::max(1L, m_qsScrubRect.right - m_qsScrubRect.left));
         const int64_t position = std::lround(level * span * 4.0F);
-        scrub = (((ink << 24) | accent) * 1000003LL) ^ position;
+        // The scrub element also carries the transport glyphs (and the knob
+        // grows while dragging), so their state is part of its signature.
+        const uint64_t state = (m_qsCache.mediaHave ? 1U : 0U) | (m_qsCache.mediaPlaying ? 2U : 0U) |
+            (m_qsCache.mediaCanPrev ? 4U : 0U) | (m_qsCache.mediaCanNext ? 8U : 0U) |
+            (m_qsCache.mediaCanPlayPause ? 16U : 0U) | (m_qsCache.mediaDurationMs > 0 ? 32U : 0U) |
+            (m_qsCache.mediaScrubPreview >= 0.0F ? 64U : 0U);
+        const uint64_t hash = (static_cast<uint64_t>((((ink << 24) | accent) * 1000003LL) ^ position) ^ state) *
+            1099511628211ULL;
+        scrub = static_cast<int64_t>(hash >> 1U);
     }
+}
+
+int64_t DockApp::QsMediaTimeSignature() const noexcept {
+    if (!m_qsScrubValid || m_qsPage != QuickSettingsPage::Home) {
+        return -1;
+    }
+    uint64_t hash = (static_cast<uint64_t>(m_qsScrubInkR) << 16) | (static_cast<uint64_t>(m_qsScrubInkG) << 8) |
+        static_cast<uint64_t>(m_qsScrubInkB);
+    auto mix = [&hash](uint64_t value) { hash = (hash ^ value) * 1099511628211ULL; };
+    mix((m_qsCache.mediaHave ? 1U : 0U) | (m_qsCache.mediaPlaying ? 2U : 0U));
+    mix(static_cast<uint64_t>(m_qsCache.mediaElapsedMs / 1000));
+    mix(static_cast<uint64_t>(m_qsCache.mediaDurationMs / 1000));
+    mix(static_cast<uint64_t>(m_qsMediaTimeRect.right - m_qsMediaTimeRect.left));
+    return static_cast<int64_t>(hash >> 1U);
 }
 
 void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float scale,
     bool includeTemps, bool includeBoost, bool includeBluetooth, bool includeMeter, bool includeScrub,
-    bool includeTray) const {
+    bool includeTray, bool includeMediaTime) const {
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
@@ -3116,22 +3806,57 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
         }
     }
     if (includeScrub && m_qsScrubValid && m_qsPage == QuickSettingsPage::Home) {
+        // Media live element: scrub, transport glyphs and time line. None of
+        // it is in the underlay, so a play/pause click or a scrub drag
+        // presents this module's rows only.
+        const QuickSettingsCache& media = m_qsCache;
         const RECT& track = m_qsScrubRect;
-        const float level = m_qsCache.mediaHave ? std::clamp(m_qsCache.mediaProgress, 0.0F, 1.0F) : 0.0F;
-        const float radius = std::max(4.0F, static_cast<float>(track.bottom - track.top) * 0.5F);
+        const bool seekable = media.mediaHave && media.mediaDurationMs > 0;
+        const float radius = std::max(1.5F, static_cast<float>(track.bottom - track.top) * 0.5F);
         const float cy = 0.5F * static_cast<float>(track.top + track.bottom);
         const float left = static_cast<float>(track.left) + radius;
         const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
-        const float fill = left + (right - left) * level;
-        FillPillColorPremul(pixels, width, height, left, right, cy, radius, 0.26F, m_qsScrubInkB,
-            m_qsScrubInkG, m_qsScrubInkR);
-        if (level > 0.01F) {
-            FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
-                g_qsAccentB, g_qsAccentG, g_qsAccentR);
+        FillPillColorPremul(pixels, width, height, left, right, cy, radius, seekable ? 0.24F : 0.12F,
+            m_qsScrubInkB, m_qsScrubInkG, m_qsScrubInkR);
+        if (seekable) {
+            const float level = std::clamp(media.mediaProgress, 0.0F, 1.0F);
+            const float fill = left + (right - left) * level;
+            if (level > 0.0F) {
+                FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
+                    g_qsAccentB, g_qsAccentG, g_qsAccentR);
+            }
+            const float knob = media.mediaScrubPreview >= 0.0F ? 2.6F : 1.8F;
+            FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(1.5F, knob * scale), 0.99F,
+                false);
         }
-        FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(1.0F, 1.5F * scale), 0.99F,
-            false);
-    }    if (includeTemps && m_qsTempsValid && m_qsPage == QuickSettingsPage::Home &&
+        for (size_t button = 0; button < 3U; ++button) {
+            const RECT& area = m_qsMediaTransportRect[button];
+            const bool enabled = media.mediaHave
+                ? (button == 0U ? media.mediaCanPrev : (button == 2U ? media.mediaCanNext : media.mediaCanPlayPause))
+                : button == 1U;
+            const MediaGlyph glyph = button == 0U ? MediaGlyph::Previous
+                : (button == 2U ? MediaGlyph::Next : (media.mediaPlaying ? MediaGlyph::Pause : MediaGlyph::Play));
+            PaintMediaGlyph(pixels, width, height, glyph, 0.5F * static_cast<float>(area.left + area.right),
+                0.5F * static_cast<float>(area.top + area.bottom), scale, enabled ? 0.92F : 0.30F,
+                m_qsScrubInkR, m_qsScrubInkG, m_qsScrubInkB);
+        }
+    }
+    // Own element (QsMediaTimeSignature) so knob ticks do not re-render text.
+    if (includeMediaTime && m_qsScrubValid && m_qsPage == QuickSettingsPage::Home &&
+        m_overflowStatusFont != nullptr) {
+        const std::wstring timeText =
+            MediaTimeText(m_qsCache, m_overflowStatusFont, m_qsMediaTimeRect.right - m_qsMediaTimeRect.left);
+        if (!timeText.empty()) {
+            const uint8_t savedR = g_flyoutInkR;
+            const uint8_t savedG = g_flyoutInkG;
+            const uint8_t savedB = g_flyoutInkB;
+            SetFlyoutChromeInk(m_qsScrubInkR, m_qsScrubInkG, m_qsScrubInkB);
+            DrawFlyoutText(pixels, width, height, m_qsMediaTimeRect, m_overflowStatusFont, timeText,
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 160);
+            SetFlyoutChromeInk(savedR, savedG, savedB);
+        }
+    }
+    if (includeTemps && m_qsTempsValid && m_qsPage == QuickSettingsPage::Home &&
         m_overflowLabelFont != nullptr) {
         // Values live outside the underlay so a new reading presents only
         // these two rects (PaintOverflowLiveFast) instead of a full rebuild.
@@ -3408,6 +4133,11 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         m_qsBtStatusValid = false;
         m_qsMeterRect = {};
         m_qsScrubRect = {};
+        m_qsMediaLiveRect = {};
+        m_qsMediaTimeRect = {};
+        for (RECT& button : m_qsMediaTransportRect) {
+            button = {};
+        }
         m_qsTempCpuRect = {};
         m_qsTempGpuRect = {};
         m_qsBoostStatusRect = {};
@@ -3917,6 +4647,11 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             }
         }
         {
+            // Now Playing (2x2), after the macOS Control Centre module: artwork
+            // with the source app and time beside it, title and "Artist -
+            // Album" below, then scrub and filled transport glyphs. Scrub,
+            // glyphs and time are live overlays (PaintQsLiveOverlays), so
+            // play/pause, seeking and the clock never rebuild the panel.
             const RECT b = moduleRect(QsModule::Media);
             const size_t idx = addShape(b, static_cast<float>(P(30.0F)));
             const CcInk ink = ccInk(idx);
@@ -3925,58 +4660,80 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             }
             const LONG inset = P(14.0F);
             const LONG art = P(42.0F);
-            const LONG artLeft = b.left + inset;
-            const LONG artTop = b.top + inset;
+            const RECT artRect{b.left + inset, b.top + inset, b.left + inset + art, b.top + inset + art};
             if (draw) {
-                FillAlbumDisc(pixels, width, height, static_cast<float>(artLeft) + static_cast<float>(art) * 0.5F,
-                    static_cast<float>(artTop) + static_cast<float>(art) * 0.5F, static_cast<float>(art) * 0.5F);
+                const float corner = static_cast<float>(art) * 0.17F;
+                const std::vector<uint8_t>& raster =
+                    MediaArtRaster(m_qsCache.mediaArt, m_qsCache.mediaArtGen, static_cast<int>(art), corner);
+                if (!raster.empty()) {
+                    CompositePremul(pixels, width, height, static_cast<int>(artRect.left),
+                        static_cast<int>(artRect.top), raster.data(), static_cast<int>(art), static_cast<int>(art));
+                } else {
+                    FillSquircleColorPremul(pixels, width, height, artRect, corner, 0.14F, ink.b, ink.g, ink.r);
+                    const LONG note = std::max(12L, art / 2L);
+                    icon(artRect.left + (art - note) / 2L, artRect.top + (art - note) / 2L, L'\uEC4F',
+                        static_cast<UINT>(note), ink.r, ink.g, ink.b);
+                }
             }
-            const std::wstring mediaTitle = m_qsCache.mediaHave && !m_qsCache.mediaTitle.empty()
-                ? m_qsCache.mediaTitle
-                : (m_qsCache.mediaHave ? L"Now playing" : L"Nothing playing");
-            const std::wstring mediaArtist = m_qsCache.mediaHave
-                ? (m_qsCache.mediaArtist.empty() ? (m_qsCache.mediaPlaying ? L"Playing" : L"Paused")
-                                                 : m_qsCache.mediaArtist)
-                : L"System media";
-            const LONG textL = artLeft + art + P(8.0F);
-            const LONG textR = b.right - inset;
-            text({textL, artTop, textR, artTop + art / 2L + P(2.0F)}, labelFont, mediaTitle,
-                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-            text({textL, artTop + art / 2L + P(2.0F), textR, artTop + art + P(2.0F)}, statusFont, mediaArtist,
-                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 185);
-            const LONG scrubH = std::max(6L, P(7.0F));
-            const LONG scrubTop = artTop + art + P(12.0F);
-            const RECT scrub{b.left + inset, scrubTop, b.right - inset, scrubTop + scrubH};
+            const LONG textLeft = b.left + inset;
+            const LONG textRight = b.right - inset;
+            const LONG sideLeft = artRect.right + P(10.0F);
+            if (m_qsCache.mediaHave && !m_qsCache.mediaApp.empty()) {
+                text({sideLeft, artRect.top - P(1.0F), textRight, artRect.top + P(17.0F)}, statusFont,
+                    m_qsCache.mediaApp, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+            }
+            const RECT timeRect{sideLeft, artRect.bottom - P(18.0F), textRight, artRect.bottom + P(1.0F)};
+            std::wstring nowTitle = L"Not Playing";
+            std::wstring nowSubtitle;
+            if (m_qsCache.mediaHave) {
+                nowTitle = !m_qsCache.mediaTitle.empty() ? m_qsCache.mediaTitle
+                    : (!m_qsCache.mediaApp.empty() ? m_qsCache.mediaApp : std::wstring(L"Now Playing"));
+                nowSubtitle = m_qsCache.mediaArtist;
+                if (!m_qsCache.mediaAlbum.empty() && m_qsCache.mediaAlbum != m_qsCache.mediaTitle &&
+                    m_qsCache.mediaAlbum != m_qsCache.mediaArtist) {
+                    nowSubtitle += nowSubtitle.empty() ? m_qsCache.mediaAlbum : L" \u2013 " + m_qsCache.mediaAlbum;
+                }
+            }
+            const LONG lineW = textRight - textLeft;
+            const LONG titleTop = artRect.bottom + P(5.0F);
+            const LONG titleH = P(18.0F);
+            const LONG subtitleH = P(16.0F);
+            text({textLeft, titleTop, textRight, titleTop + titleH}, labelFont,
+                draw ? FitFlyoutLine(labelFont, nowTitle, lineW) : nowTitle,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            text({textLeft, titleTop + titleH, textRight, titleTop + titleH + subtitleH}, statusFont,
+                draw ? FitFlyoutLine(statusFont, nowSubtitle, lineW) : nowSubtitle,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 185);
+            const LONG scrubH = std::max(4L, P(5.0F));
+            const LONG scrubTop = b.top + P(100.0F);
+            const RECT scrub{textLeft, scrubTop, textRight, scrubTop + scrubH};
+            // Taller than the bar so it is easy to grab; same left/right so the
+            // drag maps 1:1 onto the drawn track.
+            const RECT scrubHit{scrub.left, scrubTop - P(6.0F), scrub.right, scrub.bottom + P(5.0F)};
+            const LONG rowTop = scrubHit.bottom;
+            const LONG rowBottom = b.bottom - P(3.0F);
+            const LONG third = (b.right - b.left) / 3L;
+            const RECT prev{b.left, rowTop, b.left + third, rowBottom};
+            const RECT play{prev.right, rowTop, b.right - third, rowBottom};
+            const RECT next{play.right, rowTop, b.right, rowBottom};
             if (draw) {
                 m_qsScrubRect = scrub;
                 m_qsScrubValid = true;
                 m_qsScrubInkR = ink.r;
                 m_qsScrubInkG = ink.g;
                 m_qsScrubInkB = ink.b;
+                m_qsMediaTimeRect = timeRect;
+                m_qsMediaTransportRect[0] = prev;
+                m_qsMediaTransportRect[1] = play;
+                m_qsMediaTransportRect[2] = next;
+                m_qsMediaLiveRect = {textLeft - P(6.0F), scrubHit.top, textRight + P(6.0F), rowBottom};
             }
-            push(TrayFlyoutHitKind::MediaSeek, scrub);
-            const LONG transport = P(32.0F);
-            const LONG transportGap = P(10.0F);
-            const LONG rowTop = scrub.bottom + P(10.0F);
-            const LONG rowW = transport * 3L + transportGap * 2L;
-            const LONG rowLeft = (b.left + b.right - rowW) / 2L;
-            const RECT prev{rowLeft, rowTop, rowLeft + transport, rowTop + transport};
-            const RECT play{prev.right + transportGap, rowTop, prev.right + transportGap + transport, rowTop + transport};
-            const RECT next{play.right + transportGap, rowTop, play.right + transportGap + transport, rowTop + transport};
+            if (m_qsCache.mediaHave) {
+                push(TrayFlyoutHitKind::MediaSeek, scrubHit);
+            }
             push(TrayFlyoutHitKind::MediaTransport, prev, 0);
             push(TrayFlyoutHitKind::MediaTransport, play, 1);
             push(TrayFlyoutHitKind::MediaTransport, next, 2);
-            const UINT transportIcon = static_cast<UINT>(std::max(14L, P(17.0F)));
-            auto center = [&](const RECT& r) {
-                return std::pair<LONG, LONG>{r.left + (transport - static_cast<LONG>(transportIcon)) / 2L,
-                    r.top + (transport - static_cast<LONG>(transportIcon)) / 2L};
-            };
-            icon(center(prev).first, center(prev).second, L'\uE892', transportIcon, ink.r, ink.g, ink.b);
-            icon(center(play).first, center(play).second, m_qsCache.mediaPlaying ? L'\uE769' : L'\uE768',
-                transportIcon, ink.r, ink.g, ink.b);
-            icon(center(next).first, center(next).second, L'\uE893', transportIcon, ink.r, ink.g, ink.b);
-            const float scrubLevel = (!m_qsPaintUnderlayPass && m_qsCache.mediaHave) ? m_qsCache.mediaProgress : 0.0F;
-            accentSlider(scrub, scrubLevel, ink);
         }
         // macOS 26 "Edit Controls" capsule under the grid; it reads "Done" in
         // edit mode, where modules drag instead of acting.
@@ -5123,9 +5880,14 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
         }
         break;
     case TrayFlyoutHitKind::MediaTransport:
+        // Optimistic snapshot: the glyph/time flip on this frame via a live
+        // present; GSMTC runs on the media worker.
         ControlMediaSession(hit.index == 0 ? 0 : (hit.index == 2 ? 2 : 1));
-        m_qsCache.stamp = 0;
-        QueueOverflowPaint();
+        if (RefreshQuickSettingsMedia(m_qsCache) == QsLiveChange::Labels) {
+            QueueOverflowPaint();
+        } else {
+            PaintOverflowLiveFast();
+        }
         break;
     }
 }

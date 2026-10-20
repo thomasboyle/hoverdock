@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -137,12 +138,35 @@ struct QuickSettingsCache {
     int gpuWatts = -1;
     // Set when WASAPI capture cannot be opened (permission, missing device).
     std::wstring inputNote;
+    // Now Playing, copied from the GSMTC media worker's snapshot (no IPC on
+    // the UI thread). mediaGen is the snapshot generation last copied.
+    uint64_t mediaGen = 0;
     std::wstring mediaTitle;
     std::wstring mediaArtist;
+    std::wstring mediaAlbum;
+    // Short source app label ("Spotify", "Chrome", ...).
+    std::wstring mediaApp;
     bool mediaHave = false;
     bool mediaPlaying = false;
-    // 0..1 along the GSMTC timeline. 0 when the session has no duration.
+    bool mediaCanPrev = false;
+    bool mediaCanNext = false;
+    bool mediaCanPlayPause = false;
+    // Premultiplied BGRA square artwork; mediaArtGen changes with the image.
+    std::shared_ptr<const std::vector<uint8_t>> mediaArt;
+    uint64_t mediaArtGen = 0;
+    // Timeline anchor (100 ns ticks at GetTickCount64 mediaAnchorMs) that the
+    // UI extrapolates while playing.
+    int64_t mediaPositionTicks = 0;
+    int64_t mediaDurationTicks = 0;
+    ULONGLONG mediaAnchorMs = 0;
+    double mediaRate = 1.0;
+    // Derived on every refresh: elapsed / duration and 0..1 progress (0 when
+    // the session reports no duration, e.g. live streams).
+    int64_t mediaElapsedMs = 0;
+    int64_t mediaDurationMs = 0;
     float mediaProgress = 0.0F;
+    // 0..1 while the scrub is being dragged (seek is sent on release), else -1.
+    float mediaScrubPreview = -1.0F;
 };
 
 // Release the Quick Settings capture client so the microphone-in-use indicator
@@ -157,7 +181,8 @@ enum class QsLiveChange : uint8_t {
 };
 // Read the background mic peak and rate-limited GSMTC state into cache.
 QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache);
-// Seek the current GSMTC session. level is 0..1 across its timeline.
+// Seek the current GSMTC session (on the media worker). level is 0..1 across
+// its timeline; the snapshot moves to the target at once.
 void SeekQuickSettingsMedia(float level) noexcept;
 // Kick a ToolHelp energy sample on a worker (~500 ms cadence). Posts notifyMsg to
 // notifyHwnd when a fresh result is ready; never blocks the UI thread.
