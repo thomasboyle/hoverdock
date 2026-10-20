@@ -169,6 +169,10 @@ Section "Uninstall"
   ExecWait '"$SYSDIR\schtasks.exe" /End /TN "HoverDockCpuTemp"' $0
   ExecWait '"$SYSDIR\taskkill.exe" /F /IM DockCpuTemp.exe' $0
   ExecWait '"$SYSDIR\schtasks.exe" /Delete /F /TN "HoverDockCpuTemp"' $0
+  ; Search full-disk indexer task (per-user, user may delete it). The indexer
+  ; copy under Program Files is admin-owned and stays until removed by an admin.
+  nsExec::Exec `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "Get-ScheduledTask -TaskName 'HoverdockMftIndex-*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$$false"`
+  Pop $0
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
   Delete "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk"

@@ -37,9 +37,10 @@ No Electron. No WebView. No Acrylic hacks. Just a single, fast native executable
 - 🧭 **Instantly familiar.** Pinned apps, running apps, drag-to-reorder, and a right-click menu to pin, close, or reveal an app's location.
 - 🔴 **Notification badges.** Unread counts from Teams, Outlook, WhatsApp and any other app that badges its Windows taskbar icon appear on its dock icon, just like macOS. Follows the Windows *Show badges on taskbar apps* setting.
 - 🛟 **Safe by design.** It auto-imports your existing taskbar pins on first run, and restores your taskbar on exit or crash. You can't get locked out.
+- 🔎 **Spotlight for Windows.** Press **Win + Space** and a glass search panel appears above the dock. Apps, files and folders match as you type, straight from the NTFS Master File Table, and stay current through the change journal. Results arrive in milliseconds, even on drives with millions of files.
 - 🤫 **Stays out of your way.** Per-user install (no admin), launch at startup, and silent auto-updates from GitHub Releases.
 
-**And more:** Quick Settings, Start and Search shortcuts, Per-Monitor V2 DPI awareness, UWP app support, and a weather widget.
+**And more:** Quick Settings, a Start shortcut, Per-Monitor V2 DPI awareness, UWP app support, and a weather widget.
 
 ## Get started in 30 seconds
 
@@ -58,6 +59,17 @@ Your taskbar pins are imported automatically, so your dock is ready the first ti
 | Pin, close, or locate an app | Right-click its icon |
 | Reorder icons | Drag an icon onto another slot |
 | Change startup, updates, or check version | Click the gear icon in Quick Settings |
+| Search apps, files and folders | Press **Win + Space** (or click the Search tile), type, then **Enter** |
+| Show a result in File Explorer | **Ctrl + Enter** (Ctrl + click) |
+| Copy a result's path | **Ctrl + C** |
+
+### Search
+
+Search reads file names straight from the Master File Table of every fixed NTFS drive, then follows the USN change journal so new, renamed and deleted files show up within about a second. Nothing is crawled or re-scanned.
+
+Reading the MFT needs administrator rights, and Hoverdock never runs elevated. Until you opt in, Search covers your user folders. Choose **Search this entire PC** in the results to approve, once, a small on-demand task. Approving copies the indexer to `%ProgramFiles%\Hoverdock` (so nothing user-writable ever runs elevated). When Hoverdock starts indexing, the task runs it with `--mft-dump`, it streams the file names to the dock over a private pipe, and then exits. Following the change journal doesn't need elevation.
+
+Win+Space normally switches keyboard layout. If you rely on that, set `SearchHotkey=0` under `[Dock]` in `dock.ini`.
 
 Your config lives at `%LOCALAPPDATA%\LiquidGlassDock\dock.ini`.
 
@@ -72,6 +84,8 @@ cmake -S . -B out -G "Visual Studio 17 2022" -A x64
 cmake --build out --config Release
 out\bin\Release\Dock.exe
 ```
+
+Search engine tests and benchmark: configure with `-DDOCK_BUILD_TESTS=ON`, then run `FileSearchIndexTests.exe`, `FileSearchIndexBench.exe` and, from an elevated prompt, `FileSearchServiceTests.exe`. The portable index tests also build anywhere: `c++ -std=c++20 -O2 -I src tests/FileSearchIndexTests.cpp src/FileSearchIndex.cpp`.
 
 Want to build the installer too? It's per-user and supports silent installs with `/S`:
 

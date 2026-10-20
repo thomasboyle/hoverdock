@@ -1,4 +1,5 @@
 ﻿#include "DockApp.h"
+#include "FileSearch.h"
 #include "SystemTemps.h"
 
 #include <Windows.h>
@@ -86,6 +87,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         if (HasArg(argc, argv, L"--install-cpu-sensor")) {
             LocalFree(argv);
             return InstallCpuSensorTask();
+        }
+        // Search: elevated MFT reader (run by its scheduled task) and its
+        // one-time registration (run via UAC from the Search panel).
+        if (HasArg(argc, argv, L"--mft-dump")) {
+            LocalFree(argv);
+            return RunMftDumpHelper();
+        }
+        if (argc >= 3 && _wcsicmp(argv[1], L"--register-mft-task") == 0) {
+            const std::wstring sid = argv[2];
+            LocalFree(argv);
+            return RegisterMftTask(sid.c_str());
         }
         LocalFree(argv);
     }

@@ -1,5 +1,4 @@
 #include "DockApp.h"
-#include "CodeEditor.h"
 #include "DockTheme.hlsli"
 #include "PerfBoost.h"
 #include "Profile.h"
@@ -1998,65 +1997,11 @@ bool IsAnyShellFlyoutVisible() {
     return IsStartLauncherVisible() || IsNotificationCenterVisible();
 }
 
-std::wstring TrimWide(std::wstring value) {
-    const auto first = std::find_if_not(value.begin(), value.end(), [](wchar_t character) {
-        return std::iswspace(character) != 0;
-    });
-    const auto last = std::find_if_not(value.rbegin(), value.rend(), [](wchar_t character) {
-        return std::iswspace(character) != 0;
-    }).base();
-    return first >= last ? L"" : std::wstring(first, last);
-}
-
 bool EqualInsensitiveWide(std::wstring_view left, std::wstring_view right) {
     return left.size() == right.size() &&
         std::equal(left.begin(), left.end(), right.begin(), [](wchar_t lhs, wchar_t rhs) {
             return std::towlower(lhs) == std::towlower(rhs);
         });
-}
-
-bool StartsWithInsensitiveWide(std::wstring_view value, std::wstring_view prefix) {
-    return value.size() >= prefix.size() &&
-        EqualInsensitiveWide(value.substr(0, prefix.size()), prefix);
-}
-
-std::wstring StripLaunchPhrases(std::wstring text) {
-    text = TrimWide(std::move(text));
-    constexpr std::wstring_view prefixes[] = {
-        L"open ", L"launch ", L"start ", L"switch to ", L"focus ", L"show ", L"bring up ",
-    };
-    bool stripped = true;
-    while (stripped && !text.empty()) {
-        stripped = false;
-        for (const std::wstring_view prefix : prefixes) {
-            if (StartsWithInsensitiveWide(text, prefix)) {
-                text = TrimWide(text.substr(prefix.size()));
-                stripped = true;
-                break;
-            }
-        }
-    }
-    if (StartsWithInsensitiveWide(text, L"the ")) {
-        text = TrimWide(text.substr(4));
-    }
-    return text;
-}
-
-std::wstring WindowText(HWND window) {
-    if (window == nullptr) {
-        return {};
-    }
-    const int length = GetWindowTextLengthW(window);
-    if (length <= 0) {
-        return {};
-    }
-    std::wstring text(static_cast<size_t>(length) + 1U, L'\0');
-    const int copied = GetWindowTextW(window, text.data(), length + 1);
-    if (copied <= 0) {
-        return {};
-    }
-    text.resize(static_cast<size_t>(copied));
-    return text;
 }
 
 class ComApartment {
@@ -2512,7 +2457,7 @@ DockApp::~DockApp() {
     m_bluetooth.Stop();
     RevokeTrashDropTarget();
     UnregisterTrashNotify();
-    CloseLaunchPrompt(false);
+    StopSearchServices();
     m_perfProfiler.Stop();
     DestroyDockSettings();
     DestroyOverflowPopup();
@@ -2649,6 +2594,8 @@ int DockApp::Run() {
         StartRefreshTimer();
     }
     Log(L"Dock initialized.");
+    // MFT file index (background, low priority) + Win+Space.
+    StartSearchServices();
     // Startup transient allocations (icon extraction temps, shell queries) stay
     // committed in the CRT heap; hand fully-free pages back to the OS once.
     static_cast<void>(_heapmin());
@@ -2786,101 +2733,6 @@ LRESULT CALLBACK DockApp::DragGhostWindowProcedure(HWND window, UINT message, WP
     default:
         return DefWindowProcW(window, message, wParam, lParam);
     }
-}
-
-LRESULT CALLBACK DockApp::LaunchPromptWindowProcedure(HWND window, UINT message, WPARAM wParam,
-    LPARAM lParam) {
-    DockApp* app = nullptr;
-    if (message == WM_NCCREATE) {
-        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
-        app = static_cast<DockApp*>(create->lpCreateParams);
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
-    } else {
-        app = reinterpret_cast<DockApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    }
-
-    switch (message) {
-    case WM_ERASEBKGND: {
-        RECT client{};
-        GetClientRect(window, &client);
-        static HBRUSH background = CreateSolidBrush(RGB(42, 42, 46));
-        FillRect(reinterpret_cast<HDC>(wParam), &client, background);
-        return 1;
-    }
-
-    case WM_CTLCOLOREDIT:
-    case WM_CTLCOLORSTATIC: {
-        const HDC context = reinterpret_cast<HDC>(wParam);
-        SetBkColor(context, RGB(42, 42, 46));
-        // Answer strip (child id 3): slightly cooler text so it reads as a reply.
-        if (message == WM_CTLCOLOREDIT && app != nullptr &&
-            reinterpret_cast<HWND>(lParam) == app->m_launchAnswer) {
-            SetTextColor(context, RGB(186, 220, 255));
-        } else {
-            SetTextColor(context, RGB(245, 245, 247));
-        }
-        static HBRUSH background = CreateSolidBrush(RGB(42, 42, 46));
-        return reinterpret_cast<LRESULT>(background);
-    }
-
-    case WM_ACTIVATE:
-        if (app != nullptr && LOWORD(wParam) == WA_INACTIVE) {
-            const HWND newlyActive = reinterpret_cast<HWND>(lParam);
-            if (newlyActive != app->m_window && newlyActive != app->m_inputWindow &&
-                newlyActive != app->m_launchEdit) {
-                app->CloseLaunchPrompt();
-            }
-        }
-        return 0;
-
-    case WM_KEYDOWN:
-        if (app != nullptr && wParam == VK_ESCAPE) {
-            app->CloseLaunchPrompt();
-            return 0;
-        }
-        break;
-
-    case WM_CLOSE:
-        if (app != nullptr) {
-            app->CloseLaunchPrompt();
-        }
-        return 0;
-
-    default:
-        break;
-    }
-    return DefWindowProcW(window, message, wParam, lParam);
-}
-
-LRESULT CALLBACK DockApp::LaunchEditProcedure(HWND window, UINT message, WPARAM wParam,
-    LPARAM lParam) {
-    DockApp* app = reinterpret_cast<DockApp*>(GetWindowLongPtrW(GetParent(window), GWLP_USERDATA));
-    WNDPROC previous = app == nullptr ? nullptr : app->m_launchEditPrevious;
-    if (message == WM_KEYDOWN && wParam == VK_RETURN) {
-        if (app != nullptr) {
-            app->SubmitLaunchPrompt();
-        }
-        return 0;
-    }
-    if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
-        if (app != nullptr) {
-            app->CloseLaunchPrompt();
-        }
-        return 0;
-    }
-    if (message == WM_CHAR && (wParam == VK_RETURN || wParam == VK_ESCAPE)) {
-        return 0;
-    }
-    if (message == WM_GETDLGCODE) {
-        const LRESULT code = previous == nullptr
-            ? DefWindowProcW(window, message, wParam, lParam)
-            : CallWindowProcW(previous, window, message, wParam, lParam);
-        return code | DLGC_WANTALLKEYS;
-    }
-    if (previous != nullptr) {
-        return CallWindowProcW(previous, window, message, wParam, lParam);
-    }
-    return DefWindowProcW(window, message, wParam, lParam);
 }
 
 LRESULT CALLBACK DockApp::OverflowWindowProcedure(HWND window, UINT message, WPARAM wParam,
@@ -3890,29 +3742,35 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
     }
 
-    case kLaunchResultMessage: {
-        std::unique_ptr<LaunchReply> reply(reinterpret_cast<LaunchReply*>(lParam));
-        if (reply != nullptr) {
-            Log(L"Search route=" + reply->route + L" worker_ms=" + std::to_wstring(reply->workerMs));
-            if (!reply->targets.empty()) {
-                m_launchTargets = std::move(reply->targets);
-            }
-            if (reply->agentMode) {
-                ApplyAgentResult(reply->generation, reply->agent);
-            } else {
-                ApplyLaunchJudgment(reply->generation, reply->judgment);
-            }
-        }
+    case kSearchResultMessage:
+        ApplySearchReply(std::unique_ptr<FileSearchReply>(reinterpret_cast<FileSearchReply*>(lParam)));
         return 0;
-    }
 
-    case kAgentStatusMessage: {
-        std::unique_ptr<AgentStatusReply> reply(reinterpret_cast<AgentStatusReply*>(lParam));
-        if (reply != nullptr && reply->generation == m_launchGeneration.load() && m_launchInFlight) {
-            SetLaunchPromptStatus(reply->text);
+    case kSearchAppsMessage:
+        ApplySearchApps(std::unique_ptr<SearchAppsReply>(reinterpret_cast<SearchAppsReply*>(lParam)));
+        return 0;
+
+    case kSearchIconMessage:
+        ApplySearchIcons(std::unique_ptr<SearchIconReply>(reinterpret_cast<SearchIconReply*>(lParam)));
+        return 0;
+
+    case kSearchStatusMessage:
+        if (IsSearchOpen()) {
+            SearchTextChanged();
         }
         return 0;
-    }
+
+    case kSearchHotkeyMessage:
+        ToggleSearch();
+        return 0;
+
+    case kSearchMftAccessMessage:
+        m_searchMftPrompting = false;
+        if (wParam != 0) {
+            Log(L"Search: full-disk (MFT) indexing enabled; reindexing.");
+            m_fileSearch.Restart();
+        }
+        return 0;
 
     case kTrayIconsMessage: {
         std::unique_ptr<std::vector<TrayNotifyIcon>> icons(reinterpret_cast<std::vector<TrayNotifyIcon>*>(lParam));
@@ -4104,7 +3962,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         StopUpdateTimer();
         UnregisterSystemResumeNotifications();
         StopShellFlyoutWatch();
-        CloseLaunchPrompt(false);
+        StopSearchServices();
         m_perfProfiler.Stop();
         DestroyDockSettings();
         BeginOverflowHide(false);
@@ -4729,7 +4587,7 @@ void DockApp::PositionOverlayWindows() {
     } else {
         UpdateHoverLabel();
     }
-    PositionLaunchPrompt();
+    PositionSearch();
     PositionOverflowPopup();
     PositionDockSettings();
     PositionContextMenu();
@@ -7973,7 +7831,7 @@ bool DockApp::TickLivePopupGlass()
 }
 
 bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* pixels,
-    size_t byteCount, bool dockFace, bool popupShadow)
+    size_t byteCount, bool dockFace, bool popupShadow, HWND alsoExclude)
 {
     if (!m_rendererInitialized || pixels == nullptr || width <= 0 || height <= 0) {
         return false;
@@ -7993,7 +7851,8 @@ bool DockApp::TryBakePopupGlass(POINT origin, LONG width, LONG height, uint8_t* 
                                        : (dockFace ? m_dsCcDescs : std::vector<Renderer::CcShapeDesc>{}));
     if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(width), static_cast<UINT>(height),
             PackPopupGlassFxFlags(dockFace, popupShadow), glassAlpha, dpiScale, m_settingsWindow,
-            m_overflowWindow, m_contextWindow, dockFace && m_config.LightPanels(), glass)) {
+            m_overflowWindow, alsoExclude != nullptr ? alsoExclude : m_contextWindow,
+            dockFace && m_config.LightPanels(), glass)) {
         return false;
     }
     if (glass.size() != static_cast<size_t>(width) * static_cast<size_t>(height) * 4U) {
@@ -11166,7 +11025,7 @@ void DockApp::HandlePointer(POINT cursor) {
     // If a borderless fullscreen game/app took focus while the dock was up,
     // slide away unless the user is actively over the dock or a flyout.
     if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
-        borderlessFullscreen && !IsLaunchPromptOpen() && !IsCursorOverDock(cursor) &&
+        borderlessFullscreen && !IsSearchOpen() && !IsCursorOverDock(cursor) &&
         !IsCursorWithinFlyoutZone(cursor) && !IsOverflowOpen() && !IsDockSettingsOpen() &&
         !IsContextMenuOpen()) {
         BeginHide();
@@ -11174,7 +11033,7 @@ void DockApp::HandlePointer(POINT cursor) {
     }
 
     if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
-        !inHotZone && !IsLaunchPromptOpen() && !IsCursorOverDock(cursor) &&
+        !inHotZone && !IsSearchOpen() && !IsCursorOverDock(cursor) &&
         !IsCursorWithinFlyoutZone(cursor) && !IsOverflowOpen() &&
         (cursor.y < m_visibleY + DockShadowMarginPx(static_cast<float>(HostDpi()) / 96.0F) ||
             MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) != m_hostMonitor)) {
@@ -12110,7 +11969,7 @@ void DockApp::ExecuteContextCommand(UINT command) {
     bool actionSucceeded = true;
     if (command == kContextOpen && hasApp) {
         if (app.app.target == kSearchTarget) {
-            actionSucceeded = OpenLaunchPrompt();
+            actionSucceeded = OpenSearch();
         } else if (isSpecial) {
             actionSucceeded = OpenStartMenuFromDock();
         } else {
@@ -12195,15 +12054,11 @@ void DockApp::ActivatePressedApp() {
     } launchGuard{this};
 
     if (app.app.target == kSearchTarget) {
-        if (IsLaunchPromptOpen()) {
-            CloseLaunchPrompt();
-        } else if (!OpenLaunchPrompt()) {
-            Log(L"Launch prompt could not be opened.");
-        }
+        ToggleSearch();
         return;
     }
-    if (IsLaunchPromptOpen() && app.app.target != kStartTarget) {
-        CloseLaunchPrompt(false);
+    if (IsSearchOpen() && app.app.target != kStartTarget) {
+        CloseSearch(false);
     }
     if (IsSpecialDockTarget(app.app.target)) {
         static_cast<void>(OpenStartMenuFromDock());
@@ -12256,558 +12111,6 @@ LaunchCandidate DockApp::MakeLaunchCandidate(const LaunchTarget& target) const {
         candidate.executable = DisplayNameFromExecutable(target.app.target);
     }
     return candidate;
-}
-
-bool DockApp::OpenLaunchPrompt() {
-    if (m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding) {
-        BeginShow();
-    }
-    HideHoverLabel();
-
-    if (m_launchPromptWindow != nullptr) {
-        PositionLaunchPrompt();
-        if (m_launchEdit != nullptr) {
-            SetForegroundWindow(m_launchPromptWindow);
-            SetFocus(m_launchEdit);
-        }
-        return true;
-    }
-
-    INITCOMMONCONTROLSEX commonControls{sizeof(commonControls), ICC_STANDARD_CLASSES};
-    InitCommonControlsEx(&commonControls);
-
-    const wchar_t className[] = L"LiquidGlassDockLaunchPrompt";
-    WNDCLASSEXW windowClass{sizeof(windowClass)};
-    windowClass.lpfnWndProc = &DockApp::LaunchPromptWindowProcedure;
-    windowClass.hInstance = m_instance;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
-    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-    windowClass.lpszClassName = className;
-    if (RegisterClassExW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        Log(L"Could not register the launch prompt window class.");
-        return false;
-    }
-
-    constexpr DWORD extendedStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
-    m_launchPromptWindow = CreateWindowExW(extendedStyle, className, L"Launch", WS_POPUP,
-        0, 0, 1, 1, nullptr, nullptr, m_instance, this);
-    if (m_launchPromptWindow == nullptr) {
-        Log(L"Could not create the launch prompt window.");
-        return false;
-    }
-    EnsureWindowCapturable(m_launchPromptWindow);
-
-    const DWORD corner = DWMWCP_ROUND;
-    DwmSetWindowAttribute(m_launchPromptWindow, DWMWA_WINDOW_CORNER_PREFERENCE, &corner,
-        sizeof(corner));
-
-    HFONT font = HoverLabelFont();
-    // Read-only multi-line strip above the edit for factual / specs answers.
-    m_launchAnswer = CreateWindowExW(0, L"EDIT", L"",
-        WS_CHILD | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_LEFT, 0, 0, 1, 1,
-        m_launchPromptWindow, reinterpret_cast<HMENU>(3), m_instance, nullptr);
-    m_launchEdit = CreateWindowExW(0, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT, 0, 0, 1, 1, m_launchPromptWindow,
-        reinterpret_cast<HMENU>(1), m_instance, nullptr);
-    m_launchStatus = CreateWindowExW(0, L"STATIC", L"Type an app name, folder, URL, or site search",
-        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 0, 0, 1, 1, m_launchPromptWindow,
-        reinterpret_cast<HMENU>(2), m_instance, nullptr);
-    if (m_launchEdit == nullptr || m_launchStatus == nullptr || m_launchAnswer == nullptr) {
-        Log(L"Could not create the launch prompt controls.");
-        CloseLaunchPrompt(false);
-        return false;
-    }
-
-    SendMessageW(m_launchAnswer, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-    SendMessageW(m_launchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-    SendMessageW(m_launchStatus, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-    SendMessageW(m_launchEdit, EM_SETCUEBANNER, TRUE,
-        reinterpret_cast<LPARAM>(L"chrome, Apple Watch Ultra 5 specs, open downloads..."));
-
-    m_launchEditPrevious = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(m_launchEdit, GWLP_WNDPROC,
-        reinterpret_cast<LONG_PTR>(&DockApp::LaunchEditProcedure)));
-    PositionLaunchPrompt();
-    ShowWindow(m_launchPromptWindow, SW_SHOW);
-    SetForegroundWindow(m_launchPromptWindow);
-    SetFocus(m_launchEdit);
-    return true;
-}
-
-void DockApp::CloseLaunchPrompt(bool hideDockIfAway) {
-    if (m_launchPromptWindow == nullptr) {
-        return;
-    }
-
-    ++m_launchGeneration;
-    m_launchInFlight = false;
-    m_launchTargets.clear();
-
-    if (m_launchEdit != nullptr && m_launchEditPrevious != nullptr) {
-        SetWindowLongPtrW(m_launchEdit, GWLP_WNDPROC,
-            reinterpret_cast<LONG_PTR>(m_launchEditPrevious));
-    }
-    m_launchEditPrevious = nullptr;
-    m_launchAnswer = nullptr;
-    m_launchEdit = nullptr;
-    m_launchStatus = nullptr;
-
-    if (m_launchPromptWindow != nullptr) {
-        const HWND prompt = m_launchPromptWindow;
-        m_launchPromptWindow = nullptr;
-        DestroyWindow(prompt);
-    }
-
-    if (!hideDockIfAway || m_visibility == VisibilityState::Hidden ||
-        m_visibility == VisibilityState::Hiding) {
-        return;
-    }
-
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    if (cursor.y < m_visibleY + DockShadowMarginPx(static_cast<float>(HostDpi()) / 96.0F) &&
-        !IsCursorOverDock(cursor)) {
-        BeginHide();
-    }
-}
-
-void DockApp::PositionLaunchPrompt() {
-    if (m_launchPromptWindow == nullptr) {
-        return;
-    }
-
-    const UINT dpi = m_window == nullptr ? 96U : std::max(GetDpiForWindow(m_window), 96U);
-    const float scale = static_cast<float>(dpi) / 96.0F;
-    const LONG padding = GreaterOf(10L, static_cast<LONG>(std::lround(12.0F * scale)));
-    const LONG editHeight = GreaterOf(22L, static_cast<LONG>(std::lround(24.0F * scale)));
-    const LONG statusHeight = GreaterOf(16L, static_cast<LONG>(std::lround(18.0F * scale)));
-    const LONG gap = GreaterOf(4L, static_cast<LONG>(std::lround(6.0F * scale)));
-    const LONG width = std::clamp(static_cast<LONG>(m_dockWidth) - padding * 2L,
-        GreaterOf(240L, static_cast<LONG>(std::lround(280.0F * scale))),
-        GreaterOf(320L, static_cast<LONG>(std::lround(420.0F * scale))));
-
-    std::wstring answerText;
-    if (m_launchAnswer != nullptr) {
-        answerText = WindowText(m_launchAnswer);
-    }
-    const bool showAnswer = !answerText.empty();
-    LONG answerHeight = 0;
-    if (showAnswer) {
-        // ~3 wrapped lines above the edit for short specs / Q&A answers.
-        answerHeight = GreaterOf(48L, static_cast<LONG>(std::lround(54.0F * scale)));
-        HDC dc = GetDC(m_launchPromptWindow);
-        if (dc != nullptr) {
-            HFONT font = HoverLabelFont();
-            HGDIOBJ old = font != nullptr ? SelectObject(dc, font) : nullptr;
-            RECT calc{0, 0, width - padding * 2L, 0};
-            DrawTextW(dc, answerText.c_str(), -1, &calc,
-                DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
-            if (old != nullptr) {
-                SelectObject(dc, old);
-            }
-            ReleaseDC(m_launchPromptWindow, dc);
-            const LONG measured = (calc.bottom - calc.top) + GreaterOf(4L, static_cast<LONG>(std::lround(6.0F * scale)));
-            answerHeight = std::clamp(measured, answerHeight,
-                GreaterOf(96L, static_cast<LONG>(std::lround(110.0F * scale))));
-        }
-    }
-
-    const LONG height = padding + (showAnswer ? answerHeight + gap : 0L) + editHeight + gap +
-        statusHeight + padding;
-    const LONG x = m_windowX + (static_cast<LONG>(m_dockWidth) - width) / 2L;
-    const LONG y = m_visibleY - height - GreaterOf(8L, static_cast<LONG>(std::lround(10.0F * scale)));
-
-    SetWindowPos(m_launchPromptWindow, HWND_TOPMOST, SaturatedInt(x), SaturatedInt(y),
-        SaturatedInt(width), SaturatedInt(height), SWP_NOOWNERZORDER);
-
-    LONG yCursor = padding;
-    if (m_launchAnswer != nullptr) {
-        if (showAnswer) {
-            ShowWindow(m_launchAnswer, SW_SHOW);
-            SetWindowPos(m_launchAnswer, nullptr, SaturatedInt(padding), SaturatedInt(yCursor),
-                SaturatedInt(width - padding * 2L), SaturatedInt(answerHeight),
-                SWP_NOZORDER | SWP_NOACTIVATE);
-            yCursor += answerHeight + gap;
-        } else {
-            ShowWindow(m_launchAnswer, SW_HIDE);
-            SetWindowPos(m_launchAnswer, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    }
-    if (m_launchEdit != nullptr) {
-        SetWindowPos(m_launchEdit, nullptr, SaturatedInt(padding), SaturatedInt(yCursor),
-            SaturatedInt(width - padding * 2L), SaturatedInt(editHeight),
-            SWP_NOZORDER | SWP_NOACTIVATE);
-        yCursor += editHeight + gap;
-    }
-    if (m_launchStatus != nullptr) {
-        SetWindowPos(m_launchStatus, nullptr, SaturatedInt(padding), SaturatedInt(yCursor),
-            SaturatedInt(width - padding * 2L), SaturatedInt(statusHeight),
-            SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-}
-
-void DockApp::SetLaunchPromptStatus(const std::wstring& text) {
-    if (m_launchStatus != nullptr) {
-        SetWindowTextW(m_launchStatus, text.c_str());
-    }
-}
-
-void DockApp::SetLaunchPromptAnswer(const std::wstring& text) {
-    if (m_launchAnswer == nullptr) {
-        return;
-    }
-    SetWindowTextW(m_launchAnswer, text.c_str());
-    PositionLaunchPrompt();
-}
-
-void DockApp::SubmitLaunchPrompt() {
-    if (m_launchInFlight || m_launchEdit == nullptr) {
-        return;
-    }
-
-    const std::wstring request = TrimWide(WindowText(m_launchEdit));
-    if (request.empty()) {
-        SetLaunchPromptStatus(L"Type an app name, folder, URL, or site search");
-        return;
-    }
-
-    const UINT generation = ++m_launchGeneration;
-    m_launchInFlight = true;
-    m_launchRequest = request;
-    SetLaunchPromptAnswer(L"");
-    SetLaunchPromptStatus(L"Looking...");
-
-    const HWND replyWindow = m_window;
-    const std::vector<DisplayApp> displayApps = m_displayApps;
-    const std::vector<RunningWindow> runningWindows = m_windows.RunningWindows();
-    std::thread([this, generation, request, replyWindow, displayApps, runningWindows]() {
-        // Never let an exception escape: an uncaught throw in a detached
-        // thread calls std::terminate and the dock vanishes with no log.
-        std::vector<LaunchTarget> targets;
-        LaunchJudgment judgment;
-        bool agentMode = false;
-        SearchAgentResult agent;
-        const auto postStatus = [replyWindow, generation](const std::wstring& text) {
-            if (replyWindow == nullptr) {
-                return;
-            }
-            AgentStatusReply* status = nullptr;
-            try {
-                status = new AgentStatusReply{generation, text};
-            } catch (...) {
-                return;
-            }
-            if (PostMessageW(replyWindow, kAgentStatusMessage, 0, reinterpret_cast<LPARAM>(status)) ==
-                FALSE) {
-                delete status;
-            }
-        };
-        const auto superseded = [this, generation]() { return m_launchGeneration.load() != generation; };
-        const auto launchJudgment = [](const std::string& id, double confidence) {
-            LaunchJudgment picked;
-            picked.action = LaunchJudgment::Action::Launch;
-            picked.chosenId = id;
-            picked.exists = 1.0;
-            picked.confidence = confidence;
-            return picked;
-        };
-        const auto started = std::chrono::steady_clock::now();
-        std::wstring route = L"none";
-        try {
-            m_installedApps.EnsureLoaded();
-            targets = CollectLaunchTargets(displayApps, runningWindows);
-            const std::string exactId = ExactLaunchId(request, targets);
-            if (!exactId.empty()) {
-                // Fast path 1: exact app name.
-                judgment = launchJudgment(exactId, 1.0);
-                route = L"exact";
-            } else {
-                std::vector<LaunchCandidate> candidates;
-                candidates.reserve(targets.size());
-                for (const LaunchTarget& target : targets) {
-                    candidates.push_back(MakeLaunchCandidate(target));
-                }
-                // Coding goals open in the most recently used IDE (focused when
-                // running); resolved lazily, it only touches window Z-order and
-                // a few file timestamps.
-                std::optional<CodeEditorChoice> editor;
-                const auto pickEditor = [&]() -> const CodeEditorChoice& {
-                    if (!editor.has_value()) {
-                        editor = FindPreferredCodeEditor(candidates);
-                    }
-                    return *editor;
-                };
-                const auto attachEditor = [&](SearchAgentResult& result) {
-                    for (SearchAgentAction& action : result.actions) {
-                        if (action.kind == SearchAgentAction::Kind::OpenInEditor) {
-                            const CodeEditorChoice& chosen = pickEditor();
-                            action.editor = chosen.exePath;
-                            action.editorArgs = chosen.args;
-                            action.editorWindow = reinterpret_cast<std::uintptr_t>(chosen.window);
-                            route += L" editor=" + chosen.name + L"(" + chosen.source + L")";
-                        }
-                    }
-                };
-                if (LlamaServerClient::LooksLikeCodingGoal(request)) {
-                    // Coding agent needs the local LLM; left out for now. Replays
-                    // of a previously written file still reopen it without a model.
-                    agentMode = true;
-                    auto replay = LlamaServerClient::TryReplayLastGoal(request);
-                    if (replay.has_value() && !replay->actions.empty() &&
-                        std::ranges::all_of(replay->actions, [](const SearchAgentAction& a) {
-                            return a.kind == SearchAgentAction::Kind::OpenInEditor &&
-                                LlamaServerClient::IsSafeEditorFile(a.target);
-                        })) {
-                        agent = std::move(*replay);
-                        route = L"code-replay";
-                        attachEditor(agent);
-                    } else {
-                        agent.reply = L"Local coding agent is disabled for now.";
-                        route = L"code-disabled";
-                    }
-                } else if (auto replay = LlamaServerClient::TryReplayLastGoal(request); replay.has_value()) {
-                    // Exact repeat of the last successful goal (no model).
-                    agentMode = true;
-                    agent = std::move(*replay);
-                    route = L"replay";
-                    attachEditor(agent);
-                } else if (auto plan = LlamaServerClient::PlanWithoutModel(request, candidates);
-                    plan.has_value()) {
-                    // Model-free: URL/domain, site search/home, folder/path, confident
-                    // catalog app (alias/acronym/typo), question -> web, keyword match,
-                    // or a compound of those.
-                    route = plan->route;
-                    if (plan->actions.size() == 1 &&
-                        plan->actions.front().kind == SearchAgentAction::Kind::LaunchApp) {
-                        judgment = launchJudgment(plan->actions.front().appId, 0.95);
-                    } else {
-                        agentMode = true;
-                        agent.actions = std::move(plan->actions);
-                    }
-                } else if (LlamaServerClient::LooksLikeAgentGoal(request)) {
-                    judgment = LlamaServerClient::ResolveAppFuzzy(
-                        LlamaServerClient::StripGoalVerbs(request), candidates);
-                    route = L"fuzzy-goal";
-                } else {
-                    // Plain search: lexical / substring ranking only (no llama-server).
-                    judgment = LlamaServerClient::ResolveAppFuzzy(request, candidates);
-                    route = L"fuzzy";
-                }
-            }
-        } catch (const std::exception&) {
-            agentMode = false;
-            judgment.action = LaunchJudgment::Action::Error;
-            judgment.error = L"Launch failed before a match could be picked.";
-        } catch (...) {
-            agentMode = false;
-            judgment.action = LaunchJudgment::Action::Error;
-            judgment.error = L"Launch failed unexpectedly.";
-        }
-        const long long workerMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started).count();
-        LaunchReply* reply = nullptr;
-        try {
-            reply = new LaunchReply{generation, std::move(judgment), std::move(targets), agentMode,
-                std::move(agent), std::move(route), workerMs};
-        } catch (...) {
-            return;
-        }
-        if (replyWindow == nullptr ||
-            PostMessageW(replyWindow, kLaunchResultMessage, 0,
-                reinterpret_cast<LPARAM>(reply)) == FALSE) {
-            delete reply;
-        }
-    }).detach();
-}
-
-void DockApp::ApplyLaunchJudgment(UINT generation, const LaunchJudgment& judgment) {
-    if (generation != m_launchGeneration.load()) {
-        return;
-    }
-
-    m_launchInFlight = false;
-    if (m_launchEdit != nullptr) {
-        SetFocus(m_launchEdit);
-    }
-
-    Log(L"Launch judgment action=" + std::to_wstring(static_cast<int>(judgment.action)) +
-        L" choice=" + std::wstring(judgment.chosenId.begin(), judgment.chosenId.end()) +
-        L" path=" + judgment.openPath +
-        L" fuzzy=" + std::to_wstring(judgment.usedFuzzyFallback ? 1 : 0) +
-        L" exists=" + std::to_wstring(judgment.exists) +
-        L" confidence=" + std::to_wstring(judgment.confidence));
-
-    if (judgment.action == LaunchJudgment::Action::Error) {
-        SetLaunchPromptStatus(judgment.error.empty() ? L"Launch request failed." : judgment.error);
-        return;
-    }
-    if (judgment.action == LaunchJudgment::Action::Uncertain) {
-        SetLaunchPromptStatus(L"Not sure which app. Try a more specific name.");
-        return;
-    }
-    if (judgment.action == LaunchJudgment::Action::None) {
-        SetLaunchPromptStatus(L"No matching installed app.");
-        return;
-    }
-
-    if (!judgment.openPath.empty()) {
-        if (!LlamaServerClient::IsSafeShellOpenTarget(false, judgment.openPath)) {
-            SetLaunchPromptStatus(L"Blocked unsafe path.");
-            return;
-        }
-        const HINSTANCE opened = ShellExecuteW(nullptr, L"open", judgment.openPath.c_str(), nullptr,
-            nullptr, SW_SHOWNORMAL);
-        if (reinterpret_cast<INT_PTR>(opened) <= 32) {
-            SetLaunchPromptStatus(L"Could not open that path.");
-            return;
-        }
-        SearchAgentAction remembered;
-        remembered.kind = SearchAgentAction::Kind::OpenPath;
-        remembered.target = judgment.openPath;
-        remembered.label = judgment.openPath;
-        LlamaServerClient::RememberSuccessfulGoal(m_launchRequest, {remembered});
-        CloseLaunchPrompt(false);
-        BeginHide();
-        return;
-    }
-
-    const LaunchTarget* target = FindLaunchTarget(judgment.chosenId);
-    if (target == nullptr) {
-        SetLaunchPromptStatus(L"No matching installed app.");
-        return;
-    }
-    if (!ActivateLaunchTarget(*target)) {
-        SetLaunchPromptStatus(L"The selected app could not be opened.");
-        return;
-    }
-    LlamaServerClient::RememberSuccessfulLaunch(m_launchRequest, judgment.chosenId, target->app.name);
-    CloseLaunchPrompt(false);
-    BeginHide();
-}
-
-void DockApp::ApplyAgentResult(UINT generation, const SearchAgentResult& result) {
-    if (generation != m_launchGeneration.load()) {
-        return;
-    }
-
-    m_launchInFlight = false;
-    if (m_launchEdit != nullptr) {
-        SetFocus(m_launchEdit);
-    }
-
-    Log(L"Search agent steps=" + std::to_wstring(result.steps) +
-        L" actions=" + std::to_wstring(result.actions.size()) + L" reply=" + result.reply);
-
-    size_t performed = 0;
-    std::wstring failure;
-    // write_file results: planned path -> file actually created (CREATE_NEW may
-    // pick name-2.ext). OpenInEditor opens the created file only.
-    std::vector<std::pair<std::wstring, std::wstring>> written;
-    std::vector<std::wstring> failedWrites;
-    std::vector<SearchAgentAction> remember;
-    for (const SearchAgentAction& action : result.actions) {
-        switch (action.kind) {
-        case SearchAgentAction::Kind::WriteFile: {
-            std::wstring path;
-            std::wstring why;
-            if (LlamaServerClient::WriteAgentFile(action, path, why)) {
-                Log(L"Search agent wrote " + path + L" bytes=" + std::to_wstring(action.content.size()));
-                written.emplace_back(action.target, path);
-                ++performed;
-            } else {
-                Log(L"Search agent write blocked: " + action.target + L" (" + why + L")");
-                failedWrites.push_back(action.target);
-                failure = L"Could not write " + action.label + L" (" + why + L").";
-            }
-            break;
-        }
-        case SearchAgentAction::Kind::OpenInEditor: {
-            if (std::ranges::find(failedWrites, action.target) != failedWrites.end()) {
-                break;
-            }
-            std::wstring file = action.target;
-            for (const auto& [planned, actual] : written) {
-                if (planned == action.target) {
-                    file = actual;
-                }
-            }
-            if (!LlamaServerClient::IsSafeEditorFile(file)) {
-                failure = L"Blocked unsafe file.";
-                break;
-            }
-            HWND editorWindow = reinterpret_cast<HWND>(action.editorWindow);
-            bool opened = OpenFileInCodeEditor(action.editor, action.editorArgs, editorWindow, file);
-            if (!opened && !action.editor.empty()) {
-                opened = OpenFileInCodeEditor(L"", L"", nullptr, file);  // Notepad fallback
-            }
-            Log(L"Search agent open in editor=" + (action.editor.empty() ? std::wstring(L"notepad") : action.editor) +
-                L" file=" + file + L" ok=" + std::to_wstring(opened ? 1 : 0));
-            if (opened) {
-                ++performed;
-                SearchAgentAction again = action;
-                again.target = file;
-                remember.push_back(std::move(again));
-            } else {
-                failure = L"Wrote " + file + L" but could not open an editor.";
-            }
-            break;
-        }
-        case SearchAgentAction::Kind::LaunchApp: {
-            const LaunchTarget* target = FindLaunchTarget(action.appId);
-            Log(L"Search agent launch id=" + std::wstring(action.appId.begin(), action.appId.end()) +
-                L" label=" + action.label);
-            if (target != nullptr && ActivateLaunchTarget(*target)) {
-                ++performed;
-            } else {
-                failure = L"Could not open " + action.label + L".";
-            }
-            break;
-        }
-        case SearchAgentAction::Kind::OpenUrl:
-        case SearchAgentAction::Kind::OpenPath: {
-            // Defence in depth: re-validate before ShellExecute.
-            const bool isUrl = action.kind == SearchAgentAction::Kind::OpenUrl;
-            if (!LlamaServerClient::IsSafeShellOpenTarget(isUrl, action.target)) {
-                failure = L"Blocked unsafe target.";
-                break;
-            }
-            Log(L"Search agent ShellExecute " + std::wstring(isUrl ? L"url=" : L"path=") + action.target);
-            const HINSTANCE opened = ShellExecuteW(nullptr, L"open", action.target.c_str(), nullptr,
-                nullptr, SW_SHOWNORMAL);
-            if (reinterpret_cast<INT_PTR>(opened) > 32) {
-                ++performed;
-            } else {
-                failure = L"Could not open " + action.label + L".";
-            }
-            break;
-        }
-        }
-    }
-
-    if (performed > 0) {
-        // A code goal is remembered as "reopen the file it wrote", never as a
-        // second write.
-        const bool hasEditorStep = std::ranges::any_of(result.actions, [](const SearchAgentAction& a) {
-            return a.kind == SearchAgentAction::Kind::WriteFile || a.kind == SearchAgentAction::Kind::OpenInEditor;
-        });
-        if (!hasEditorStep) {
-            LlamaServerClient::RememberSuccessfulGoal(m_launchRequest, result.actions);
-        } else if (!remember.empty()) {
-            LlamaServerClient::RememberSuccessfulGoal(m_launchRequest, remember);
-        }
-        CloseLaunchPrompt(false);
-        BeginHide();
-        return;
-    }
-    if (failure.empty() && !result.reply.empty()) {
-        // Status / disabled-feature reply: keep Search open and show text above
-        // the edit (no local LLM answers or tok/s).
-        Log(L"Search reply shown chars=" + std::to_wstring(result.reply.size()));
-        SetLaunchPromptAnswer(result.reply);
-        SetLaunchPromptStatus(L"-");
-        return;
-    }
-    SetLaunchPromptStatus(!failure.empty() ? failure
-        : L"No matching app, folder, or site for that.");
 }
 
 std::vector<DockApp::LaunchTarget> DockApp::CollectLaunchTargets(
@@ -12955,41 +12258,6 @@ std::vector<DockApp::LaunchTarget> DockApp::CollectLaunchTargets(
     return targets;
 }
 
-const DockApp::LaunchTarget* DockApp::FindLaunchTarget(const std::string& id) const noexcept {
-    for (const LaunchTarget& target : m_launchTargets) {
-        if (target.id == id) {
-            return &target;
-        }
-    }
-    return nullptr;
-}
-
-std::string DockApp::ExactLaunchId(const std::wstring& request,
-    const std::vector<LaunchTarget>& targets) const {
-    const std::wstring stripped = StripLaunchPhrases(request);
-    if (stripped.empty()) {
-        return {};
-    }
-
-    const LaunchTarget* matched = nullptr;
-    for (const LaunchTarget& target : targets) {
-        const LaunchCandidate candidate = MakeLaunchCandidate(target);
-        if (EqualInsensitiveWide(stripped, candidate.name) ||
-            EqualInsensitiveWide(stripped, candidate.pinName) ||
-            EqualInsensitiveWide(stripped, candidate.shortcutName) ||
-            EqualInsensitiveWide(stripped, candidate.productName) ||
-            EqualInsensitiveWide(stripped, candidate.executable) ||
-            EqualInsensitiveWide(stripped, candidate.windowTitle) ||
-            (target.isStart && EqualInsensitiveWide(stripped, L"start menu"))) {
-            if (matched != nullptr) {
-                return {};
-            }
-            matched = &target;
-        }
-    }
-    return matched == nullptr ? std::string{} : matched->id;
-}
-
 bool DockApp::ActivateLaunchTarget(const LaunchTarget& target) {
     if (target.isStart) {
         return OpenStartMenuFromDock();
@@ -13011,10 +12279,6 @@ bool DockApp::ActivateLaunchTarget(const LaunchTarget& target) {
     m_lastWindowRefresh = 0.0;
     RefreshRunningWindows();
     return true;
-}
-
-bool DockApp::IsLaunchPromptOpen() const noexcept {
-    return m_launchPromptWindow != nullptr && IsWindowVisible(m_launchPromptWindow) != FALSE;
 }
 
 void DockApp::CacheLayoutSlotBounds() {
@@ -15020,7 +14284,7 @@ bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
     }
     if (foreground == m_window || foreground == m_inputWindow ||
         foreground == m_hoverLabelWindow || foreground == m_dragGhostWindow ||
-        foreground == m_launchPromptWindow || foreground == m_overflowWindow ||
+        foreground == m_searchWindow || foreground == m_overflowWindow ||
         foreground == m_settingsWindow || foreground == m_contextWindow) {
         return false;
     }
@@ -15193,7 +14457,7 @@ bool DockApp::NeedsHookPointerPost(POINT cursor) const noexcept {
             return true;
         }
         if (IsCursorWithinFlyoutZone(cursor) || IsOverflowOpen() || IsDockSettingsOpen() ||
-            IsContextMenuOpen() || IsLaunchPromptOpen()) {
+            IsContextMenuOpen() || IsSearchOpen()) {
             return true;
         }
         return false;

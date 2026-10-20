@@ -23,8 +23,15 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
-          cmake -S . -B out -G "Visual Studio 17 2022" -A x64
+          cmake -S . -B out -G "Visual Studio 17 2022" -A x64 -DDOCK_BUILD_TESTS=ON
           cmake --build out --config Release
+
+      - name: Search engine tests
+        shell: cmd
+        run: |
+          out\bin\Release\FileSearchIndexTests.exe || exit /b 1
+          out\bin\Release\FileSearchIndexBench.exe || exit /b 1
+          out\bin\Release\FileSearchServiceTests.exe || exit /b 1
 
       - name: Install NSIS
         shell: powershell

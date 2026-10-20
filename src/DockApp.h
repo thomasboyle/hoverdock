@@ -5,7 +5,8 @@
 #include "NotificationBadges.h"
 #include "Renderer.h"
 #include "TypeSafeClient.h"
-#include "LlamaServerClient.h"
+#include "FileSearch.h"
+#include "SearchHotkey.h"
 #include "WindowCatalog.h"
 #include "SystemTray.h"
 #include "Bluetooth.h"
@@ -20,9 +21,11 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -95,22 +98,27 @@ private:
         std::wstring windowTitle;
     };
 
-    struct LaunchReply {
-        UINT generation = 0;
-        LaunchJudgment judgment;
-        std::vector<LaunchTarget> targets;
-        // Agent-in-search: when set, `agent` carries the validated actions and
-        // reply instead of `judgment`.
-        bool agentMode = false;
-        SearchAgentResult agent;
-        // Latency log: which path resolved the query and worker time.
-        std::wstring route;
-        long long workerMs = 0;
+    // Spotlight-style Search panel rows.
+    struct SearchRow {
+        enum class Kind : uint8_t { App, File, Folder, Web, EnableMft, Info };
+        Kind kind = Kind::Info;
+        std::wstring title;
+        std::wstring subtitle;
+        std::wstring path;
+        size_t appIndex = 0;
+        // Icon cache key + what to extract it from (empty: drawn glyph).
+        std::wstring iconKey;
+        std::wstring iconSource;
     };
 
-    struct AgentStatusReply {
-        UINT generation = 0;
-        std::wstring text;
+    struct SearchAppsReply {
+        std::vector<LaunchTarget> targets;
+        std::vector<std::wstring> names;
+    };
+
+    struct SearchIconReply {
+        UINT extent = 0;
+        std::vector<std::pair<std::wstring, std::vector<uint8_t>>> icons;
     };
 
     struct BoostReply {
@@ -138,7 +146,7 @@ private:
     static constexpr UINT kPointerMessage = WM_APP + 1;
     static constexpr UINT kRenderMessage = WM_APP + 2;
     static constexpr UINT kRefreshApplyMessage = WM_APP + 5;
-    static constexpr UINT kLaunchResultMessage = WM_APP + 6;
+    static constexpr UINT kSearchResultMessage = WM_APP + 6;
     static constexpr UINT kOpenStartMenuMessage = WM_APP + 7;
     static constexpr UINT kOverflowPaintMessage = WM_APP + 8;
     static constexpr UINT kOverflowWheelMessage = WM_APP + 9;
@@ -152,7 +160,11 @@ private:
     static constexpr UINT kDeferredClickMessage = WM_APP + 17;
     static constexpr UINT kWeatherMessage = WM_APP + 22;
     static constexpr UINT kBluetoothMessage = WM_APP + 23;
-    static constexpr UINT kAgentStatusMessage = WM_APP + 28;
+    static constexpr UINT kSearchStatusMessage = WM_APP + 28;
+    static constexpr UINT kSearchHotkeyMessage = WM_APP + 36;
+    static constexpr UINT kSearchIconMessage = WM_APP + 37;
+    static constexpr UINT kSearchAppsMessage = WM_APP + 38;
+    static constexpr UINT kSearchMftAccessMessage = WM_APP + 39;
     static constexpr UINT_PTR kWeatherTimerId = 10;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
@@ -349,9 +361,7 @@ private:
         LPARAM lParam);
     static LRESULT CALLBACK DragGhostWindowProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
-    static LRESULT CALLBACK LaunchPromptWindowProcedure(HWND window, UINT message, WPARAM wParam,
-        LPARAM lParam);
-    static LRESULT CALLBACK LaunchEditProcedure(HWND window, UINT message, WPARAM wParam,
+    static LRESULT CALLBACK SearchWindowProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
     static LRESULT CALLBACK OverflowWindowProcedure(HWND window, UINT message, WPARAM wParam,
         LPARAM lParam);
@@ -466,8 +476,10 @@ private:
         const RECT* dirty = nullptr, bool preservePopupShadow = false) noexcept;
     void QueueSettingsPaint(bool hoverOnly = false);
     [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false) const noexcept;
+    // `alsoExclude` keeps another visible popup (Search) out of the sample.
     [[nodiscard]] bool TryBakePopupGlass(POINT origin, LONG width, LONG height,
-        uint8_t* pixels, size_t byteCount, bool dockFace, bool popupShadow = false);
+        uint8_t* pixels, size_t byteCount, bool dockFace, bool popupShadow = false,
+        HWND alsoExclude = nullptr);
     void RebuildSettingsPopup();
     void HandleSettingsClick(const SettingsHit& hit, UINT message);
     void ApplyFrostSliderAt(LONG clientX);
@@ -612,23 +624,35 @@ private:
     void EnsureContextFonts(float scale);
     void DestroyContextFonts() noexcept;
     void ActivatePressedApp();
-    bool OpenLaunchPrompt();
-    void CloseLaunchPrompt(bool hideDockIfAway = true);
-    void PositionLaunchPrompt();
-    void SetLaunchPromptStatus(const std::wstring& text);
-    void SetLaunchPromptAnswer(const std::wstring& text);
-    void SubmitLaunchPrompt();
-    void ApplyLaunchJudgment(UINT generation, const LaunchJudgment& judgment);
-    void ApplyAgentResult(UINT generation, const SearchAgentResult& result);
+    // Spotlight Search (DockSearch.cpp): glass panel centred above the dock,
+    // Win+Space, MFT-backed file index + app catalogue.
+    bool OpenSearch();
+    void CloseSearch(bool hideDockIfAway = true);
+    void ToggleSearch();
+    [[nodiscard]] bool IsSearchOpen() const noexcept;
+    void PositionSearch();
+    void PaintSearch();
+    void SearchTextChanged();
+    void ApplySearchReply(std::unique_ptr<FileSearchReply> reply);
+    void ApplySearchApps(std::unique_ptr<SearchAppsReply> reply);
+    void ApplySearchIcons(std::unique_ptr<SearchIconReply> reply);
+    void RefreshSearchApps();
+    void RequestSearchIcons();
+    void ActivateSearchRow(int index, bool reveal);
+    void MoveSearchSelection(int delta);
+    bool HandleSearchKey(WPARAM key);
+    void HandleSearchChar(wchar_t character);
+    [[nodiscard]] int SearchRowAt(POINT client) const noexcept;
+    [[nodiscard]] bool SearchScreenOrigin(POINT& origin, SIZE& size, float& scale) const;
+    void EnsureSearchFonts(float scale);
+    void DestroySearchFonts() noexcept;
+    void StartSearchServices();
+    void StopSearchServices() noexcept;
     [[nodiscard]] std::vector<LaunchTarget> CollectLaunchTargets(
         const std::vector<DisplayApp>& displayApps,
         const std::vector<RunningWindow>& runningWindows) const;
-    [[nodiscard]] const LaunchTarget* FindLaunchTarget(const std::string& id) const noexcept;
     [[nodiscard]] LaunchCandidate MakeLaunchCandidate(const LaunchTarget& target) const;
-    [[nodiscard]] std::string ExactLaunchId(const std::wstring& request,
-        const std::vector<LaunchTarget>& targets) const;
     bool ActivateLaunchTarget(const LaunchTarget& target);
-    [[nodiscard]] bool IsLaunchPromptOpen() const noexcept;
     void BeginDrag(POINT screenCursor);
     void UpdateDrag(POINT screenCursor);
     void FinishDrag(POINT screenCursor);
@@ -763,10 +787,7 @@ private:
     HWND m_inputWindow = nullptr;
     HWND m_hoverLabelWindow = nullptr;
     HWND m_dragGhostWindow = nullptr;
-    HWND m_launchPromptWindow = nullptr;
-    HWND m_launchAnswer = nullptr;  // multi-line Q&A strip above the Search edit
-    HWND m_launchEdit = nullptr;
-    HWND m_launchStatus = nullptr;
+    HWND m_searchWindow = nullptr;
     HHOOK m_mouseHook = nullptr;
     HHOOK m_overflowDismissHook = nullptr;
     HFONT m_hoverLabelFont = nullptr;
@@ -986,12 +1007,41 @@ private:
     std::atomic<UINT> m_pinIconGeneration{0};
     std::mutex m_pinIconMutex;
     std::optional<PinIconResult> m_pinIconPending;
-    std::vector<LaunchTarget> m_launchTargets;
-    std::atomic<UINT> m_launchGeneration{0};
-    std::atomic<bool> m_launchInFlight{false};
-    // Last submitted Search query (for last-goal replay memory).
-    std::wstring m_launchRequest;
-    WNDPROC m_launchEditPrevious = nullptr;
+    // ---- Spotlight Search ----
+    FileSearchService m_fileSearch;
+    SearchHotkey m_searchHotkey;
+    std::wstring m_searchText;
+    size_t m_searchCaret = 0;
+    bool m_searchSelectAll = false;
+    bool m_searchCaretVisible = true;
+    std::vector<SearchRow> m_searchRows;
+    int m_searchSelected = 0;
+    int m_searchScroll = 0;
+    uint64_t m_searchRequestId = 0;
+    std::vector<LaunchTarget> m_searchApps;
+    bool m_searchAppsInFlight = false;
+    std::unordered_map<std::wstring, std::vector<uint8_t>> m_searchIcons;
+    std::unordered_set<std::wstring> m_searchIconsMissing;
+    bool m_searchIconsInFlight = false;
+    UINT m_searchIconExtent = 0;
+    bool m_searchMftPrompting = false;
+    bool m_searchClosing = false;
+    // Last client mouse position: rows only follow real pointer movement.
+    POINT m_searchMouse{-1, -1};
+    // Glass plates per panel height (origin is fixed while open; rows grow down).
+    std::unordered_map<LONG, std::vector<uint8_t>> m_searchGlass;
+    POINT m_searchGlassOrigin{};
+    POINT m_searchOrigin{};
+    SIZE m_searchSize{};
+    std::vector<uint8_t> m_searchBits;
+    std::vector<RECT> m_searchRowRects;
+    float m_searchFontScale = 0.0F;
+    HFONT m_searchQueryFont = nullptr;
+    HFONT m_searchTitleFont = nullptr;
+    HFONT m_searchSubFont = nullptr;
+    HFONT m_searchGlyphFont = nullptr;
+    HFONT m_searchBigGlyphFont = nullptr;
+    LayerPresentDib m_searchLayerDib{};
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;
     WeatherService m_weather;

@@ -940,7 +940,7 @@ bool DockConfig::Load() {
     m_followsTaskbarPins = true;
     m_dockScale = 1.0F;
     m_typeSafeApiKey.clear();
-    m_llamaServerUrl.clear();
+    m_searchHotkey = true;
     m_launchAtStartup = false;
     m_checkForUpdates = true;
     m_rimLight = true;
@@ -976,9 +976,9 @@ bool DockConfig::Load() {
         if (typeSafeApiKey != dockSection->second.end()) {
             m_typeSafeApiKey = typeSafeApiKey->second;
         }
-        const auto llamaServerUrl = dockSection->second.find(L"llamaserverurl");
-        if (llamaServerUrl != dockSection->second.end()) {
-            m_llamaServerUrl = llamaServerUrl->second;
+        const auto searchHotkey = dockSection->second.find(L"searchhotkey");
+        if (searchHotkey != dockSection->second.end()) {
+            m_searchHotkey = ParseBoolean(searchHotkey->second);
         }
         const auto launchAtStartup = dockSection->second.find(L"launchatstartup");
         if (launchAtStartup != dockSection->second.end()) {
@@ -1146,8 +1146,8 @@ bool DockConfig::Save() const {
     if (!m_typeSafeApiKey.empty()) {
         contents << L"TypeSafeApiKey=" << m_typeSafeApiKey << L"\n";
     }
-    if (!m_llamaServerUrl.empty()) {
-        contents << L"LlamaServerUrl=" << m_llamaServerUrl << L"\n";
+    if (!m_searchHotkey) {
+        contents << L"SearchHotkey=0\n";
     }
     contents << L"\n";
 
@@ -1350,16 +1350,8 @@ std::wstring DockConfig::TypeSafeApiKey() const {
     return Trim(m_typeSafeApiKey);
 }
 
-std::wstring DockConfig::LlamaServerUrl() const {
-    const std::wstring fromEnvironment = Trim(EnvironmentVariable(L"HOVERDOCK_LLAMA_URL"));
-    if (!fromEnvironment.empty()) {
-        return fromEnvironment;
-    }
-    const std::wstring configured = Trim(m_llamaServerUrl);
-    if (!configured.empty()) {
-        return configured;
-    }
-    return L"http://127.0.0.1:8080";
+bool DockConfig::SearchHotkey() const noexcept {
+    return m_searchHotkey;
 }
 
 void DockConfig::SetDefaults() {
@@ -1384,4 +1376,5 @@ void DockConfig::SetDefaults() {
     m_qsIconColor = kDefaultQsIconColor;
     m_qsLayout.clear();
     m_frostAmount = 0.0F;
+    m_searchHotkey = true;
 }

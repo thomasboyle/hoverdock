@@ -42,8 +42,6 @@ add_executable(Dock WIN32
     src/SystemTemps.cpp
     src/Weather.cpp
     src/TypeSafeClient.cpp
-    src/LlamaServerClient.cpp
-    src/CodeEditor.cpp
     src/Updater.cpp
     src/WindowCatalog.cpp
     src/Bluetooth.cpp
@@ -51,6 +49,10 @@ add_executable(Dock WIN32
     src/PerfProfiler.cpp
     src/RecycleBin.cpp
     src/SpeedTest.cpp
+    src/FileSearchIndex.cpp
+    src/FileSearch.cpp
+    src/SearchHotkey.cpp
+    src/DockSearch.cpp
 )
 
 file(GLOB _dock_media_headers
@@ -190,6 +192,28 @@ add_dependencies(Dock DockShaders)
 
 set_property(TARGET Dock PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:Dock>")
 
+
+# --- Search engine tests (opt-in: -DDOCK_BUILD_TESTS=ON) -------------------
+#   FileSearchIndexTests   portable index unit tests (also build off-Windows)
+#   FileSearchIndexBench   query benchmark at real-volume scale
+#   FileSearchServiceTests real-disk MFT/journal/helper integration (elevated)
+option(DOCK_BUILD_TESTS "Build the Search engine tests" OFF)
+if(DOCK_BUILD_TESTS)
+    enable_testing()
+    function(add_dock_test name)
+        add_executable(${name} ${ARGN})
+        target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_definitions(${name} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_compile_options(${name} PRIVATE /W4 /WX /permissive- /EHsc /utf-8
+            $<IF:$<BOOL:${DOCK_HAS_CXX26}>,/std:c++26,/std:c++latest>)
+    endfunction()
+    add_dock_test(FileSearchIndexTests tests/FileSearchIndexTests.cpp src/FileSearchIndex.cpp)
+    add_dock_test(FileSearchIndexBench tests/FileSearchIndexBench.cpp src/FileSearchIndex.cpp)
+    add_dock_test(FileSearchServiceTests tests/FileSearchServiceTests.cpp src/FileSearch.cpp
+        src/FileSearchIndex.cpp)
+    target_link_libraries(FileSearchServiceTests PRIVATE taskschd ole32 oleaut32 shell32 advapi32)
+    add_test(NAME FileSearchIndexTests COMMAND FileSearchIndexTests)
+endif()
 
 # Signed PawnIO IntelMSR blob header (third_party/pawnio/IntelMsrBin.h).
 target_include_directories(Dock PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pawnio")
