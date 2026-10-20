@@ -83,7 +83,9 @@ LRESULT CALLBACK SearchHotkey::Hook(int code, WPARAM wParam, LPARAM lParam) {
     SearchHotkey* self = g_hotkey;
     if (code == HC_ACTION && self != nullptr) {
         const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
-        if (key->vkCode == VK_SPACE && (key->flags & LLKHF_INJECTED) == 0) {
+        // Injected Space is honoured too (PowerToys / AutoHotkey remaps); our
+        // own masking key is not Space, so it cannot re-trigger this.
+        if (key->vkCode == VK_SPACE) {
             const bool keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
             if (keyDown && (Down(VK_LWIN) || Down(VK_RWIN)) && !Down(VK_CONTROL) && !Down(VK_MENU) &&
                 !Down(VK_SHIFT)) {
