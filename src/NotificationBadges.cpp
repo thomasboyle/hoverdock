@@ -6,6 +6,7 @@
 #include <array>
 #include <cwctype>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -94,11 +95,22 @@ struct SqliteApi {
     }
 };
 
-// Latest badge per handler wins (ArrivalTime ascending, later rows overwrite).
+// Badges and toasts. Latest badge per handler wins (ArrivalTime ascending,
+// later rows overwrite); toasts are counted per handler.
 constexpr char kBadgeQuery[] =
-    "SELECT h.PrimaryId, n.Payload, n.ExpiryTime FROM Notification n "
+    "SELECT h.PrimaryId, n.Type, n.Payload, n.ExpiryTime, n.ArrivalTime FROM Notification n "
     "JOIN NotificationHandler h ON h.RecordId = n.HandlerId "
-    "WHERE n.Type = 'badge' ORDER BY n.ArrivalTime";
+    "WHERE n.Type IN ('badge', 'toast') ORDER BY n.ArrivalTime";
+
+std::wstring LowerAumid(std::wstring aumid) {
+    for (wchar_t& c : aumid) {
+        c = static_cast<wchar_t>(std::towlower(c));
+    }
+    return aumid;
+}
+
+// Toasts arriving after this FILETIME count as unread for an app.
+using SeenMap = std::unordered_map<std::wstring, long long>;
 
 class BadgeStore {
 public:
@@ -157,7 +169,8 @@ public:
     }
 
     // nextExpiry receives the earliest future ExpiryTime (FILETIME), 0 if none.
-    bool ReadBadges(std::vector<NotificationBadges::Badge>& out, Sqlite3Int64& nextExpiry);
+    bool ReadBadges(std::vector<NotificationBadges::Badge>& out, Sqlite3Int64& nextExpiry, const SeenMap& seen,
+        Sqlite3Int64 since);
 
 private:
     const SqliteApi& m_api;
@@ -236,10 +249,15 @@ std::wstring BadgeValue(const std::wstring& xml) {
     }
 }
 
-bool BadgeStore::ReadBadges(std::vector<NotificationBadges::Badge>& out, Sqlite3Int64& nextExpiry) {
+bool BadgeStore::ReadBadges(std::vector<NotificationBadges::Badge>& out, Sqlite3Int64& nextExpiry,
+    const SeenMap& seen, Sqlite3Int64 since) {
     out.clear();
     nextExpiry = 0;
     const Sqlite3Int64 now = FileTimeNow();
+    // Apps that ever published a badge row manage their own unread state;
+    // their toasts never produce a count.
+    std::unordered_map<std::wstring, bool> badgeApps;
+    std::unordered_map<std::wstring, std::pair<std::wstring, int>> toastCounts;
     int result = kSqliteOk;
     while ((result = m_api.step(m_query)) == kSqliteRow) {
         const auto* id = static_cast<const wchar_t*>(m_api.columnText16(m_query, 0));
@@ -248,13 +266,36 @@ bool BadgeStore::ReadBadges(std::vector<NotificationBadges::Badge>& out, Sqlite3
             continue;
         }
         std::wstring aumid(id, static_cast<size_t>(idBytes) / sizeof(wchar_t));
+        const auto* type = static_cast<const wchar_t*>(m_api.columnText16(m_query, 1));
+        const bool isBadge = type != nullptr && CompareStringOrdinal(type, -1, L"badge", -1, TRUE) == CSTR_EQUAL;
         // FILETIME; anything before 1970 is not a real deadline (0 = never).
-        Sqlite3Int64 expiry = m_api.columnInt64(m_query, 2);
+        Sqlite3Int64 expiry = m_api.columnInt64(m_query, 3);
         if (expiry < kUnixEpochFileTime) {
             expiry = 0;
         }
-        const void* payload = m_api.columnBlob(m_query, 1);
-        const int payloadBytes = m_api.columnBytes(m_query, 1);
+        const bool live = expiry == 0 || expiry > now;
+        if (!isBadge) {
+            const Sqlite3Int64 arrival = m_api.columnInt64(m_query, 4);
+            std::wstring key = LowerAumid(aumid);
+            Sqlite3Int64 floor = since;
+            if (const auto found = seen.find(key); found != seen.end()) {
+                floor = std::max(floor, static_cast<Sqlite3Int64>(found->second));
+            }
+            if (live && arrival > floor) {
+                if (expiry != 0 && (nextExpiry == 0 || expiry < nextExpiry)) {
+                    nextExpiry = expiry;
+                }
+                auto& entry = toastCounts[std::move(key)];
+                if (entry.first.empty()) {
+                    entry.first = std::move(aumid);
+                }
+                ++entry.second;
+            }
+            continue;
+        }
+        badgeApps[LowerAumid(aumid)] = true;
+        const void* payload = m_api.columnBlob(m_query, 2);
+        const int payloadBytes = m_api.columnBytes(m_query, 2);
 
         const auto existing = std::ranges::find_if(out,
             [&aumid](const NotificationBadges::Badge& badge) {
@@ -262,7 +303,6 @@ bool BadgeStore::ReadBadges(std::vector<NotificationBadges::Badge>& out, Sqlite3
                     aumid.c_str(), static_cast<int>(aumid.size()), TRUE) == CSTR_EQUAL;
             });
         std::wstring text;
-        const bool live = expiry == 0 || expiry > now;
         if (!live || !NotificationBadges::DisplayTextForValue(
                 BadgeValue(PayloadText(payload, payloadBytes)), text)) {
             if (existing != out.end()) {
@@ -276,12 +316,21 @@ bool BadgeStore::ReadBadges(std::vector<NotificationBadges::Badge>& out, Sqlite3
         if (existing != out.end()) {
             existing->text = std::move(text);
         } else {
-            out.push_back({std::move(aumid), std::move(text)});
+            out.push_back({std::move(aumid), std::move(text), false});
         }
     }
     m_api.reset(m_query);
     if (result != kSqliteDone) {
         return false;
+    }
+    for (auto& [key, entry] : toastCounts) {
+        if (badgeApps.contains(key) || entry.second <= 0) {
+            continue;
+        }
+        std::wstring text;
+        if (NotificationBadges::DisplayTextForValue(std::to_wstring(entry.second), text)) {
+            out.push_back({std::move(entry.first), std::move(text), true});
+        }
     }
     std::ranges::sort(out, {}, &NotificationBadges::Badge::aumid);
     return true;
@@ -442,8 +491,14 @@ void NotificationBadges::Start(HWND notifyWindow, UINT notifyMessage) {
     m_notifyWindow = notifyWindow;
     m_notifyMessage = notifyMessage;
     m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (m_stopEvent == nullptr) {
         return;
+    }
+    {
+        const std::lock_guard lock(m_seenMutex);
+        m_since = FileTimeNow();
+        m_seen.clear();
     }
     m_thread = CreateThread(nullptr, 0, &NotificationBadges::ThreadProc, this, 0, nullptr);
     if (m_thread == nullptr) {
@@ -467,8 +522,26 @@ void NotificationBadges::Stop() noexcept {
         CloseHandle(m_stopEvent);
         m_stopEvent = nullptr;
     }
+    if (m_wakeEvent != nullptr) {
+        CloseHandle(m_wakeEvent);
+        m_wakeEvent = nullptr;
+    }
     m_notifyWindow = nullptr;
     m_notifyMessage = 0;
+}
+
+void NotificationBadges::MarkSeen(const std::wstring& aumid) {
+    if (aumid.empty()) {
+        return;
+    }
+    {
+        const std::lock_guard lock(m_seenMutex);
+        m_seen[LowerAumid(aumid)] = FileTimeNow();
+    }
+    m_forceRead.store(true);
+    if (m_wakeEvent != nullptr) {
+        SetEvent(m_wakeEvent);
+    }
 }
 
 std::vector<NotificationBadges::Badge> NotificationBadges::Snapshot() const {
@@ -519,12 +592,22 @@ void NotificationBadges::WorkerLoop() {
         std::vector<Badge> badges;
         DWORD wait = 0;
         while (true) {
-            const HANDLE handles[] = {m_stopEvent, change};
-            const DWORD signaled = WaitForMultipleObjects(change != nullptr ? 2U : 1U, handles, FALSE, wait);
+            // stop, MarkSeen wake, then the directory change handle (optional).
+            HANDLE handles[3]{m_stopEvent};
+            DWORD count = 1;
+            DWORD changeIndex = MAXDWORD;
+            if (m_wakeEvent != nullptr) {
+                handles[count++] = m_wakeEvent;
+            }
+            if (change != nullptr) {
+                changeIndex = count;
+                handles[count++] = change;
+            }
+            const DWORD signaled = WaitForMultipleObjects(count, handles, FALSE, wait);
             if (signaled == WAIT_OBJECT_0) {
                 break;
             }
-            if (signaled == WAIT_OBJECT_0 + 1) {
+            if (changeIndex != MAXDWORD && signaled == WAIT_OBJECT_0 + changeIndex) {
                 if (FindNextChangeNotification(change) == FALSE) {
                     FindCloseChangeNotification(change);
                     change = nullptr;
@@ -541,7 +624,15 @@ void NotificationBadges::WorkerLoop() {
                 Publish({});
                 continue;
             }
-            const bool expired = nextExpiry != 0 && FileTimeNow() >= nextExpiry;
+            // MarkSeen changes the result without a database write.
+            const bool expired = (nextExpiry != 0 && FileTimeNow() >= nextExpiry) || m_forceRead.exchange(false);
+            SeenMap seen;
+            Sqlite3Int64 since = 0;
+            {
+                const std::lock_guard lock(m_seenMutex);
+                seen = m_seen;
+                since = m_since;
+            }
 
             if (snapshotMode) {
                 const StoreSignature signature = ReadStoreSignature(databasePath);
@@ -549,7 +640,7 @@ void NotificationBadges::WorkerLoop() {
                     continue;
                 }
                 const bool read = CopySnapshot(databasePath, snapshotPath) &&
-                    store.Open(snapshotPath, false) && store.ReadBadges(badges, nextExpiry);
+                    store.Open(snapshotPath, false) && store.ReadBadges(badges, nextExpiry, seen, since);
                 store.Close();
                 if (!read) {
                     haveSignature = false;
@@ -570,7 +661,7 @@ void NotificationBadges::WorkerLoop() {
                 liveFailures = 0;
                 continue;
             }
-            if (versioned && store.ReadBadges(badges, nextExpiry)) {
+            if (versioned && store.ReadBadges(badges, nextExpiry, seen, since)) {
                 liveFailures = 0;
                 lastVersion = version;
                 Publish(badges);

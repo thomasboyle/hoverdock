@@ -78,6 +78,9 @@ private:
         std::vector<std::wstring> executableNames;
         std::wstring appsFolderAumid;
         std::wstring packageFamily;
+        // System.AppUserModel.ID of a .lnk pin (Electron / Squirrel apps set
+        // it), so notifications match even while the app has no window.
+        std::wstring shortcutAumid;
     };
 
     struct HiddenWindowCandidate {

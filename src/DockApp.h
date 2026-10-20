@@ -232,6 +232,8 @@ private:
     static constexpr UINT kBadgeMessage = WM_APP + 33;
     // Speed test progress / result (SpeedTestService, ~5 Hz while running).
     static constexpr UINT kSpeedTestMessage = WM_APP + 34;
+    // Foreground window changed: wParam = HWND, clears that app's toast badge.
+    static constexpr UINT kBadgeSeenMessage = WM_APP + 35;
 
     enum class TrayFlyoutHitKind : uint8_t {
         None,
@@ -388,6 +390,8 @@ private:
     void RefreshTray(bool forceLayout);
     // Notification badges (red unread counts on app icons).
     void OnBadgesUpdated();
+    // Clears toast-count badges of the dock app owning `foreground`.
+    void MarkBadgesSeenFor(HWND foreground);
     // Re-match badge sources to dock entries; queues the raster upload when the
     // visuals changed. Returns true when the visible badge set changed.
     bool RefreshBadgeAssignments();

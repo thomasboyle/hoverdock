@@ -3950,6 +3950,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         OnBadgesUpdated();
         return 0;
 
+    case kBadgeSeenMessage:
+        MarkBadgesSeenFor(reinterpret_cast<HWND>(wParam));
+        return 0;
+
     case kBluetoothMessage:
         ApplyBluetoothSnapshot();
         return 0;
@@ -5352,6 +5356,43 @@ void DockApp::OnBadgesUpdated() {
     m_badgeMatchMemo.clear();
     if (RefreshBadgeAssignments()) {
         QueueRenderFrame(false);
+    }
+    // A notification for the app already in front counts as read.
+    MarkBadgesSeenFor(GetForegroundWindow());
+}
+
+void DockApp::MarkBadgesSeenFor(HWND foreground) {
+    if (foreground == nullptr || !IsWindow(foreground)) {
+        return;
+    }
+    const bool anyToastBadge = std::ranges::any_of(m_badgeSources,
+        [](const NotificationBadges::Badge& source) { return source.fromToasts; });
+    if (!anyToastBadge) {
+        return;
+    }
+    HWND root = GetAncestor(foreground, GA_ROOTOWNER);
+    if (root == nullptr) {
+        root = foreground;
+    }
+    DWORD foregroundPid = 0;
+    GetWindowThreadProcessId(root, &foregroundPid);
+    if (foregroundPid == 0 || foregroundPid == GetCurrentProcessId()) {
+        return;
+    }
+    for (const DisplayApp& entry : m_displayApps) {
+        if (entry.runningWindow == nullptr) {
+            continue;
+        }
+        DWORD entryPid = 0;
+        GetWindowThreadProcessId(entry.runningWindow, &entryPid);
+        if (entry.runningWindow != root && entryPid != foregroundPid) {
+            continue;
+        }
+        for (const NotificationBadges::Badge& source : m_badgeSources) {
+            if (source.fromToasts && m_windows.MatchesAppUserModelId(entry.app, root, source.aumid)) {
+                m_badges.MarkSeen(source.aumid);
+            }
+        }
     }
 }
 
@@ -14635,9 +14676,12 @@ void DockApp::UnregisterForegroundWatch() noexcept {
     }
 }
 
-void CALLBACK DockApp::ForegroundWinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+void CALLBACK DockApp::ForegroundWinEventProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DWORD, DWORD) {
     if (s_instance == nullptr || s_instance->m_window == nullptr) {
         return;
+    }
+    if (hwnd != nullptr) {
+        PostMessageW(s_instance->m_window, kBadgeSeenMessage, reinterpret_cast<WPARAM>(hwnd), 0);
     }
     s_instance->m_renderer.RequestBackdropRefresh();
     if (s_instance->m_visibility == VisibilityState::Hidden ||

@@ -797,6 +797,25 @@ std::wstring AppUserModelId(HWND window) {
     return {};
 }
 
+// System.AppUserModel.ID stored on a shortcut file; empty when absent.
+std::wstring ShortcutAppUserModelId(const std::wstring& shortcut) {
+    IPropertyStore* store = nullptr;
+    if (FAILED(SHGetPropertyStoreFromParsingName(shortcut.c_str(), nullptr, GPS_DEFAULT, IID_PPV_ARGS(&store))) ||
+        store == nullptr) {
+        return {};
+    }
+    PROPVARIANT value;
+    PropVariantInit(&value);
+    std::wstring aumid;
+    if (SUCCEEDED(store->GetValue(PKEY_AppUserModel_ID, &value)) && value.vt == VT_LPWSTR &&
+        value.pwszVal != nullptr) {
+        aumid = value.pwszVal;
+    }
+    PropVariantClear(&value);
+    store->Release();
+    return aumid;
+}
+
 std::wstring ResolveShortcutTarget(const std::wstring& shortcut) {
     ComApartment apartment;
     if (!apartment.CanUse()) {
@@ -1162,6 +1181,7 @@ void WindowCatalog::RebuildPinProfiles(const std::vector<PinnedApp>& pins) {
         }
         if (EndsWithInsensitive(pin.target, L".lnk") && IsExistingFile(pin.target)) {
             addCandidate(ResolveShortcutTarget(pin.target));
+            profile.shortcutAumid = ShortcutAppUserModelId(pin.target);
         }
         // Steam pins launch a different exe than the shortcut names
         // (valheim.exe for a steam://rungameid/892970 pin). Without the real
@@ -1297,6 +1317,26 @@ bool WindowCatalog::MatchesAppUserModelId(const PinnedApp& app, HWND runningWind
     if (const PinMatchProfile* profile = ProfileForPin(app); profile != nullptr) {
         if (!profile->appsFolderAumid.empty() && EqualInsensitive(profile->appsFolderAumid, aumid)) {
             return true;
+        }
+        if (!profile->shortcutAumid.empty() && EqualInsensitive(profile->shortcutAumid, aumid)) {
+            return true;
+        }
+        if (family.empty()) {
+            // Unpackaged AUMIDs commonly end in the exe name (Squirrel /
+            // Electron: com.squirrel.Discord.Discord, com.squirrel.slack.slack),
+            // which matches even when the app runs only in the tray.
+            std::wstring last = aumid.substr(aumid.find_last_of(L'.') == std::wstring::npos
+                    ? 0
+                    : aumid.find_last_of(L'.') + 1);
+            if (EqualInsensitive(last, L"exe") && aumid.size() > 4) {
+                const std::wstring trimmed = aumid.substr(0, aumid.size() - 4);
+                const size_t dot = trimmed.find_last_of(L'.');
+                last = dot == std::wstring::npos ? trimmed : trimmed.substr(dot + 1);
+            }
+            if (!last.empty() && std::ranges::any_of(profile->executableNames,
+                                     [&last](const std::wstring& name) { return EqualInsensitive(name, last); })) {
+                return true;
+            }
         }
         if (!family.empty()) {
             if (!profile->packageFamily.empty() && EqualInsensitive(profile->packageFamily, family)) {
