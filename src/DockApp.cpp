@@ -3562,6 +3562,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
     case WM_WTSSESSION_CHANGE:
         if (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT) {
             HideTaskbar();
+            ScheduleResumeZOrderReassert();
         }
         return 0;
 
@@ -4015,6 +4016,11 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             KillTimer(window, kPerfOpenSettingsTimerId);
             if (!IsDockSettingsOpen()) {
                 OpenDockSettings();
+            }
+        } else if (wParam == kResumeZOrderTimerId) {
+            ReassertOverlayZOrder();
+            if (--m_resumeZOrderPasses <= 0) {
+                KillTimer(window, kResumeZOrderTimerId);
             }
         } else if (wParam == kTaskbarMonitorTimerId) {
             // Adaptive cadence: poll fast while suppression is actively fighting
@@ -4727,6 +4733,25 @@ void DockApp::PositionOverlayWindows() {
     PositionOverflowPopup();
     PositionDockSettings();
     PositionContextMenu();
+}
+
+void DockApp::ReassertOverlayZOrder() {
+    if (m_window == nullptr) {
+        return;
+    }
+    // Drop the change-cache so the HWND_TOPMOST move runs even though the
+    // rect is unchanged; that is what lifts the dock back above windows.
+    m_overlayPosValid = false;
+    PositionOverlayWindows();
+}
+
+void DockApp::ScheduleResumeZOrderReassert() {
+    if (m_window == nullptr) {
+        return;
+    }
+    ReassertOverlayZOrder();
+    m_resumeZOrderPasses = kResumeZOrderPasses;
+    SetTimer(m_window, kResumeZOrderTimerId, kResumeZOrderIntervalMs, nullptr);
 }
 
 struct HoverBubbleLayout {
@@ -14815,6 +14840,7 @@ LRESULT DockApp::HandlePowerBroadcast(WPARAM wParam, LPARAM lParam) {
     if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND ||
         wParam == PBT_APMRESUMECRITICAL) {
         HideTaskbar();
+        ScheduleResumeZOrderReassert();
         return TRUE;
     }
     if (wParam == PBT_POWERSETTINGCHANGE) {
@@ -14823,6 +14849,7 @@ LRESULT DockApp::HandlePowerBroadcast(WPARAM wParam, LPARAM lParam) {
             IsEqualGUID(setting->PowerSetting, kMonitorPowerOnGuid) &&
             *reinterpret_cast<const DWORD*>(setting->Data) != 0) {
             HideTaskbar();
+            ScheduleResumeZOrderReassert();
         }
         return TRUE;
     }

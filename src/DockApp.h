@@ -175,6 +175,11 @@ private:
     static constexpr UINT_PTR kQsChevronFadeTimerId = 20;
     // Home module drag-to-rearrange animation frames (~60 Hz while moving).
     static constexpr UINT_PTR kQsReorderTimerId = 21;
+    // Post-wake topmost re-assertion: Explorer/DWM reshuffle z-order for a
+    // few seconds after resume/unlock, which can sink the dock under windows.
+    static constexpr UINT_PTR kResumeZOrderTimerId = 23;
+    static constexpr UINT kResumeZOrderIntervalMs = 1000;
+    static constexpr int kResumeZOrderPasses = 4;
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
     static constexpr float kQsChevronFadeMs = 140.0F;
     // Home tiles with a hover arrow: Wi-Fi, Bluetooth, Boost, Power, Sound,
@@ -366,6 +371,8 @@ private:
     void RebuildLayout(bool reloadIcons);
     void UpdateInputRegion();
     void PositionOverlayWindows();
+    void ReassertOverlayZOrder();
+    void ScheduleResumeZOrderReassert();
     void UpdateHoverLabel(bool forceGlassRefresh = false);
     void HideHoverLabel() noexcept;
     // Liquid-glass hover label: BakeGlassPanel plate + flyout ink glyphs.
@@ -939,6 +946,7 @@ private:
     // Last rect applied by PositionOverlayWindows: skips redundant DWM
     // SetWindowPos round-trips so steady calls cost microseconds.
     bool m_overlayPosValid = false;
+    int m_resumeZOrderPasses = 0;
     LONG m_overlayX = 0;
     LONG m_overlayY = 0;
     LONG m_overlayW = 0;
