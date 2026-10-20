@@ -15,6 +15,8 @@
 #include <tlhelp32.h>
 #include <wlanapi.h>
 #include <audioclient.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <mutex>
 
 #pragma warning(push)
@@ -884,8 +886,12 @@ std::wstring PrettyProcessName(std::wstring name) {
 
 struct EnergyCpuSample {
     DWORD pid = 0;
+    // Kernel + user time (100 ns) and read + write bytes since process start.
     unsigned long long cpu = 0;
+    unsigned long long io = 0;
+    // Display name; also the per-app grouping key (Chrome's many processes).
     std::wstring name;
+    std::wstring path;
 };
 
 struct EnergyBaseline {
@@ -894,6 +900,99 @@ struct EnergyBaseline {
 };
 
 EnergyBaseline g_energyBaseline;
+
+// Score is roughly "% of the machine": CPU share + 0.4 x busiest GPU engine +
+// 0.6 x disk MB/s (capped). Bands follow Task Manager's Power usage column:
+// Very low < 1.5, Low < 4, Moderate < 9, High < 20, Very high >= 20.
+constexpr double kEnergyHighScore = 9.0;
+constexpr double kEnergyVeryHighScore = 20.0;
+// Hysteresis: a listed app stays until it has been below these for the hold.
+constexpr double kEnergyLeaveScore = 6.0;
+constexpr double kEnergyVeryHighLeaveScore = 16.0;
+constexpr ULONGLONG kEnergyHoldMs = 6000;
+constexpr size_t kEnergyMaxRows = 5;
+
+// Per-app smoothed score and list membership, kept across samples so the
+// Power page list changes only when an app clearly starts or stops.
+struct EnergyTrack {
+    double score = 0.0;
+    bool listed = false;
+    bool veryHigh = false;
+    ULONGLONG listedAt = 0;
+    ULONGLONG belowSince = 0;
+    ULONGLONG seenAt = 0;
+    std::wstring path;
+};
+
+std::unordered_map<std::wstring, EnergyTrack> g_energyTracks;
+
+// "\GPU Engine(*)\Utilization Percentage", the counters Task Manager's GPU
+// column reads. Only the energy worker touches it (one sample in flight).
+struct GpuEngineCounters {
+    PDH_HQUERY query = nullptr;
+    PDH_HCOUNTER counter = nullptr;
+    bool failed = false;
+    bool primed = false;
+};
+
+GpuEngineCounters g_gpuEngines;
+
+// Busiest GPU engine (%) per pid since the previous call. A rate counter: the
+// first collect only primes it and reports nothing.
+void SampleGpuEngines(std::unordered_map<DWORD, double>& busiest) {
+    GpuEngineCounters& gpu = g_gpuEngines;
+    if (gpu.failed) {
+        return;
+    }
+    if (gpu.query == nullptr) {
+        if (PdhOpenQueryW(nullptr, 0, &gpu.query) != ERROR_SUCCESS) {
+            gpu.query = nullptr;
+            gpu.failed = true;
+            return;
+        }
+        if (PdhAddEnglishCounterW(gpu.query, L"\\GPU Engine(*)\\Utilization Percentage", 0, &gpu.counter) !=
+            ERROR_SUCCESS) {
+            PdhCloseQuery(gpu.query);
+            gpu.query = nullptr;
+            gpu.failed = true;
+            return;
+        }
+    }
+    if (PdhCollectQueryData(gpu.query) != ERROR_SUCCESS) {
+        return;
+    }
+    if (!gpu.primed) {
+        gpu.primed = true;
+        return;
+    }
+    DWORD bytes = 0;
+    DWORD count = 0;
+    if (PdhGetFormattedCounterArrayW(gpu.counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &bytes, &count, nullptr) !=
+            static_cast<PDH_STATUS>(PDH_MORE_DATA) ||
+        bytes == 0) {
+        return;
+    }
+    std::vector<uint8_t> buffer(bytes);
+    auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+    if (PdhGetFormattedCounterArrayW(gpu.counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &bytes, &count, items) !=
+        ERROR_SUCCESS) {
+        return;
+    }
+    for (DWORD index = 0; index < count; ++index) {
+        const PDH_FMT_COUNTERVALUE& value = items[index].FmtValue;
+        if (value.CStatus != PDH_CSTATUS_VALID_DATA && value.CStatus != PDH_CSTATUS_NEW_DATA) {
+            continue;
+        }
+        // Instances look like "pid_1234_luid_0x..._phys_0_eng_0_engtype_3D".
+        const wchar_t* tag = items[index].szName != nullptr ? std::wcsstr(items[index].szName, L"pid_") : nullptr;
+        if (tag == nullptr) {
+            continue;
+        }
+        const DWORD pid = static_cast<DWORD>(std::wcstoul(tag + 4, nullptr, 10));
+        double& peak = busiest[pid];
+        peak = (std::max)(peak, value.doubleValue);
+    }
+}
 
 struct EnergyBridge {
     std::mutex mutex;
@@ -919,9 +1018,11 @@ struct NetworkBridge {
 NetworkBridge g_network;
 std::atomic<bool> g_captureOpenInFlight{false};
 
-// Two toolhelp snapshots. The first open of Energy has no delta yet and is
-// labeled pending; the follow-up paint (about a second later) reports real
-// CPU share. Snapshot failure is an explicit stub, not a fake app list.
+// Two samples ~2 s apart (the first open seeds a baseline and re-samples
+// after ~0.7 s). Per app: CPU share, busiest GPU engine and disk I/O give a
+// Task Manager style power score; apps above Moderate are listed, smoothed
+// and held so rows neither flicker nor reorder. Snapshot failure is an
+// explicit note, not a fake app list.
 void QueryEnergyApps(QuickSettingsCache& cache) {
     cache.energyApps.clear();
     cache.energyLive = false;
@@ -961,6 +1062,15 @@ void QueryEnergyApps(QuickSettingsCache& cache) {
                 EnergyCpuSample sample;
                 sample.pid = entry.th32ProcessID;
                 sample.cpu = kernelTime.QuadPart + userTime.QuadPart;
+                IO_COUNTERS io{};
+                if (GetProcessIoCounters(process, &io)) {
+                    sample.io = io.ReadTransferCount + io.WriteTransferCount;
+                }
+                wchar_t imagePath[MAX_PATH]{};
+                DWORD imageChars = MAX_PATH;
+                if (QueryFullProcessImageNameW(process, 0, imagePath, &imageChars)) {
+                    sample.path.assign(imagePath, imageChars);
+                }
                 sample.name = PrettyProcessName(entry.szExeFile);
                 current.push_back(std::move(sample));
             }
@@ -981,69 +1091,127 @@ void QueryEnergyApps(QuickSettingsCache& cache) {
     const bool usable = haveBaseline && !tooSoon && !tooStale;
     if (!usable) {
         // First sample or a stale baseline: seed/re-seed. A too-soon follow-up
-        // (paint -> RefreshQuickSettingsCache -> RequestEnergyAppsAsync) must NOT
-        // reset the tick - that kept the Power page stuck on Measuring forever
-        // whenever ToolHelp finished under 250 ms.
+        // must NOT reset the tick - that kept the Power page stuck on
+        // Measuring forever whenever ToolHelp finished under 250 ms.
         if (!haveBaseline || tooStale) {
             g_energyBaseline.tick = now;
             g_energyBaseline.samples = std::move(current);
+            g_energyTracks.clear();
+            std::unordered_map<DWORD, double> discard;
+            SampleGpuEngines(discard);
         }
         cache.energyPending = true;
         cache.energyNote = L"Measuring energy use\u2026";
         return;
     }
 
-    std::unordered_map<DWORD, unsigned long long> previous;
+    std::unordered_map<DWORD, double> gpuByPid;
+    SampleGpuEngines(gpuByPid);
+    std::unordered_map<DWORD, const EnergyCpuSample*> previous;
     previous.reserve(g_energyBaseline.samples.size());
     for (const EnergyCpuSample& sample : g_energyBaseline.samples) {
-        previous[sample.pid] = sample.cpu;
+        previous[sample.pid] = &sample;
     }
     const DWORD cores = (std::max)(static_cast<DWORD>(1), GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
     const double wall = static_cast<double>(elapsed) * 10000.0 * static_cast<double>(cores);
-    struct Ranked {
-        std::wstring name;
-        double percent = 0.0;
+    const double seconds = static_cast<double>(elapsed) / 1000.0;
+    struct AppLoad {
+        double cpu = 0.0;
+        double gpu = 0.0;
+        double ioBytes = 0.0;
+        std::wstring path;
     };
-    std::vector<Ranked> ranked;
+    std::unordered_map<std::wstring, AppLoad> apps;
     for (const EnergyCpuSample& sample : current) {
+        AppLoad& load = apps[sample.name];
+        if (load.path.empty()) {
+            load.path = sample.path;
+        }
         const auto found = previous.find(sample.pid);
-        if (found == previous.end() || sample.cpu < found->second || wall <= 0.0) {
+        if (found != previous.end()) {
+            const EnergyCpuSample& before = *found->second;
+            if (sample.cpu >= before.cpu && wall > 0.0) {
+                load.cpu += static_cast<double>(sample.cpu - before.cpu) / wall * 100.0;
+            }
+            if (sample.io >= before.io) {
+                load.ioBytes += static_cast<double>(sample.io - before.io);
+            }
+        }
+        const auto gpu = gpuByPid.find(sample.pid);
+        if (gpu != gpuByPid.end()) {
+            load.gpu += gpu->second;
+        }
+    }
+    for (const auto& [name, load] : apps) {
+        const double diskMBps = load.ioBytes / (std::max)(0.25, seconds) / 1048576.0;
+        const double raw = load.cpu + 0.4 * (std::min)(load.gpu, 100.0) + (std::min)(15.0, 0.6 * diskMBps);
+        EnergyTrack& track = g_energyTracks[name];
+        // ~4 s time constant at the 2 s cadence; a new app starts at its value.
+        track.score = track.seenAt == 0 ? raw : 0.5 * track.score + 0.5 * raw;
+        track.seenAt = now;
+        if (!load.path.empty()) {
+            track.path = load.path;
+        }
+    }
+    std::vector<std::pair<const std::wstring*, const EnergyTrack*>> listed;
+    for (auto it = g_energyTracks.begin(); it != g_energyTracks.end();) {
+        EnergyTrack& track = it->second;
+        if (track.seenAt != now) {
+            // Exited: decay so a listed app still leaves through the hold.
+            track.score *= 0.5;
+            if (!track.listed) {
+                it = g_energyTracks.erase(it);
+                continue;
+            }
+        }
+        if (!track.listed) {
+            if (track.score >= kEnergyHighScore) {
+                track.listed = true;
+                track.listedAt = now;
+                track.belowSince = 0;
+                track.veryHigh = track.score >= kEnergyVeryHighScore;
+            }
+        } else {
+            if (track.score >= kEnergyLeaveScore) {
+                track.belowSince = 0;
+            } else if (track.belowSince == 0) {
+                track.belowSince = now;
+            } else if (now - track.belowSince >= kEnergyHoldMs && now - track.listedAt >= kEnergyHoldMs) {
+                track.listed = false;
+            }
+            track.veryHigh = track.veryHigh ? track.score >= kEnergyVeryHighLeaveScore
+                                            : track.score >= kEnergyVeryHighScore;
+        }
+        if (track.listed) {
+            listed.emplace_back(&it->first, &track);
+        } else if (track.seenAt != now) {
+            it = g_energyTracks.erase(it);
             continue;
         }
-        const double percent =
-            (static_cast<double>(sample.cpu - found->second) / wall) * 100.0;
-        if (percent >= 1.0) {
-            ranked.push_back(Ranked{sample.name, percent});
-        }
+        ++it;
     }
-    std::sort(ranked.begin(), ranked.end(), [](const Ranked& left, const Ranked& right) {
-        return left.percent > right.percent;
+    // Stable order: first listed stays on top, like the macOS menu.
+    std::sort(listed.begin(), listed.end(), [](const auto& left, const auto& right) {
+        if (left.second->listedAt != right.second->listedAt) {
+            return left.second->listedAt < right.second->listedAt;
+        }
+        return *left.first < *right.first;
     });
-    // Prefer clearly busy apps. If nothing clears 2%, keep the >=1% tail so a
-    // mildly busy machine still lists something real.
-    std::vector<Ranked> significant;
-    for (const Ranked& row : ranked) {
-        if (row.percent >= 2.0) {
-            significant.push_back(row);
+    for (const auto& [name, track] : listed) {
+        if (cache.energyApps.size() >= kEnergyMaxRows) {
+            break;
         }
-    }
-    if (significant.empty()) {
-        significant = ranked;
-    }
-    if (significant.size() > 3) {
-        significant.resize(3);
-    }
-    for (const Ranked& row : significant) {
         QsEnergyApp app;
-        app.name = row.name;
-        app.cpuPercent = std::clamp(static_cast<int>(std::lround(row.percent)), 1, 100);
+        app.name = *name;
+        app.path = track->path;
+        app.level = track->veryHigh ? QsPowerLevel::VeryHigh : QsPowerLevel::High;
         cache.energyApps.push_back(std::move(app));
     }
     g_energyBaseline.tick = now;
     g_energyBaseline.samples = std::move(current);
     cache.energyLive = true;
     if (cache.energyApps.empty()) {
-        cache.energyNote = L"No apps using significant energy";
+        cache.energyNote = L"No Apps Using Significant Energy";
     }
 }
 
@@ -3148,6 +3316,50 @@ void BlitIcon(uint8_t* pixels, int width, int height, HDC memory, HICON icon, in
     DeleteObject(bitmap);
 }
 
+// Shell icon for a Power page app row, cached per executable path (UI thread
+// only). Bounded: the cache is dropped wholesale if it ever grows large.
+HICON EnergyAppIcon(const std::wstring& path) {
+    static std::unordered_map<std::wstring, HICON> icons;
+    if (path.empty()) {
+        return nullptr;
+    }
+    const auto found = icons.find(path);
+    if (found != icons.end()) {
+        return found->second;
+    }
+    if (icons.size() >= 64U) {
+        for (const auto& cached : icons) {
+            if (cached.second != nullptr) {
+                DestroyIcon(cached.second);
+            }
+        }
+        icons.clear();
+    }
+    SHFILEINFOW info{};
+    HICON icon = nullptr;
+    if (SHGetFileInfoW(path.c_str(), 0, &info, sizeof(info), SHGFI_ICON | SHGFI_LARGEICON) != 0) {
+        icon = info.hIcon;
+    }
+    icons.emplace(path, icon);
+    return icon;
+}
+
+const wchar_t* PowerLevelLabel(QsPowerLevel level) noexcept {
+    switch (level) {
+    case QsPowerLevel::VeryHigh:
+        return L"Very high";
+    case QsPowerLevel::High:
+        return L"High";
+    case QsPowerLevel::Moderate:
+        return L"Moderate";
+    case QsPowerLevel::Low:
+        return L"Low";
+    case QsPowerLevel::VeryLow:
+        break;
+    }
+    return L"Very low";
+}
+
 }  // namespace
 
 void SeekQuickSettingsMedia(float level) noexcept {
@@ -3344,6 +3556,12 @@ void RequestEnergyAppsAsync(HWND notifyHwnd, UINT notifyMsg) {
     std::thread([] {
         QuickSettingsCache local{};
         QueryEnergyApps(local);
+        if (local.energyPending) {
+            // Fresh baseline: take the first real sample shortly after rather
+            // than waiting a whole 2 s timer tick on "Measuring".
+            Sleep(700);
+            QueryEnergyApps(local);
+        }
         HWND hwnd = nullptr;
         UINT msg = 0;
         {
@@ -3376,7 +3594,8 @@ bool ApplyEnergyAppsResult(QuickSettingsCache& cache) {
     if (!changed) {
         for (size_t i = 0; i < cache.energyApps.size(); ++i) {
             if (cache.energyApps[i].name != g_energy.result.energyApps[i].name ||
-                cache.energyApps[i].cpuPercent != g_energy.result.energyApps[i].cpuPercent) {
+                cache.energyApps[i].path != g_energy.result.energyApps[i].path ||
+                cache.energyApps[i].level != g_energy.result.energyApps[i].level) {
                 changed = true;
                 break;
             }
@@ -3475,7 +3694,7 @@ void DockApp::RefreshQuickSettingsCache() {
         if (!m_qsCache.energyLive && !m_qsCache.energyPending) {
             m_qsCache.energyPending = true;
             m_qsCache.energyNote = L"Measuring energy use\u2026";
-            // First entry only: the 500 ms timer + ArmOverflowLiveWorkers own the
+            // First entry only: the 2 s timer + ArmOverflowLiveWorkers own the
             // steady sample cadence. Re-requesting from every paint was racing the
             // 250 ms baseline window and left the list empty on Measuring.
             if (m_overflowWindow != nullptr) {
@@ -4316,7 +4535,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     auto footer = [&](const wchar_t* label, int link) {
         const RECT row{padding, y, panelWidth - padding, y + listRow};
         if (draw) {
-            SetFlyoutChromeInk(84, 104, 44);
+            // Links follow the dock's Quick Settings colour (QuickSettingsIconColor).
+            SetFlyoutChromeInk(g_qsAccentR, g_qsAccentG, g_qsAccentB);
             text(row, labelFont, std::wstring(label) + L"    \u203A",
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
             restoreInk();
@@ -4880,8 +5100,13 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     };
     auto menuLink = [&](const wchar_t* label, int link) {
         const RECT row{padding, y, panelWidth - padding, y + menuRow};
-        text({row.left + menuInset, row.top, row.right - menuInset, row.bottom}, labelFont, label,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+        if (draw) {
+            // Links follow the dock's Quick Settings colour (QuickSettingsIconColor).
+            SetFlyoutChromeInk(g_qsAccentR, g_qsAccentG, g_qsAccentB);
+            text({row.left + menuInset, row.top, row.right - menuInset, row.bottom}, labelFont, label,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+            restoreInk();
+        }
         push(TrayFlyoutHitKind::MoreSettings, row, link);
         y += menuRow;
     };
@@ -5058,62 +5283,90 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         y += listRow + gap;
         footer(L"More sound settings", kLinkSound);
     } else if (m_qsPage == QuickSettingsPage::Power) {
-        beginHeader(L"Power", false, -1, false);
-        y += gap;
-        section(L"Energy mode");
-        const RECT group{padding, y, panelWidth - padding, y + listRow * 3L};
-        card(group, false);
-        const wchar_t* modes[3] = {L"High power", L"Automatic", L"Low power"};
-        for (int index = 0; index < 3; ++index) {
-            const RECT row{group.left, group.top + index * listRow, group.right,
-                group.top + (index + 1) * listRow};
-            radio(static_cast<float>(row.left + 22), static_cast<float>(row.top + listRow / 2L),
-                m_qsCache.powerMode == index);
-            text({row.left + 40, row.top, row.right - 12, row.bottom}, labelFont, modes[index],
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-            push(TrayFlyoutHitKind::PowerMode, row, index);
-        }
-        y += listRow * 3L + gap;
-        if (m_qsCache.usbKnown) {
-            const RECT usb{padding, y, panelWidth - padding, y + listRow};
-            card(usb, false);
-            text({usb.left + 14, usb.top, usb.right - 70, usb.bottom}, labelFont, L"USB selective suspend",
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
-            push(TrayFlyoutHitKind::Toggle,
-                toggleRect(usb.top + listRow / 2L, usb.right - 12, m_qsCache.usbSuspend), kToggleUsb);
-            y += listRow + gap;
-        }
-        section(L"Using significant energy");
-        const size_t energyCount = m_qsCache.energyLive
-            ? std::min(m_qsCache.energyApps.size(), static_cast<size_t>(3))
-            : 0;
-        if (energyCount == 0) {
-            const std::wstring note = m_qsCache.energyNote.empty()
-                ? (m_qsCache.energyPending ? L"Measuring energy use\u2026" : L"Energy usage unavailable")
-                : m_qsCache.energyNote;
-            const RECT row{padding, y, panelWidth - padding, y + listRow};
-            card(row, false);
-            text({row.left + 14, row.top, row.right - 14, row.bottom}, labelFont, note,
+        // macOS Battery menu: one flat glass face (no lighter/darker cards),
+        // grey section titles, hairlines and glyph-disc rows.
+        SYSTEM_POWER_STATUS power{};
+        const bool powerKnown = GetSystemPowerStatus(&power) != FALSE;
+        const bool onBattery = powerKnown && power.BatteryFlag != 128 && power.BatteryFlag != 255 &&
+            power.BatteryLifePercent <= 100;
+        const LONG headerTop = y;
+        beginHeader(onBattery ? L"Battery" : L"Power", false, -1, false);
+        if (onBattery) {
+            text({padding + menuInset, headerTop, panelWidth - padding - menuInset, headerTop + headerHeight},
+                titleFont, std::to_wstring(power.BatteryLifePercent) + L"%",
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 200);
+            const wchar_t* source = power.ACLineStatus == 1 ? L"Power Source: Power Adapter"
+                                                            : L"Power Source: Battery";
+            text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont, source,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 200);
-            y += listRow + gap;
-        } else {
-            const RECT energyGroup{padding, y, panelWidth - padding,
-                y + static_cast<LONG>(energyCount) * listRow};
-            card(energyGroup, false);
-            for (size_t index = 0; index < energyCount; ++index) {
-                const QsEnergyApp& energyApp = m_qsCache.energyApps[index];
-                const RECT row{energyGroup.left,
-                    energyGroup.top + static_cast<LONG>(index) * listRow, energyGroup.right,
-                    energyGroup.top + static_cast<LONG>(index + 1) * listRow};
-                const std::wstring usage = std::to_wstring(energyApp.cpuPercent) + L"% CPU";
-                text({row.left + 14, row.top, row.right - 92, row.bottom}, labelFont, energyApp.name,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-                text({row.right - 88, row.top, row.right - 12, row.bottom}, statusFont, usage,
-                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
-            }
-            y += static_cast<LONG>(energyCount) * listRow + gap;
+            y += sectionH;
         }
-        footer(L"More power settings", kLinkPower);
+        hairline();
+        menuSection(L"Energy Mode");
+        // Display order follows macOS; the hit index stays the power mode
+        // (0 High, 1 Automatic, 2 Low).
+        struct ModeRow {
+            int mode;
+            wchar_t glyph;
+            const wchar_t* label;
+        };
+        static constexpr ModeRow kModeRows[3] = {
+            {1, L'\uE83F', L"Automatic"},
+            {2, L'\uE851', L"Low Power"},
+            {0, L'\uE945', L"High Power"},
+        };
+        static const std::wstring kNoTrailing;
+        for (const ModeRow& mode : kModeRows) {
+            menuItem(mode.glyph, m_qsCache.powerMode == mode.mode, false, mode.label, kNoTrailing, 0,
+                TrayFlyoutHitKind::PowerMode, mode.mode);
+        }
+        if (m_qsCache.usbKnown) {
+            hairline();
+            const RECT usb{padding, y, panelWidth - padding, y + menuRow};
+            text({usb.left + menuInset, usb.top, usb.right - std::lround(64.0F * scale), usb.bottom}, labelFont,
+                L"USB selective suspend", DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+            push(TrayFlyoutHitKind::Toggle,
+                toggleRect(usb.top + menuRow / 2L, usb.right - menuInset, m_qsCache.usbSuspend), kToggleUsb);
+            y += menuRow;
+        }
+        hairline();
+        menuSection(L"Using Significant Energy");
+        if (!m_qsCache.energyLive || m_qsCache.energyApps.empty()) {
+            menuNote(m_qsCache.energyNote.empty()
+                    ? std::wstring(m_qsCache.energyPending ? L"Measuring energy use\u2026"
+                                                           : L"Energy usage unavailable")
+                    : m_qsCache.energyNote);
+        } else {
+            const LONG appIcon = std::max(16L, std::lround(22.0F * scale));
+            const LONG levelW = std::lround(80.0F * scale);
+            for (const QsEnergyApp& energyApp : m_qsCache.energyApps) {
+                const RECT row{padding, y, panelWidth - padding, y + menuRow};
+                const LONG iconLeft = row.left + menuInset;
+                const LONG iconTop = row.top + (menuRow - appIcon) / 2L;
+                if (draw) {
+                    HICON appHandle = EnergyAppIcon(energyApp.path);
+                    if (appHandle != nullptr) {
+                        BlitIcon(pixels, width, height, memory, appHandle, static_cast<int>(iconLeft),
+                            static_cast<int>(iconTop), static_cast<int>(appIcon));
+                    } else {
+                        icon(iconLeft, iconTop, L'\uECAA', static_cast<UINT>(appIcon), inkR, inkG, inkB);
+                    }
+                }
+                const LONG levelRight = row.right - menuInset;
+                text({levelRight - levelW, row.top, levelRight, row.bottom}, statusFont,
+                    PowerLevelLabel(energyApp.level), DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 160);
+                const LONG nameLeft = iconLeft + appIcon + std::lround(10.0F * scale);
+                const LONG nameRight = levelRight - levelW - std::lround(6.0F * scale);
+                text({nameLeft, row.top, nameRight, row.bottom}, labelFont,
+                    draw ? FitFlyoutLine(labelFont, energyApp.name, (std::max)(0L, nameRight - nameLeft))
+                         : energyApp.name,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                y += menuRow;
+            }
+        }
+        hairline();
+        menuLink(L"Power Settings\u2026", kLinkPower);
+        y += gap / 2L;
 
     } else if (m_qsPage == QuickSettingsPage::SystemTray) {
         // Windows' notification area as a Control Centre menu: every tray

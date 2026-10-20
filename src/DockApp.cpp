@@ -6829,7 +6829,7 @@ void DockApp::ArmOverflowLiveWorkers() noexcept {
         RequestQuickSettingsCacheAsync(m_overflowWindow, kQsCacheResultMessage, m_qsPage);
     }
     if (m_qsPage == QuickSettingsPage::Power) {
-        SetTimer(m_overflowWindow, kEnergySampleTimerId, 500, nullptr);
+        SetTimer(m_overflowWindow, kEnergySampleTimerId, 2000, nullptr);
         RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
     } else {
         KillTimer(m_overflowWindow, kEnergySampleTimerId);
@@ -9513,10 +9513,12 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
         // menu rows get a plate; other pages keep their bare footer links.
         if (hit.kind == TrayFlyoutHitKind::MoreSettings && m_qsPage != QuickSettingsPage::Wifi &&
             m_qsPage != QuickSettingsPage::Bluetooth && m_qsPage != QuickSettingsPage::Boost &&
-            m_qsPage != QuickSettingsPage::Display && m_qsPage != QuickSettingsPage::RefreshRate) {
+            m_qsPage != QuickSettingsPage::Display && m_qsPage != QuickSettingsPage::RefreshRate &&
+            m_qsPage != QuickSettingsPage::Power) {
             break;
         }
         [[fallthrough]];
+    case TrayFlyoutHitKind::PowerMode:
     case TrayFlyoutHitKind::WifiNetwork:
     case TrayFlyoutHitKind::WifiOthers:
     case TrayFlyoutHitKind::BluetoothOthers:
@@ -9562,7 +9564,6 @@ void DockApp::ApplyOverflowHoverHighlight(uint8_t* pixels, int width, int height
     case TrayFlyoutHitKind::VolumeSlider:
     case TrayFlyoutHitKind::BrightnessSlider:
     case TrayFlyoutHitKind::CaptureGain:
-    case TrayFlyoutHitKind::PowerMode:
     case TrayFlyoutHitKind::AudioOutput:
     case TrayFlyoutHitKind::AudioInput:
     case TrayFlyoutHitKind::VpnEntry:
@@ -10459,7 +10460,7 @@ void DockApp::PaintOverflowPopup() {
             RequestQuickSettingsCacheAsync(m_overflowWindow, kQsCacheResultMessage, m_qsPage);
         }
         if (m_qsPage == QuickSettingsPage::Power) {
-            SetTimer(m_overflowWindow, kEnergySampleTimerId, 500, nullptr);
+            SetTimer(m_overflowWindow, kEnergySampleTimerId, 2000, nullptr);
             RequestEnergyAppsAsync(m_overflowWindow, kQsEnergyResultMessage);
         } else {
             KillTimer(m_overflowWindow, kEnergySampleTimerId);

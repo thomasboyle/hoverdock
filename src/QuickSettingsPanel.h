@@ -76,11 +76,23 @@ struct QsVpnEntry {
     bool connected = false;
 };
 
-// One app row on the Energy page. cpuPercent is this process's share of
-// machine CPU between two samples (a stand-in for significant energy use).
+// Task Manager's "Power usage" bands. Its model is private; ours estimates the
+// same inputs (CPU share, busiest GPU engine, disk I/O) per app.
+enum class QsPowerLevel : uint8_t {
+    VeryLow = 0,
+    Low,
+    Moderate,
+    High,
+    VeryHigh,
+};
+
+// One app row on the Power page: power usage above Moderate, held in the list
+// with hysteresis so rows do not flicker between samples.
 struct QsEnergyApp {
     std::wstring name;
-    int cpuPercent = 0;
+    // Executable path for the row icon (empty if the process is protected).
+    std::wstring path;
+    QsPowerLevel level = QsPowerLevel::High;
 };
 
 // Snapshot filled on the UI thread while Quick Settings is open. Queries are
@@ -184,7 +196,7 @@ QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache);
 // Seek the current GSMTC session (on the media worker). level is 0..1 across
 // its timeline; the snapshot moves to the target at once.
 void SeekQuickSettingsMedia(float level) noexcept;
-// Kick a ToolHelp energy sample on a worker (~500 ms cadence). Posts notifyMsg to
+// Kick a power-usage sample on a worker (~2 s cadence). Posts notifyMsg to
 // notifyHwnd when a fresh result is ready; never blocks the UI thread.
 void RequestEnergyAppsAsync(HWND notifyHwnd, UINT notifyMsg);
 // Copy the latest worker energy snapshot into cache. True when values changed.
