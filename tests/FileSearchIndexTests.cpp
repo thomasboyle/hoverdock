@@ -208,6 +208,16 @@ void TestIncremental() {
     // Backspace -> full rescan path.
     static_cast<void>(index.Search("repo", 10, &state));
     CHECK(!state.lastWasIncremental);
+    // With journal-added (unsorted tail) names present, a repeated or
+    // extended query still narrows instead of rescanning.
+    for (uint64_t i = 0; i < 300; ++i) {
+        index.Upsert(v, 500000 + i, kRoot, 0, "tail_report_" + std::to_string(i) + ".txt");
+    }
+    static_cast<void>(index.Search("report", 50, &state, 1));
+    static_cast<void>(index.Search("report ", 50, &state, 1));
+    CHECK(state.lastWasIncremental);
+    static_cast<void>(index.Search("report_", 50, &state, 1));
+    CHECK(state.lastWasIncremental);
     // Mutation invalidates.
     index.Upsert(v, 99999, kRoot, 0, "report_new_mail.txt");
     const auto after = Names(index, index.Search("report_new", 10, &state));

@@ -946,6 +946,9 @@ struct ScanContext {
     uint16_t queryKey = 0;
     bool queryHasDot = false;
     size_t slotCount = 0;
+    // Narrowing only pays for small match sets (see Search): stop recording
+    // past this many (one cap for the whole query, across scan phases).
+    size_t recordCap = 0;
     // Upper bound of the query-dependent score part with all tokens at
     // position 0: without (tokenCeiling) and with (ceilingHead) the
     // whole-name bonus. A slot can never beat ceilingHead + its base.
@@ -1134,9 +1137,6 @@ void ScanSlots(const ScanContext& ctx, uint32_t s0, uint32_t s1, bool sorted, st
     const Token& token = ctx.query->tokens[ctx.query->anchor];
     const unsigned char* names = ctx.names;
     const uint32_t* starts = ctx.slotStart;
-    // Narrowing only pays for small match sets (see Search), so stop
-    // recording once this part exceeds that share.
-    const size_t recordLimit = (s1 - s0) / 8 + 1;
     const size_t begin = starts[s0];
     const size_t end = starts[s1];
     uint32_t slot = s0;
@@ -1168,7 +1168,7 @@ void ScanSlots(const ScanContext& ctx, uint32_t s0, uint32_t s1, bool sorted, st
         Hit hit;
         const SlotResult result = ScoreSlot(ctx, slot, ctx.query->anchor, threshold, hit);
         if (result != SlotResult::NoMatch) {
-            if (matches.size() <= recordLimit) {
+            if (matches.size() <= ctx.recordCap) {
                 matches.push_back(slot);
             }
             ++matchCount;
@@ -1282,6 +1282,7 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
     ctx.queryKey = FoldedKey(query.folded);
     ctx.queryHasDot = query.folded.find('.') != std::string::npos;
     ctx.slotCount = m_slotEntry.size();
+    ctx.recordCap = ctx.slotCount / 8 + 1;
     ctx.tokenCeiling = static_cast<int>(query.tokens.size()) * kTokenCeiling;
     ctx.ceilingHead = ctx.tokenCeiling + kWholeNameCeiling;
     ctx.shared = &shared;
