@@ -330,8 +330,18 @@ std::vector<uint8_t> DownsamplePremul(const std::vector<uint8_t>& source, UINT d
 }
 
 // Brings `window` to the foreground even when another process owns it (the
-// hotkey arrives while some other app is active).
-void ForceForeground(HWND window) {
+// hotkey arrives while some other app is active). The foreground lock only
+// yields to the process with the latest input, so post a no-op input first
+// (as PowerToys Run does), then fall back to joining the foreground thread and
+// finally to an Alt tap.
+bool ForceForeground(HWND window) {
+    INPUT nudge{};
+    nudge.type = INPUT_MOUSE;
+    SendInput(1, &nudge, sizeof(nudge));
+    if (SetForegroundWindow(window) != FALSE && GetForegroundWindow() == window) {
+        SetFocus(window);
+        return true;
+    }
     const HWND foreground = GetForegroundWindow();
     const DWORD foregroundThread = foreground != nullptr ? GetWindowThreadProcessId(foreground, nullptr) : 0;
     const DWORD thisThread = GetCurrentThreadId();
@@ -344,6 +354,17 @@ void ForceForeground(HWND window) {
     if (attached) {
         AttachThreadInput(thisThread, foregroundThread, FALSE);
     }
+    if (GetForegroundWindow() != window) {
+        INPUT alt[2]{};
+        alt[0].type = INPUT_KEYBOARD;
+        alt[0].ki.wVk = VK_MENU;
+        alt[1] = alt[0];
+        alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, alt, sizeof(INPUT));
+        SetForegroundWindow(window);
+        SetFocus(window);
+    }
+    return GetForegroundWindow() == window;
 }
 
 void ShellOpenAsync(std::wstring target, bool reveal) {
@@ -481,6 +502,7 @@ void DockApp::ToggleSearch() {
 }
 
 bool DockApp::OpenSearch() {
+    const ULONGLONG openStarted = GetTickCount64();
     if (m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding) {
         BeginShow();
     }
@@ -520,9 +542,12 @@ bool DockApp::OpenSearch() {
     m_searchGlass.clear();
     m_searchLayerDib.contentValid = false;
     PaintSearch();
+    const ULONGLONG painted = GetTickCount64();
     ShowWindow(m_searchWindow, SW_SHOW);
-    ForceForeground(m_searchWindow);
+    const bool focused = ForceForeground(m_searchWindow);
     SetTimer(m_searchWindow, kCaretTimerId, kCaretBlinkMs, nullptr);
+    Log(L"Search opened: first paint " + std::to_wstring(painted - openStarted) + L" ms, total " +
+        std::to_wstring(GetTickCount64() - openStarted) + L" ms, focused=" + (focused ? L"1" : L"0"));
     m_fileSearch.SetActive(true);
     RefreshSearchApps();
     if (!m_searchText.empty()) {
