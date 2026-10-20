@@ -6,6 +6,7 @@
 #include <cmath>
 #include <atomic>
 #include <cstdint>
+#include <cwchar>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -142,8 +143,34 @@ double NowMs() noexcept {
     return static_cast<double>(counter.QuadPart) * 1000.0 / frequency;
 }
 
-// Request round trip (send -> response headers) for an empty body, in ms;
-// -1 on failure.
+// Sum of every `dur=` in the Server-Timing headers: time the server spent
+// before responding (MEASURED ~25-30 ms on __down: cfSpeedEdge + cfSpeedWorker),
+// which is not network latency.
+double ServerTimingMs(HINTERNET request) {
+    double total = 0.0;
+    DWORD index = 0;
+    for (;;) {
+        wchar_t value[512];
+        DWORD size = sizeof(value);
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, L"Server-Timing", value, &size, &index) == FALSE) {
+            break;
+        }
+        const std::wstring header(value, size / sizeof(wchar_t));
+        for (size_t at = header.find(L"dur="); at != std::wstring::npos; at = header.find(L"dur=", at + 4U)) {
+            if (at > 0U && header[at - 1U] != L';' && header[at - 1U] != L' ') {
+                continue;
+            }
+            const double ms = wcstod(header.c_str() + at + 4U, nullptr);
+            if (std::isfinite(ms) && ms > 0.0) {
+                total += ms;
+            }
+        }
+    }
+    return total;
+}
+
+// Network round trip for an empty body in ms (send -> response headers,
+// minus the server's reported processing time); -1 on failure.
 double TimedRequest(const Connection& connection) {
     InternetHandle request = connection.Request(L"GET", L"/__down?bytes=0");
     if (!request) {
@@ -156,10 +183,14 @@ double TimedRequest(const Connection& connection) {
         return -1.0;
     }
     const double elapsed = NowMs() - start;
-    if (!StatusOk(request.Get()) || !Drain(request.Get())) {
+    if (!StatusOk(request.Get())) {
         return -1.0;
     }
-    return elapsed;
+    const double server = ServerTimingMs(request.Get());
+    if (!Drain(request.Get())) {
+        return -1.0;
+    }
+    return std::max(0.0, server < elapsed ? elapsed - server : elapsed);
 }
 
 double Median(std::vector<double> values) {
@@ -440,6 +471,13 @@ struct SpeedTestService::State {
                 continue;
             }
             if (index == 0) {
+                // The download connections' TLS handshakes compete for the
+                // link and CPU; let them finish before the timed samples.
+                for (std::thread& warmer : warmers) {
+                    if (warmer.joinable()) {
+                        warmer.join();
+                    }
+                }
                 continue;
             }
             samples.push_back(ms);
@@ -460,7 +498,9 @@ struct SpeedTestService::State {
             s.liveValue = -1.0;
         });
         for (std::thread& warmer : warmers) {
-            warmer.join();
+            if (warmer.joinable()) {
+                warmer.join();
+            }
         }
         const double download = MeasureThroughput(false, kDownloadMs, downloadConnections);
         if (cancel.load()) {
