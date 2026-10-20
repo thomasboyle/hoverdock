@@ -1104,7 +1104,9 @@ IDWriteTextFormat* FlyoutTextFormat(IDWriteFactory* factory, FlyoutDWriteCache& 
     if ((format & DT_END_ELLIPSIS) != 0U) {
         IDWriteInlineObject* ellipsis = nullptr;
         if (SUCCEEDED(factory->CreateEllipsisTrimmingSign(textFormat, &ellipsis)) && ellipsis != nullptr) {
-            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_WORD, 0, 0};
+            // Character granularity like GDI's DT_END_ELLIPSIS: word granularity
+            // dropped whole words ("Tap to boost" -> "Tap to") in narrow tiles.
+            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
             textFormat->SetTrimming(&trimming, ellipsis);
             ellipsis->Release();
         }
