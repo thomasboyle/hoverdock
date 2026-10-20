@@ -311,6 +311,76 @@ void TestCompaction() {
     CHECK(index.Search("renamed", 10).size() == 1);
 }
 
+// Characterization: the bounded top-N must equal the head of the complete
+// ranking (same entries, scores and order), for every limit and thread count,
+// on a tree with zones, hidden folders and varied depth.
+void TestTopNIsPrefixOfFullRanking() {
+    FileIndex index;
+    const uint8_t v = index.AddVolume("C:", kRoot);
+    std::mt19937 rng(2024);
+    std::vector<uint64_t> directories{kRoot};
+    const char* words[] = {"Alpha", "beta", "report", "Mail", "photo", "data", "a", "re", "notes", "x"};
+    const char* exts[] = {".txt", ".exe", ".lnk", ".dll", "", ".docx"};
+    constexpr uint64_t kCount = 120000;
+    for (uint64_t i = 0; i < kCount; ++i) {
+        const bool directory = i % 9 == 0;
+        std::string name = std::string(words[rng() % 10]) + (rng() % 2 ? " " : "_") + words[rng() % 10];
+        if (rng() % 3 == 0) {
+            name += std::to_string(rng() % 100);
+        }
+        if (!directory) {
+            name += exts[rng() % 6];
+        }
+        const uint64_t parent = directories[rng() % directories.size()];
+        const uint8_t flags = (directory ? kFlagDirectory : 0) | (rng() % 40 == 0 ? kFlagHidden : 0);
+        index.Add(v, 1000 + i, parent, flags, name);
+        if (directory) {
+            directories.push_back(1000 + i);
+        }
+    }
+    index.FinishVolume(v);
+    const Zone zones[] = {Zone::UserFolder, Zone::UserHome, Zone::ProgramFiles, Zone::AppData, Zone::Windows,
+        Zone::Hidden};
+    for (size_t d = 1; d < directories.size(); d += 37) {
+        index.SetZoneMarker(v, directories[d], zones[d % 6]);
+    }
+    index.RecomputeZones();
+    // A few journal-style changes so appended (renamed) slots are covered.
+    for (uint64_t i = 0; i < 2000; ++i) {
+        index.Upsert(v, 1000 + (i * 53) % kCount, directories[i % directories.size()],
+            (i % 9 == 0) ? kFlagDirectory : 0, std::string("renamed report a ") + std::to_string(i));
+    }
+    for (const char* q : {"a", "re", "report", "mail a", "e", "x", "alpha beta", "zz"}) {
+        const std::vector<Hit> full = index.Search(q, 10000000, nullptr, 1);
+        for (const size_t limit : {1U, 7U, 50U, 400U}) {
+            for (const unsigned threads : {1U, 4U}) {
+                const std::vector<Hit> top = index.Search(q, limit, nullptr, threads);
+                bool same = top.size() == std::min<size_t>(limit, full.size());
+                for (size_t i = 0; same && i < top.size(); ++i) {
+                    same = top[i].entry == full[i].entry && top[i].score == full[i].score;
+                }
+                CHECK(same);
+                if (!same) {
+                    std::printf("  query '%s' limit %zu threads %u differs\n", q, limit, threads);
+                }
+            }
+        }
+        // Typing with the narrowing cache gives the same head.
+        SearchState state;
+        std::string typed;
+        std::vector<Hit> last;
+        for (const char c : std::string(q)) {
+            typed.push_back(c);
+            last = index.Search(typed, 50, &state, 4);
+        }
+        bool same = last.size() == std::min<size_t>(50, full.size());
+        for (size_t i = 0; same && i < last.size(); ++i) {
+            same = last[i].entry == full[i].entry && last[i].score == full[i].score;
+        }
+        CHECK(same);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -322,6 +392,7 @@ int main() {
     TestParallelMatchesSerial();
     TestUnicodeMatching();
     TestCompaction();
+    TestTopNIsPrefixOfFullRanking();
     if (g_failures == 0) {
         std::printf("FileSearchIndex tests: all passed\n");
         return 0;
