@@ -3117,6 +3117,8 @@ LRESULT CALLBACK DockApp::ContextWindowProcedure(HWND window, UINT message, WPAR
 
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
+        // Automatic energy mode: wakes its engine only when it asked for input.
+        s_instance->m_autoPower.NoteInput();
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         if (wParam == WM_MOUSEMOVE && !s_instance->IsDragActive() &&
             s_instance->NeedsHookPointerPost(mouse->pt)) {

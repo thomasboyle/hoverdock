@@ -3,11 +3,13 @@
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <powrprof.h>
+#include <powersetting.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <optional>
@@ -33,6 +35,17 @@ constexpr wchar_t kAutoPlanDescription[] =
 // SCHEME_BALANCED (GUID_TYPICAL_POWER_SAVINGS).
 const GUID kBalancedPlan = {0x381b4222, 0xf694, 0x41f0, {0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e}};
 constexpr wchar_t kBalancedPlanText[] = L"381b4222-f694-41f0-9685-ff5bb260df2e";
+
+// GUID_ACTIVE_POWERSCHEME: notified with the new plan's GUID on every switch.
+const GUID kActiveSchemeSetting = {0x31f9f286, 0x5084, 0x42fe, {0xb7, 0x20, 0x2b, 0x02, 0x64, 0x99, 0x37, 0x63}};
+
+// DEVICE_NOTIFY_CALLBACK and DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS (powrprof.h),
+// spelled out so the subscription does not depend on SDK header revisions.
+constexpr DWORD kDeviceNotifyCallback = 2;
+struct PlanSubscription {
+    ULONG(CALLBACK* callback)(PVOID context, ULONG type, PVOID setting);
+    PVOID context;
+};
 
 const GUID kProcessorSubgroup = {0x54533251, 0x82be, 0x4824, {0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00}};
 const GUID kPcieSubgroup = {0x501a4d13, 0x42af, 0x4429, {0x9f, 0xd1, 0xa8, 0x21, 0x8c, 0x26, 0x8e, 0x20}};
@@ -63,9 +76,20 @@ const PlanSetting kPlanSettings[] = {
 
 constexpr size_t kPlanSettingCount = sizeof(kPlanSettings) / sizeof(kPlanSettings[0]);
 
-constexpr DWORD kTickMs = 500;
+// Engaged cadence: one load sample per tick. Faster while a focused creative
+// tool waits to be driven (keyboard-only scrubbing such as J/K/L has no hook),
+// slower when the user is away and nothing demanding runs. Mouse input wakes
+// either at once through the dock's mouse hook.
+constexpr DWORD kTickMs = 1500;
+constexpr DWORD kCreativeTickMs = 500;
+constexpr DWORD kParkedTickMs = 10000;
+// Plan polling when GUID_ACTIVE_POWERSCHEME notifications are unavailable.
 constexpr DWORD kDormantTickMs = 2000;
-constexpr ULONGLONG kLoadSampleMs = 1500;
+// Timer wakes can land a little early; still count them as a full interval.
+constexpr ULONGLONG kLoadSampleMs = kTickMs - 100;
+// GPU engine counters are the costliest read: renders run for minutes and
+// are held 20 s, so a 4.5 s cadence is enough outside the fullscreen probe.
+constexpr ULONGLONG kGpuSampleMs = 3 * kTickMs - 100;
 constexpr ULONGLONG kRegisteredGamesRefreshMs = 5ULL * 60ULL * 1000ULL;
 // Children of these are launched apps, not part of the launcher's work.
 constexpr std::wstring_view kNeverFoldInto[] = {
@@ -252,6 +276,13 @@ private:
     bool m_primed = false;
 };
 
+struct TickResult {
+    AutoPowerStatus status;
+    DWORD waitMs = kTickMs;
+    // Ask the mouse hook to wake the engine on the next input.
+    bool wantInput = false;
+};
+
 // Everything the worker owns. Lives only on the worker thread.
 class Engine {
 public:
@@ -267,17 +298,22 @@ public:
         GoDormant();
     }
 
-    // One evaluation. Returns the status to publish.
-    AutoPowerStatus Tick(bool forceLoadSample) {
-        AutoPowerStatus status;
-        if (!ActivePlanIs(kAutoPlan)) {
+    // One evaluation: status to publish and how long to sleep. hookInputTick
+    // is the GetTickCount of the last hook-reported input (0 = none).
+    TickResult Tick(bool forceLoadSample, bool planActive, DWORD hookInputTick) {
+        TickResult result;
+        AutoPowerStatus& status = result.status;
+        if (!planActive) {
             GoDormant();
-            return status;
+            return result;
         }
         status.engaged = true;
         if (!m_engaged) {
             m_engaged = true;
             m_planFull.reset();
+            for (Written& written : m_written) {
+                written.valid = false;
+            }
             forceLoadSample = true;
             Trace(L"Engaged.");
         }
@@ -293,6 +329,10 @@ public:
         autopower::Inputs inputs;
         inputs.nowMs = now;
         inputs.idleMs = IdleMs();
+        // The hook sees input before GetLastInputInfo is updated.
+        if (hookInputTick != 0) {
+            inputs.idleMs = (std::min)(inputs.idleMs, static_cast<uint64_t>(GetTickCount() - hookInputTick));
+        }
         inputs.apps.reserve(m_groups.size());
         const auto foregroundGroup = m_groupOfPid.find(foregroundPid);
         const std::wstring foregroundKey = foregroundGroup != m_groupOfPid.end() ? foregroundGroup->second : L"";
@@ -325,7 +365,25 @@ public:
             m_lastFull = status.fullPower;
             m_lastApp = status.appName;
         }
-        return status;
+
+        const auto foregroundApp = m_groups.find(foregroundKey);
+        const bool creativeFocused = foregroundApp != m_groups.end() &&
+            foregroundApp->second.sample.kind == autopower::AppKind::Creative;
+        bool demandingRunning = false;
+        for (const auto& [key, group] : m_groups) {
+            demandingRunning = demandingRunning || group.sample.kind == autopower::AppKind::Creative ||
+                group.sample.kind == autopower::AppKind::Game || group.sample.registeredGame;
+        }
+        if (!decision.fullPower && creativeFocused) {
+            result.waitMs = kCreativeTickMs;
+            result.wantInput = true;
+        } else if (!decision.fullPower && !demandingRunning && inputs.idleMs > m_policy.Settings().heavyIdleMs) {
+            // Away from the desk with nothing demanding open: only input or
+            // a focus change (both events) can create demand.
+            result.waitMs = kParkedTickMs;
+            result.wantInput = true;
+        }
+        return result;
     }
 
     // Restore everything this engine changed: calm plan, OS-managed throttling.
@@ -346,6 +404,8 @@ public:
         }
         m_procs.clear();
         m_gpu.Close();
+        m_gpuLoads.clear();
+        m_lastGpuSample = 0;
         m_foregroundPid = 0;
         m_lastFull = false;
         m_lastApp.clear();
@@ -353,6 +413,12 @@ public:
 
 private:
     struct Baseline {
+        bool valid = false;
+        DWORD ac = 0;
+        DWORD dc = 0;
+    };
+
+    struct Written {
         bool valid = false;
         DWORD ac = 0;
         DWORD dc = 0;
@@ -373,6 +439,7 @@ private:
         ULONGLONG lastCpu = 0;
         ULONGLONG lastCpuTick = 0;
         double lastPercent = 0.0;
+        unsigned seenGeneration = 0;
         bool exempt = false;
         bool haveOriginal = false;
         PROCESS_POWER_THROTTLING_STATE original{};
@@ -398,7 +465,10 @@ private:
         if (m_planFull.has_value() && *m_planFull == full) {
             return;
         }
+        // Each write is a power-service round trip: skip values already in the
+        // plan (Balanced's 100% maximum state equals the full-power value).
         bool wrote = false;
+        bool failed = false;
         for (size_t index = 0; index < kPlanSettingCount; ++index) {
             const Baseline& base = m_baseline[index];
             if (!base.valid) {
@@ -407,15 +477,23 @@ private:
             const PlanSetting& setting = kPlanSettings[index];
             const DWORD ac = full ? setting.fullValue : base.ac;
             const DWORD dc = full ? setting.fullValue : base.dc;
-            const DWORD acResult = PowerWriteACValueIndex(nullptr, &kAutoPlan, setting.subgroup, &setting.setting, ac);
-            const DWORD dcResult = PowerWriteDCValueIndex(nullptr, &kAutoPlan, setting.subgroup, &setting.setting, dc);
-            wrote = wrote || acResult == ERROR_SUCCESS || dcResult == ERROR_SUCCESS;
+            Written& written = m_written[index];
+            if (written.valid && written.ac == ac && written.dc == dc) {
+                continue;
+            }
+            const bool acOk =
+                PowerWriteACValueIndex(nullptr, &kAutoPlan, setting.subgroup, &setting.setting, ac) == ERROR_SUCCESS;
+            const bool dcOk =
+                PowerWriteDCValueIndex(nullptr, &kAutoPlan, setting.subgroup, &setting.setting, dc) == ERROR_SUCCESS;
+            written = {acOk && dcOk, ac, dc};
+            wrote = wrote || acOk || dcOk;
+            failed = failed || !acOk || !dcOk;
         }
         // Re-activating the active plan is what applies freshly written values.
         if (wrote && ActivePlanIs(kAutoPlan)) {
             static_cast<void>(PowerSetActiveScheme(nullptr, &kAutoPlan));
         }
-        if (!wrote) {
+        if (failed && !wrote) {
             Trace(L"Plan values could not be written; only throttling is managed.");
         }
         m_planFull = full;
@@ -635,7 +713,7 @@ private:
             return;
         }
         const DWORD self = GetCurrentProcessId();
-        std::unordered_set<DWORD> alive;
+        const unsigned generation = ++m_generation;
         PROCESSENTRY32W entry{};
         entry.dwSize = sizeof(entry);
         if (Process32FirstW(snapshot, &entry) != FALSE) {
@@ -644,28 +722,28 @@ private:
                 if (pid == 0 || pid == 4 || pid == self) {
                     continue;
                 }
-                alive.insert(pid);
-                const std::wstring exe = Lower(entry.szExeFile);
+                // Known pids compare in place; only new ones pay for a copy.
                 auto it = m_procs.find(pid);
-                if (it != m_procs.end() && it->second.exe != exe) {
+                if (it != m_procs.end() && _wcsicmp(it->second.exe.c_str(), entry.szExeFile) != 0) {
                     CloseProc(it->second);
                     m_procs.erase(it);
                     it = m_procs.end();
                 }
                 if (it == m_procs.end()) {
                     Proc proc;
-                    proc.exe = exe;
+                    proc.exe = Lower(entry.szExeFile);
                     proc.display = DisplayName(entry.szExeFile);
                     proc.parent = entry.th32ParentProcessID;
                     Classify(pid, proc);
                     it = m_procs.emplace(pid, std::move(proc)).first;
                 }
                 it->second.parent = entry.th32ParentProcessID;
+                it->second.seenGeneration = generation;
             } while (Process32NextW(snapshot, &entry) != FALSE);
         }
         CloseHandle(snapshot);
         for (auto it = m_procs.begin(); it != m_procs.end();) {
-            if (!alive.contains(it->first)) {
+            if (it->second.seenGeneration != generation) {
                 CloseProc(it->second);
                 it = m_procs.erase(it);
             } else {
@@ -711,19 +789,23 @@ private:
 
         // GPU engine counters are costly: only read them when a creative tool
         // could be rendering, or a fullscreen app might be an unknown game.
-        bool needGpu = false;
+        bool creativeRunning = false;
         for (const auto& [key, group] : m_groups) {
-            needGpu = needGpu || group.sample.kind == autopower::AppKind::Creative;
+            creativeRunning = creativeRunning || group.sample.kind == autopower::AppKind::Creative;
         }
+        // An unknown fullscreen app is only a game with 3D load: probe every
+        // sample until decided. Renders only need the slower cadence.
+        bool fullscreenProbe = false;
         const auto foreground = m_groupOfPid.find(m_foregroundPid);
-        if (!needGpu && foreground != m_groupOfPid.end()) {
+        if (foreground != m_groupOfPid.end()) {
             const Group& group = m_groups[foreground->second];
-            needGpu = group.sample.kind == autopower::AppKind::Other && !group.sample.registeredGame &&
+            fullscreenProbe = group.sample.kind == autopower::AppKind::Other && !group.sample.registeredGame &&
                 ForegroundIsFullscreen();
         }
-        if (needGpu) {
+        if (fullscreenProbe || (creativeRunning && now - m_lastGpuSample >= kGpuSampleMs)) {
             m_gpu.Sample(m_gpuLoads);
-        } else {
+            m_lastGpuSample = now;
+        } else if (!fullscreenProbe && !creativeRunning) {
             m_gpuLoads.clear();
         }
         for (auto& [key, group] : m_groups) {
@@ -812,11 +894,14 @@ private:
     }
 
     Baseline m_baseline[kPlanSettingCount]{};
+    Written m_written[kPlanSettingCount]{};
     std::optional<bool> m_planFull;
     bool m_engaged = false;
     DWORD m_cpuCount = 1;
     DWORD m_foregroundPid = 0;
     ULONGLONG m_lastLoadSample = 0;
+    ULONGLONG m_lastGpuSample = 0;
+    unsigned m_generation = 0;
     bool m_lastFull = false;
     std::wstring m_lastApp;
     bool m_registeredLoaded = false;
@@ -876,6 +961,7 @@ void AutoPowerEngine::Start(HWND notifyHwnd, UINT notifyMsg, bool adoptBalanced)
         std::lock_guard lock(m_mutex);
         m_stop = false;
         m_woken = false;
+        m_forceSample = false;
         m_notifyHwnd = notifyHwnd;
         m_notifyMsg = notifyMsg;
         m_status = {};
@@ -910,11 +996,41 @@ void AutoPowerEngine::Stop() {
 }
 
 void AutoPowerEngine::Wake() noexcept {
+    Signal(true);
+}
+
+void AutoPowerEngine::NoteInput() noexcept {
+    if (!m_wantInput.load(std::memory_order_relaxed) || !m_wantInput.exchange(false)) {
+        return;
+    }
+    m_hookInputTick.store(GetTickCount(), std::memory_order_relaxed);
+    Signal(false);
+}
+
+void AutoPowerEngine::Signal(bool forceSample) noexcept {
     {
         std::lock_guard lock(m_mutex);
         m_woken = true;
+        m_forceSample = m_forceSample || forceSample;
     }
     m_wake.notify_all();
+}
+
+ULONG CALLBACK AutoPowerEngine::PlanChanged(PVOID context, ULONG type, PVOID setting) {
+    auto* self = static_cast<AutoPowerEngine*>(context);
+    const auto* change = static_cast<const POWERBROADCAST_SETTING*>(setting);
+    if (self == nullptr || type != PBT_POWERSETTINGCHANGE || change == nullptr ||
+        change->DataLength < sizeof(GUID) || IsEqualGUID(change->PowerSetting, kActiveSchemeSetting) == FALSE) {
+        return ERROR_SUCCESS;
+    }
+    GUID scheme{};
+    std::memcpy(&scheme, change->Data, sizeof(scheme));
+    const int state = IsEqualGUID(scheme, kAutoPlan) != FALSE ? 1 : 2;
+    // Re-activating our own plan to apply new values reports no change.
+    if (self->m_planState.exchange(state) != state) {
+        self->Wake();
+    }
+    return ERROR_SUCCESS;
 }
 
 AutoPowerStatus AutoPowerEngine::Status() const {
@@ -923,32 +1039,65 @@ AutoPowerStatus AutoPowerEngine::Status() const {
 }
 
 void AutoPowerEngine::ThreadMain() {
-    Engine engine;
-    bool forceSample = true;
-    for (;;) {
-        const AutoPowerStatus status = engine.Tick(forceSample);
-        HWND notifyHwnd = nullptr;
-        UINT notifyMsg = 0;
-        {
-            std::unique_lock lock(m_mutex);
-            if (status.engaged != m_status.engaged || status.fullPower != m_status.fullPower ||
-                status.reason != m_status.reason || status.appName != m_status.appName) {
-                m_status = status;
-                notifyHwnd = m_notifyHwnd;
-                notifyMsg = m_notifyMsg;
-            }
-        }
-        if (notifyHwnd != nullptr) {
-            PostMessageW(notifyHwnd, notifyMsg, 0, 0);
-        }
-        std::unique_lock lock(m_mutex);
-        const DWORD waitMs = status.engaged ? kTickMs : kDormantTickMs;
-        m_wake.wait_for(lock, std::chrono::milliseconds(waitMs), [this] { return m_stop || m_woken; });
-        if (m_stop) {
-            break;
-        }
-        forceSample = m_woken;
-        m_woken = false;
+    // Plan switches arrive as events, so a dormant engine sleeps until one
+    // does. Without the subscription, fall back to polling the active plan.
+    m_planState.store(0);
+    PlanSubscription subscribe{&AutoPowerEngine::PlanChanged, this};
+    HPOWERNOTIFY notify = nullptr;
+    if (PowerSettingRegisterNotification(&kActiveSchemeSetting, kDeviceNotifyCallback, &subscribe, &notify) !=
+        ERROR_SUCCESS) {
+        notify = nullptr;
+        Trace(L"Plan change notifications unavailable; polling.");
+    } else {
+        // Seed the state in case no initial notification is delivered; a
+        // callback that already arrived wins.
+        int unknown = 0;
+        static_cast<void>(m_planState.compare_exchange_strong(unknown, ActivePlanIs(kAutoPlan) ? 1 : 2));
     }
-    // Engine destructor restores the calm plan and process throttling.
+    {
+        Engine engine;
+        bool forceSample = true;
+        for (;;) {
+            const int planState = m_planState.load();
+            const bool planActive = planState == 0 ? ActivePlanIs(kAutoPlan) : planState == 1;
+            const TickResult result =
+                engine.Tick(forceSample, planActive, m_hookInputTick.load(std::memory_order_relaxed));
+            const AutoPowerStatus& status = result.status;
+            m_wantInput.store(status.engaged && result.wantInput, std::memory_order_relaxed);
+            HWND notifyHwnd = nullptr;
+            UINT notifyMsg = 0;
+            {
+                std::lock_guard lock(m_mutex);
+                if (status.engaged != m_status.engaged || status.fullPower != m_status.fullPower ||
+                    status.reason != m_status.reason || status.appName != m_status.appName) {
+                    m_status = status;
+                    notifyHwnd = m_notifyHwnd;
+                    notifyMsg = m_notifyMsg;
+                }
+            }
+            if (notifyHwnd != nullptr) {
+                PostMessageW(notifyHwnd, notifyMsg, 0, 0);
+            }
+            std::unique_lock lock(m_mutex);
+            const auto ready = [this] { return m_stop || m_woken; };
+            if (status.engaged) {
+                m_wake.wait_for(lock, std::chrono::milliseconds(result.waitMs), ready);
+            } else if (notify != nullptr && m_planState.load() != 0) {
+                m_wake.wait(lock, ready);
+            } else {
+                m_wake.wait_for(lock, std::chrono::milliseconds(kDormantTickMs), ready);
+            }
+            if (m_stop) {
+                break;
+            }
+            forceSample = m_forceSample;
+            m_forceSample = false;
+            m_woken = false;
+        }
+        m_wantInput.store(false);
+        if (notify != nullptr) {
+            PowerSettingUnregisterNotification(notify);
+        }
+        // Engine destructor restores the calm plan and process throttling.
+    }
 }

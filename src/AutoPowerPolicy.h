@@ -126,6 +126,9 @@ private:
         // When the current busy run started (0 = not busy).
         uint64_t renderSinceMs = 0;
         uint64_t heavySinceMs = 0;
+        // Update generation that last saw this app (exited apps are dropped).
+        uint64_t seenGeneration = 0;
+        bool exemptNow = false;
     };
 
     [[nodiscard]] BoostReason Demand(const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track) const;
@@ -133,6 +136,7 @@ private:
 
     Tuning m_tuning;
     std::unordered_map<std::wstring, Track> m_tracks;
+    uint64_t m_generation = 0;
 };
 
 }  // namespace autopower

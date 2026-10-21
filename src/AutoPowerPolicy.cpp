@@ -1,7 +1,6 @@
 #include "AutoPowerPolicy.h"
 
 #include <algorithm>
-#include <unordered_set>
 
 namespace autopower {
 
@@ -279,15 +278,22 @@ BoostReason Policy::Demand(const AppSample& app, uint64_t nowMs, uint64_t idleMs
 
 Decision Policy::Update(const Inputs& inputs) {
     const uint64_t now = inputs.nowMs;
-    std::unordered_set<std::wstring> seen;
-    seen.reserve(inputs.apps.size());
+    const uint64_t generation = ++m_generation;
 
     Decision decision;
+    const AppSample* foreground = nullptr;
     for (const AppSample& app : inputs.apps) {
-        if (app.key.empty() || !seen.insert(app.key).second) {
+        if (app.key.empty()) {
             continue;
         }
         Track& track = m_tracks[app.key];
+        if (track.seenGeneration == generation) {
+            continue;
+        }
+        track.seenGeneration = generation;
+        if (app.foreground && foreground == nullptr) {
+            foreground = &app;
+        }
         track.name = app.name;
         const BoostReason demand = Demand(app, now, inputs.idleMs, track);
         if (demand != BoostReason::None) {
@@ -300,36 +306,27 @@ Decision Policy::Update(const Inputs& inputs) {
         } else if (track.holdUntilMs <= now) {
             track.reason = BoostReason::None;
         }
-        if (app.kind == AppKind::Game || app.kind == AppKind::Creative || app.registeredGame) {
-            decision.unthrottle.push_back(app.key);
-        }
+        track.exemptNow = app.kind == AppKind::Game || app.kind == AppKind::Creative || app.registeredGame;
     }
 
-    // Exited apps lose their hold immediately: there is nothing left to boost.
-    for (auto it = m_tracks.begin(); it != m_tracks.end();) {
-        if (seen.find(it->first) == seen.end()) {
-            it = m_tracks.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    const AppSample* foreground = nullptr;
-    for (const AppSample& app : inputs.apps) {
-        if (app.foreground) {
-            foreground = &app;
-            break;
-        }
-    }
-
+    decision.unthrottle.reserve(m_tracks.size());
     const std::wstring* bestKey = nullptr;
     const Track* best = nullptr;
-    for (const auto& [key, track] : m_tracks) {
-        if (track.reason == BoostReason::None || track.holdUntilMs <= now) {
+    for (auto it = m_tracks.begin(); it != m_tracks.end();) {
+        // Exited apps lose their hold immediately: there is nothing left to boost.
+        if (it->second.seenGeneration != generation) {
+            it = m_tracks.erase(it);
             continue;
         }
-        if (std::find(decision.unthrottle.begin(), decision.unthrottle.end(), key) == decision.unthrottle.end()) {
+        const std::wstring& key = it->first;
+        const Track& track = it->second;
+        ++it;
+        const bool active = track.reason != BoostReason::None && track.holdUntilMs > now;
+        if (track.exemptNow || active) {
             decision.unthrottle.push_back(key);
+        }
+        if (!active) {
+            continue;
         }
         const bool isForeground = foreground != nullptr && foreground->key == key;
         const bool bestIsForeground = bestKey != nullptr && foreground != nullptr && foreground->key == *bestKey;

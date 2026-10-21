@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -43,8 +44,13 @@ public:
     void Start(HWND notifyHwnd, UINT notifyMsg, bool adoptBalanced);
     // Stops the worker and restores the calm plan and process throttling.
     void Stop();
-    // Re-evaluate now (foreground changed, energy mode picked).
+    // Re-evaluate now with a fresh load sample (foreground changed, energy
+    // mode picked).
     void Wake() noexcept;
+    // Called from the dock's low-level mouse hook. Costs one relaxed atomic
+    // load unless the engine asked to be woken by input (a focused creative
+    // tool waiting to be driven, or an idle machine parked on a slow poll).
+    void NoteInput() noexcept;
 
     [[nodiscard]] AutoPowerStatus Status() const;
 
@@ -54,12 +60,20 @@ public:
 
 private:
     void ThreadMain();
+    void Signal(bool forceSample) noexcept;
+    // Active power plan change (GUID_ACTIVE_POWERSCHEME) from the power service.
+    static ULONG CALLBACK PlanChanged(PVOID context, ULONG type, PVOID setting);
 
     mutable std::mutex m_mutex;
     std::condition_variable m_wake;
     std::thread m_thread;
     bool m_stop = false;
     bool m_woken = false;
+    bool m_forceSample = false;
+    std::atomic<bool> m_wantInput{false};
+    std::atomic<DWORD> m_hookInputTick{0};
+    // 0 = unknown (poll the active plan), 1 = ours active, 2 = another plan.
+    std::atomic<int> m_planState{0};
     HWND m_notifyHwnd = nullptr;
     UINT m_notifyMsg = 0;
     AutoPowerStatus m_status;
