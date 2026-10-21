@@ -20,14 +20,20 @@
 //     sessions, and camera / microphone use,
 //   - asks autopower::Policy whether demanding work needs full power, trusting
 //     apps it has learned are demanding (autopower-history.txt) sooner,
-//   - switches the plan's processor policy between low power (the Power saver
-//     plan's processor settings, as efficient as Hoverdock's Low Power) and
-//     high power (minimum state 100%, EPP 0, aggressive boost, no core
-//     parking, PCIe ASPM off, full-strength latency hints) on both AC and
-//     battery,
+//   - sets the plan's processor profile, macOS style: the processor's own
+//     controller follows the work every millisecond and the profile only sets
+//     how eagerly. Rest = Power saver's values with efficient turbo, so real
+//     work gets turbo at once and an idle cursor gets nothing; Work =
+//     performance-first preference and aggressive turbo for demanding work;
+//     Game = more so, no core parking. No profile pins clocks at 100% (that
+//     is Hoverdock's High Power mode). Same on AC and battery,
 //   - exempts games, creative tools, AI runtimes and apps using audio, the
 //     camera or the microphone from Windows power throttling (EcoQoS) so a
-//     minimized export, a call or a focused game is never slowed.
+//     minimized export, a call or a focused game is never slowed,
+//   - naps hidden apps like App Nap: an app whose windows are all minimized
+//     or on another desktop, unused for 30 s and not doing work the user just
+//     started, runs as EcoQoS with its timer resolution requests ignored
+//     until a window is shown again.
 // Every plan switch is timed and traced (OutputDebugString).
 // Picking Low or High Power (or another plan in Windows) makes the engine go
 // dormant and restore everything it changed.

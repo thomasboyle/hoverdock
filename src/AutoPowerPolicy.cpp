@@ -248,6 +248,38 @@ AppKind ClassifyApp(std::wstring_view exeLower, std::wstring_view pathLower) {
     return AppKind::Other;
 }
 
+namespace {
+constexpr std::wstring_view kNeverNapExes[] = {
+    L"explorer.exe",
+    L"dwm.exe",
+    L"csrss.exe",
+    L"winlogon.exe",
+    L"logonui.exe",
+    L"lockapp.exe",
+    L"sihost.exe",
+    L"ctfmon.exe",
+    L"textinputhost.exe",
+    L"shellexperiencehost.exe",
+    L"startmenuexperiencehost.exe",
+    L"searchhost.exe",
+    L"searchapp.exe",
+    L"applicationframehost.exe",
+    L"systemsettings.exe",
+    L"taskmgr.exe",
+    L"narrator.exe",
+    L"magnify.exe",
+    L"osk.exe",
+    L"tabtip.exe",
+    L"consent.exe",
+    L"credentialuibroker.exe",
+    L"dock.exe",
+};
+}  // namespace
+
+bool NeverNap(std::wstring_view exeLower) noexcept {
+    return MatchesAny(exeLower, kNeverNapExes);
+}
+
 const wchar_t* ReasonLabel(BoostReason reason) noexcept {
     switch (reason) {
     case BoostReason::Game:
@@ -328,7 +360,8 @@ BoostReason Policy::Demand(
                 (app.cpuCores >= m_tuning.callCores || app.gpuPercent >= m_tuning.callGpuPercent));
         const bool aiRuntimeBusy = app.kind == AppKind::Ai &&
             (app.cpuCores >= m_tuning.aiCores || app.gpuPercent >= m_tuning.aiGpuPercent);
-        const bool computeBusy = !gameKind && app.kind != AppKind::Creative &&
+        // Browsers and players (NeverGame) use compute for video effects.
+        const bool computeBusy = !gameKind && (app.kind == AppKind::Other || app.kind == AppKind::Ai) &&
             app.gpuComputePercent >= m_tuning.computeGpuPercent;
         advance(track.ai, aiRuntimeBusy || computeBusy);
     }
@@ -395,7 +428,7 @@ Decision Policy::Update(const Inputs& inputs) {
 namespace {
 // Exempt-list versions are unique across every Policy in the process, so a
 // decision can only ever match the list of the policy that filled it.
-std::atomic<uint64_t> g_unthrottleVersion{0};
+std::atomic<uint64_t> g_throttleVersion{0};
 }  // namespace
 
 void Policy::Update(const Inputs& inputs, Decision& decision) {
@@ -443,6 +476,12 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
         if (app.foreground && foreground == nullptr) {
             foreground = &track;
         }
+        if (track.firstSeenMs == 0) {
+            track.firstSeenMs = (std::max)(now, uint64_t{1});
+        }
+        if (app.foreground) {
+            track.lastForegroundMs = (std::max)(now, uint64_t{1});
+        }
         bool newRun = false;
         const BoostReason demand = Demand(app, now, inputs.idleMs, track, newRun);
         if (newRun) {
@@ -466,16 +505,27 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
         }
         track.exemptNow = app.kind == AppKind::Game || app.kind == AppKind::Creative || app.kind == AppKind::Ai ||
             app.registeredGame || app.audioActive || app.cameraActive || app.micActive;
-        const bool listed = track.exemptNow || (track.reason != BoostReason::None && track.holdUntilMs > now);
-        listChanged = listChanged || listed != track.listed;
-        track.listed = listed;
+        const bool boosting = track.reason != BoostReason::None && track.holdUntilMs > now;
+        Track::Qos qos = Track::Qos::Os;
+        if (track.exemptNow || boosting) {
+            qos = Track::Qos::Never;
+        } else if (app.windowed && !app.windowVisible && !app.foreground && !NeverNap(app.key)) {
+            const uint64_t lastUsed = (std::max)(track.lastForegroundMs, track.firstSeenMs);
+            const bool userWork = app.cpuCores >= m_tuning.napBusyCores && track.lastForegroundMs != 0 &&
+                now - track.lastForegroundMs < m_tuning.napBusyGraceMs;
+            if (now - lastUsed >= m_tuning.napAfterMs && !userWork) {
+                qos = Track::Qos::Nap;
+            }
+        }
+        listChanged = listChanged || qos != track.qos;
+        track.qos = qos;
     }
 
     // Exited apps lose their hold immediately: there is nothing left to boost.
     if (m_tracks.size() != m_seen.size()) {
         for (auto it = m_tracks.begin(); it != m_tracks.end();) {
             if (it->second.seenGeneration != generation) {
-                listChanged = listChanged || it->second.listed;
+                listChanged = listChanged || it->second.qos != Track::Qos::Os;
                 it = m_tracks.erase(it);
             } else {
                 ++it;
@@ -519,17 +569,22 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
     // and copied out only to a decision that does not hold it already.
     if (listChanged) {
         m_unthrottle.clear();
+        m_nap.clear();
         for (const Slot& slot : m_seen) {
-            if (slot.track->listed) {
+            if (slot.track->qos == Track::Qos::Never) {
                 m_unthrottle.push_back(*slot.key);
+            } else if (slot.track->qos == Track::Qos::Nap) {
+                m_nap.push_back(*slot.key);
             }
         }
         std::sort(m_unthrottle.begin(), m_unthrottle.end());
-        m_unthrottleVersion = ++g_unthrottleVersion;
+        std::sort(m_nap.begin(), m_nap.end());
+        m_throttleVersion = ++g_throttleVersion;
     }
-    if (decision.unthrottleVersion != m_unthrottleVersion) {
+    if (decision.throttleVersion != m_throttleVersion) {
         decision.unthrottle = m_unthrottle;
-        decision.unthrottleVersion = m_unthrottleVersion;
+        decision.nap = m_nap;
+        decision.throttleVersion = m_throttleVersion;
     }
 }
 
@@ -539,7 +594,8 @@ void Policy::Reset() noexcept {
     m_layout = 0;
     m_seen.clear();
     m_unthrottle.clear();
-    m_unthrottleVersion = ++g_unthrottleVersion;
+    m_nap.clear();
+    m_throttleVersion = ++g_throttleVersion;
 }
 
 bool History::Record(const std::wstring& key, uint32_t day) {

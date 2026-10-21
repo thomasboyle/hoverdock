@@ -155,8 +155,8 @@ struct EngineDriver {
         }
         // The engine re-applies throttling when the version moves; the
         // content compare only feeds the behaviour fingerprint.
-        if (decision.unthrottleVersion != lastVersion) {
-            lastVersion = decision.unthrottleVersion;
+        if (decision.throttleVersion != lastVersion) {
+            lastVersion = decision.throttleVersion;
             if (decision.unthrottle != lastUnthrottle) {
                 lastUnthrottle = decision.unthrottle;
                 ++changes;

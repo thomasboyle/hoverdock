@@ -33,6 +33,11 @@
 // does not flap between samples. Games, creative tools, AI runtimes, and apps
 // playing audio or using the camera or microphone are also exempt from
 // Windows background throttling (EcoQoS) while that is true.
+//
+// Like App Nap on macOS, apps the user cannot see (every window minimized or
+// on another desktop) that are not playing audio, on a call, demanding power,
+// or recently used are napped: run as EcoQoS with their timer resolution
+// requests ignored, until a window is shown again.
 namespace autopower {
 
 enum class AppKind : uint8_t {
@@ -83,6 +88,10 @@ struct AppSample {
     double gpuPercent = 0.0;
     double gpu3dPercent = 0.0;
     double gpuComputePercent = 0.0;
+    // Has a window the user could switch to (taskbar-eligible), and whether
+    // any such window is showing (not minimized, not on another desktop).
+    bool windowed = false;
+    bool windowVisible = false;
     // Live audio stream (playback or capture) and camera / microphone use.
     bool audioActive = false;
     bool cameraActive = false;
@@ -112,11 +121,13 @@ struct Decision {
     // App the boost is credited to (foreground first, then priority).
     std::wstring appKey;
     std::wstring appName;
-    // App keys whose processes must never be power throttled right now
-    // (sorted), and a version that changes whenever the list may have:
-    // compare versions to detect a change without comparing the strings.
+    // App keys whose processes must never be power throttled right now, and
+    // app keys to nap (EcoQoS, timer resolution ignored); both sorted. The
+    // version changes whenever either list may have: compare versions to
+    // detect a change without comparing the strings.
     std::vector<std::wstring> unthrottle;
-    uint64_t unthrottleVersion = 0;
+    std::vector<std::wstring> nap;
+    uint64_t throttleVersion = 0;
     // Apps whose sustained work (Heavy, Render, Ai, Call) was newly confirmed
     // by this update: worth remembering as demanding (see History).
     std::vector<std::wstring> confirmed;
@@ -162,6 +173,12 @@ struct Tuning {
     uint64_t callHoldMs = 10000;
     uint64_t aiHoldMs = 20000;
     uint64_t heavyHoldMs = 10000;
+    // App Nap: hidden this long since it was last focused (or first seen).
+    uint64_t napAfterMs = 30000;
+    // Work the user started stays unnapped: an app busy above napBusyCores
+    // that was focused within napBusyGraceMs keeps running at full speed.
+    uint64_t napBusyGraceMs = 10 * 60 * 1000;
+    double napBusyCores = 0.5;
 };
 
 // Classify an executable by lowercase file name and lowercase full path
@@ -169,6 +186,9 @@ struct Tuning {
 [[nodiscard]] AppKind ClassifyApp(std::wstring_view exeLower, std::wstring_view pathLower);
 
 [[nodiscard]] const wchar_t* ReasonLabel(BoostReason reason) noexcept;
+
+// Shell, input and accessibility processes that must never be napped.
+[[nodiscard]] bool NeverNap(std::wstring_view exeLower) noexcept;
 
 class Policy {
 public:
@@ -210,8 +230,12 @@ private:
         // Update generation that last saw this app (exited apps are dropped).
         uint64_t seenGeneration = 0;
         bool exemptNow = false;
-        // On the exempt list (exempt, or holding a boost).
-        bool listed = false;
+        // When it was first seen and last focused (0 = never).
+        uint64_t firstSeenMs = 0;
+        uint64_t lastForegroundMs = 0;
+        // Power throttling wanted: OS-managed, never throttled, or napped.
+        enum class Qos : uint8_t { Os, Never, Nap };
+        Qos qos = Qos::Os;
     };
 
     // An input position's track (pointers into m_tracks stay valid until
@@ -236,7 +260,8 @@ private:
     uint64_t m_layout = 0;
     std::vector<Slot> m_seen;
     std::vector<std::wstring> m_unthrottle;
-    uint64_t m_unthrottleVersion = 0;
+    std::vector<std::wstring> m_nap;
+    uint64_t m_throttleVersion = 0;
 };
 
 // Per-app memory of confirmed demanding work, persisted between sessions so
