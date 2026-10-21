@@ -33,8 +33,8 @@ public:
     // Groq model id; empty in dock.ini means the default (qwen/qwen3.8-27b).
     [[nodiscard]] std::wstring AiModel() const;
     void SetAiModel(std::wstring model);
-    // Win+Space opens dock Search (dock.ini SearchHotkey=0 leaves Win+Space
-    // to the Windows input-language switcher).
+    // Ctrl+Space opens dock Search (dock.ini SearchHotkey=0 leaves Ctrl+Space
+    // to apps and input methods).
     [[nodiscard]] bool SearchHotkey() const noexcept;
     [[nodiscard]] bool LaunchAtStartup() const noexcept;
     void SetLaunchAtStartup(bool enabled) noexcept;

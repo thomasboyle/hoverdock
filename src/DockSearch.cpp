@@ -1,6 +1,6 @@
 // Spotlight-style Search: a liquid-glass panel centred above the dock that
 // matches apps and every file/folder name (FileSearchService) as you type.
-// Opened by the dock's Search tile or Win+Space.
+// Opened by the dock's Search tile or Ctrl+Space.
 
 #include "DockApp.h"
 #include "DockTheme.hlsli"
@@ -2363,7 +2363,7 @@ void DockApp::ExitSearchEntry(bool refresh) {
 void DockApp::StartSearchServices() {
     m_fileSearch.Start(m_window, kSearchStatusMessage);
     if (m_config.SearchHotkey() && !m_searchHotkey.Start(m_window, kSearchHotkeyMessage)) {
-        Log(L"Search: Win+Space hook unavailable; use the dock Search tile.");
+        Log(L"Search: Ctrl+Space is taken by another app; use the dock Search tile.");
     }
     RefreshSearchApps();
 }

@@ -37,7 +37,7 @@ No Electron. No WebView. No Acrylic hacks. Just a single, fast native executable
 - 🧭 **Instantly familiar.** Pinned apps, running apps, drag-to-reorder, and a right-click menu to pin, close, or reveal an app's location.
 - 🔴 **Notification badges.** Unread counts from Teams, Outlook, WhatsApp and any other app that badges its Windows taskbar icon appear on its dock icon, just like macOS. Follows the Windows *Show badges on taskbar apps* setting.
 - 🛟 **Safe by design.** It auto-imports your existing taskbar pins on first run, and restores your taskbar on exit or crash. You can't get locked out.
-- 🔎 **Spotlight for Windows.** Press **Win + Space** and a glass search panel appears above the dock. Apps, files and folders match as you type, straight from the NTFS Master File Table, and stay current through the change journal. Results arrive in milliseconds, even on drives with millions of files.
+- 🔎 **Spotlight for Windows.** Press **Ctrl + Space** and a glass search panel appears above the dock. Apps, files and folders match as you type, straight from the NTFS Master File Table, and stay current through the change journal. Results arrive in milliseconds, even on drives with millions of files.
 - ✨ **Ask AI from Search.** Type a question and press **Ctrl + Enter** for a streamed answer from Groq (Qwen 3.8 27B by default) with formatted text, tables, highlighted code, links and images. When it searches the web, a **Sources** badge lists every page it used.
 - 🤫 **Stays out of your way.** Per-user install (no admin), launch at startup, and silent auto-updates from GitHub Releases.
 
@@ -60,7 +60,7 @@ Your taskbar pins are imported automatically, so your dock is ready the first ti
 | Pin, close, or locate an app | Right-click its icon |
 | Reorder icons | Drag an icon onto another slot |
 | Change startup, updates, or check version | Click the gear icon in Quick Settings |
-| Search apps, files and folders | Press **Win + Space** (or click the Search tile), type, then **Enter** |
+| Search apps, files and folders | Press **Ctrl + Space** (or click the Search tile), type, then **Enter** |
 | Show a result in File Explorer | **Shift + Enter** (Ctrl + click) |
 | Copy a result's path | **Ctrl + C** |
 | Ask AI about what you typed | **Ctrl + Enter** (Esc goes back to results) |
@@ -72,7 +72,7 @@ Search reads file names straight from the Master File Table of every fixed NTFS 
 
 Reading the MFT needs administrator rights, and Hoverdock never runs elevated. Until you opt in, Search covers your user folders. Choose **Search this entire PC** in the results to approve, once, a small on-demand task. Approving copies the indexer to `%ProgramFiles%\Hoverdock` (so nothing user-writable ever runs elevated). When Hoverdock starts indexing, the task runs it with `--mft-dump`, it streams the file names to the dock over a private pipe, and then exits. Following the change journal doesn't need elevation.
 
-Win+Space normally switches keyboard layout. If you rely on that, set `SearchHotkey=0` under `[Dock]` in `dock.ini`.
+Ctrl+Space is claimed system-wide while the dock runs, so apps that use it (code-completion in editors, some IME on/off toggles) won't see it. If you rely on that, set `SearchHotkey=0` under `[Dock]` in `dock.ini` and open Search from the dock tile.
 
 ### Ask AI
 

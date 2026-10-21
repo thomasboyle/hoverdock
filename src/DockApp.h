@@ -645,7 +645,7 @@ private:
     void DestroyContextFonts() noexcept;
     void ActivatePressedApp();
     // Spotlight Search (DockSearch.cpp): glass panel centred above the dock,
-    // Win+Space, MFT-backed file index + app catalogue.
+    // Ctrl+Space, MFT-backed file index + app catalogue.
     bool OpenSearch();
     void CloseSearch(bool hideDockIfAway = true);
     void ToggleSearch();
