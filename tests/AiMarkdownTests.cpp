@@ -216,7 +216,7 @@ void TestSafeUrl() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     TestInlineStyles();
     TestNestedEmphasis();
     TestLinks();
@@ -225,8 +225,8 @@ int main() {
     TestHighlight();
     TestSafeUrl();
     TestBlockEquality();
-    const char* fuzzDocs = std::getenv("AIMD_FUZZ_DOCS");
-    TestIncrementalParser(1, fuzzDocs != nullptr ? std::atoi(fuzzDocs) : 400);
+    // Optional argument: number of fuzz documents (default 400).
+    TestIncrementalParser(1, argc > 1 ? std::atoi(argv[1]) : 400);
     if (g_failures == 0) {
         std::printf("AiMarkdownTests: all passed\n");
         return 0;
