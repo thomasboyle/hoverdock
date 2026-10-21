@@ -58,10 +58,13 @@ enum class BoostReason : uint8_t {
     Game,
 };
 
+// Plain data (views, flags and numbers): copying one is a memcpy, so the
+// engine can refresh its inputs every tick for free. key and name view
+// strings the caller owns, which must outlive the Update call.
 struct AppSample {
     // Stable grouping key (lowercase executable name of the app's root).
-    std::wstring key;
-    std::wstring name;
+    std::wstring_view key;
+    std::wstring_view name;
     AppKind kind = AppKind::Other;
     bool foreground = false;
     // Foreground window covers its whole monitor (borderless or exclusive).
@@ -97,6 +100,10 @@ struct Inputs {
     // Time since the last keyboard/mouse/pen/gamepad input in the session.
     uint64_t idleMs = 0;
     std::vector<AppSample> apps;
+    // Optional promise: a nonzero value equal to the previous update's means
+    // apps holds the same keys in the same order (only loads and flags
+    // changed), so keys need not be compared. 0 = no promise.
+    uint64_t layout = 0;
 };
 
 struct Decision {
@@ -105,8 +112,11 @@ struct Decision {
     // App the boost is credited to (foreground first, then priority).
     std::wstring appKey;
     std::wstring appName;
-    // App keys whose processes must never be power throttled right now.
+    // App keys whose processes must never be power throttled right now
+    // (sorted), and a version that changes whenever the list may have:
+    // compare versions to detect a change without comparing the strings.
     std::vector<std::wstring> unthrottle;
+    uint64_t unthrottleVersion = 0;
     // Apps whose sustained work (Heavy, Render, Ai, Call) was newly confirmed
     // by this update: worth remembering as demanding (see History).
     std::vector<std::wstring> confirmed;
@@ -200,6 +210,16 @@ private:
         // Update generation that last saw this app (exited apps are dropped).
         uint64_t seenGeneration = 0;
         bool exemptNow = false;
+        // On the exempt list (exempt, or holding a boost).
+        bool listed = false;
+    };
+
+    // An input position's track (pointers into m_tracks stay valid until
+    // the track is erased, which only happens to apps absent from the last
+    // update, whose slots were overwritten by it).
+    struct Slot {
+        const std::wstring* key = nullptr;
+        Track* track = nullptr;
     };
 
     // newRun: the returned demand is a sustained run demanding for the first time.
@@ -212,6 +232,11 @@ private:
     Tuning m_tuning;
     std::unordered_map<std::wstring, Track> m_tracks;
     uint64_t m_generation = 0;
+    std::vector<Slot> m_slots;
+    uint64_t m_layout = 0;
+    std::vector<Slot> m_seen;
+    std::vector<std::wstring> m_unthrottle;
+    uint64_t m_unthrottleVersion = 0;
 };
 
 // Per-app memory of confirmed demanding work, persisted between sessions so

@@ -4,6 +4,9 @@
 // unthrottle change check). The engine runs it every 100 ms while probing
 // and every 1.5 s otherwise, so its cost is paid continuously at rest.
 //
+// Build with -DAUTOPOWER_BENCH_FROZEN_ONLY to time only the frozen driver
+// against an older AutoPowerPolicy (before Update(inputs, decision)).
+//
 // Reports median ns per tick and heap allocations per tick for a typical
 // (8 app groups) and a busy (64 app groups) desktop.
 
@@ -24,6 +27,11 @@ namespace {
 std::atomic<unsigned long long> g_allocations{0};
 }
 
+// GCC cannot see that these replacements pair with each other.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+
 void* operator new(std::size_t size) {
     g_allocations.fetch_add(1, std::memory_order_relaxed);
     if (void* block = std::malloc(size == 0 ? 1 : size)) {
@@ -43,7 +51,10 @@ namespace {
 using autopower::AppKind;
 using autopower::AppSample;
 
+// The engine's app group: owns its key and name (the sample may view them).
 struct Group {
+    std::wstring key;
+    std::wstring name;
     AppSample sample;
 };
 
@@ -60,13 +71,14 @@ std::unordered_map<std::wstring, Group> MakeGroups(size_t count) {
         if (index >= std::size(kNames)) {
             key.insert(0, L"app" + std::to_wstring(index) + L"-");
         }
-        Group group;
-        group.sample.key = key;
-        group.sample.name = key.substr(0, key.size() - 4);
+        Group& group = groups[key];
+        group.key = key;
+        group.name = key.substr(0, key.size() - 4);
+        group.sample.key = group.key;
+        group.sample.name = group.name;
         group.sample.kind = kKinds[base];
         group.sample.audioActive = base == 3;
         group.sample.micActive = base == 9;
-        groups.emplace(key, std::move(group));
     }
     return groups;
 }
@@ -105,6 +117,7 @@ struct TickDriver {
     }
 };
 
+#if !defined(AUTOPOWER_BENCH_FROZEN_ONLY)
 // The engine's current tick (reused inputs/decision; knownDemanding resolved
 // when groups are built and when history records). Same workload, same
 // observable decisions as TickDriver.
@@ -114,23 +127,25 @@ struct EngineDriver {
     autopower::Inputs inputs;
     autopower::Decision decision;
     std::vector<std::wstring> lastUnthrottle;
+    uint64_t lastVersion = 0;
     unsigned changes = 0;
 
     void Tick(std::unordered_map<std::wstring, Group>& groups, const std::wstring& foregroundKey, uint64_t now,
         uint64_t idle, uint32_t day) {
         inputs.nowMs = now;
         inputs.idleMs = idle;
+        const auto foregroundIt = groups.find(foregroundKey);
+        const Group* foreground = foregroundIt != groups.end() ? &foregroundIt->second : nullptr;
         inputs.apps.resize(groups.size());
+        inputs.layout = 1;  // the benchmark's groups never change
         size_t slot = 0;
-        for (const auto& [key, group] : groups) {
+        for (auto& [key, group] : groups) {
             AppSample& app = inputs.apps[slot++];
             app = group.sample;
-            app.foreground = key == foregroundKey;
+            group.sample.freshLoad = false;
+            app.foreground = &group == foreground;
         }
         policy.Update(inputs, decision);
-        for (auto& [key, group] : groups) {
-            group.sample.freshLoad = false;
-        }
         for (const std::wstring& key : decision.confirmed) {
             static_cast<void>(history.Record(key, day));
             const auto group = groups.find(key);
@@ -138,12 +153,19 @@ struct EngineDriver {
                 group->second.sample.knownDemanding = history.IsKnown(key, day);
             }
         }
-        if (decision.unthrottle != lastUnthrottle) {
-            lastUnthrottle = decision.unthrottle;
-            ++changes;
+        // The engine re-applies throttling when the version moves; the
+        // content compare only feeds the behaviour fingerprint.
+        if (decision.unthrottleVersion != lastVersion) {
+            lastVersion = decision.unthrottleVersion;
+            if (decision.unthrottle != lastUnthrottle) {
+                lastUnthrottle = decision.unthrottle;
+                ++changes;
+            }
         }
     }
 };
+
+#endif
 
 template <typename Driver>
 void Run(const char* label, size_t groupCount) {
@@ -194,7 +216,9 @@ int main() {
     // AutoPowerEngine runs it now.
     Run<TickDriver>("frozen", 8);
     Run<TickDriver>("frozen", 64);
+#if !defined(AUTOPOWER_BENCH_FROZEN_ONLY)
     Run<EngineDriver>("engine", 8);
     Run<EngineDriver>("engine", 64);
+#endif
     return 0;
 }

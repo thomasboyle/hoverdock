@@ -1148,6 +1148,8 @@ public:
         }
         const auto foregroundGroup = m_groupOfPid.find(foregroundPid);
         const std::wstring* foregroundKey = foregroundGroup != m_groupOfPid.end() ? &foregroundGroup->second : nullptr;
+        const auto foregroundApp = foregroundKey != nullptr ? m_groups.find(*foregroundKey) : m_groups.end();
+        const Group* foregroundEntry = foregroundApp != m_groups.end() ? &foregroundApp->second : nullptr;
         // Fullscreen state only matters for an app that could be an unknown
         // game: known games, creative tools and browsers/players skip it.
         bool fullscreen = false;
@@ -1158,20 +1160,21 @@ public:
             exclusive = SUCCEEDED(SHQueryUserNotificationState(&state)) && state == QUNS_RUNNING_D3D_FULL_SCREEN;
         }
         inputs.apps.resize(m_groups.size());
+        // Groups (keys and order) only change when a scan rebuilds them.
+        inputs.layout = m_groupGeneration;
         size_t slot = 0;
-        for (const auto& [key, group] : m_groups) {
+        for (auto& [key, group] : m_groups) {
             autopower::AppSample& app = inputs.apps[slot++];
             app = group.sample;
-            app.foreground = foregroundKey != nullptr && key == *foregroundKey;
+            // The input holds this reading; later re-evaluations reuse it.
+            group.sample.freshLoad = false;
+            app.foreground = &group == foregroundEntry;
             app.fullscreen = app.foreground && fullscreen;
             app.exclusiveFullscreen = app.foreground && exclusive;
         }
 
         m_policy.Update(inputs, m_decision);
         const autopower::Decision& decision = m_decision;
-        for (auto& [key, group] : m_groups) {
-            group.sample.freshLoad = false;
-        }
         for (const std::wstring& key : decision.confirmed) {
             m_historyDirty = m_history.Record(key, today) || m_historyDirty;
             const auto group = m_groups.find(key);
@@ -1190,9 +1193,9 @@ public:
         }
         // Exemptions only change with the exempt set or group membership
         // (rebuilt by each process scan); probe ticks usually change neither.
-        if (decision.unthrottle != m_lastUnthrottle || m_throttleGeneration != m_groupGeneration) {
+        if (decision.unthrottleVersion != m_lastUnthrottleVersion || m_throttleGeneration != m_groupGeneration) {
             ApplyThrottling(decision.unthrottle);
-            m_lastUnthrottle = decision.unthrottle;
+            m_lastUnthrottleVersion = decision.unthrottleVersion;
             m_throttleGeneration = m_groupGeneration;
         }
 
@@ -1207,7 +1210,6 @@ public:
             m_lastApp = status.appName;
         }
 
-        const auto foregroundApp = foregroundKey != nullptr ? m_groups.find(*foregroundKey) : m_groups.end();
         const bool creativeFocused = foregroundApp != m_groups.end() &&
             foregroundApp->second.sample.kind == autopower::AppKind::Creative;
         bool demandingRunning = false;
@@ -1276,7 +1278,7 @@ public:
         m_lastGpuSample = 0;
         m_probeUntil = 0;
         m_fullscreenProbeUntil = 0;
-        m_lastUnthrottle.clear();
+        m_lastUnthrottleVersion = 0;
         ++m_groupGeneration;
         m_foregroundPid = 0;
         m_lastFull = false;
@@ -1324,6 +1326,10 @@ private:
     };
 
     struct Group {
+        // Owned here; sample.key / sample.name view them (map nodes and these
+        // strings never move while the group exists).
+        std::wstring key;
+        std::wstring name;
         autopower::AppSample sample;
         std::vector<DWORD> pids;
     };
@@ -1731,9 +1737,11 @@ private:
             }
             const Proc& rootProc = rootIt->second;
             Group& group = m_groups[rootProc.exe];
-            if (group.sample.key.empty()) {
-                group.sample.key = rootProc.exe;
-                group.sample.name = rootProc.display;
+            if (group.key.empty()) {
+                group.key = rootProc.exe;
+                group.name = rootProc.display;
+                group.sample.key = group.key;
+                group.sample.name = group.name;
                 group.sample.kind = rootProc.kind;
                 group.sample.registeredGame = rootProc.registeredGame;
                 group.sample.knownDemanding = m_history.IsKnown(rootProc.exe, m_today);
@@ -1750,9 +1758,11 @@ private:
             const auto it = m_procs.find(m_foregroundPid);
             if (it != m_procs.end()) {
                 Group& group = m_groups[it->second.exe];
-                if (group.sample.key.empty()) {
-                    group.sample.key = it->second.exe;
-                    group.sample.name = it->second.display;
+                if (group.key.empty()) {
+                    group.key = it->second.exe;
+                    group.name = it->second.display;
+                    group.sample.key = group.key;
+                    group.sample.name = group.name;
                     group.sample.kind = it->second.kind;
                     group.sample.knownDemanding = m_history.IsKnown(it->second.exe, m_today);
                 }
@@ -2007,7 +2017,7 @@ private:
     int m_fullscreenCache = -1;
     unsigned m_groupGeneration = 0;
     unsigned m_throttleGeneration = 0;
-    std::vector<std::wstring> m_lastUnthrottle;
+    uint64_t m_lastUnthrottleVersion = 0;
     unsigned m_generation = 0;
     bool m_lastFull = false;
     std::wstring m_lastApp;

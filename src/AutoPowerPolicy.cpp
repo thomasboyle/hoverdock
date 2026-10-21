@@ -1,6 +1,7 @@
 #include "AutoPowerPolicy.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <utility>
 
@@ -391,6 +392,12 @@ Decision Policy::Update(const Inputs& inputs) {
     return decision;
 }
 
+namespace {
+// Exempt-list versions are unique across every Policy in the process, so a
+// decision can only ever match the list of the policy that filled it.
+std::atomic<uint64_t> g_unthrottleVersion{0};
+}  // namespace
+
 void Policy::Update(const Inputs& inputs, Decision& decision) {
     const uint64_t now = inputs.nowMs;
     const uint64_t generation = ++m_generation;
@@ -400,26 +407,46 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
     decision.appKey.clear();
     decision.appName.clear();
     decision.confirmed.clear();
-    const AppSample* foreground = nullptr;
-    for (const AppSample& app : inputs.apps) {
+    // The engine passes the same apps in the same order tick after tick (the
+    // groups only change on a process scan): each input slot remembers its
+    // track, so a key is only hashed when the slot's app changes.
+    const bool sameLayout =
+        inputs.layout != 0 && inputs.layout == m_layout && m_slots.size() == inputs.apps.size();
+    if (m_slots.size() != inputs.apps.size()) {
+        m_slots.assign(inputs.apps.size(), Slot{});
+    }
+    m_layout = inputs.layout;
+    m_seen.clear();
+    bool listChanged = false;
+    const Track* foreground = nullptr;
+    for (size_t index = 0; index < inputs.apps.size(); ++index) {
+        const AppSample& app = inputs.apps[index];
+        Slot& slot = m_slots[index];
         if (app.key.empty()) {
+            slot = {};
             continue;
         }
-        Track& track = m_tracks[app.key];
+        if (slot.track == nullptr || (!sameLayout && *slot.key != app.key)) {
+            const auto it = m_tracks.try_emplace(std::wstring(app.key)).first;
+            slot = {&it->first, &it->second};
+            // A key's display name is fixed (both come from its executable).
+            if (it->second.name != app.name) {
+                it->second.name = app.name;
+            }
+        }
+        Track& track = *slot.track;
         if (track.seenGeneration == generation) {
             continue;
         }
         track.seenGeneration = generation;
+        m_seen.push_back(slot);
         if (app.foreground && foreground == nullptr) {
-            foreground = &app;
-        }
-        if (track.name != app.name) {
-            track.name = app.name;
+            foreground = &track;
         }
         bool newRun = false;
         const BoostReason demand = Demand(app, now, inputs.idleMs, track, newRun);
         if (newRun) {
-            decision.confirmed.push_back(app.key);
+            decision.confirmed.emplace_back(app.key);
         }
         if (demand != BoostReason::None) {
             if (demand >= track.reason || track.reasonUntilMs <= now) {
@@ -439,38 +466,33 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
         }
         track.exemptNow = app.kind == AppKind::Game || app.kind == AppKind::Creative || app.kind == AppKind::Ai ||
             app.registeredGame || app.audioActive || app.cameraActive || app.micActive;
+        const bool listed = track.exemptNow || (track.reason != BoostReason::None && track.holdUntilMs > now);
+        listChanged = listChanged || listed != track.listed;
+        track.listed = listed;
     }
 
-    // Filled in place: the strings keep their capacity from earlier updates.
-    if (decision.unthrottle.capacity() < m_tracks.size()) {
-        decision.unthrottle.reserve(m_tracks.size());
+    // Exited apps lose their hold immediately: there is nothing left to boost.
+    if (m_tracks.size() != m_seen.size()) {
+        for (auto it = m_tracks.begin(); it != m_tracks.end();) {
+            if (it->second.seenGeneration != generation) {
+                listChanged = listChanged || it->second.listed;
+                it = m_tracks.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
-    size_t exempt = 0;
+
     const std::wstring* bestKey = nullptr;
     const Track* best = nullptr;
-    for (auto it = m_tracks.begin(); it != m_tracks.end();) {
-        // Exited apps lose their hold immediately: there is nothing left to boost.
-        if (it->second.seenGeneration != generation) {
-            it = m_tracks.erase(it);
+    for (const Slot& slot : m_seen) {
+        const Track& track = *slot.track;
+        if (track.reason == BoostReason::None || track.holdUntilMs <= now) {
             continue;
         }
-        const std::wstring& key = it->first;
-        const Track& track = it->second;
-        ++it;
-        const bool active = track.reason != BoostReason::None && track.holdUntilMs > now;
-        if (track.exemptNow || active) {
-            if (exempt < decision.unthrottle.size()) {
-                decision.unthrottle[exempt] = key;
-            } else {
-                decision.unthrottle.push_back(key);
-            }
-            ++exempt;
-        }
-        if (!active) {
-            continue;
-        }
-        const bool isForeground = foreground != nullptr && foreground->key == key;
-        const bool bestIsForeground = bestKey != nullptr && foreground != nullptr && foreground->key == *bestKey;
+        const std::wstring& key = *slot.key;
+        const bool isForeground = &track == foreground;
+        const bool bestIsForeground = best != nullptr && best == foreground;
         bool better = best == nullptr;
         if (!better && isForeground != bestIsForeground) {
             better = isForeground;
@@ -486,18 +508,38 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
             bestKey = &key;
         }
     }
-    decision.unthrottle.resize(exempt);
     if (best != nullptr) {
         decision.fullPower = true;
         decision.reason = best->reason;
         decision.appKey = *bestKey;
         decision.appName = best->name;
     }
-    std::sort(decision.unthrottle.begin(), decision.unthrottle.end());
+
+    // The exempt list is rebuilt (and sorted) only when membership changes,
+    // and copied out only to a decision that does not hold it already.
+    if (listChanged) {
+        m_unthrottle.clear();
+        for (const Slot& slot : m_seen) {
+            if (slot.track->listed) {
+                m_unthrottle.push_back(*slot.key);
+            }
+        }
+        std::sort(m_unthrottle.begin(), m_unthrottle.end());
+        m_unthrottleVersion = ++g_unthrottleVersion;
+    }
+    if (decision.unthrottleVersion != m_unthrottleVersion) {
+        decision.unthrottle = m_unthrottle;
+        decision.unthrottleVersion = m_unthrottleVersion;
+    }
 }
 
 void Policy::Reset() noexcept {
     m_tracks.clear();
+    m_slots.clear();
+    m_layout = 0;
+    m_seen.clear();
+    m_unthrottle.clear();
+    m_unthrottleVersion = ++g_unthrottleVersion;
 }
 
 bool History::Record(const std::wstring& key, uint32_t day) {

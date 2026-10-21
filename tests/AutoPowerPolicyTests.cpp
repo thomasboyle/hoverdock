@@ -465,6 +465,10 @@ void TestReusedDecisionMatchesFresh() {
     Policy fresh;
     Policy reused;
     Decision decision;
+    // The reused path also promises a layout, bumped whenever the app list
+    // (keys or order) differs from the previous update's.
+    uint64_t layout = 1;
+    std::vector<std::wstring_view> lastKeys;
     AppSample blender = App(L"blender.exe", AppKind::Creative);
     AppSample game = App(L"a-very-long-game-executable-name.exe", AppKind::Game, true);
     AppSample spotify = App(L"spotify.exe", AppKind::NeverGame);
@@ -477,9 +481,22 @@ void TestReusedDecisionMatchesFresh() {
         std::vector<AppSample> apps = {blender, code, spotify};
         if (tick % 17 < 12) {
             apps.push_back(game);
+        } else if (tick % 2 == 0) {
+            // Same size, different app in the last slot.
+            apps.push_back(App(L"notepad.exe", AppKind::Other));
         }
-        const Inputs inputs = At(1000 + tick * 700, (tick % 5) * 2000, apps);
+        if (tick % 3 == 0) {
+            std::reverse(apps.begin(), apps.end());
+        }
+        Inputs inputs = At(1000 + tick * 700, (tick % 5) * 2000, apps);
         const Decision expected = fresh.Update(inputs);
+        std::vector<std::wstring_view> keys;
+        for (const AppSample& app : apps) {
+            keys.push_back(app.key);
+        }
+        layout += keys != lastKeys ? 1 : 0;
+        lastKeys = keys;
+        inputs.layout = layout;
         reused.Update(inputs, decision);
         EXPECT(decision.fullPower == expected.fullPower);
         EXPECT(decision.reason == expected.reason);
