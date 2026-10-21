@@ -1088,6 +1088,10 @@ private:
     POINT m_searchOrigin{};
     SIZE m_searchSize{};
     std::vector<uint8_t> m_searchBits;
+    // Everything drawn over the glass (text, highlights, icons, answer), kept
+    // separately so a live backdrop update is glass + overlay, nothing redrawn.
+    std::vector<uint8_t> m_searchOverlay;
+    uint32_t m_searchOverlayInk = 0;
     std::vector<RECT> m_searchRowRects;
     float m_searchFontScale = 0.0F;
     HFONT m_searchQueryFont = nullptr;

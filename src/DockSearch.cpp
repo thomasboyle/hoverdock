@@ -729,6 +729,7 @@ void DockApp::CloseSearch(bool hideDockIfAway) {
     m_searchRowRects.clear();
     m_searchGlass.clear();
     std::vector<uint8_t>().swap(m_searchBits);
+    std::vector<uint8_t>().swap(m_searchOverlay);
 
     if (!hideDockIfAway || m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding) {
         return;
@@ -882,22 +883,40 @@ bool DockApp::SearchGlassLiveReady(POINT& origin, SIZE& size) const {
     return true;
 }
 
-// A live rebake finished: swap the new backdrop under the panel without
-// re-rendering its text (glass-only pixels take the new bake; the next full
-// paint, at the latest the caret blink, refreshes the rest).
+namespace {
+
+uint32_t PackFlyoutInk() noexcept {
+    return (static_cast<uint32_t>(g_flyoutInkR) << 16U) | (static_cast<uint32_t>(g_flyoutInkG) << 8U) | g_flyoutInkB;
+}
+
+}  // namespace
+
+// A live rebake finished: re-compose the new backdrop with the unchanged
+// overlay, so every pixel (selected row, text edges, answer) moves with the
+// desktop at the bake rate without re-rendering any text.
 void DockApp::ApplySearchLiveGlass(std::vector<uint8_t>& glass) {
     POINT origin{};
     SIZE size{};
     if (!SearchGlassLiveReady(origin, size)) {
         return;
     }
+    const size_t bytes = static_cast<size_t>(size.cx) * static_cast<size_t>(size.cy) * 4U;
     std::vector<uint8_t>& cached = m_searchGlass[size.cy];
-    SIZE presentSize = size;
-    if (!ApplyLivePopupGlass(glass, size, cached, m_searchBits, m_searchBits, presentSize)) {
+    if (glass.size() != bytes || m_searchOverlay.size() != bytes ||
+        std::memcmp(glass.data(), cached.data(), bytes) == 0) {
         return;
     }
+    cached.swap(glass);
     // Other heights were baked against the old desktop.
     std::erase_if(m_searchGlass, [&](const auto& entry) { return entry.first != size.cy; });
+    SetFlyoutChromeInkForGlass(cached.data(), static_cast<int>(size.cx), static_cast<int>(size.cy));
+    if (PackFlyoutInk() != m_searchOverlayInk) {
+        PaintSearch();  // the backdrop flipped light/dark: redraw with the other ink
+        return;
+    }
+    m_searchBits = cached;
+    CompositePremul(m_searchBits.data(), static_cast<int>(size.cx), static_cast<int>(size.cy), 0, 0,
+        m_searchOverlay.data(), static_cast<int>(size.cx), static_cast<int>(size.cy));
     m_searchLayerDib.contentValid = false;
     PresentLayeredBits(m_searchWindow, origin, size.cx, size.cy, m_searchBits.data(), m_searchBits.size(),
         m_searchLayerDib);
@@ -936,9 +955,11 @@ void DockApp::PaintSearch() {
                 DockCornerRadiusPx(scale), 0.94F, shade, shade, shade);
         }
     }
-    m_searchBits = glass;
-    uint8_t* pixels = m_searchBits.data();
-    SetFlyoutChromeInkForGlass(pixels, width, height);
+    // Content goes into a transparent overlay composited over the glass below.
+    SetFlyoutChromeInkForGlass(glass.data(), width, height);
+    m_searchOverlayInk = PackFlyoutInk();
+    m_searchOverlay.assign(bytes, 0);
+    uint8_t* pixels = m_searchOverlay.data();
     const uint8_t inkB = g_flyoutInkB;
     const uint8_t inkG = g_flyoutInkG;
     const uint8_t inkR = g_flyoutInkR;
@@ -1115,6 +1136,8 @@ void DockApp::PaintSearch() {
         }
     }
 
+    m_searchBits = glass;
+    CompositePremul(m_searchBits.data(), width, height, 0, 0, pixels, width, height);
     m_searchOrigin = origin;
     m_searchSize = size;
     PresentLayeredBits(m_searchWindow, origin, size.cx, size.cy, m_searchBits.data(), m_searchBits.size(),
