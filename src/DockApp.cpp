@@ -3772,6 +3772,18 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         }
         return 0;
 
+    case kAiUpdateMessage:
+        ApplyAiUpdate(static_cast<uint64_t>(wParam));
+        return 0;
+
+    case kAiImageMessage:
+        ApplyAiImage(std::unique_ptr<AiImageReply>(reinterpret_cast<AiImageReply*>(lParam)));
+        return 0;
+
+    case kOpenSearchEntryMessage:
+        OpenSearchEntry(static_cast<SearchMode>(wParam));
+        return 0;
+
     case kTrayIconsMessage: {
         std::unique_ptr<std::vector<TrayNotifyIcon>> icons(reinterpret_cast<std::vector<TrayNotifyIcon>*>(lParam));
         m_trayIconsInFlight.store(false);
@@ -7458,7 +7470,9 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     case SettingsHitKind::DropShadow:
     case SettingsHitKind::DepthShade:
     case SettingsHitKind::HandsFree:
-    case SettingsHitKind::LightPanels: {
+    case SettingsHitKind::LightPanels:
+    case SettingsHitKind::AiApiKey:
+    case SettingsHitKind::AiModel: {
         // Rows sit inside a group module: wash an inset chip so module corners stay clean.
         SetFlyoutChromeInk(33, 34, 36);
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
@@ -8150,6 +8164,13 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         SetQsIconColorLive(DockConfig::kDefaultQsIconColor);
         ScheduleConfigSave();
         break;
+    case SettingsHitKind::AiApiKey:
+    case SettingsHitKind::AiModel:
+        // Search owns the text entry; post so this click handler returns first.
+        PostMessageW(m_window, kOpenSearchEntryMessage,
+            static_cast<WPARAM>(hit.kind == SettingsHitKind::AiApiKey ? SearchMode::KeyEntry : SearchMode::ModelEntry),
+            0);
+        break;
     case SettingsHitKind::QsColorHue:
     case SettingsHitKind::QsColorSat:
     case SettingsHitKind::QsColorVal:
@@ -8313,6 +8334,8 @@ void DockApp::PaintSettingsPopup() {
         bool slider;
         bool enabled;
         float amount;
+        // Opens an editor (chevron) instead of toggling a switch.
+        bool link = false;
     };
     const SettingsRow generalRows[] = {
         {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows", false,
@@ -8341,10 +8364,32 @@ void DockApp::PaintSettingsPopup() {
     const LONG generalCount = static_cast<LONG>(sizeof(generalRows) / sizeof(generalRows[0]));
     const LONG glassCount = static_cast<LONG>(sizeof(glassRows) / sizeof(glassRows[0]));
 
+    // AI search (Ctrl+Enter in Search): rows open a one-line editor in the Search panel.
+    std::wstring aiKeySublabel;
+    {
+        std::wstring groqKey = m_config.GroqApiKey();
+        if (m_config.GroqApiKeyFromEnvironment()) {
+            aiKeySublabel = L"Using GROQ_API_KEY from the environment";
+        } else if (groqKey.empty()) {
+            aiKeySublabel = L"Not set \u00B7 click to add one";
+        } else {
+            aiKeySublabel = L"Saved \u00B7 ends in " + groqKey.substr(groqKey.size() - std::min<size_t>(4, groqKey.size()));
+        }
+        SecureZeroMemory(groqKey.data(), groqKey.size() * sizeof(wchar_t));
+    }
+    const std::wstring aiModelSublabel = m_config.AiModel() + L" \u00B7 Ctrl+Enter in Search";
+    const SettingsRow aiRows[] = {
+        {SettingsHitKind::AiApiKey, L"Groq API key", aiKeySublabel.c_str(), false, false, 0.0F, true},
+        {SettingsHitKind::AiModel, L"AI model", aiModelSublabel.c_str(), false, false, 0.0F, true},
+    };
+    const LONG aiCount = static_cast<LONG>(sizeof(aiRows) / sizeof(aiRows[0]));
+
     LONG contentY = padding + headerHeight + P(10.0F);
     const RECT generalRect{padding, contentY, padding + moduleWidth,
         contentY + rowHeight * generalCount};
     contentY = generalRect.bottom + gutter;
+    const RECT aiRect{padding, contentY, padding + moduleWidth, contentY + rowHeight * aiCount};
+    contentY = aiRect.bottom + gutter;
     const RECT glassRect{padding, contentY, padding + moduleWidth,
         contentY + rowHeight * (glassCount - 1L) + frostRowHeight};
     contentY = glassRect.bottom + gutter;
@@ -8375,6 +8420,7 @@ void DockApp::PaintSettingsPopup() {
         addShape(RECT{ringInset, ringInset, panelWidth - ringInset, contentY - ringInset},
             34.0F * scale);
         addShape(generalRect, static_cast<float>(moduleRadius));
+        addShape(aiRect, static_cast<float>(moduleRadius));
         addShape(glassRect, static_cast<float>(moduleRadius));
         addShape(colorRect, static_cast<float>(moduleRadius));
         addShape(checkRect, static_cast<float>(buttonHeight) * 0.5F);
@@ -8637,13 +8683,21 @@ void DockApp::PaintSettingsPopup() {
                     DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
                 DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
                     DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
-                const float capRadius = static_cast<float>(switchHeight) * 0.5F;
-                const float right = static_cast<float>(module.right - P(16.0F));
-                CcDrawSwitch(pixels, width, height, right - static_cast<float>(switchWidth) + capRadius,
-                    right - capRadius, static_cast<float>(rowTop) + static_cast<float>(rowH) * 0.5F,
-                    capRadius, scale, row.enabled, accentR, accentG,
-                    accentB, inkR, inkG, inkB);
-                pushHit(row.kind, {module.left, rowTop, module.right, rowTop + rowH});
+                if (row.link) {
+                    const RECT chevron{module.right - P(16.0F) - switchWidth, rowTop, module.right - P(16.0F),
+                        rowTop + rowH};
+                    DrawFlyoutText(pixels, width, height, chevron, titleFont, L"\u203A",
+                        DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 200);
+                    pushHit(row.kind, {module.left, rowTop, module.right, rowTop + rowH});
+                } else {
+                    const float capRadius = static_cast<float>(switchHeight) * 0.5F;
+                    const float right = static_cast<float>(module.right - P(16.0F));
+                    CcDrawSwitch(pixels, width, height, right - static_cast<float>(switchWidth) + capRadius,
+                        right - capRadius, static_cast<float>(rowTop) + static_cast<float>(rowH) * 0.5F,
+                        capRadius, scale, row.enabled, accentR, accentG,
+                        accentB, inkR, inkG, inkB);
+                    pushHit(row.kind, {module.left, rowTop, module.right, rowTop + rowH});
+                }
             }
             if (i + 1 < count) {
                 FillRectPremul(pixels, width, height, {textLeft, rowTop + rowH - 1,
@@ -8653,6 +8707,7 @@ void DockApp::PaintSettingsPopup() {
         }
     };
     drawRows(generalRect, generalRows, generalCount);
+    drawRows(aiRect, aiRows, aiCount);
     drawRows(glassRect, glassRows, glassCount);
 
     // ---- Quick Settings icon colour picker -----------------------------------

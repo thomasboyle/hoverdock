@@ -1,6 +1,8 @@
 #pragma once
 
 #include "DockConfig.h"
+#include "AiAnswerView.h"
+#include "GroqClient.h"
 #include "InstalledApps.h"
 #include "NotificationBadges.h"
 #include "Renderer.h"
@@ -100,7 +102,8 @@ private:
 
     // Spotlight-style Search panel rows.
     struct SearchRow {
-        enum class Kind : uint8_t { App, File, Folder, Web, EnableMft, Info };
+        // Link opens `path` (a URL); Ai asks the AI about the query.
+        enum class Kind : uint8_t { App, File, Folder, Web, EnableMft, Info, Link, Ai };
         Kind kind = Kind::Info;
         std::wstring title;
         std::wstring subtitle;
@@ -115,6 +118,10 @@ private:
         std::vector<LaunchTarget> targets;
         std::vector<std::wstring> names;
     };
+
+    // What the Search panel is showing: results, an AI answer, or a one-line
+    // entry for a Dock Settings value (Groq API key / AI model).
+    enum class SearchMode : uint8_t { Search, Ai, KeyEntry, ModelEntry };
 
     struct SearchIconReply {
         UINT extent = 0;
@@ -165,6 +172,12 @@ private:
     static constexpr UINT kSearchIconMessage = WM_APP + 37;
     static constexpr UINT kSearchAppsMessage = WM_APP + 38;
     static constexpr UINT kSearchMftAccessMessage = WM_APP + 39;
+    // AI answer progress: wParam = AiSession id (state read from the session).
+    static constexpr UINT kAiUpdateMessage = WM_APP + 40;
+    // AI answer image decoded: lParam owns an AiImageReply.
+    static constexpr UINT kAiImageMessage = WM_APP + 41;
+    // Dock Settings AI rows: wParam = SearchMode to open Search in.
+    static constexpr UINT kOpenSearchEntryMessage = WM_APP + 42;
     static constexpr UINT_PTR kWeatherTimerId = 10;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
@@ -333,6 +346,8 @@ private:
         QsColorSat,
         QsColorVal,
         QsColorReset,
+        AiApiKey,
+        AiModel,
     };
 
     struct SettingsHit {
@@ -648,6 +663,23 @@ private:
     void DestroySearchFonts() noexcept;
     void StartSearchServices();
     void StopSearchServices() noexcept;
+    // AI answers in Search (Ctrl+Enter), DockSearch.cpp.
+    void AskAi();
+    void ApplyAiUpdate(uint64_t sessionId);
+    void ApplyAiImage(std::unique_ptr<AiImageReply> image);
+    void RequestAiImages();
+    // Stops the answer and returns to plain Search state (no repaint/query).
+    void ExitAiState() noexcept;
+    void PaintSearchAi(uint8_t* pixels, int width, int height, float scale, LONG listTop);
+    bool HandleAiClick(POINT client);
+    [[nodiscard]] int AiHoverTarget(POINT client) const;
+    [[nodiscard]] bool AiPointerIsLink(POINT client) const;
+    void ScrollAi(int delta);
+    void CopyAiAnswer();
+    void OpenSearchEntry(SearchMode mode);
+    void BuildSearchEntryRows();
+    void CommitSearchEntry();
+    void ExitSearchEntry(bool refresh);
     [[nodiscard]] std::vector<LaunchTarget> CollectLaunchTargets(
         const std::vector<DisplayApp>& displayApps,
         const std::vector<RunningWindow>& runningWindows) const;
@@ -1041,7 +1073,27 @@ private:
     HFONT m_searchSubFont = nullptr;
     HFONT m_searchGlyphFont = nullptr;
     HFONT m_searchBigGlyphFont = nullptr;
+    HFONT m_searchSmallGlyphFont = nullptr;
     LayerPresentDib m_searchLayerDib{};
+    // ---- Search AI answers ----
+    SearchMode m_searchMode = SearchMode::Search;
+    std::wstring m_searchSavedText;
+    bool m_aiAskAfterKey = false;
+    std::unique_ptr<AiAnswerView> m_aiView;
+    std::shared_ptr<AiSession> m_aiSession;
+    uint64_t m_aiSessionCounter = 0;
+    AiSnapshot m_aiState;
+    std::wstring m_aiModel;
+    bool m_aiNeedsKey = false;
+    int m_aiScroll = 0;
+    int m_aiSpinner = 0;
+    bool m_aiShowSources = false;
+    int m_aiSourcesScroll = 0;
+    int m_aiHover = -1;
+    RECT m_aiViewport{};
+    RECT m_aiBadge{};
+    RECT m_aiKeyButton{};
+    std::vector<RECT> m_aiSourceRects;
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;
     WeatherService m_weather;

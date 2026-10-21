@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 #include <ShObjIdl.h>
+#include <wincrypt.h>
 
 #include <algorithm>
 #include <array>
@@ -857,6 +858,65 @@ bool SamePins(const std::vector<PinnedApp>& left, const std::vector<PinnedApp>& 
         });
 }
 
+constexpr wchar_t kProtectedPrefix[] = L"dpapi:";
+
+// Encrypts `secret` for the current Windows user (DPAPI) as "dpapi:<base64>".
+std::wstring ProtectSecret(const std::wstring& secret) {
+    if (secret.empty()) {
+        return {};
+    }
+    DATA_BLOB input{static_cast<DWORD>(secret.size() * sizeof(wchar_t)),
+        reinterpret_cast<BYTE*>(const_cast<wchar_t*>(secret.data()))};
+    DATA_BLOB output{};
+    if (CryptProtectData(&input, L"Hoverdock Groq API key", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN,
+            &output) == FALSE) {
+        return {};
+    }
+    std::wstring encoded;
+    DWORD length = 0;
+    if (CryptBinaryToStringW(output.pbData, output.cbData, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr,
+            &length) != FALSE &&
+        length > 0) {
+        encoded.resize(length);
+        if (CryptBinaryToStringW(output.pbData, output.cbData, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                encoded.data(), &length) != FALSE) {
+            encoded.resize(length);
+        } else {
+            encoded.clear();
+        }
+    }
+    LocalFree(output.pbData);
+    return encoded.empty() ? std::wstring() : kProtectedPrefix + encoded;
+}
+
+// Inverse of ProtectSecret; plain (hand-edited) values pass through.
+std::wstring UnprotectSecret(const std::wstring& stored) {
+    if (!stored.starts_with(kProtectedPrefix)) {
+        return stored;
+    }
+    const std::wstring encoded = stored.substr(std::size(kProtectedPrefix) - 1);
+    DWORD size = 0;
+    if (CryptStringToBinaryW(encoded.c_str(), static_cast<DWORD>(encoded.size()), CRYPT_STRING_BASE64, nullptr, &size,
+            nullptr, nullptr) == FALSE ||
+        size == 0) {
+        return {};
+    }
+    std::vector<BYTE> bytes(size);
+    if (CryptStringToBinaryW(encoded.c_str(), static_cast<DWORD>(encoded.size()), CRYPT_STRING_BASE64, bytes.data(),
+            &size, nullptr, nullptr) == FALSE) {
+        return {};
+    }
+    DATA_BLOB input{size, bytes.data()};
+    DATA_BLOB output{};
+    if (CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output) == FALSE) {
+        return {};
+    }
+    std::wstring secret(reinterpret_cast<const wchar_t*>(output.pbData), output.cbData / sizeof(wchar_t));
+    SecureZeroMemory(output.pbData, output.cbData);
+    LocalFree(output.pbData);
+    return secret;
+}
+
 }  // namespace
 
 bool DockConfig::LoadOrCreate() {
@@ -940,6 +1000,9 @@ bool DockConfig::Load() {
     m_followsTaskbarPins = true;
     m_dockScale = 1.0F;
     m_typeSafeApiKey.clear();
+    SecureZeroMemory(m_groqApiKey.data(), m_groqApiKey.size() * sizeof(wchar_t));
+    m_groqApiKey.clear();
+    m_aiModel.clear();
     m_searchHotkey = true;
     m_launchAtStartup = false;
     m_checkForUpdates = true;
@@ -975,6 +1038,14 @@ bool DockConfig::Load() {
         const auto typeSafeApiKey = dockSection->second.find(L"typesafeapikey");
         if (typeSafeApiKey != dockSection->second.end()) {
             m_typeSafeApiKey = typeSafeApiKey->second;
+        }
+        const auto groqApiKey = dockSection->second.find(L"groqapikey");
+        if (groqApiKey != dockSection->second.end()) {
+            m_groqApiKey = Trim(UnprotectSecret(groqApiKey->second));
+        }
+        const auto aiModel = dockSection->second.find(L"aimodel");
+        if (aiModel != dockSection->second.end()) {
+            m_aiModel = Trim(aiModel->second);
         }
         const auto searchHotkey = dockSection->second.find(L"searchhotkey");
         if (searchHotkey != dockSection->second.end()) {
@@ -1145,6 +1216,15 @@ bool DockConfig::Save() const {
     }
     if (!m_typeSafeApiKey.empty()) {
         contents << L"TypeSafeApiKey=" << m_typeSafeApiKey << L"\n";
+    }
+    if (!m_groqApiKey.empty()) {
+        const std::wstring protectedKey = ProtectSecret(m_groqApiKey);
+        if (!protectedKey.empty()) {
+            contents << L"GroqApiKey=" << protectedKey << L"\n";
+        }
+    }
+    if (!m_aiModel.empty()) {
+        contents << L"AiModel=" << m_aiModel << L"\n";
     }
     if (!m_searchHotkey) {
         contents << L"SearchHotkey=0\n";
@@ -1352,6 +1432,32 @@ std::wstring DockConfig::TypeSafeApiKey() const {
 
 bool DockConfig::SearchHotkey() const noexcept {
     return m_searchHotkey;
+}
+
+std::wstring DockConfig::GroqApiKey() const {
+    const std::wstring fromEnvironment = Trim(EnvironmentVariable(L"GROQ_API_KEY"));
+    return fromEnvironment.empty() ? m_groqApiKey : fromEnvironment;
+}
+
+bool DockConfig::GroqApiKeyFromEnvironment() const {
+    return !Trim(EnvironmentVariable(L"GROQ_API_KEY")).empty();
+}
+
+void DockConfig::SetGroqApiKey(std::wstring key) {
+    SecureZeroMemory(m_groqApiKey.data(), m_groqApiKey.size() * sizeof(wchar_t));
+    m_groqApiKey = Trim(key);
+    SecureZeroMemory(key.data(), key.size() * sizeof(wchar_t));
+}
+
+std::wstring DockConfig::AiModel() const {
+    return m_aiModel.empty() ? std::wstring(L"qwen/qwen3.8-27b") : m_aiModel;
+}
+
+void DockConfig::SetAiModel(std::wstring model) {
+    m_aiModel = Trim(std::move(model));
+    if (m_aiModel == L"qwen/qwen3.8-27b") {
+        m_aiModel.clear();
+    }
 }
 
 void DockConfig::SetDefaults() {

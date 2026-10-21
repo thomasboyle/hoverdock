@@ -45,6 +45,12 @@ namespace {
 constexpr wchar_t kSearchClassName[] = L"LiquidGlassDockSearch";
 constexpr UINT_PTR kCaretTimerId = 1;
 constexpr UINT kCaretBlinkMs = 530;
+// "Thinking..." dots while an AI answer has no text yet.
+constexpr UINT_PTR kAiSpinnerTimerId = 2;
+constexpr UINT kAiSpinnerMs = 360;
+// Reverts a code block's "Copied" label.
+constexpr UINT_PTR kAiCopiedTimerId = 3;
+constexpr UINT kAiCopiedMs = 1600;
 constexpr int kMaxVisibleRows = 8;
 constexpr size_t kFileLimit = 40;
 constexpr size_t kAppLimit = 6;
@@ -56,6 +62,10 @@ constexpr wchar_t kGlyphInfo[] = L"\uE946";
 constexpr wchar_t kGlyphFolder[] = L"\uE8B7";
 constexpr wchar_t kGlyphFile[] = L"\uE8A5";
 constexpr wchar_t kGlyphApp[] = L"\uE71D";
+constexpr wchar_t kGlyphChat[] = L"\uE8BD";
+constexpr wchar_t kGlyphKey[] = L"\uE8D7";
+constexpr wchar_t kGlyphSettings[] = L"\uE713";
+constexpr wchar_t kGlyphLink[] = L"\uE71B";
 
 int Px(float value, float scale) noexcept {
     return static_cast<int>(std::lround(value * scale));
@@ -392,6 +402,53 @@ bool IsWordChar(wchar_t c) noexcept {
     return std::iswalnum(c) != 0 || c == L'_';
 }
 
+bool CopyTextToClipboard(HWND owner, const std::wstring& text) {
+    if (text.empty() || OpenClipboard(owner) == FALSE) {
+        return false;
+    }
+    EmptyClipboard();
+    bool copied = false;
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* target = GlobalLock(memory)) {
+            std::memcpy(target, text.c_str(), bytes);
+            GlobalUnlock(memory);
+            copied = SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+            if (!copied) {
+                GlobalFree(memory);
+            }
+        } else {
+            GlobalFree(memory);
+        }
+    }
+    CloseClipboard();
+    return copied;
+}
+
+// "https://www.example.com/a/b" -> "example.com".
+std::wstring UrlHost(const std::wstring& url) {
+    size_t start = url.find(L"://");
+    start = start == std::wstring::npos ? 0 : start + 3;
+    const size_t end = url.find_first_of(L"/?#", start);
+    std::wstring host = url.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+    if (host.starts_with(L"www.")) {
+        host.erase(0, 4);
+    }
+    return host;
+}
+
+std::wstring FontFace(HFONT font) {
+    LOGFONTW logFont{};
+    if (font == nullptr || GetObjectW(font, sizeof(logFont), &logFont) == 0) {
+        return {};
+    }
+    return logFont.lfFaceName;
+}
+
+bool PointIn(const RECT& rect, POINT point) noexcept {
+    return point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
+}
+
 }  // namespace
 
 // ---- window ---------------------------------------------------------------------
@@ -439,6 +496,32 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
             app->PaintSearch();
             return 0;
         }
+        if (wParam == kAiSpinnerTimerId) {
+            ++app->m_aiSpinner;
+            if (app->m_searchMode == SearchMode::Ai && app->m_aiState.markdown.empty()) {
+                app->PaintSearch();
+            }
+            return 0;
+        }
+        if (wParam == kAiCopiedTimerId) {
+            KillTimer(window, kAiCopiedTimerId);
+            if (app->m_aiView != nullptr) {
+                app->m_aiView->ClearCopied();
+                app->PaintSearch();
+            }
+            return 0;
+        }
+        break;
+
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT && app->m_searchMode == SearchMode::Ai) {
+            POINT cursor{};
+            if (GetCursorPos(&cursor) != FALSE && ScreenToClient(window, &cursor) != FALSE &&
+                app->AiPointerIsLink(cursor)) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+        }
         break;
 
     case WM_MOUSEMOVE: {
@@ -446,6 +529,16 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
         const bool moved = app->m_searchMouse.x >= 0 &&
             (point.x != app->m_searchMouse.x || point.y != app->m_searchMouse.y);
         app->m_searchMouse = point;
+        if (app->m_searchMode == SearchMode::Ai) {
+            const int hover = app->AiHoverTarget(point);
+            if (hover != app->m_aiHover) {
+                app->m_aiHover = hover;
+                app->PaintSearch();
+            }
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
+            TrackMouseEvent(&track);
+            return 0;
+        }
         const int row = app->SearchRowAt(point);
         if (moved && row >= 0 && row != app->m_searchSelected &&
             app->m_searchRows[static_cast<size_t>(row)].kind != SearchRow::Kind::Info) {
@@ -455,8 +548,19 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
         return 0;
     }
 
+    case WM_MOUSELEAVE:
+        if (app->m_aiHover >= 0) {
+            app->m_aiHover = -1;
+            app->PaintSearch();
+        }
+        return 0;
+
     case WM_LBUTTONUP: {
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (app->m_searchMode == SearchMode::Ai) {
+            app->HandleAiClick(point);
+            return 0;
+        }
         const int row = app->SearchRowAt(point);
         if (row >= 0) {
             app->ActivateSearchRow(row, (wParam & MK_CONTROL) != 0);
@@ -465,6 +569,13 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
     }
 
     case WM_MOUSEWHEEL: {
+        if (app->m_searchMode == SearchMode::Ai) {
+            const float scale = static_cast<float>(app->HostDpi() == 0 ? 96U : app->HostDpi()) / 96.0F;
+            const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+            const int step = notches != 0 ? notches : (GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 1 : -1);
+            app->ScrollAi(-step * Px(56.0F, scale));
+            return 0;
+        }
         const int rows = static_cast<int>(app->m_searchRows.size());
         const int maxScroll = std::max(0, rows - kMaxVisibleRows);
         const int step = GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -1 : 1;
@@ -539,6 +650,7 @@ bool DockApp::OpenSearch() {
     m_searchRows.clear();
     m_searchSelected = 0;
     m_searchScroll = 0;
+    m_aiHover = -1;
     m_searchGlass.clear();
     m_searchLayerDib.contentValid = false;
     PaintSearch();
@@ -550,7 +662,13 @@ bool DockApp::OpenSearch() {
         std::to_wstring(GetTickCount64() - openStarted) + L" ms, focused=" + (focused ? L"1" : L"0"));
     m_fileSearch.SetActive(true);
     RefreshSearchApps();
-    if (!m_searchText.empty()) {
+    if (m_searchMode == SearchMode::Ai) {
+        // An answer (or one still streaming) survives closing the panel.
+        if (m_aiSession != nullptr) {
+            SetTimer(m_searchWindow, kAiSpinnerTimerId, kAiSpinnerMs, nullptr);
+        }
+        RequestAiImages();
+    } else if (m_searchMode == SearchMode::Search && !m_searchText.empty()) {
         SearchTextChanged();
     }
     return true;
@@ -562,8 +680,12 @@ void DockApp::CloseSearch(bool hideDockIfAway) {
     }
     m_searchClosing = true;
     KillTimer(m_searchWindow, kCaretTimerId);
+    KillTimer(m_searchWindow, kAiSpinnerTimerId);
     ShowWindow(m_searchWindow, SW_HIDE);
     m_searchClosing = false;
+    if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry) {
+        ExitSearchEntry(false);
+    }
     m_fileSearch.SetActive(false);
     ++m_searchRequestId;
     m_searchRows.clear();
@@ -604,7 +726,8 @@ bool DockApp::SearchScreenOrigin(POINT& origin, SIZE& size, float& scale) const 
         return false;
     }
     const SearchMetrics m = MetricsFor(scale, hostWidth - margin * 2);
-    const int rows = std::min(static_cast<int>(m_searchRows.size()), kMaxVisibleRows);
+    const int rows = m_searchMode == SearchMode::Ai ? kMaxVisibleRows
+                                                    : std::min(static_cast<int>(m_searchRows.size()), kMaxVisibleRows);
     size = {m.width, m.HeightFor(rows)};
     const LONG maxHeight = m.HeightFor(kMaxVisibleRows);
     const bool haveDock = m_dockWidth > 1 && m_visibleY != 0;
@@ -641,12 +764,13 @@ void DockApp::EnsureSearchFonts(float scale) {
     m_searchSubFont = CreateFlyoutFont(Px(12.5F, scale), FW_NORMAL);
     m_searchGlyphFont = CreateGlyphFont(Px(20.0F, scale));
     m_searchBigGlyphFont = CreateGlyphFont(Px(22.0F, scale));
+    m_searchSmallGlyphFont = CreateGlyphFont(Px(13.0F, scale));
     m_searchFontScale = scale;
 }
 
 void DockApp::DestroySearchFonts() noexcept {
     for (HFONT* font : {&m_searchQueryFont, &m_searchTitleFont, &m_searchSubFont, &m_searchGlyphFont,
-             &m_searchBigGlyphFont}) {
+             &m_searchBigGlyphFont, &m_searchSmallGlyphFont}) {
         if (*font != nullptr) {
             DeleteObject(*font);
             *font = nullptr;
@@ -696,17 +820,45 @@ void DockApp::PaintSearch() {
     // ---- search bar ----
     const LONG barLeft = Px(14.0F, scale);
     const RECT glyphRect{barLeft, 0, barLeft + m.glyphBox, m.barHeight};
-    DrawFlyoutText(pixels, width, height, glyphRect, m_searchBigGlyphFont, kGlyphSearch,
+    const wchar_t* barGlyph = m_searchMode == SearchMode::KeyEntry ? kGlyphKey
+        : m_searchMode == SearchMode::ModelEntry                   ? kGlyphSettings
+                                                                   : kGlyphSearch;
+    DrawFlyoutText(pixels, width, height, glyphRect, m_searchBigGlyphFont, barGlyph,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
     const LONG textLeft = glyphRect.right + Px(6.0F, scale);
-    const LONG textRight = width - Px(18.0F, scale);
+    LONG textRight = width - Px(18.0F, scale);
+    // Right-hand key hint: how to ask AI / leave the answer / save an entry.
+    const wchar_t* hint = nullptr;
+    if (m_searchMode == SearchMode::Search && !Trimmed(m_searchText).empty()) {
+        hint = L"Ask AI  Ctrl+\u21B5";
+    } else if (m_searchMode == SearchMode::Ai) {
+        hint = L"Esc  Back to results";
+    } else if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry) {
+        hint = L"\u21B5  Save";
+    }
+    if (hint != nullptr) {
+        const LONG hintWidth = static_cast<LONG>(std::ceil(MeasureText(m_searchSubFont, hint))) + 2;
+        DrawFlyoutText(pixels, width, height, {textRight - hintWidth, 0, textRight, m.barHeight}, m_searchSubFont,
+            hint, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 130);
+        textRight -= hintWidth + Px(14.0F, scale);
+    }
     const LONG textWidth = std::max<LONG>(1, textRight - textLeft);
     const LONG lineHeight = Px(34.0F, scale);
     const LONG lineTop = (m.barHeight - lineHeight) / 2;
     const bool focused = GetForegroundWindow() == m_searchWindow;
-    if (m_searchText.empty()) {
+    // The API key is never painted: bullets stand in, one per character.
+    const std::wstring masked =
+        m_searchMode == SearchMode::KeyEntry ? std::wstring(m_searchText.size(), L'\u2022') : std::wstring();
+    const std::wstring& shown = m_searchMode == SearchMode::KeyEntry ? masked : m_searchText;
+    if (shown.empty()) {
+        const wchar_t* placeholder = L"Search apps, files and folders";
+        if (m_searchMode == SearchMode::KeyEntry) {
+            placeholder = L"Paste your Groq API key (gsk_\u2026)";
+        } else if (m_searchMode == SearchMode::ModelEntry) {
+            placeholder = L"Groq model ID (default qwen/qwen3.8-27b)";
+        }
         DrawFlyoutText(pixels, width, height, {textLeft, lineTop, textRight, lineTop + lineHeight},
-            m_searchQueryFont, L"Search apps, files and folders", DT_LEFT | DT_VCENTER | DT_SINGLELINE, 120);
+            m_searchQueryFont, placeholder, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 120);
         if (focused && m_searchCaretVisible) {
             FillRectColorPremul(pixels, width, height,
                 {textLeft, lineTop + Px(5.0F, scale), textLeft + std::max(1, Px(1.5F, scale)),
@@ -714,8 +866,8 @@ void DockApp::PaintSearch() {
                 1.0F, inkB, inkG, inkR);
         }
     } else {
-        const float full = MeasureText(m_searchQueryFont, m_searchText);
-        const float caretX = MeasureText(m_searchQueryFont, m_searchText.substr(0, m_searchCaret));
+        const float full = MeasureText(m_searchQueryFont, shown);
+        const float caretX = MeasureText(m_searchQueryFont, shown.substr(0, m_searchCaret));
         // Scroll long queries so the caret stays visible.
         const float shift = std::max(0.0F, caretX - static_cast<float>(textWidth) + 4.0F);
         const LONG drawLeft = -static_cast<LONG>(std::lround(shift));
@@ -728,7 +880,7 @@ void DockApp::PaintSearch() {
         }
         DrawFlyoutText(line.data(), static_cast<int>(textWidth), static_cast<int>(lineHeight),
             {drawLeft, 0, drawLeft + static_cast<LONG>(std::ceil(full)) + Px(8.0F, scale), lineHeight},
-            m_searchQueryFont, m_searchText, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
+            m_searchQueryFont, shown, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
         if (focused && m_searchCaretVisible && !m_searchSelectAll) {
             const LONG x = drawLeft + static_cast<LONG>(std::lround(caretX));
             FillRectColorPremul(line.data(), static_cast<int>(textWidth), static_cast<int>(lineHeight),
@@ -741,7 +893,10 @@ void DockApp::PaintSearch() {
 
     // ---- results ----
     m_searchRowRects.clear();
-    const int rows = static_cast<int>(m_searchRows.size());
+    const int rows = m_searchMode == SearchMode::Ai ? 0 : static_cast<int>(m_searchRows.size());
+    if (m_searchMode == SearchMode::Ai) {
+        PaintSearchAi(pixels, width, height, scale, m.listTop);
+    }
     if (rows > 0) {
         FillRectColorPremul(pixels, width, height, {Px(16.0F, scale), m.barHeight, width - Px(16.0F, scale),
             m.barHeight + 1}, 0.14F, inkB, inkG, inkR);
@@ -773,6 +928,8 @@ void DockApp::PaintSearch() {
                 case SearchRow::Kind::Web: glyph = kGlyphGlobe; break;
                 case SearchRow::Kind::EnableMft: glyph = kGlyphDrive; break;
                 case SearchRow::Kind::Info: glyph = kGlyphInfo; break;
+                case SearchRow::Kind::Link: glyph = kGlyphLink; break;
+                case SearchRow::Kind::Ai: glyph = kGlyphChat; break;
                 case SearchRow::Kind::File: break;
                 }
                 DrawFlyoutText(pixels, width, height, {iconLeft, iconTop, iconLeft + m.iconSize, iconTop + m.iconSize},
@@ -786,6 +943,10 @@ void DockApp::PaintSearch() {
                     action = L"Search \u21B5";
                 } else if (row.kind == SearchRow::Kind::EnableMft) {
                     action = L"Enable \u21B5";
+                } else if (row.kind == SearchRow::Kind::Ai) {
+                    action = L"Ask \u21B5";
+                } else if (row.kind == SearchRow::Kind::Link) {
+                    action = L"Open";
                 }
                 const LONG hintWidth = static_cast<LONG>(std::ceil(MeasureText(m_searchSubFont, action))) + 2;
                 DrawFlyoutText(pixels, width, height, {labelRight - hintWidth, rect.top, labelRight, rect.bottom},
@@ -880,9 +1041,18 @@ bool DockApp::HandleSearchKey(WPARAM key) {
         PaintSearch();
     };
 
+    const bool entry = m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry;
+    const bool ai = m_searchMode == SearchMode::Ai;
+    const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+    const int page = std::max(1, static_cast<int>(m_aiViewport.bottom - m_aiViewport.top) - Px(40.0F, scale));
     switch (key) {
     case VK_ESCAPE:
-        if (!m_searchText.empty()) {
+        if (entry) {
+            ExitSearchEntry(true);
+        } else if (ai) {
+            ExitAiState();
+            SearchTextChanged();
+        } else if (!m_searchText.empty()) {
             m_searchText.clear();
             m_searchCaret = 0;
             m_searchSelectAll = false;
@@ -892,22 +1062,52 @@ bool DockApp::HandleSearchKey(WPARAM key) {
         }
         return true;
     case VK_RETURN:
-        ActivateSearchRow(m_searchSelected, ctrl);
+        if (entry) {
+            CommitSearchEntry();
+        } else if (ctrl) {
+            AskAi();
+        } else if (ai) {
+            if (m_aiNeedsKey) {
+                m_aiAskAfterKey = true;
+                OpenSearchEntry(SearchMode::KeyEntry);
+            }
+        } else {
+            // Shift+Enter shows the item in File Explorer (Ctrl+click too).
+            ActivateSearchRow(m_searchSelected, shift);
+        }
         return true;
     case VK_UP:
-        MoveSearchSelection(-1);
+        if (ai) {
+            ScrollAi(-Px(40.0F, scale));
+        } else if (!entry) {
+            MoveSearchSelection(-1);
+        }
         return true;
     case VK_DOWN:
-        MoveSearchSelection(1);
+        if (ai) {
+            ScrollAi(Px(40.0F, scale));
+        } else if (!entry) {
+            MoveSearchSelection(1);
+        }
         return true;
     case VK_TAB:
-        MoveSearchSelection(shift ? -1 : 1);
+        if (!ai && !entry) {
+            MoveSearchSelection(shift ? -1 : 1);
+        }
         return true;
     case VK_PRIOR:
-        MoveSearchSelection(-kMaxVisibleRows);
+        if (ai) {
+            ScrollAi(-page);
+        } else if (!entry) {
+            MoveSearchSelection(-kMaxVisibleRows);
+        }
         return true;
     case VK_NEXT:
-        MoveSearchSelection(kMaxVisibleRows);
+        if (ai) {
+            ScrollAi(page);
+        } else if (!entry) {
+            MoveSearchSelection(kMaxVisibleRows);
+        }
         return true;
     case VK_LEFT:
         moveCaret(m_searchSelectAll ? 0 : (ctrl ? wordLeft(m_searchCaret) : prevChar(m_searchCaret)));
@@ -916,10 +1116,18 @@ bool DockApp::HandleSearchKey(WPARAM key) {
         moveCaret(m_searchSelectAll ? length : (ctrl ? wordRight(m_searchCaret) : nextChar(m_searchCaret)));
         return true;
     case VK_HOME:
-        moveCaret(0);
+        if (ai && ctrl) {
+            ScrollAi(-1000000);
+        } else {
+            moveCaret(0);
+        }
         return true;
     case VK_END:
-        moveCaret(length);
+        if (ai && ctrl) {
+            ScrollAi(1000000);
+        } else {
+            moveCaret(length);
+        }
         return true;
     case VK_BACK:
     case VK_DELETE: {
@@ -982,28 +1190,20 @@ bool DockApp::HandleSearchKey(WPARAM key) {
         return true;
     }
     if (key == 'C') {
+        if (m_searchMode == SearchMode::KeyEntry) {
+            return true;  // never put the API key on the clipboard
+        }
+        if (m_searchMode == SearchMode::Ai) {
+            CopyAiAnswer();
+            return true;
+        }
         // Copy the selected item's path (or the query).
         std::wstring text = m_searchText;
         if (m_searchSelected >= 0 && static_cast<size_t>(m_searchSelected) < m_searchRows.size() &&
             !m_searchRows[static_cast<size_t>(m_searchSelected)].path.empty()) {
             text = m_searchRows[static_cast<size_t>(m_searchSelected)].path;
         }
-        if (!text.empty() && OpenClipboard(m_searchWindow) != FALSE) {
-            EmptyClipboard();
-            const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-            if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
-                if (void* target = GlobalLock(memory)) {
-                    std::memcpy(target, text.c_str(), bytes);
-                    GlobalUnlock(memory);
-                    if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr) {
-                        GlobalFree(memory);
-                    }
-                } else {
-                    GlobalFree(memory);
-                }
-            }
-            CloseClipboard();
-        }
+        CopyTextToClipboard(m_searchWindow, text);
         return true;
     }
     return false;
@@ -1036,6 +1236,14 @@ void DockApp::SearchTextChanged() {
     if (m_searchWindow != nullptr) {
         SetTimer(m_searchWindow, kCaretTimerId, kCaretBlinkMs, nullptr);
     }
+    if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry) {
+        PaintSearch();
+        return;
+    }
+    // Editing the question leaves the answer for live results again.
+    if (m_searchMode == SearchMode::Ai) {
+        ExitAiState();
+    }
     const uint64_t request = ++m_searchRequestId;
     if (Trimmed(m_searchText).empty()) {
         m_searchRows.clear();
@@ -1049,7 +1257,8 @@ void DockApp::SearchTextChanged() {
 }
 
 void DockApp::ApplySearchReply(std::unique_ptr<FileSearchReply> reply) {
-    if (reply == nullptr || reply->requestId != m_searchRequestId || !IsSearchOpen()) {
+    if (reply == nullptr || reply->requestId != m_searchRequestId || !IsSearchOpen() ||
+        m_searchMode != SearchMode::Search) {
         return;
     }
     if (reply->metadata) {
@@ -1124,6 +1333,13 @@ void DockApp::ApplySearchReply(std::unique_ptr<FileSearchReply> reply) {
         web.kind = SearchRow::Kind::Web;
         web.title = L"Search the web for \u201C" + query + L"\u201D";
         rows.push_back(std::move(web));
+        SearchRow ai;
+        ai.kind = SearchRow::Kind::Ai;
+        ai.title = L"Ask AI \u201C" + query + L"\u201D";
+        ai.subtitle = m_config.GroqApiKey().empty()
+            ? std::wstring(L"Ctrl+Enter \u00B7 Add a Groq API key in Dock Settings to get started")
+            : L"Ctrl+Enter \u00B7 Groq \u00B7 " + m_config.AiModel();
+        rows.push_back(std::move(ai));
     }
     const FileSearchService::Status status = m_fileSearch.GetStatus();
     if (status.canEnableMft && !m_searchMftPrompting) {
@@ -1183,6 +1399,15 @@ void DockApp::ActivateSearchRow(int index, bool reveal) {
         }).detach();
         return;
     }
+    case SearchRow::Kind::Link:
+        if (aimd::IsSafeUrl(row.path)) {
+            CloseSearch();
+            ShellOpenAsync(row.path, false);
+        }
+        return;
+    case SearchRow::Kind::Ai:
+        AskAi();
+        return;
     case SearchRow::Kind::Info:
         return;
     }
@@ -1310,6 +1535,493 @@ void DockApp::ApplySearchIcons(std::unique_ptr<SearchIconReply> reply) {
     }
 }
 
+// ---- AI answers -------------------------------------------------------------------------
+
+void DockApp::AskAi() {
+    const std::wstring prompt = Trimmed(m_searchText);
+    if (prompt.empty() || m_searchWindow == nullptr) {
+        return;
+    }
+    ExitAiState();
+    m_searchMode = SearchMode::Ai;
+    m_searchSelectAll = false;
+    m_searchCaret = m_searchText.size();
+    ++m_searchRequestId;  // drop file results still in flight
+    if (m_aiView == nullptr) {
+        m_aiView = std::make_unique<AiAnswerView>();
+    }
+    std::wstring apiKey = m_config.GroqApiKey();
+    if (apiKey.empty()) {
+        m_aiNeedsKey = true;
+        m_aiState.error = L"Hoverdock answers with your own Groq API key. Add one to ask AI: it's free to "
+                          L"create and is stored encrypted for your Windows account.";
+        m_aiState.done = true;
+        PaintSearch();
+        return;
+    }
+    m_aiModel = m_config.AiModel();
+    auto session = std::make_shared<AiSession>();
+    session->id = ++m_aiSessionCounter;
+    m_aiSession = session;
+    m_aiState.status = L"Thinking\u2026";
+    GroqClient::AskAsync(std::move(session), m_window, kAiUpdateMessage, std::move(apiKey), m_aiModel, prompt);
+    SetTimer(m_searchWindow, kAiSpinnerTimerId, kAiSpinnerMs, nullptr);
+    Log(L"AI: asking " + m_aiModel + L" (" + std::to_wstring(prompt.size()) + L" chars).");
+    PaintSearch();
+}
+
+void DockApp::ApplyAiUpdate(uint64_t sessionId) {
+    if (m_aiSession == nullptr || m_aiSession->id != sessionId) {
+        return;
+    }
+    m_aiState = m_aiSession->Snapshot();
+    if (m_aiView != nullptr) {
+        m_aiView->SetMarkdown(m_aiState.markdown);
+    }
+    if (m_aiState.done) {
+        m_aiSession.reset();
+        if (m_searchWindow != nullptr) {
+            KillTimer(m_searchWindow, kAiSpinnerTimerId);
+        }
+        if (!m_aiState.error.empty()) {
+            Log(L"AI: failed: " + m_aiState.error);
+        } else {
+            Log(L"AI: answered (" + std::to_wstring(m_aiState.markdown.size()) + L" chars, " +
+                std::to_wstring(m_aiState.sources.size()) + L" sources, searched=" +
+                (m_aiState.searched ? L"1)." : L"0)."));
+        }
+    }
+    if (IsSearchOpen() && m_searchMode == SearchMode::Ai) {
+        PaintSearch();
+        RequestAiImages();
+    }
+}
+
+void DockApp::RequestAiImages() {
+    if (m_aiView == nullptr || m_searchMode != SearchMode::Ai || m_window == nullptr) {
+        return;
+    }
+    const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+    for (std::wstring& url : m_aiView->TakeImageRequests()) {
+        GroqClient::FetchImageAsync(m_window, kAiImageMessage, std::move(url),
+            static_cast<UINT>(Px(640.0F, scale)), static_cast<UINT>(Px(420.0F, scale)));
+    }
+}
+
+void DockApp::ApplyAiImage(std::unique_ptr<AiImageReply> image) {
+    if (image == nullptr || m_aiView == nullptr) {
+        return;
+    }
+    if (m_aiView->SetImage(*image) && IsSearchOpen() && m_searchMode == SearchMode::Ai) {
+        PaintSearch();
+    }
+}
+
+void DockApp::ExitAiState() noexcept {
+    if (m_aiSession != nullptr) {
+        m_aiSession->cancelled.store(true);
+        m_aiSession.reset();
+    }
+    if (m_searchWindow != nullptr) {
+        KillTimer(m_searchWindow, kAiSpinnerTimerId);
+        KillTimer(m_searchWindow, kAiCopiedTimerId);
+    }
+    if (m_searchMode == SearchMode::Ai) {
+        m_searchMode = SearchMode::Search;
+    }
+    m_aiState = AiSnapshot{};
+    m_aiNeedsKey = false;
+    m_aiShowSources = false;
+    m_aiScroll = 0;
+    m_aiSourcesScroll = 0;
+    m_aiHover = -1;
+    m_aiSourceRects.clear();
+    m_aiBadge = {};
+    m_aiKeyButton = {};
+    if (m_aiView != nullptr) {
+        m_aiView->Clear();
+    }
+}
+
+void DockApp::PaintSearchAi(uint8_t* pixels, int width, int height, float scale, LONG listTop) {
+    const uint8_t inkB = g_flyoutInkB;
+    const uint8_t inkG = g_flyoutInkG;
+    const uint8_t inkR = g_flyoutInkR;
+    const LONG separatorY = listTop - 1 - Px(6.0F, scale);
+    FillRectColorPremul(pixels, width, height, {Px(16.0F, scale), separatorY, width - Px(16.0F, scale),
+        separatorY + 1}, 0.14F, inkB, inkG, inkR);
+    const LONG footerHeight = Px(42.0F, scale);
+    const LONG footerTop = height - footerHeight;
+    const LONG sideX = Px(26.0F, scale);
+    m_aiViewport = {sideX, listTop + Px(6.0F, scale), width - sideX, footerTop - Px(4.0F, scale)};
+    const RECT& view = m_aiViewport;
+    const int viewHeight = static_cast<int>(view.bottom - view.top);
+    m_aiSourceRects.clear();
+    m_aiBadge = {};
+    m_aiKeyButton = {};
+    FillRectColorPremul(pixels, width, height, {Px(16.0F, scale), footerTop, width - Px(16.0F, scale),
+        footerTop + 1}, 0.10F, inkB, inkG, inkR);
+
+    if (m_aiShowSources) {
+        const LONG rowHeight = Px(54.0F, scale);
+        const int visible = std::max(1, viewHeight / static_cast<int>(rowHeight));
+        const int count = static_cast<int>(m_aiState.sources.size());
+        m_aiSourcesScroll = std::clamp(m_aiSourcesScroll, 0, std::max(0, count - visible));
+        if (count == 0) {
+            DrawFlyoutText(pixels, width, height, view, m_searchTitleFont,
+                L"The web was searched, but no source links were returned.", DT_LEFT | DT_TOP | DT_WORDBREAK, 200);
+        }
+        for (int v = 0; v < visible && m_aiSourcesScroll + v < count; ++v) {
+            const int index = m_aiSourcesScroll + v;
+            const AiSource& source = m_aiState.sources[static_cast<size_t>(index)];
+            const RECT rect{Px(10.0F, scale), view.top + v * rowHeight, width - Px(10.0F, scale),
+                view.top + (v + 1) * rowHeight};
+            m_aiSourceRects.push_back(rect);
+            if (m_aiHover == 100 + v) {
+                FillSquircleColorPremul(pixels, width, height, rect, static_cast<float>(Px(11.0F, scale)), 0.16F,
+                    inkB, inkG, inkR);
+            }
+            const LONG numberLeft = rect.left + Px(10.0F, scale);
+            const LONG numberSize = Px(26.0F, scale);
+            const LONG numberTop = rect.top + (rowHeight - numberSize) / 2;
+            const RECT numberRect{numberLeft, numberTop, numberLeft + numberSize, numberTop + numberSize};
+            FillSquircleColorPremul(pixels, width, height, numberRect, static_cast<float>(numberSize) * 0.5F, 0.12F,
+                inkB, inkG, inkR);
+            DrawFlyoutText(pixels, width, height, numberRect, m_searchSubFont, std::to_wstring(index + 1),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 220);
+            const LONG labelLeft = numberRect.right + Px(12.0F, scale);
+            const LONG labelRight = rect.right - Px(12.0F, scale);
+            const LONG titleHeight = Px(21.0F, scale);
+            const LONG subHeight = Px(17.0F, scale);
+            const LONG top = rect.top + (rowHeight - titleHeight - subHeight) / 2;
+            DrawFlyoutText(pixels, width, height, {labelLeft, top, labelRight, top + titleHeight}, m_searchTitleFont,
+                source.title.empty() ? source.url : source.title,
+                DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 250);
+            std::wstring subtitle = UrlHost(source.url);
+            if (!source.snippet.empty()) {
+                std::wstring snippet = source.snippet.substr(0, 200);
+                std::replace(snippet.begin(), snippet.end(), L'\n', L' ');
+                subtitle += L" \u00B7 " + snippet;
+            }
+            DrawFlyoutText(pixels, width, height, {labelLeft, top + titleHeight, labelRight, top + titleHeight + subHeight},
+                m_searchSubFont, subtitle, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+        }
+    } else if (!m_aiState.markdown.empty() && m_aiView != nullptr) {
+        const int scrollbarRoom = Px(12.0F, scale);
+        const int contentWidth = std::max(1, static_cast<int>(view.right - view.left) - scrollbarRoom);
+        m_aiView->Layout(contentWidth, scale, FontFace(m_searchTitleFont));
+        const int contentHeight = m_aiView->ContentHeight();
+        const int maxScroll = std::max(0, contentHeight - viewHeight);
+        m_aiScroll = std::clamp(m_aiScroll, 0, maxScroll);
+        m_aiView->Paint(pixels, width, height, RECT{view.left, view.top, view.left + contentWidth, view.bottom},
+            m_aiScroll, AiInk{inkR, inkG, inkB});
+        if (maxScroll > 0) {
+            const int thumbHeight = std::max(Px(28.0F, scale), viewHeight * viewHeight / std::max(1, contentHeight));
+            const int thumbTop = static_cast<int>(view.top) +
+                static_cast<int>(static_cast<long long>(viewHeight - thumbHeight) * m_aiScroll / maxScroll);
+            const LONG thumbX = width - Px(15.0F, scale);
+            FillSquircleColorPremul(pixels, width, height,
+                {thumbX, thumbTop, thumbX + Px(4.0F, scale), thumbTop + thumbHeight}, static_cast<float>(Px(2.0F, scale)),
+                0.30F, inkB, inkG, inkR);
+        }
+    } else if (!m_aiState.error.empty()) {
+        const LONG glyphSize = Px(28.0F, scale);
+        DrawFlyoutText(pixels, width, height, {view.left, view.top, view.left + glyphSize, view.top + glyphSize},
+            m_searchGlyphFont, kGlyphInfo, DT_CENTER | DT_VCENTER | DT_SINGLELINE, 220);
+        const RECT textRect{view.left + glyphSize + Px(10.0F, scale), view.top + Px(3.0F, scale), view.right,
+            view.top + Px(120.0F, scale)};
+        DrawFlyoutText(pixels, width, height, textRect, m_searchTitleFont, m_aiState.error,
+            DT_LEFT | DT_TOP | DT_WORDBREAK, 235);
+        if (m_aiNeedsKey) {
+            const std::wstring label = L"Add Groq API key";
+            const LONG buttonWidth = static_cast<LONG>(std::ceil(MeasureText(m_searchTitleFont, label))) +
+                Px(36.0F, scale);
+            const LONG buttonTop = textRect.bottom + Px(8.0F, scale);
+            m_aiKeyButton = {textRect.left, buttonTop, textRect.left + buttonWidth, buttonTop + Px(36.0F, scale)};
+            FillSquircleColorPremul(pixels, width, height, m_aiKeyButton,
+                static_cast<float>(m_aiKeyButton.bottom - m_aiKeyButton.top) * 0.5F, m_aiHover == 2 ? 0.26F : 0.16F,
+                inkB, inkG, inkR);
+            DrawFlyoutText(pixels, width, height, m_aiKeyButton, m_searchTitleFont, label,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
+        }
+    } else {
+        std::wstring status = m_aiState.status.empty() ? std::wstring(L"Thinking") : m_aiState.status;
+        if (!status.empty() && status.back() == L'\u2026') {
+            status.pop_back();
+        }
+        status += std::wstring(static_cast<size_t>(1 + m_aiSpinner % 3), L'.');
+        DrawFlyoutText(pixels, width, height, {view.left, view.top, view.right, view.top + Px(28.0F, scale)},
+            m_searchTitleFont, status, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
+        // Skeleton lines hint where the answer will appear.
+        const float pulse = 0.05F + 0.03F * static_cast<float>(m_aiSpinner % 3);
+        for (int line = 0; line < 3; ++line) {
+            const LONG top = view.top + Px(44.0F, scale) + line * Px(24.0F, scale);
+            const LONG right = view.left + (view.right - view.left) * (line == 2 ? 55 : 92 - line * 8) / 100;
+            FillSquircleColorPremul(pixels, width, height, {view.left, top, right, top + Px(12.0F, scale)},
+                static_cast<float>(Px(6.0F, scale)), pulse, inkB, inkG, inkR);
+        }
+    }
+
+    // ---- footer: model + state on the left, Sources badge on the right ----
+    LONG footerRight = width - Px(20.0F, scale);
+    if (m_aiState.searched) {
+        const size_t count = m_aiState.sources.size();
+        const std::wstring label = m_aiShowSources ? std::wstring(L"Back to answer")
+            : count == 1                           ? std::wstring(L"1 source")
+            : count == 0                           ? std::wstring(L"Searched the web")
+                                                   : std::to_wstring(count) + L" sources";
+        const LONG glyphWidth = Px(16.0F, scale);
+        const LONG textWidth = static_cast<LONG>(std::ceil(MeasureText(m_searchSubFont, label))) + 2;
+        const LONG badgeHeight = Px(26.0F, scale);
+        const LONG badgeWidth = Px(10.0F, scale) + glyphWidth + Px(6.0F, scale) + textWidth + Px(12.0F, scale);
+        const LONG badgeTop = footerTop + (footerHeight - badgeHeight) / 2;
+        m_aiBadge = {footerRight - badgeWidth, badgeTop, footerRight, badgeTop + badgeHeight};
+        const float alpha = m_aiShowSources ? 0.24F : m_aiHover == 1 ? 0.22F : 0.13F;
+        FillSquircleColorPremul(pixels, width, height, m_aiBadge, static_cast<float>(badgeHeight) * 0.5F, alpha, inkB,
+            inkG, inkR);
+        const LONG glyphLeft = m_aiBadge.left + Px(10.0F, scale);
+        DrawFlyoutText(pixels, width, height, {glyphLeft, m_aiBadge.top, glyphLeft + glyphWidth, m_aiBadge.bottom},
+            m_searchSmallGlyphFont, kGlyphGlobe, DT_CENTER | DT_VCENTER | DT_SINGLELINE, 230);
+        DrawFlyoutText(pixels, width, height,
+            {glyphLeft + glyphWidth + Px(6.0F, scale), m_aiBadge.top, m_aiBadge.right, m_aiBadge.bottom},
+            m_searchSubFont, label, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 235);
+        footerRight = m_aiBadge.left - Px(10.0F, scale);
+    }
+    std::wstring footer = L"\u2726 " + (m_aiModel.empty() ? m_config.AiModel() : m_aiModel);
+    if (!m_aiState.done && !m_aiState.status.empty()) {
+        footer += L" \u00B7 " + m_aiState.status;
+    } else if (m_aiNeedsKey) {
+        footer = L"\u2726 Groq \u00B7 Enter to add a key";
+    } else if (!m_aiState.error.empty()) {
+        footer += L" \u00B7 Ctrl+Enter to retry";
+    } else if (m_aiState.done) {
+        footer += L" \u00B7 Ctrl+C copies the answer";
+    }
+    DrawFlyoutText(pixels, width, height, {Px(24.0F, scale), footerTop, footerRight, height}, m_searchSubFont, footer,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
+}
+
+int DockApp::AiHoverTarget(POINT client) const {
+    if (PointIn(m_aiBadge, client)) {
+        return 1;
+    }
+    if (m_aiNeedsKey && PointIn(m_aiKeyButton, client)) {
+        return 2;
+    }
+    if (m_aiShowSources) {
+        for (size_t i = 0; i < m_aiSourceRects.size(); ++i) {
+            if (PointIn(m_aiSourceRects[i], client)) {
+                return 100 + static_cast<int>(i);
+            }
+        }
+    }
+    return -1;
+}
+
+bool DockApp::AiPointerIsLink(POINT client) const {
+    if (AiHoverTarget(client) >= 0) {
+        return true;
+    }
+    if (m_aiShowSources || m_aiView == nullptr || !PointIn(m_aiViewport, client)) {
+        return false;
+    }
+    const POINT content{client.x - m_aiViewport.left, client.y - m_aiViewport.top + m_aiScroll};
+    return m_aiView->HitTest(content).kind != AiAnswerView::Hit::Kind::None;
+}
+
+bool DockApp::HandleAiClick(POINT client) {
+    if (PointIn(m_aiBadge, client)) {
+        m_aiShowSources = !m_aiShowSources;
+        m_aiSourcesScroll = 0;
+        m_aiHover = AiHoverTarget(client);
+        PaintSearch();
+        return true;
+    }
+    if (m_aiNeedsKey && PointIn(m_aiKeyButton, client)) {
+        m_aiAskAfterKey = true;
+        OpenSearchEntry(SearchMode::KeyEntry);
+        return true;
+    }
+    if (m_aiShowSources) {
+        for (size_t i = 0; i < m_aiSourceRects.size(); ++i) {
+            const size_t index = static_cast<size_t>(m_aiSourcesScroll) + i;
+            if (PointIn(m_aiSourceRects[i], client) && index < m_aiState.sources.size() &&
+                aimd::IsSafeUrl(m_aiState.sources[index].url)) {
+                const std::wstring url = m_aiState.sources[index].url;
+                CloseSearch();
+                ShellOpenAsync(url, false);
+                return true;
+            }
+        }
+        return false;
+    }
+    if (m_aiView == nullptr || !PointIn(m_aiViewport, client)) {
+        return false;
+    }
+    const POINT content{client.x - m_aiViewport.left, client.y - m_aiViewport.top + m_aiScroll};
+    const AiAnswerView::Hit hit = m_aiView->HitTest(content);
+    if (hit.kind == AiAnswerView::Hit::Kind::Link && aimd::IsSafeUrl(hit.url)) {
+        CloseSearch();
+        ShellOpenAsync(hit.url, false);
+        return true;
+    }
+    if (hit.kind == AiAnswerView::Hit::Kind::CopyCode &&
+        CopyTextToClipboard(m_searchWindow, m_aiView->CodeText(hit.code))) {
+        m_aiView->SetCopied(hit.code);
+        SetTimer(m_searchWindow, kAiCopiedTimerId, kAiCopiedMs, nullptr);
+        PaintSearch();
+        return true;
+    }
+    return false;
+}
+
+void DockApp::ScrollAi(int delta) {
+    if (m_aiShowSources) {
+        const int step = delta > 0 ? 1 : -1;
+        const int before = m_aiSourcesScroll;
+        m_aiSourcesScroll = std::max(0, m_aiSourcesScroll + step);
+        if (m_aiSourcesScroll != before) {
+            PaintSearch();  // the paint clamps to the list length
+        }
+        return;
+    }
+    if (m_aiView == nullptr) {
+        return;
+    }
+    const int viewHeight = static_cast<int>(m_aiViewport.bottom - m_aiViewport.top);
+    const int maxScroll = std::max(0, m_aiView->ContentHeight() - viewHeight);
+    const int next = std::clamp(m_aiScroll + delta, 0, maxScroll);
+    if (next != m_aiScroll) {
+        m_aiScroll = next;
+        PaintSearch();
+    }
+}
+
+void DockApp::CopyAiAnswer() {
+    if (m_aiState.markdown.empty()) {
+        CopyTextToClipboard(m_searchWindow, m_searchText);
+        return;
+    }
+    std::wstring text = m_aiState.markdown;
+    if (!m_aiState.sources.empty()) {
+        text += L"\n\nSources:\n";
+        for (size_t i = 0; i < m_aiState.sources.size(); ++i) {
+            const AiSource& source = m_aiState.sources[i];
+            text += std::to_wstring(i + 1) + L". " + source.title + L" \u2014 " + source.url + L"\n";
+        }
+    }
+    CopyTextToClipboard(m_searchWindow, text);
+}
+
+// ---- Dock Settings entries (Groq API key / AI model) ------------------------------------
+
+void DockApp::OpenSearchEntry(SearchMode mode) {
+    if (mode != SearchMode::KeyEntry && mode != SearchMode::ModelEntry) {
+        return;
+    }
+    const bool askAfterKey = m_aiAskAfterKey;
+    if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry) {
+        SecureZeroMemory(m_searchText.data(), m_searchText.size() * sizeof(wchar_t));
+    } else {
+        m_searchSavedText = m_searchText;
+    }
+    ExitAiState();
+    m_aiAskAfterKey = askAfterKey && mode == SearchMode::KeyEntry;
+    m_searchMode = mode;
+    m_searchText = mode == SearchMode::ModelEntry ? m_config.AiModel() : std::wstring();
+    m_searchCaret = m_searchText.size();
+    if (!IsSearchOpen() && !OpenSearch()) {
+        ExitSearchEntry(false);
+        return;
+    }
+    m_searchSelectAll = !m_searchText.empty();
+    m_searchCaretVisible = true;
+    BuildSearchEntryRows();
+    PaintSearch();
+}
+
+void DockApp::BuildSearchEntryRows() {
+    m_searchRows.clear();
+    m_searchScroll = 0;
+    m_searchSelected = -1;
+    SearchRow info;
+    info.kind = SearchRow::Kind::Info;
+    SearchRow link;
+    link.kind = SearchRow::Kind::Link;
+    if (m_searchMode == SearchMode::KeyEntry) {
+        info.title = L"Paste your Groq API key and press Enter";
+        info.subtitle = m_config.GroqApiKeyFromEnvironment()
+            ? L"The GROQ_API_KEY environment variable is set and takes priority over a saved key."
+            : L"Stored encrypted for your Windows account. Save an empty key to remove it.";
+        link.title = L"Get a free API key at console.groq.com/keys";
+        link.subtitle = L"Opens GroqCloud in your browser";
+        link.path = L"https://console.groq.com/keys";
+    } else {
+        info.title = L"Type a Groq model ID and press Enter";
+        info.subtitle = L"Leave it empty to use the default, qwen/qwen3.8-27b.";
+        link.title = L"Browse models on GroqCloud";
+        link.subtitle = L"Opens the Groq model list in your browser";
+        link.path = L"https://console.groq.com/docs/models";
+    }
+    m_searchRows.push_back(std::move(info));
+    m_searchRows.push_back(std::move(link));
+}
+
+void DockApp::CommitSearchEntry() {
+    const SearchMode mode = m_searchMode;
+    std::wstring value = Trimmed(m_searchText);
+    SearchRow notice;
+    notice.kind = SearchRow::Kind::Info;
+    bool askNow = false;
+    if (mode == SearchMode::KeyEntry) {
+        const bool removed = value.empty();
+        m_config.SetGroqApiKey(std::move(value));
+        notice.title = removed ? L"Groq API key removed." : L"Groq API key saved.";
+        notice.subtitle = removed ? L"" : L"Type a question and press Ctrl+Enter to ask AI.";
+        askNow = m_aiAskAfterKey && !removed;
+        Log(removed ? L"AI: Groq API key removed." : L"AI: Groq API key saved.");
+    } else if (mode == SearchMode::ModelEntry) {
+        m_config.SetAiModel(std::move(value));
+        notice.title = L"AI model set to " + m_config.AiModel() + L".";
+        notice.subtitle = L"Used for Ctrl+Enter answers in Search.";
+        Log(L"AI: model set to " + m_config.AiModel() + L".");
+    } else {
+        return;
+    }
+    ScheduleConfigSave();
+    ExitSearchEntry(false);
+    RefreshSettingsControls();
+    if (askNow && !Trimmed(m_searchText).empty()) {
+        AskAi();
+        return;
+    }
+    m_searchRows.clear();
+    m_searchRows.push_back(std::move(notice));
+    m_searchSelected = 0;
+    m_searchScroll = 0;
+    m_searchSelectAll = !m_searchText.empty();
+    PaintSearch();
+}
+
+void DockApp::ExitSearchEntry(bool refresh) {
+    if (m_searchMode != SearchMode::KeyEntry && m_searchMode != SearchMode::ModelEntry) {
+        return;
+    }
+    SecureZeroMemory(m_searchText.data(), m_searchText.size() * sizeof(wchar_t));
+    m_searchText = std::move(m_searchSavedText);
+    m_searchSavedText.clear();
+    m_searchCaret = m_searchText.size();
+    m_searchSelectAll = false;
+    m_searchMode = SearchMode::Search;
+    m_aiAskAfterKey = false;
+    m_searchRows.clear();
+    m_searchSelected = 0;
+    m_searchScroll = 0;
+    if (refresh && IsSearchOpen()) {
+        SearchTextChanged();
+    }
+}
+
 // ---- lifetime -------------------------------------------------------------------------
 
 void DockApp::StartSearchServices() {
@@ -1321,6 +2033,8 @@ void DockApp::StartSearchServices() {
 }
 
 void DockApp::StopSearchServices() noexcept {
+    ExitAiState();
+    m_aiView.reset();
     m_searchHotkey.Stop();
     if (m_searchWindow != nullptr) {
         KillTimer(m_searchWindow, kCaretTimerId);

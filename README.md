@@ -38,6 +38,7 @@ No Electron. No WebView. No Acrylic hacks. Just a single, fast native executable
 - 🔴 **Notification badges.** Unread counts from Teams, Outlook, WhatsApp and any other app that badges its Windows taskbar icon appear on its dock icon, just like macOS. Follows the Windows *Show badges on taskbar apps* setting.
 - 🛟 **Safe by design.** It auto-imports your existing taskbar pins on first run, and restores your taskbar on exit or crash. You can't get locked out.
 - 🔎 **Spotlight for Windows.** Press **Win + Space** and a glass search panel appears above the dock. Apps, files and folders match as you type, straight from the NTFS Master File Table, and stay current through the change journal. Results arrive in milliseconds, even on drives with millions of files.
+- ✨ **Ask AI from Search.** Type a question and press **Ctrl + Enter** for a streamed answer from Groq (Qwen 3.8 27B by default) with formatted text, tables, highlighted code, links and images. When it searches the web, a **Sources** badge lists every page it used.
 - 🤫 **Stays out of your way.** Per-user install (no admin), launch at startup, and silent auto-updates from GitHub Releases.
 
 **And more:** Quick Settings, a Start shortcut, Per-Monitor V2 DPI awareness, UWP app support, and a weather widget.
@@ -60,8 +61,9 @@ Your taskbar pins are imported automatically, so your dock is ready the first ti
 | Reorder icons | Drag an icon onto another slot |
 | Change startup, updates, or check version | Click the gear icon in Quick Settings |
 | Search apps, files and folders | Press **Win + Space** (or click the Search tile), type, then **Enter** |
-| Show a result in File Explorer | **Ctrl + Enter** (Ctrl + click) |
+| Show a result in File Explorer | **Shift + Enter** (Ctrl + click) |
 | Copy a result's path | **Ctrl + C** |
+| Ask AI about what you typed | **Ctrl + Enter** (Esc goes back to results) |
 
 ### Search
 
@@ -70,6 +72,18 @@ Search reads file names straight from the Master File Table of every fixed NTFS 
 Reading the MFT needs administrator rights, and Hoverdock never runs elevated. Until you opt in, Search covers your user folders. Choose **Search this entire PC** in the results to approve, once, a small on-demand task. Approving copies the indexer to `%ProgramFiles%\Hoverdock` (so nothing user-writable ever runs elevated). When Hoverdock starts indexing, the task runs it with `--mft-dump`, it streams the file names to the dock over a private pipe, and then exits. Following the change journal doesn't need elevation.
 
 Win+Space normally switches keyboard layout. If you rely on that, set `SearchHotkey=0` under `[Dock]` in `dock.ini`.
+
+### Ask AI
+
+Type a question into Search and press **Ctrl + Enter**. The answer streams into the panel as rich text: headings, lists, tables, syntax-highlighted code blocks (with a **Copy** button), clickable links and images. Scroll with the mouse wheel or the arrow keys, and press **Ctrl + C** to copy the whole answer. When the model looks something up online, a **Sources** badge appears at the bottom; click it to see, and open, every page it used.
+
+Answers come from [Groq](https://console.groq.com) using your own API key (creating one is free):
+
+1. Open Quick Settings, click the gear, and choose **Groq API key** under the AI section.
+2. Paste your key and press **Enter**. It's stored in `dock.ini` encrypted for your Windows account (DPAPI). A `GROQ_API_KEY` environment variable takes priority if set.
+3. Optionally change **AI model** (default `qwen/qwen3.8-27b`) to any Groq chat model.
+
+Web search uses Groq's built-in browser search on the same key, so nothing else needs setting up.
 
 Your config lives at `%LOCALAPPDATA%\LiquidGlassDock\dock.ini`.
 
