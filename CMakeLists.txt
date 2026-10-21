@@ -206,6 +206,7 @@ set_property(TARGET Dock PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_D
 #   TrayIconsTests         system tray detection against the live shell
 #   AiMarkdownTests        AI answer Markdown parser (portable)
 #   GroqProtocolTests      Groq request/stream/source handling (portable)
+#   AiPipelineBench        AI answer streaming/request benchmark (portable)
 option(DOCK_BUILD_TESTS "Build the Search engine tests" OFF)
 if(DOCK_BUILD_TESTS)
     enable_testing()
@@ -229,6 +230,8 @@ if(DOCK_BUILD_TESTS)
     # Search AI answers: Markdown parsing and the Groq protocol (portable).
     add_dock_test(AiMarkdownTests tests/AiMarkdownTests.cpp src/AiMarkdown.cpp)
     add_dock_test(GroqProtocolTests tests/GroqProtocolTests.cpp src/GroqProtocol.cpp)
+    # AI answer pipeline benchmark (streaming parse/convert, request JSON); not a CTest.
+    add_dock_test(AiPipelineBench tests/AiPipelineBench.cpp src/AiMarkdown.cpp src/GroqProtocol.cpp)
     add_test(NAME AiMarkdownTests COMMAND AiMarkdownTests)
     add_test(NAME GroqProtocolTests COMMAND GroqProtocolTests)
 endif()
