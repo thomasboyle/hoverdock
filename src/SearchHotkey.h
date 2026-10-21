@@ -20,6 +20,9 @@ public:
     // chord is already registered by another app.
     bool Start(HWND target, UINT message);
     void Stop() noexcept;
+    // Releases Ctrl+Space while suspended (a fullscreen app is focused) so the
+    // app receives the chord itself; re-registers it when resumed.
+    void SetSuspended(bool suspended) noexcept;
     [[nodiscard]] bool Running() const noexcept { return m_thread.joinable(); }
 
 private:
@@ -30,4 +33,5 @@ private:
     HWND m_target = nullptr;
     UINT m_message = 0;
     std::atomic<bool> m_installed{false};
+    std::atomic<bool> m_suspended{false};
 };
