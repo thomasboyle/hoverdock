@@ -3776,6 +3776,12 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
 
     case kSearchHotkeyMessage:
+        // A press racing a switch into fullscreen still never opens Search
+        // over a fullscreen app.
+        if (!IsSearchOpen() && IsForegroundBorderlessFullscreen()) {
+            SyncSearchHotkeyForFullscreen();
+            return 0;
+        }
         ToggleSearch();
         return 0;
 
@@ -3943,6 +3949,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 m_taskbarMonitorFast = false;
                 SetTimer(window, kTaskbarMonitorTimerId, kTaskbarMonitorSlowIntervalMs, nullptr);
             }
+            // Apps can enter or leave fullscreen without a focus change.
+            SyncSearchHotkeyForFullscreen();
             // Hook reinstall + cursor-watch cadence sync. When Hidden with a healthy
             // hook the cursor timer is off (0 Hz); elevated FG / missing hook re-arms
             // 33 ms. Foreground WinEvent also posts kCursorWatchSyncMessage for lag-free
@@ -14084,6 +14092,7 @@ void CALLBACK DockApp::ForegroundWinEventProc(HWINEVENTHOOK, DWORD, HWND hwnd, L
     s_instance->m_renderer.RequestBackdropRefresh();
     // A focused game must be at full power before its first frame.
     s_instance->m_autoPower.Wake();
+    s_instance->SyncSearchHotkeyForFullscreen();
     if (s_instance->m_visibility == VisibilityState::Hidden ||
         s_instance->m_visibility == VisibilityState::Hiding) {
         s_instance->m_hiddenCatalogEpoch.fetch_add(1, std::memory_order_relaxed);
@@ -14405,7 +14414,7 @@ void DockApp::Log(const std::wstring& message) const {
     OutputDebugStringW((message + L"\n").c_str());
 }
 
-bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
+bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept {
     const HWND foreground = GetForegroundWindow();
     if (foreground == nullptr || IsWindowVisible(foreground) == FALSE ||
         IsIconic(foreground) != FALSE) {
@@ -14446,9 +14455,8 @@ bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
     if (GetWindowRect(foreground, &windowRect) == FALSE) {
         return false;
     }
-    const HMONITOR cursorMonitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
     const HMONITOR windowMonitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
-    if (cursorMonitor == nullptr || windowMonitor == nullptr || cursorMonitor != windowMonitor) {
+    if (windowMonitor == nullptr) {
         return false;
     }
     MONITORINFO info{sizeof(info)};
@@ -14459,8 +14467,24 @@ bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
     // window to essentially cover the full monitor rect (not just the work area).
     constexpr LONG kTol = 4;
     const RECT& mon = info.rcMonitor;
-    return windowRect.left <= mon.left + kTol && windowRect.top <= mon.top + kTol &&
+    const bool covers = windowRect.left <= mon.left + kTol && windowRect.top <= mon.top + kTol &&
         windowRect.right >= mon.right - kTol && windowRect.bottom >= mon.bottom - kTol;
+    if (covers && monitor != nullptr) {
+        *monitor = windowMonitor;
+    }
+    return covers;
+}
+
+bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
+    HMONITOR monitor = nullptr;
+    return IsForegroundBorderlessFullscreen(&monitor) &&
+        MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) == monitor;
+}
+
+void DockApp::SyncSearchHotkeyForFullscreen() noexcept {
+    if (m_searchHotkey.Running()) {
+        m_searchHotkey.SetSuspended(IsForegroundBorderlessFullscreen());
+    }
 }
 
 bool DockApp::IsCursorInBottomHotZone(POINT cursor) const noexcept {

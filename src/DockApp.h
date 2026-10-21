@@ -806,6 +806,12 @@ private:
     // the monitor under `cursor` (typical game borderless). Used to suppress
     // edge-show so the dock does not interrupt gameplay.
     [[nodiscard]] bool IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept;
+    // Same rule without the cursor: the foreground app covers its own monitor.
+    // monitor (optional) receives that monitor.
+    [[nodiscard]] bool IsForegroundBorderlessFullscreen(HMONITOR* monitor = nullptr) const noexcept;
+    // Ctrl+Space stays out of fullscreen apps, like the dock's edge-show: the
+    // chord is released to the app while one is focused.
+    void SyncSearchHotkeyForFullscreen() noexcept;
     [[nodiscard]] int IconAtScreenPoint(POINT cursor) const noexcept;
     [[nodiscard]] int DividerAtScreenPoint(POINT cursor) const noexcept;
     [[nodiscard]] int InsertionIndexForDrag(POINT cursor) const noexcept;
