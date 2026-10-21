@@ -26,11 +26,15 @@ struct Span {
     size_t length = 0;
     uint8_t flags = 0;
     std::wstring url;
+
+    bool operator==(const Span&) const = default;
 };
 
 struct InlineText {
     std::wstring text;
     std::vector<Span> spans;
+
+    bool operator==(const InlineText&) const = default;
 };
 
 enum class BlockKind : uint8_t { Paragraph, Heading, ListItem, Code, Rule, Image, Table };
@@ -55,6 +59,9 @@ struct Block {
     // Table: rows[0] is the header row; every row has align.size() cells.
     std::vector<std::vector<InlineText>> rows;
     std::vector<Align> align;
+
+    // Equal blocks lay out identically (AiAnswerView reuses their layouts).
+    bool operator==(const Block&) const = default;
 };
 
 // Inline images found while parsing a run of text (hoisted to Image blocks).

@@ -157,6 +157,18 @@ void TestHighlight() {
     EXPECT(sql.size() == 3 && sql[0].cls == aimd::TokenClass::Keyword && sql[2].cls == aimd::TokenClass::Comment);
 }
 
+void TestBlockEquality() {
+    // Appending text only changes the last block (streaming reuses the rest).
+    const std::wstring head = L"# T\n\nPara **b** [l](https://x.y)\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- item";
+    const std::vector<aimd::Block> before = aimd::Parse(head);
+    const std::vector<aimd::Block> after = aimd::Parse(head + L" more");
+    EXPECT(before.size() == after.size() && before.size() == 4);
+    if (before.size() == 4 && after.size() == 4) {
+        EXPECT(before[0] == after[0] && before[1] == after[1] && before[2] == after[2]);
+        EXPECT(!(before[3] == after[3]));
+    }
+}
+
 void TestSafeUrl() {
     EXPECT(aimd::IsSafeUrl(L"https://a.b"));
     EXPECT(aimd::IsSafeUrl(L"mailto:x@y.z"));
@@ -176,6 +188,7 @@ int main() {
     TestStreamingFence();
     TestHighlight();
     TestSafeUrl();
+    TestBlockEquality();
     if (g_failures == 0) {
         std::printf("AiMarkdownTests: all passed\n");
         return 0;

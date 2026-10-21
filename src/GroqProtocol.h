@@ -108,6 +108,19 @@ struct SearchOutcome {
 [[nodiscard]] std::string ErrorMessage(std::string_view body);
 // Removes <think>...</think> reasoning; an unterminated block hides the rest.
 [[nodiscard]] std::string StripThinking(std::string_view content);
+// Streamed content -> displayed UTF-16 Markdown, equal to
+// Utf8ToWide(StripThinking(content)) for every prefix of an append-only stream,
+// but converting only the bytes that arrived since the last call.
+class DisplayText {
+public:
+    const std::wstring& Update(const std::string& content);
+
+private:
+    std::wstring m_text;
+    size_t m_converted = 0;
+    bool m_thinking = false;
+};
+
 // Appends unless a source with the same URL is already present.
 void AddSource(std::vector<Source>& sources, Source source);
 // executed_tools[] (Groq built-in tools) -> sources / image URLs. Returns

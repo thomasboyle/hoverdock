@@ -92,6 +92,19 @@ private:
         RECT rect{};
         size_t code = 0;
     };
+    // One block's layout in block-relative coordinates (y = 0 at the block top).
+    // Kept across streaming updates while the block is unchanged.
+    struct BlockLayout {
+        aimd::Block block;
+        bool copied = false;
+        int top = 0;
+        int height = 0;
+        std::vector<TextItem> texts;
+        std::vector<RectItem> rects;
+        std::vector<ImageItem> images;
+        std::vector<LinkArea> links;
+        std::vector<CopyArea> copies;
+    };
     struct Image {
         std::wstring url;
         bool requested = false;
@@ -105,6 +118,9 @@ private:
     };
 
     void ReleaseLayout() noexcept;
+    static void ReleaseBlock(BlockLayout& layout) noexcept;
+    // Lays out m_blocks[index] at y = 0 into the scratch item lists; returns its height.
+    int LayoutBlock(size_t index, size_t codeIndex, int x, int width);
     void ReleaseFormats() noexcept;
     bool EnsureFactory();
     IDWriteTextFormat* Format(float size, int weight, bool mono);
@@ -114,7 +130,7 @@ private:
     // Inline-code chips and link hit areas for a layout placed at (x, y).
     void AddInlineDecorations(const aimd::InlineText& text, IDWriteTextLayout* layout, int x, int y);
     void AddText(IDWriteTextLayout* layout, int x, int y, int width, uint8_t gray, uint8_t classMask);
-    int LayoutCode(size_t blockIndex, int x, int y, int width);
+    int LayoutCode(size_t blockIndex, size_t codeIndex, int x, int y, int width);
     int LayoutTable(const aimd::Block& block, int x, int y, int width);
     int LayoutImage(const aimd::Block& block, int x, int y, int width);
     size_t ImageIndex(const std::wstring& url);
@@ -134,6 +150,10 @@ private:
     std::wstring m_face;
     std::wstring m_monoFace;
     int m_height = 0;
+    std::vector<BlockLayout> m_layouts;
+    // Quote bars span block gaps, so they live in content coordinates.
+    std::vector<RectItem> m_quoteBars;
+    // Scratch output of LayoutBlock, moved into a BlockLayout.
     std::vector<TextItem> m_texts;
     std::vector<RectItem> m_rects;
     std::vector<ImageItem> m_images;

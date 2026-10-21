@@ -163,6 +163,33 @@ void TestSearchResponse() {
     EXPECT(groq::ErrorMessage("oops\nbad") == "oops bad");
 }
 
+void TestDisplayText() {
+    // Every prefix (cut at arbitrary bytes, as streams are) matches the full conversion
+    // once the bytes form whole characters.
+    const std::string samples[] = {
+        "  Hello \xC3\xA9 world \xF0\x9F\x98\x80 done", "<think>plan</think>\n\nAnswer \xE4\xB8\xAD",
+        "Text then <think>hidden", "\n\n  \n", "a<thi", "x\xE2\x82\xAC<think>y</think>z"};
+    for (const std::string& sample : samples) {
+        groq::DisplayText display;
+        std::string content;
+        for (const char c : sample) {
+            content.push_back(c);
+            const std::wstring& shown = display.Update(content);
+            const size_t tail = content.size() - std::min<size_t>(content.size(), 3);
+            bool whole = true;
+            for (size_t i = tail; i < content.size(); ++i) {
+                const auto b = static_cast<unsigned char>(content[i]);
+                const size_t need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+                whole = whole && (b < 0x80 || (b & 0xC0) == 0x80 || content.size() - i >= need);
+            }
+            if (whole) {
+                EXPECT(shown == groq::Utf8ToWide(groq::StripThinking(content)));
+            }
+        }
+        EXPECT(display.Update(content) == groq::Utf8ToWide(groq::StripThinking(content)));
+    }
+}
+
 void TestImages() {
     EXPECT(groq::Base64("") == "");
     EXPECT(groq::Base64("f") == "Zg==");
@@ -197,6 +224,7 @@ int main() {
     TestSearchResponse();
     TestThinking();
     TestImages();
+    TestDisplayText();
     if (g_failures == 0) {
         std::printf("GroqProtocolTests: all passed\n");
         return 0;

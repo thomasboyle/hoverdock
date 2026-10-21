@@ -259,7 +259,21 @@ AiAnswerView::~AiAnswerView() {
     }
 }
 
+void AiAnswerView::ReleaseBlock(BlockLayout& layout) noexcept {
+    for (TextItem& item : layout.texts) {
+        if (item.layout != nullptr) {
+            item.layout->Release();
+        }
+    }
+    layout.texts.clear();
+}
+
 void AiAnswerView::ReleaseLayout() noexcept {
+    for (BlockLayout& layout : m_layouts) {
+        ReleaseBlock(layout);
+    }
+    m_layouts.clear();
+    m_quoteBars.clear();
     for (TextItem& item : m_texts) {
         if (item.layout != nullptr) {
             item.layout->Release();
@@ -482,14 +496,10 @@ void AiAnswerView::AddText(IDWriteTextLayout* layout, int x, int y, int width, u
     m_texts.push_back(item);
 }
 
-int AiAnswerView::LayoutCode(size_t blockIndex, int x, int y, int width) {
+int AiAnswerView::LayoutCode(size_t blockIndex, size_t codeIndex, int x, int y, int width) {
     const float scale = m_layoutScale;
     auto P = [scale](float value) { return static_cast<int>(std::lround(value * scale)); };
     const aimd::Block& block = m_blocks[blockIndex];
-    size_t codeIndex = 0;
-    for (size_t i = 0; i < blockIndex; ++i) {
-        codeIndex += m_blocks[i].kind == aimd::BlockKind::Code ? 1U : 0U;
-    }
     const int pad = P(12.0F);
     const int header = P(28.0F);
     const float labelSize = 12.0F * scale;
@@ -724,30 +734,99 @@ int AiAnswerView::LayoutImage(const aimd::Block& block, int x, int y, int width)
     return boxHeight;
 }
 
+int AiAnswerView::LayoutBlock(size_t index, size_t codeIndex, int x, int w) {
+    const float scale = m_layoutScale;
+    auto P = [scale](float value) { return static_cast<int>(std::lround(value * scale)); };
+    const float body = 15.0F * scale;
+    const aimd::Block& block = m_blocks[index];
+    const int quote = std::min(block.quote, 4);
+    switch (block.kind) {
+    case aimd::BlockKind::Paragraph:
+    case aimd::BlockKind::Heading: {
+        float size = body;
+        int weight = 400;
+        if (block.kind == aimd::BlockKind::Heading) {
+            size = (block.level == 1 ? 21.0F : block.level == 2 ? 18.0F : 16.0F) * scale;
+            weight = 600;
+        }
+        uint8_t mask = 0;
+        IDWriteTextLayout* layout = InlineLayout(block.text, size, weight, w, mask);
+        if (layout == nullptr) {
+            return 0;
+        }
+        AddInlineDecorations(block.text, layout, x, 0);
+        const int height = TextHeight(layout);
+        AddText(layout, x, 0, w, quote > 0 ? 200 : 255, mask);
+        return height;
+    }
+    case aimd::BlockKind::ListItem: {
+        const int listX = x + std::min(block.level, 5) * P(18.0F);
+        const bool ordered = !block.marker.empty() && block.marker.back() == L'.';
+        const int markerWidth = ordered ? P(26.0F) : P(16.0F);
+        const int contentX = listX + markerWidth + P(8.0F);
+        const int contentWidth = std::max(P(40.0F), x + w - contentX);
+        int height = 0;
+        if (IDWriteTextLayout* marker = MakeLayout(block.marker, body, ordered ? 500 : 400, false, markerWidth)) {
+            marker->SetTextAlignment(ordered ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_CENTER);
+            height = TextHeight(marker);
+            AddText(marker, listX, 0, markerWidth, ordered ? 200 : 220, 1U << kInk);
+        }
+        uint8_t mask = 0;
+        IDWriteTextLayout* layout = InlineLayout(block.text, body, 400, contentWidth, mask);
+        if (layout != nullptr) {
+            AddInlineDecorations(block.text, layout, contentX, 0);
+            height = std::max(height, TextHeight(layout));
+            AddText(layout, contentX, 0, contentWidth, quote > 0 ? 200 : 255, mask);
+        }
+        return height;
+    }
+    case aimd::BlockKind::Code:
+        return LayoutCode(index, codeIndex, x, 0, w);
+    case aimd::BlockKind::Rule:
+        m_rects.push_back(RectItem{RECT{x, P(4.0F), x + w, P(4.0F) + std::max(1, P(1.0F))}, 0.0F, 0.16F});
+        return P(9.0F);
+    case aimd::BlockKind::Image:
+        return LayoutImage(block, x, 0, w);
+    case aimd::BlockKind::Table:
+        return LayoutTable(block, x, 0, w);
+    }
+    return 0;
+}
+
 void AiAnswerView::Layout(int width, float scale, const std::wstring& bodyFace) {
-    if (!m_dirty && width == m_layoutWidth && scale == m_layoutScale && bodyFace == m_face) {
+    const std::wstring face = bodyFace.empty() ? std::wstring(L"Segoe UI") : bodyFace;
+    const bool geometryChanged = width != m_layoutWidth || scale != m_layoutScale || face != m_face;
+    if (!m_dirty && !geometryChanged) {
         return;
     }
-    if (scale != m_layoutScale || bodyFace != m_face) {
+    if (scale != m_layoutScale || face != m_face) {
         ReleaseFormats();
     }
-    ReleaseLayout();
+    if (geometryChanged) {
+        ReleaseLayout();
+    }
     m_layoutWidth = width;
     m_layoutScale = scale;
-    m_face = bodyFace.empty() ? std::wstring(L"Segoe UI") : bodyFace;
+    m_face = face;
     m_dirty = false;
     ++m_generation;
     m_height = 0;
+    m_quoteBars.clear();
     if (width <= 0 || !EnsureFactory()) {
+        ReleaseLayout();
         return;
     }
     auto P = [scale](float value) { return static_cast<int>(std::lround(value * scale)); };
-    const float body = 15.0F * scale;
+    // Streaming only appends, so all but the last block or two are unchanged:
+    // reuse their layouts (DirectWrite layout, hit rects, highlighting).
+    std::vector<BlockLayout> next;
+    next.reserve(m_blocks.size());
     int y = 0;
     bool first = true;
     aimd::BlockKind previous = aimd::BlockKind::Paragraph;
     int previousQuote = 0;
     int previousBottom = 0;
+    size_t codeIndex = 0;
     for (size_t index = 0; index < m_blocks.size(); ++index) {
         const aimd::Block& block = m_blocks[index];
         if (!first) {
@@ -762,92 +841,70 @@ void AiAnswerView::Layout(int width, float scale, const std::wstring& bodyFace) 
             y += gap;
         }
         const int quote = std::min(block.quote, 4);
-        const int x = quote * P(14.0F);
-        const int w = std::max(P(40.0F), width - x);
-        const int top = y;
-        switch (block.kind) {
-        case aimd::BlockKind::Paragraph:
-        case aimd::BlockKind::Heading: {
-            float size = body;
-            int weight = 400;
-            if (block.kind == aimd::BlockKind::Heading) {
-                size = (block.level == 1 ? 21.0F : block.level == 2 ? 18.0F : 16.0F) * scale;
-                weight = 600;
-            }
-            uint8_t mask = 0;
-            IDWriteTextLayout* layout = InlineLayout(block.text, size, weight, w, mask);
-            if (layout != nullptr) {
-                AddInlineDecorations(block.text, layout, x, y);
-                const int height = TextHeight(layout);
-                AddText(layout, x, y, w, quote > 0 ? 200 : 255, mask);
-                y += height;
-            }
-            break;
+        const bool isCode = block.kind == aimd::BlockKind::Code;
+        const bool copied = isCode && codeIndex == m_copiedCode;
+        BlockLayout entry;
+        if (index < m_layouts.size() && block.kind != aimd::BlockKind::Image && m_layouts[index].copied == copied &&
+            m_layouts[index].block == block) {
+            entry = std::move(m_layouts[index]);
+            m_layouts[index].texts.clear();
+        } else {
+            const int x = quote * P(14.0F);
+            entry.height = LayoutBlock(index, codeIndex, x, std::max(P(40.0F), width - x));
+            entry.block = block;
+            entry.copied = copied;
+            entry.texts = std::move(m_texts);
+            entry.rects = std::move(m_rects);
+            entry.images = std::move(m_images);
+            entry.links = std::move(m_links);
+            entry.copies = std::move(m_copies);
+            m_texts.clear();
+            m_rects.clear();
+            m_images.clear();
+            m_links.clear();
+            m_copies.clear();
         }
-        case aimd::BlockKind::ListItem: {
-            const int listX = x + std::min(block.level, 5) * P(18.0F);
-            const bool ordered = !block.marker.empty() && block.marker.back() == L'.';
-            const int markerWidth = ordered ? P(26.0F) : P(16.0F);
-            const int contentX = listX + markerWidth + P(8.0F);
-            const int contentWidth = std::max(P(40.0F), x + w - contentX);
-            int height = 0;
-            if (IDWriteTextLayout* marker = MakeLayout(block.marker, body, ordered ? 500 : 400, false, markerWidth)) {
-                marker->SetTextAlignment(ordered ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_CENTER);
-                height = TextHeight(marker);
-                AddText(marker, listX, y, markerWidth, ordered ? 200 : 220, 1U << kInk);
-            }
-            uint8_t mask = 0;
-            IDWriteTextLayout* layout = InlineLayout(block.text, body, 400, contentWidth, mask);
-            if (layout != nullptr) {
-                AddInlineDecorations(block.text, layout, contentX, y);
-                height = std::max(height, TextHeight(layout));
-                AddText(layout, contentX, y, contentWidth, quote > 0 ? 200 : 255, mask);
-            }
-            y += height;
-            break;
-        }
-        case aimd::BlockKind::Code:
-            y += LayoutCode(index, x, y, w);
-            break;
-        case aimd::BlockKind::Rule:
-            y += P(4.0F);
-            m_rects.push_back(RectItem{RECT{x, y, x + w, y + std::max(1, P(1.0F))}, 0.0F, 0.16F});
-            y += P(5.0F);
-            break;
-        case aimd::BlockKind::Image:
-            y += LayoutImage(block, x, y, w);
-            break;
-        case aimd::BlockKind::Table:
-            y += LayoutTable(block, x, y, w);
-            break;
-        }
+        entry.top = y;
+        y += entry.height;
         // Quote bars, joined across consecutive quoted blocks.
         for (int level = 1; level <= quote; ++level) {
             const int barX = (level - 1) * P(14.0F) + P(1.0F);
-            const int barTop = previousQuote >= level && !first ? previousBottom : top;
-            m_rects.push_back(RectItem{RECT{barX, barTop, barX + std::max(2, P(3.0F)), y},
+            const int barTop = previousQuote >= level && !first ? previousBottom : entry.top;
+            m_quoteBars.push_back(RectItem{RECT{barX, barTop, barX + std::max(2, P(3.0F)), y},
                 static_cast<float>(P(1.5F)), 0.28F});
         }
+        next.push_back(std::move(entry));
+        codeIndex += isCode ? 1U : 0U;
         previous = block.kind;
         previousQuote = quote;
         previousBottom = y;
         first = false;
     }
+    for (BlockLayout& stale : m_layouts) {
+        ReleaseBlock(stale);
+    }
+    m_layouts = std::move(next);
     m_height = y + P(4.0F);
 }
 
 AiAnswerView::Hit AiAnswerView::HitTest(POINT point) const {
-    auto inside = [&](const RECT& r) {
-        return point.x >= r.left && point.x < r.right && point.y >= r.top && point.y < r.bottom;
+    auto inside = [](const RECT& r, LONG x, LONG y) {
+        return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
     };
-    for (const CopyArea& copy : m_copies) {
-        if (inside(copy.rect)) {
-            return Hit{Hit::Kind::CopyCode, {}, copy.code};
+    // First block whose bottom is below the point (blocks are sorted by top).
+    auto block = std::partition_point(m_layouts.begin(), m_layouts.end(),
+        [&](const BlockLayout& layout) { return layout.top + layout.height < point.y; });
+    for (; block != m_layouts.end() && block->top <= point.y; ++block) {
+        const LONG localY = point.y - block->top;
+        for (const CopyArea& copy : block->copies) {
+            if (inside(copy.rect, point.x, localY)) {
+                return Hit{Hit::Kind::CopyCode, {}, copy.code};
+            }
         }
-    }
-    for (const LinkArea& link : m_links) {
-        if (inside(link.rect)) {
-            return Hit{Hit::Kind::Link, link.url, 0};
+        for (const LinkArea& link : block->links) {
+            if (inside(link.rect, point.x, localY)) {
+                return Hit{Hit::Kind::Link, link.url, 0};
+            }
         }
     }
     return {};
@@ -948,29 +1005,42 @@ void AiAnswerView::Paint(uint8_t* dest, int destWidth, int destHeight, RECT view
     if (!cached) {
         m_layer.assign(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U, 0);
         uint8_t* layer = m_layer.data();
-        for (const RectItem& item : m_rects) {
+        auto fillRect = [&](const RectItem& item, int offset) {
             RECT rect = item.rect;
-            rect.top -= scroll;
-            rect.bottom -= scroll;
+            rect.top -= offset;
+            rect.bottom -= offset;
             if (rect.bottom <= 0 || rect.top >= height) {
-                continue;
+                return;
             }
             if (item.radius <= 0.0F) {
                 FillRectColorPremul(layer, width, height, rect, item.alpha, ink.b, ink.g, ink.r);
             } else {
                 FillSquircleColorPremul(layer, width, height, rect, item.radius, item.alpha, ink.b, ink.g, ink.r);
             }
+        };
+        for (const RectItem& bar : m_quoteBars) {
+            fillRect(bar, scroll);
         }
-        for (const ImageItem& item : m_images) {
-            const Image& image = m_imagesData[item.image];
-            if (image.scaled.empty() || item.rect.bottom - scroll <= 0 || item.rect.top - scroll >= height) {
-                continue;
+        // Only blocks overlapping [scroll, scroll + height); glyphs may overhang a few px.
+        const int overhang = static_cast<int>(std::lround(6.0F * std::max(1.0F, m_layoutScale)));
+        auto block = std::partition_point(m_layouts.begin(), m_layouts.end(),
+            [&](const BlockLayout& layout) { return layout.top + layout.height + overhang <= scroll; });
+        for (; block != m_layouts.end() && block->top - overhang < scroll + height; ++block) {
+            const int offset = scroll - block->top;
+            for (const RectItem& item : block->rects) {
+                fillRect(item, offset);
             }
-            CompositePremul(layer, width, height, static_cast<int>(item.rect.left),
-                static_cast<int>(item.rect.top) - scroll, image.scaled.data(), image.scaledWidth, image.scaledHeight);
-        }
-        for (const TextItem& item : m_texts) {
-            static_cast<void>(RasterizeText(item, layer, width, height, scroll, ink));
+            for (const ImageItem& item : block->images) {
+                const Image& image = m_imagesData[item.image];
+                if (!image.scaled.empty()) {
+                    CompositePremul(layer, width, height, static_cast<int>(item.rect.left),
+                        static_cast<int>(item.rect.top) - offset, image.scaled.data(), image.scaledWidth,
+                        image.scaledHeight);
+                }
+            }
+            for (const TextItem& item : block->texts) {
+                static_cast<void>(RasterizeText(item, layer, width, height, offset, ink));
+            }
         }
         m_layerGeneration = m_generation;
         m_layerScroll = scroll;

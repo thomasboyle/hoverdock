@@ -277,6 +277,7 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
         groq::StreamParser parser;
         ULONGLONG lastPublish = 0;
         size_t publishedBytes = 0;
+        groq::DisplayText display;
         auto publishContent = [&](bool force) {
             const ULONGLONG now = GetTickCount64();
             if (!force && (now - lastPublish < kPublishIntervalMs || parser.Content().size() == publishedBytes)) {
@@ -284,7 +285,7 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
             }
             lastPublish = now;
             publishedBytes = parser.Content().size();
-            std::wstring markdown = groq::Utf8ToWide(groq::StripThinking(parser.Content()));
+            std::wstring markdown = display.Update(parser.Content());
             const bool thinking = markdown.empty() && (parser.Reasoning() || !parser.Content().empty());
             publisher.Update([&](AiSnapshot& state) {
                 state.markdown = std::move(markdown);

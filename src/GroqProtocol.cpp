@@ -280,8 +280,24 @@ std::optional<Value> Parse(std::string_view text) {
 void AppendQuoted(std::string& out, std::string_view utf8) {
     static constexpr char kHex[] = "0123456789abcdef";
     out.push_back('"');
-    for (const char ch : utf8) {
-        const auto c = static_cast<unsigned char>(ch);
+    size_t i = 0;
+    while (i < utf8.size()) {
+        // Copy the run of bytes that need no escaping in one append (image
+        // data URLs are megabytes of plain base64).
+        size_t run = i;
+        while (run < utf8.size()) {
+            const auto c = static_cast<unsigned char>(utf8[run]);
+            if (c < 0x20 || c == '"' || c == '\\') {
+                break;
+            }
+            ++run;
+        }
+        out.append(utf8.data() + i, run - i);
+        if (run >= utf8.size()) {
+            break;
+        }
+        const auto c = static_cast<unsigned char>(utf8[run]);
+        i = run + 1;
         switch (c) {
         case '"': out += "\\\""; break;
         case '\\': out += "\\\\"; break;
@@ -289,13 +305,9 @@ void AppendQuoted(std::string& out, std::string_view utf8) {
         case '\r': out += "\\r"; break;
         case '\t': out += "\\t"; break;
         default:
-            if (c < 0x20) {
-                out += "\\u00";
-                out.push_back(kHex[c >> 4U]);
-                out.push_back(kHex[c & 15U]);
-            } else {
-                out.push_back(ch);
-            }
+            out += "\\u00";
+            out.push_back(kHex[c >> 4U]);
+            out.push_back(kHex[c & 15U]);
         }
     }
     out.push_back('"');
@@ -780,14 +792,66 @@ std::string StripThinking(std::string_view content) {
 
 // ---- streaming -----------------------------------------------------------------------------
 
-void StreamParser::Feed(std::string_view bytes) {
-    for (const char c : bytes) {
-        if (c == '\n') {
-            HandleLine(m_line);
-            m_line.clear();
-        } else if (c != '\r') {
-            m_line.push_back(c);
+const std::wstring& DisplayText::Update(const std::string& content) {
+    if (content.size() < m_converted) {
+        m_text.clear();
+        m_converted = 0;
+        m_thinking = false;
+    }
+    // A <think> block can hide or reveal earlier text: convert the whole thing.
+    if (!m_thinking && content.find("<think", m_converted >= 6 ? m_converted - 6 : 0) != std::string::npos) {
+        m_thinking = true;
+    }
+    if (m_thinking) {
+        m_text = Utf8ToWide(StripThinking(content));
+        m_converted = content.size();
+        return m_text;
+    }
+    // Stop before an incomplete trailing UTF-8 sequence; it completes later.
+    size_t end = content.size();
+    size_t lead = end;
+    while (lead > m_converted && (static_cast<unsigned char>(content[lead - 1]) & 0xC0) == 0x80) {
+        --lead;
+    }
+    if (lead > m_converted) {
+        const auto c = static_cast<unsigned char>(content[lead - 1]);
+        const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (end - (lead - 1) < need) {
+            end = lead - 1;
         }
+    }
+    std::string_view fresh = std::string_view(content).substr(m_converted, end - m_converted);
+    if (m_text.empty()) {
+        // StripThinking also drops leading whitespace.
+        const size_t first = fresh.find_first_not_of(" \t\r\n");
+        if (first == std::string_view::npos) {
+            m_converted = end;
+            return m_text;
+        }
+        m_converted += first;
+        fresh.remove_prefix(first);
+    }
+    m_text += Utf8ToWide(fresh);
+    m_converted = end;
+    return m_text;
+}
+
+void StreamParser::Feed(std::string_view bytes) {
+    size_t start = 0;
+    while (start < bytes.size()) {
+        const size_t newline = bytes.find('\n', start);
+        const size_t end = newline == std::string_view::npos ? bytes.size() : newline;
+        m_line.append(bytes.data() + start, end - start);
+        if (newline == std::string_view::npos) {
+            break;
+        }
+        // SSE lines end in \n or \r\n; drop any carriage returns.
+        if (m_line.find('\r') != std::string::npos) {
+            std::erase(m_line, '\r');
+        }
+        HandleLine(m_line);
+        m_line.clear();
+        start = newline + 1;
     }
 }
 
