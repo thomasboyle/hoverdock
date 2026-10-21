@@ -23,9 +23,8 @@
 //   - switches the plan's processor policy between low power (the Power saver
 //     plan's processor settings, as efficient as Hoverdock's Low Power) and
 //     high power (minimum state 100%, EPP 0, aggressive boost, no core
-//     parking, PCIe ASPM off) on both AC and battery; at low power the
-//     latency-sensitivity hints stay at full strength so Windows itself
-//     bursts the processor on every click and launch,
+//     parking, PCIe ASPM off, full-strength latency hints) on both AC and
+//     battery,
 //   - exempts games, creative tools, AI runtimes and apps using audio, the
 //     camera or the microphone from Windows power throttling (EcoQoS) so a
 //     minimized export, a call or a focused game is never slowed.

@@ -64,15 +64,16 @@ const GUID kPcieSubgroup = {0x501a4d13, 0x42af, 0x4429, {0x9f, 0xd1, 0xa8, 0x21,
 // Processor policy the plan switches between. High power matches Hoverdock's
 // High Power mode; low power is read from the Power saver plan (Hoverdock's
 // Low Power mode), with lowFallback used when a machine has no Power saver
-// plan (many Modern Standby laptops only ship Balanced). lowFixed settings
-// always use lowFallback at low power. Display, sleep and other settings stay
-// as in Balanced.
+// plan (many Modern Standby laptops only ship Balanced). Optional settings
+// may not exist on every Windows build (E-core variants): their low value
+// falls back to Balanced's before lowFallback, and a write Windows refuses is
+// not retried. Display, sleep and other settings stay as in Balanced.
 struct PlanSetting {
     const GUID* subgroup;
     GUID setting;
     DWORD highValue;
     DWORD lowFallback;
-    bool lowFixed = false;
+    bool optional = false;
 };
 
 const PlanSetting kPlanSettings[] = {
@@ -94,19 +95,19 @@ const PlanSetting kPlanSettings[] = {
     {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x84}}, 100, 5},
     // PCI Express link state power management: Off / Maximum power savings.
     {&kPcieSubgroup, {0xee12f906, 0xd277, 0x404b, {0xb6, 0xda, 0xe5, 0xfa, 0x1a, 0x57, 0x6d, 0xf5}}, 0, 2},
-    // Latency sensitivity hints (P-cores / E-cores): Windows raises a hint on
-    // clicks, key presses and launches, and these let the processor burst to
-    // full performance and unpark every core for it on its own, within a
-    // millisecond and without waiting for Hoverdock. Power saver leaves the
-    // hint weak; at rest Automatic keeps it at full strength, so a click is
-    // instant while the clock and core count still fall back right after.
-    {&kProcessorSubgroup, {0x619b7505, 0x003b, 0x4e82, {0xb7, 0xa6, 0x4d, 0xd2, 0x9c, 0x30, 0x09, 0x71}}, 100, 100,
+    // Latency sensitivity hints (P-cores / E-cores): performance and unparked
+    // cores Windows grants for 1-3 s whenever it raises a hint, which it does
+    // for every input, pointer motion included. At full power they are at
+    // full strength; at rest they follow Power saver, so moving the cursor
+    // does not spin the processor up (work a click starts is still caught by
+    // the engine's probe).
+    {&kProcessorSubgroup, {0x619b7505, 0x003b, 0x4e82, {0xb7, 0xa6, 0x4d, 0xd2, 0x9c, 0x30, 0x09, 0x71}}, 100, 0,
         true},
-    {&kProcessorSubgroup, {0x619b7505, 0x003b, 0x4e82, {0xb7, 0xa6, 0x4d, 0xd2, 0x9c, 0x30, 0x09, 0x72}}, 100, 100,
+    {&kProcessorSubgroup, {0x619b7505, 0x003b, 0x4e82, {0xb7, 0xa6, 0x4d, 0xd2, 0x9c, 0x30, 0x09, 0x72}}, 100, 0,
         true},
-    {&kProcessorSubgroup, {0x616cdaa5, 0x695e, 0x4545, {0x97, 0xad, 0x97, 0xdc, 0x2d, 0x1b, 0xdd, 0x88}}, 100, 100,
+    {&kProcessorSubgroup, {0x616cdaa5, 0x695e, 0x4545, {0x97, 0xad, 0x97, 0xdc, 0x2d, 0x1b, 0xdd, 0x88}}, 100, 0,
         true},
-    {&kProcessorSubgroup, {0x616cdaa5, 0x695e, 0x4545, {0x97, 0xad, 0x97, 0xdc, 0x2d, 0x1b, 0xdd, 0x89}}, 100, 100,
+    {&kProcessorSubgroup, {0x616cdaa5, 0x695e, 0x4545, {0x97, 0xad, 0x97, 0xdc, 0x2d, 0x1b, 0xdd, 0x89}}, 100, 0,
         true},
 };
 
@@ -1340,16 +1341,18 @@ private:
         for (size_t index = 0; index < kPlanSettingCount; ++index) {
             const PlanSetting& setting = kPlanSettings[index];
             Baseline& base = m_baseline[index];
-            if (setting.lowFixed) {
-                base = {setting.lowFallback, setting.lowFallback};
-                continue;
-            }
             if (PowerReadACValueIndex(nullptr, &kPowerSaverPlan, setting.subgroup, &setting.setting, &base.ac) !=
-                ERROR_SUCCESS) {
+                    ERROR_SUCCESS &&
+                (!setting.optional ||
+                    PowerReadACValueIndex(nullptr, &kBalancedPlan, setting.subgroup, &setting.setting, &base.ac) !=
+                        ERROR_SUCCESS)) {
                 base.ac = setting.lowFallback;
             }
             if (PowerReadDCValueIndex(nullptr, &kPowerSaverPlan, setting.subgroup, &setting.setting, &base.dc) !=
-                ERROR_SUCCESS) {
+                    ERROR_SUCCESS &&
+                (!setting.optional ||
+                    PowerReadDCValueIndex(nullptr, &kBalancedPlan, setting.subgroup, &setting.setting, &base.dc) !=
+                        ERROR_SUCCESS)) {
                 base.dc = setting.lowFallback;
             }
         }
@@ -1373,7 +1376,7 @@ private:
             const DWORD ac = full ? setting.highValue : base.ac;
             const DWORD dc = full ? setting.highValue : base.dc;
             Written& written = m_written[index];
-            if (written.valid && written.ac == ac && written.dc == dc) {
+            if (m_unsupported[index] || (written.valid && written.ac == ac && written.dc == dc)) {
                 continue;
             }
             const bool acOk =
@@ -1381,9 +1384,10 @@ private:
             const bool dcOk =
                 PowerWriteDCValueIndex(nullptr, &kAutoPlan, setting.subgroup, &setting.setting, dc) == ERROR_SUCCESS;
             writes += 2;
+            written = {acOk && dcOk, ac, dc};
             // Settings this Windows build lacks (E-core variants) are not
-            // retried: values that never change between modes are settled.
-            written = {(acOk && dcOk) || setting.lowFixed, ac, dc};
+            // retried on every switch.
+            m_unsupported[index] = setting.optional && !acOk && !dcOk;
             wrote = wrote || acOk || dcOk;
             failed = failed || !acOk || !dcOk;
         }
@@ -2006,6 +2010,7 @@ private:
 
     Baseline m_baseline[kPlanSettingCount]{};
     Written m_written[kPlanSettingCount]{};
+    bool m_unsupported[kPlanSettingCount]{};
     std::optional<bool> m_planFull;
     bool m_engaged = false;
     DWORD m_cpuCount = 1;
