@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DockConfig.h"
+#include "AutoPower.h"
 #include "AiAnswerView.h"
 #include "AiAttachments.h"
 #include "GroqClient.h"
@@ -181,6 +182,8 @@ private:
     static constexpr UINT kOpenSearchEntryMessage = WM_APP + 42;
     // AI image attachment prepared: lParam owns an AiAttachmentReply.
     static constexpr UINT kAiAttachmentMessage = WM_APP + 43;
+    // Automatic energy mode status changed (AutoPowerEngine worker, no payload).
+    static constexpr UINT kAutoPowerMessage = WM_APP + 44;
     static constexpr UINT_PTR kWeatherTimerId = 10;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
@@ -1236,6 +1239,7 @@ private:
     std::atomic<bool> m_updateInFlight{false};
     std::atomic<bool> m_updateInstalling{false};
     PerfProfiler m_perfProfiler;
+    AutoPowerEngine m_autoPower;
     std::wstring m_perfStatus;
     // Set only after a profile finishes writing. Clicking the path opens it.
     std::wstring m_perfSavedLog;

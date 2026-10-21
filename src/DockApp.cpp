@@ -2459,6 +2459,7 @@ DockApp::~DockApp() {
     UnregisterTrashNotify();
     StopSearchServices();
     m_perfProfiler.Stop();
+    m_autoPower.Stop();
     DestroyDockSettings();
     DestroyOverflowPopup();
     DestroyContextMenu();
@@ -2586,6 +2587,16 @@ int DockApp::Run() {
     RefreshTrash(true);
     RegisterForegroundWatch();
     StartCursorWatch();
+    // Automatic energy mode. Hoverdock has always shown Balanced as
+    // Automatic, so move Balanced onto the managed plan once.
+    {
+        const bool adoptBalanced = !m_config.AutoPowerAdopted();
+        if (adoptBalanced) {
+            m_config.SetAutoPowerAdopted(true);
+            ScheduleConfigSave();
+        }
+        m_autoPower.Start(m_window, kAutoPowerMessage, adoptBalanced);
+    }
 
     GetCursorPos(&m_lastCursor);
     m_lastPointerSampleAt = QpcSeconds();
@@ -3106,6 +3117,8 @@ LRESULT CALLBACK DockApp::ContextWindowProcedure(HWND window, UINT message, WPAR
 
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
+        // Automatic energy mode: wakes its engine only when it asked for input.
+        s_instance->m_autoPower.NoteInput();
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         if (wParam == WM_MOUSEMOVE && !s_instance->IsDragActive() &&
             s_instance->NeedsHookPointerPost(mouse->pt)) {
@@ -3833,6 +3846,13 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         ApplyBluetoothSnapshot();
         return 0;
 
+    case kAutoPowerMessage:
+        // Only the Power page shows the Automatic mode's live state.
+        if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Power) {
+            QueueOverflowPaint();
+        }
+        return 0;
+
     case kSpeedTestMessage:
         // Progress only matters while the Wi-Fi page shows it.
         if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Wifi) {
@@ -3980,6 +4000,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         StopShellFlyoutWatch();
         StopSearchServices();
         m_perfProfiler.Stop();
+        m_autoPower.Stop();
         DestroyDockSettings();
         BeginOverflowHide(false);
         DestroyOverflowPopup();
@@ -14049,6 +14070,8 @@ void CALLBACK DockApp::ForegroundWinEventProc(HWINEVENTHOOK, DWORD, HWND hwnd, L
         PostMessageW(s_instance->m_window, kBadgeSeenMessage, reinterpret_cast<WPARAM>(hwnd), 0);
     }
     s_instance->m_renderer.RequestBackdropRefresh();
+    // A focused game must be at full power before its first frame.
+    s_instance->m_autoPower.Wake();
     if (s_instance->m_visibility == VisibilityState::Hidden ||
         s_instance->m_visibility == VisibilityState::Hiding) {
         s_instance->m_hiddenCatalogEpoch.fetch_add(1, std::memory_order_relaxed);

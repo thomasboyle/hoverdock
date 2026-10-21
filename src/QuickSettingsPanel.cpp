@@ -1249,23 +1249,7 @@ bool FindUltimatePowerScheme(GUID& scheme) {
 }
 
 bool DuplicateUltimatePowerScheme() {
-    wchar_t commandLine[] =
-        L"powercfg.exe /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61";
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    if (!CreateProcessW(nullptr, commandLine, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
-            nullptr, &startup, &process)) {
-        return false;
-    }
-    const DWORD wait = WaitForSingleObject(process.hProcess, 10000);
-    DWORD exitCode = ERROR_PROCESS_ABORTED;
-    if (wait == WAIT_OBJECT_0) {
-        GetExitCodeProcess(process.hProcess, &exitCode);
-    }
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    return wait == WAIT_OBJECT_0 && exitCode == ERROR_SUCCESS;
+    return RunPowercfg(L"/duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61");
 }
 
 bool EnsureUltimatePowerScheme(GUID& scheme) {
@@ -1298,6 +1282,11 @@ void QueryPower(QuickSettingsCache& cache) {
 }
 
 bool SetPowerMode(int mode) {
+    // Automatic is the Hoverdock Automatic plan, run by AutoPowerEngine;
+    // plain Balanced is the fallback when the plan cannot be created.
+    if (mode == 1 && AutoPowerEngine::Activate()) {
+        return true;
+    }
     GUID ultimate{};
     const GUID* scheme = &GUID_TYPICAL_POWER_SAVINGS;
     if (mode == 0) {
@@ -5402,9 +5391,14 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             {0, L'\uE945', L"High Power"},
         };
         static const std::wstring kNoTrailing;
+        static const std::wstring kFullPower = L"Full Power";
+        // Automatic shows when it is currently giving an app full power.
+        const AutoPowerStatus autoPower = m_autoPower.Status();
+        const bool autoFull = autoPower.engaged && autoPower.fullPower;
         for (const ModeRow& mode : kModeRows) {
-            menuItem(mode.glyph, m_qsCache.powerMode == mode.mode, false, mode.label, kNoTrailing, 0,
-                TrayFlyoutHitKind::PowerMode, mode.mode);
+            const bool automaticRow = mode.mode == 1;
+            menuItem(mode.glyph, m_qsCache.powerMode == mode.mode, false, mode.label,
+                automaticRow && autoFull ? kFullPower : kNoTrailing, 0, TrayFlyoutHitKind::PowerMode, mode.mode);
         }
         hairline();
         menuSection(L"Using Significant Energy");
@@ -6119,6 +6113,7 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
         if (SetPowerMode(hit.index)) {
             m_qsCache.powerMode = hit.index;
             m_qsCache.stamp = 0;
+            m_autoPower.Wake();
             QueueOverflowPaint();
         }
         break;

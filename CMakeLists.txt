@@ -47,6 +47,8 @@ add_executable(Dock WIN32
     src/Bluetooth.cpp
     src/PerfBoost.cpp
     src/PerfProfiler.cpp
+    src/AutoPower.cpp
+    src/AutoPowerPolicy.cpp
     src/RecycleBin.cpp
     src/SpeedTest.cpp
     src/FileSearchIndex.cpp
@@ -207,6 +209,7 @@ set_property(TARGET Dock PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_D
 #   AiMarkdownTests        AI answer Markdown parser (portable)
 #   GroqProtocolTests      Groq request/stream/source handling (portable)
 #   AiPipelineBench        AI answer streaming/request benchmark (portable)
+#   AutoPowerPolicyTests   Automatic energy mode decisions (portable)
 option(DOCK_BUILD_TESTS "Build the Search engine tests" OFF)
 if(DOCK_BUILD_TESTS)
     enable_testing()
@@ -234,6 +237,9 @@ if(DOCK_BUILD_TESTS)
     add_dock_test(AiPipelineBench tests/AiPipelineBench.cpp src/AiMarkdown.cpp src/GroqProtocol.cpp)
     add_test(NAME AiMarkdownTests COMMAND AiMarkdownTests)
     add_test(NAME GroqProtocolTests COMMAND GroqProtocolTests)
+    # Automatic energy mode: app classification and full-power decisions (portable).
+    add_dock_test(AutoPowerPolicyTests tests/AutoPowerPolicyTests.cpp src/AutoPowerPolicy.cpp)
+    add_test(NAME AutoPowerPolicyTests COMMAND AutoPowerPolicyTests)
 endif()
 
 # Signed PawnIO IntelMSR blob header (third_party/pawnio/IntelMsrBin.h).
