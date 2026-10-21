@@ -671,6 +671,9 @@ private:
     // Search panel glass: the dock's own material and corner (live-refreshed
     // by TickLivePopupGlass as target 3).
     [[nodiscard]] float DockCornerRadiusPx(float scale) const noexcept;
+    // Dock face + macOS Spotlight material (wide frost, vibrancy, light/dark fill).
+    [[nodiscard]] UINT SearchGlassFxFlags() const noexcept;
+    static bool SystemUsesLightApps() noexcept;
     [[nodiscard]] bool BakeSearchGlass(POINT origin, SIZE size, uint8_t* pixels, size_t bytes);
     [[nodiscard]] bool SearchGlassLiveReady(POINT& origin, SIZE& size) const;
     void ApplySearchLiveGlass(std::vector<uint8_t>& glass);
@@ -1126,6 +1129,8 @@ private:
     bool m_aiAskWhenReady = false;
     std::wstring m_aiAttachNotice;
     bool m_searchPickerOpen = false;
+    // Windows "app mode" light theme, read when Search opens (Spotlight fill).
+    bool m_searchLightTheme = false;
     RECT m_searchAttachButton{};
     std::vector<RECT> m_aiAttachRemoveRects;
     InstalledAppCatalog m_installedApps;

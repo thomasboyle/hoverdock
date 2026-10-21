@@ -182,6 +182,12 @@ float FxEnabled(float packed, float bit)
     return (((uint)packed) & (uint)bit) != 0u ? 1.0 : 0.0;
 }
 
+// Search panel: macOS Spotlight material (see DOCK_FX_SPOTLIGHT).
+bool SpotlightPanel()
+{
+    return FxEnabled(scene1.x, (float)DOCK_FX_PANEL) > 0.5 && FxEnabled(scene1.x, (float)DOCK_FX_SPOTLIGHT) > 0.5;
+}
+
 // Bevel (lens band) width. Context panels refract as one full-face slab. The
 // dock, and text panels (DOCK_FX_DOCK_FACE), confine the lens to an edge band
 // so the center stays flat. Shared by GlassPS and ComputeFrostUVs.
@@ -448,7 +454,8 @@ float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
     const float2 hi = 1.0 - texel * 0.5;
     // Unit-pixel steps (never sparse). blurPx scales how far the lobe
     // reaches; with blurPx == 16, step == 1 and all 33 taps are used.
-    const float step = min(blurPx / 16.0, 1.0);
+    // Spotlight spreads the taps past 1 px so one pass reaches sigma = blurPx / 2.
+    const float step = SpotlightPanel() ? blurPx / 16.0 : min(blurPx / 16.0, 1.0);
     float3 acc = float3(tex.Sample(linearClamp, clamp(uvR, lo, hi)).r,
         tex.Sample(linearClamp, clamp(uvG, lo, hi)).g,
         tex.Sample(linearClamp, clamp(uvB, lo, hi)).b) * kGaussW[0];
@@ -850,7 +857,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // Heavy mica: soft rim (refraction still reads), near-opaque frost
         // in the thick center. Iterated separable passes compound radii.
         // Icon legibility comes from blur + the #e1e1e1 plate, not sharpness.
-        const float blurPx = lerp(frostRim, frostCore, height01) * dpi;
+        const float blurPx = SpotlightPanel() ? DOCK_SPOTLIGHT_BLUR_PX * dpi : lerp(frostRim, frostCore, height01) * dpi;
         // Frost off samples each channel once at its (possibly refracted)
         // UV instead of the 17-tap ring: same result as a zero-radius blur
         // with a seventeenth of the fetches.
@@ -882,14 +889,27 @@ float4 GlassPS(VertexOutput input) : SV_Target
         // differs: it lifts the same tint layer toward a light plate so dark
         // ink stays legible. Dock and Light-off panels use the dock constants.
         const float lightP = isPanel ? saturate(scene0.w) : 0.0;
-        const float tintA = lerp(kDock27TintAlpha, 0.80, lightP);
-        const float3 tintC = lerp(kDock27Tint, float3(0.95, 0.96, 0.98), lightP);
+        float tintA = lerp(kDock27TintAlpha, 0.80, lightP);
+        float3 tintC = lerp(kDock27Tint, float3(0.95, 0.96, 0.98), lightP);
+        const bool spotlight = SpotlightPanel();
+        if (spotlight)
+        {
+            // Spotlight: vibrant blurred backdrop under the system light/dark fill.
+            tintA = lerp(DOCK_SPOTLIGHT_DARK_ALPHA, DOCK_SPOTLIGHT_LIGHT_ALPHA, lightP);
+            tintC = lerp(DOCK_SPOTLIGHT_DARK_FILL, DOCK_SPOTLIGHT_LIGHT_FILL, lightP) * float3(1.0, 1.0, 1.0);
+        }
         float3 inside;
         float insideAlpha;
         if (hasBackdrop)
         {
-            const float3 fill = lerp(frostedBackground, tintC, tintA);
-            inside = fill + rimR * (1.0 - fill);
+            float3 backdrop = frostedBackground;
+            if (spotlight)
+            {
+                const float luma = dot(backdrop, float3(0.2126, 0.7152, 0.0722));
+                backdrop = saturate(lerp(luma.xxx, backdrop, DOCK_SPOTLIGHT_SATURATION));
+            }
+            const float3 fill = lerp(backdrop, tintC, tintA);
+            inside = fill + rimR * (spotlight ? 0.6 : 1.0) * (1.0 - fill);
             insideAlpha = 1.0;
         }
         else
@@ -1118,7 +1138,7 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE)) * (1.0 - labelFace);
     FrostMicaRadii(max(frostAmt, max(charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR,
         (dockStyle ? 0.0 : textPanel * DOCK_TEXT_PANEL_FROST_FLOOR))), micaRim, micaCore);
-    blurPx = lerp(micaRim, micaCore, height01) * dpi;
+    blurPx = SpotlightPanel() ? DOCK_SPOTLIGHT_BLUR_PX * dpi : lerp(micaRim, micaCore, height01) * dpi;
 }
 
 
