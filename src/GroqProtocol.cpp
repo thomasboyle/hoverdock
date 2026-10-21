@@ -445,7 +445,7 @@ void AppendTools(std::string& out, SearchMode search) {
                R"({"query":{"type":"string","description":"A focused web search query."}},"required":["query"]}}}])"
                R"(,"tool_choice":"auto")";
     } else if (search == SearchMode::Builtin) {
-        out += R"(,"tools":[{"type":"browser_search"}],"reasoning_effort":"low")";
+        out += R"(,"tools":[{"type":"browser_search"}])";
     }
 }
 
@@ -455,6 +455,10 @@ void AppendTools(std::string& out, SearchMode search) {
 
 bool HasBuiltinSearch(std::string_view model) noexcept {
     return model.starts_with("openai/gpt-oss");
+}
+
+bool SupportsReasoningEffort(std::string_view model) noexcept {
+    return HasBuiltinSearch(model) || model.starts_with("qwen/qwen3.8");
 }
 
 std::string SystemPrompt(std::string_view today, SearchMode search) {
@@ -507,8 +511,14 @@ std::string BuildChatRequest(std::string_view model, const std::vector<Message>&
                 out += "}}";
             }
             out.push_back(']');
-        } else if (message.content.empty() && !message.toolCalls.empty()) {
-            out += "null";
+        } else if (message.role == "assistant") {
+            // History carries final outputs only, never reasoning (Groq multi-turn guidance).
+            const std::string finalOutput = StripThinking(message.content);
+            if (finalOutput.empty() && !message.toolCalls.empty()) {
+                out += "null";
+            } else {
+                json::AppendQuoted(out, finalOutput);
+            }
         } else {
             json::AppendQuoted(out, message.content);
         }
@@ -537,11 +547,21 @@ std::string BuildChatRequest(std::string_view model, const std::vector<Message>&
     }
     out.push_back(']');
     AppendTools(out, search);
-    // Qwen 3.x instruct-mode sampling recommended by Groq's model card.
-    if (model.find("qwen") != std::string_view::npos) {
-        out += R"(,"temperature":0.7,"top_p":0.8)";
+    // Medium thinking. Qwen returns it in a separate `reasoning` field
+    // (parsed) so `content` is the final answer only; GPT-OSS always does.
+    if (SupportsReasoningEffort(model)) {
+        out += R"(,"reasoning_effort":"medium")";
+        if (!HasBuiltinSearch(model)) {
+            out += R"(,"reasoning_format":"parsed")";
+        }
     }
-    out += R"(,"max_completion_tokens":4096)";
+    out += R"(,"temperature":0.8)";
+    // Groq's Qwen 3.8 thinking-mode nucleus setting.
+    if (model.find("qwen") != std::string_view::npos) {
+        out += R"(,"top_p":0.95)";
+    }
+    // Room for the reasoning tokens as well as the answer.
+    out += R"(,"max_completion_tokens":8192)";
     out += stream ? R"(,"stream":true})" : R"(,"stream":false})";
     return out;
 }

@@ -68,12 +68,34 @@ void TestRequest() {
         EXPECT(parsed->Get("messages")->items[2].Get("content")->type == groq::json::Value::Type::Null);
         EXPECT(parsed->Get("messages")->items[3].Str("tool_call_id") == "call_1");
         EXPECT(parsed->Get("tools")->items[0].Get("function")->Str("name") == "web_search");
-        EXPECT(parsed->Get("temperature") != nullptr);
+        EXPECT(parsed->Get("temperature")->number == 0.8);
+        EXPECT(parsed->Get("top_p")->number == 0.95);
+        EXPECT(parsed->Str("reasoning_effort") == "medium");
+        EXPECT(parsed->Str("reasoning_format") == "parsed");
     }
+    // Assistant history drops reasoning; content that was only thinking becomes null.
+    std::vector<groq::Message> history = {
+        {"assistant", "<think>secret plan</think>Final answer", {}, {}, {}},
+        {"assistant", "<think>only thinking</think>", {}, {{"c2", "web_search", "{}"}}, {}},
+        {"user", "<think>user text is untouched</think>", {}, {}, {}},
+    };
+    const auto stripped = groq::json::Parse(
+        groq::BuildChatRequest(groq::kDefaultModel, history, groq::SearchMode::None, true));
+    EXPECT(stripped.has_value());
+    if (stripped.has_value()) {
+        const auto& items = stripped->Get("messages")->items;
+        EXPECT(items[0].Str("content") == "Final answer");
+        EXPECT(items[1].Get("content")->type == groq::json::Value::Type::Null);
+        EXPECT(items[2].Str("content") == "<think>user text is untouched</think>");
+    }
+    const auto other = groq::json::Parse(
+        groq::BuildChatRequest("llama-3.3-70b-versatile", history, groq::SearchMode::None, true));
+    EXPECT(other.has_value() && other->Get("reasoning_effort") == nullptr && other->Get("top_p") == nullptr &&
+        other->Get("temperature")->number == 0.8);
     const auto builtin = groq::json::Parse(
         groq::BuildChatRequest("openai/gpt-oss-120b", messages, groq::SearchMode::Builtin, false));
     EXPECT(builtin.has_value() && builtin->Get("tools")->items[0].Str("type") == "browser_search" &&
-        builtin->Get("temperature") == nullptr);
+        builtin->Str("reasoning_effort") == "medium" && builtin->Get("reasoning_format") == nullptr);
     const auto search = groq::json::Parse(groq::BuildSearchRequest("weather \"today\""));
     EXPECT(search.has_value() && search->Str("model") == groq::kSearchModel && search->Str("tool_choice") == "required");
     EXPECT(groq::SearchQueryFromArguments(R"({"query":"a b"})") == "a b");

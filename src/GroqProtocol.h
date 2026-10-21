@@ -83,6 +83,8 @@ inline constexpr size_t kMaxImages = 3;
 enum class SearchMode : uint8_t { None, Function, Builtin };
 
 [[nodiscard]] bool HasBuiltinSearch(std::string_view model) noexcept;
+// Models that accept reasoning_effort low/medium/high (others reject it with a 400).
+[[nodiscard]] bool SupportsReasoningEffort(std::string_view model) noexcept;
 [[nodiscard]] std::string SystemPrompt(std::string_view today, SearchMode search);
 [[nodiscard]] std::string BuildChatRequest(std::string_view model, const std::vector<Message>& messages,
     SearchMode search, bool stream);
