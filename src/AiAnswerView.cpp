@@ -327,6 +327,7 @@ void AiAnswerView::Clear() {
     m_blocks.clear();
     m_codes.clear();
     m_imagesData.clear();
+    m_allowedImages.clear();
     m_copiedCode = static_cast<size_t>(-1);
     ReleaseLayout();
     m_height = 0;
@@ -344,8 +345,10 @@ size_t AiAnswerView::ImageIndex(const std::wstring& url) {
     }
     Image image;
     image.url = url;
-    // Only the first few images are fetched; the rest render as links.
-    image.failed = m_imagesData.size() >= kMaxImages || url.starts_with(L"mailto:");
+    // Only the first few search-result images are fetched; the rest render as links.
+    const bool allowed = url.starts_with(L"https://") &&
+        std::find(m_allowedImages.begin(), m_allowedImages.end(), url) != m_allowedImages.end();
+    image.failed = m_imagesData.size() >= kMaxImages || !allowed;
     m_imagesData.push_back(std::move(image));
     return m_imagesData.size() - 1;
 }

@@ -24,6 +24,8 @@ struct AiSnapshot {
     std::wstring status;
     std::wstring error;
     std::vector<AiSource> sources;
+    // Image URLs returned by web search: the only ones the UI fetches automatically.
+    std::vector<std::wstring> imageUrls;
     bool searched = false;
     bool done = false;
 };

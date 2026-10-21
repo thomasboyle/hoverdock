@@ -43,6 +43,9 @@ public:
 
     // Re-parses when the text changed.
     void SetMarkdown(const std::wstring& markdown);
+    // Only these image URLs (from web search results) are fetched; any other
+    // image renders as a link, so injected text can't trigger requests.
+    void SetAllowedImages(const std::vector<std::wstring>& urls) { m_allowedImages = urls; }
     void Clear();
     [[nodiscard]] bool Empty() const noexcept { return m_blocks.empty(); }
     [[nodiscard]] const std::wstring& Markdown() const noexcept { return m_markdown; }
@@ -122,6 +125,7 @@ private:
     std::vector<aimd::Block> m_blocks;
     std::vector<std::wstring> m_codes;
     std::vector<Image> m_imagesData;
+    std::vector<std::wstring> m_allowedImages;
     size_t m_copiedCode = static_cast<size_t>(-1);
 
     bool m_dirty = true;

@@ -1576,6 +1576,7 @@ void DockApp::ApplyAiUpdate(uint64_t sessionId) {
     }
     m_aiState = m_aiSession->Snapshot();
     if (m_aiView != nullptr) {
+        m_aiView->SetAllowedImages(m_aiState.imageUrls);
         m_aiView->SetMarkdown(m_aiState.markdown);
     }
     if (m_aiState.done) {
@@ -1793,7 +1794,8 @@ void DockApp::PaintSearchAi(uint8_t* pixels, int width, int height, float scale,
     } else if (m_aiNeedsKey) {
         footer = L"\u2726 Groq \u00B7 Enter to add a key";
     } else if (!m_aiState.error.empty()) {
-        footer += L" \u00B7 Ctrl+Enter to retry";
+        // A failure after partial text: keep the text, surface the error here.
+        footer = m_aiState.markdown.empty() ? footer + L" \u00B7 Ctrl+Enter to retry" : L"\u26A0 " + m_aiState.error;
     } else if (m_aiState.done) {
         footer += L" \u00B7 Ctrl+C copies the answer";
     }

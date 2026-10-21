@@ -159,7 +159,8 @@ bool PostChat(const std::wstring& apiKey, const std::string& body, const std::fu
 }
 
 std::wstring DescribeFailure(const HttpResult& result, const std::wstring& model) {
-    if (result.status == 0) {
+    // Transport failures (including a stream cut off after a 200) carry their own message.
+    if (result.status == 0 || (!result.error.empty() && result.status >= 200 && result.status <= 299)) {
         return result.error.empty() ? L"The request to Groq failed." : result.error;
     }
     const std::wstring detail = groq::Utf8ToWide(groq::ErrorMessage(result.errorBody));
@@ -265,6 +266,7 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
     messages.push_back({"system", groq::SystemPrompt(TodayText(), searchMode), {}, {}});
     messages.push_back({"user", groq::WideToUtf8(prompt), {}, {}});
     std::vector<groq::Source> sources;
+    std::vector<std::wstring> imageUrls;
     bool searched = false;
     bool toolsRetried = false;
 
@@ -363,6 +365,9 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
                             numbers.push_back(static_cast<size_t>(found - sources.begin()) + 1);
                         }
                         searched = true;
+                        for (const std::string& image : outcome.images) {
+                            imageUrls.push_back(groq::Utf8ToWide(image));
+                        }
                         toolContent = groq::BuildToolResult(query, outcome, numbers);
                     } else {
                         if (publisher.Cancelled()) {
@@ -381,6 +386,7 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
             std::vector<AiSource> wide = WideSources(sources);
             publisher.Update([&](AiSnapshot& state) {
                 state.sources = std::move(wide);
+                state.imageUrls = imageUrls;
                 state.searched = searched;
                 state.status = L"Reading results\u2026";
             });
@@ -439,7 +445,7 @@ bool DownloadImage(const std::wstring& url, std::string& bytes) {
     parts.lpszExtraInfo = extra;
     parts.dwExtraInfoLength = 4096;
     if (WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0, &parts) == FALSE ||
-        (parts.nScheme != INTERNET_SCHEME_HTTPS && parts.nScheme != INTERNET_SCHEME_HTTP)) {
+        (parts.nScheme != INTERNET_SCHEME_HTTPS)) {
         return false;
     }
     WinHttpHandle session = OpenSession();
@@ -452,7 +458,7 @@ bool DownloadImage(const std::wstring& url, std::string& bytes) {
     }
     const std::wstring object = std::wstring(path) + extra;
     WinHttpHandle request(WinHttpOpenRequest(connection.Get(), L"GET", object.c_str(), nullptr, WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES, parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0));
+        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
     if (!request) {
         return false;
     }
@@ -538,7 +544,7 @@ void AskAsync(std::shared_ptr<AiSession> session, HWND reply, UINT message, std:
 }
 
 void FetchImageAsync(HWND reply, UINT message, std::wstring url, UINT maxWidth, UINT maxHeight) {
-    if (!aimd::IsSafeUrl(url) || url.starts_with(L"mailto:")) {
+    if (!url.starts_with(L"https://") || !aimd::IsSafeUrl(url)) {
         return;
     }
     std::thread([reply, message, url = std::move(url), maxWidth, maxHeight]() {
