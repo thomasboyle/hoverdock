@@ -4,6 +4,7 @@
 
 #include <Xinput.h>
 #include <audiopolicy.h>
+#include <dwmapi.h>
 #include <d3dkmthk.h>
 #include <mmdeviceapi.h>
 #include <pdh.h>
@@ -61,53 +62,89 @@ struct PlanSubscription {
 const GUID kProcessorSubgroup = {0x54533251, 0x82be, 0x4824, {0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00}};
 const GUID kPcieSubgroup = {0x501a4d13, 0x42af, 0x4429, {0x9f, 0xd1, 0xa8, 0x21, 0x8c, 0x26, 0x8e, 0x20}};
 
-// Processor policy the plan switches between. High power matches Hoverdock's
-// High Power mode; low power is read from the Power saver plan (Hoverdock's
-// Low Power mode), with lowFallback used when a machine has no Power saver
-// plan (many Modern Standby laptops only ship Balanced). lowFixed settings
-// always use lowFallback at low power. Display, sleep and other settings stay
-// as in Balanced.
+// Processor policy for the plan's three profiles. Like a Mac, performance
+// follows the work rather than a mode: the processor's own controller (Intel
+// Speed Shift / AMD CPPC) picks clocks per core every millisecond, and each
+// profile only sets how eagerly it does so.
+//   Rest  Power saver's processor values (Hoverdock's Low Power), except that
+//         turbo stays available on an efficiency bias, so real work gets
+//         turbo the moment it runs while an idle cursor gets nothing.
+//   Work  demanding work (creative, renders, builds, calls, AI, live audio):
+//         performance-first preference and aggressive turbo, but cores still
+//         clock down and park between bursts.
+//   Game  a game being played: more performance-first still and no parking,
+//         without pinning clocks at 100% (on a laptop that steals the GPU's
+//         share of the power budget).
+// kFromPowerSaver reads the Power saver plan (restFallback when a machine has
+// none; many Modern Standby laptops only ship Balanced); kAsRest repeats the
+// rest value. Optional settings may not exist on every Windows build (E-core
+// variants): their rest value falls back to Balanced's first, and a write
+// Windows refuses is not retried. Display, sleep and other settings stay as
+// in Balanced; Hoverdock's High Power mode remains the pinned maximum.
+constexpr DWORD kFromPowerSaver = 0xFFFFFFFF;
+constexpr DWORD kAsRest = 0xFFFFFFFE;
+
+enum class Profile : uint8_t { Rest, Work, Game };
+
+const wchar_t* ProfileLabel(Profile profile) noexcept {
+    return profile == Profile::Game ? L"game" : profile == Profile::Work ? L"work" : L"rest";
+}
+
 struct PlanSetting {
     const GUID* subgroup;
     GUID setting;
-    DWORD highValue;
-    DWORD lowFallback;
-    bool lowFixed = false;
+    DWORD work;
+    DWORD game;
+    DWORD rest;
+    DWORD restFallback;
+    bool optional = false;
 };
 
 const PlanSetting kPlanSettings[] = {
     // Minimum processor state (P-cores / class 0, E-cores / class 1).
-    {&kProcessorSubgroup, {0x893dee8e, 0x2bef, 0x41e0, {0x89, 0xc6, 0xb5, 0x5d, 0x09, 0x29, 0x96, 0x4c}}, 100, 5},
-    {&kProcessorSubgroup, {0x893dee8e, 0x2bef, 0x41e0, {0x89, 0xc6, 0xb5, 0x5d, 0x09, 0x29, 0x96, 0x4d}}, 100, 5},
+    {&kProcessorSubgroup, {0x893dee8e, 0x2bef, 0x41e0, {0x89, 0xc6, 0xb5, 0x5d, 0x09, 0x29, 0x96, 0x4c}}, kAsRest,
+        kAsRest, kFromPowerSaver, 5},
+    {&kProcessorSubgroup, {0x893dee8e, 0x2bef, 0x41e0, {0x89, 0xc6, 0xb5, 0x5d, 0x09, 0x29, 0x96, 0x4d}}, kAsRest,
+        kAsRest, kFromPowerSaver, 5},
     // Maximum processor state.
-    {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xec}}, 100, 100},
-    {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xed}}, 100, 100},
-    // Processor performance boost mode: Aggressive / Disabled.
-    {&kProcessorSubgroup, {0xbe337238, 0x0d82, 0x4146, {0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7}}, 2, 0},
-    // Processor performance boost policy (0-100).
-    {&kProcessorSubgroup, {0x45bcc044, 0xd885, 0x43e2, {0x86, 0x05, 0xee, 0x0e, 0xc6, 0xe9, 0x6b, 0x59}}, 100, 0},
+    {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xec}}, 100, 100,
+        kFromPowerSaver, 100},
+    {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xed}}, 100, 100,
+        kFromPowerSaver, 100},
+    // Processor performance boost mode: 2 Aggressive; 3 Efficient Enabled
+    // (turbo when the controller judges it efficient).
+    {&kProcessorSubgroup, {0xbe337238, 0x0d82, 0x4146, {0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7}}, 2, 2, 3,
+        3},
+    // Processor performance boost policy (0-100; processors without Speed
+    // Shift / CPPC).
+    {&kProcessorSubgroup, {0x45bcc044, 0xd885, 0x43e2, {0x86, 0x05, 0xee, 0x0e, 0xc6, 0xe9, 0x6b, 0x59}}, 100, 100,
+        kFromPowerSaver, 0},
     // Energy performance preference: 0 = favour performance, 100 = efficiency.
-    {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x63}}, 0, 80},
-    {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x64}}, 0, 80},
-    // Core parking minimum cores: 100% (no parking) / park freely.
-    {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x83}}, 100, 5},
-    {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x84}}, 100, 5},
-    // PCI Express link state power management: Off / Maximum power savings.
-    {&kPcieSubgroup, {0xee12f906, 0xd277, 0x404b, {0xb6, 0xda, 0xe5, 0xfa, 0x1a, 0x57, 0x6d, 0xf5}}, 0, 2},
-    // Latency sensitivity hints (P-cores / E-cores): Windows raises a hint on
-    // clicks, key presses and launches, and these let the processor burst to
-    // full performance and unpark every core for it on its own, within a
-    // millisecond and without waiting for Hoverdock. Power saver leaves the
-    // hint weak; at rest Automatic keeps it at full strength, so a click is
-    // instant while the clock and core count still fall back right after.
+    {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x63}}, 25, 10,
+        kFromPowerSaver, 80},
+    {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x64}}, 25, 10,
+        kFromPowerSaver, 80},
+    // Core parking minimum cores (% kept unparked).
+    {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x83}}, 50, 100,
+        kFromPowerSaver, 5},
+    {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x84}}, 50, 100,
+        kFromPowerSaver, 5},
+    // PCI Express link state power management: 0 Off, 1 Moderate, 2 Maximum.
+    {&kPcieSubgroup, {0xee12f906, 0xd277, 0x404b, {0xb6, 0xda, 0xe5, 0xfa, 0x1a, 0x57, 0x6d, 0xf5}}, 1, 0,
+        kFromPowerSaver, 2},
+    // Latency sensitivity hints (P-cores / E-cores): performance and unparked
+    // cores Windows grants for 1-3 s whenever it raises a hint, which it does
+    // for every input, pointer motion included. While work runs they are at
+    // full strength; at rest they follow Power saver, so moving the cursor
+    // does not spin the processor up.
     {&kProcessorSubgroup, {0x619b7505, 0x003b, 0x4e82, {0xb7, 0xa6, 0x4d, 0xd2, 0x9c, 0x30, 0x09, 0x71}}, 100, 100,
-        true},
+        kFromPowerSaver, 0, true},
     {&kProcessorSubgroup, {0x619b7505, 0x003b, 0x4e82, {0xb7, 0xa6, 0x4d, 0xd2, 0x9c, 0x30, 0x09, 0x72}}, 100, 100,
-        true},
+        kFromPowerSaver, 0, true},
     {&kProcessorSubgroup, {0x616cdaa5, 0x695e, 0x4545, {0x97, 0xad, 0x97, 0xdc, 0x2d, 0x1b, 0xdd, 0x88}}, 100, 100,
-        true},
+        kFromPowerSaver, 0, true},
     {&kProcessorSubgroup, {0x616cdaa5, 0x695e, 0x4545, {0x97, 0xad, 0x97, 0xdc, 0x2d, 0x1b, 0xdd, 0x89}}, 100, 100,
-        true},
+        kFromPowerSaver, 0, true},
 };
 
 constexpr size_t kPlanSettingCount = sizeof(kPlanSettings) / sizeof(kPlanSettings[0]);
@@ -1101,7 +1138,7 @@ public:
         m_today = today;
         if (!m_engaged) {
             m_engaged = true;
-            m_planFull.reset();
+            m_profile.reset();
             for (Written& written : m_written) {
                 written.valid = false;
             }
@@ -1187,15 +1224,19 @@ public:
             // Already at high power: nothing left for the probe to find.
             m_probeUntil = 0;
         }
-        const double switchMs = ApplyPlan(decision.fullPower);
+        // Games get the game profile; every other demand the work profile.
+        const Profile profile = !decision.fullPower ? Profile::Rest
+            : decision.reason == autopower::BoostReason::Game ? Profile::Game
+                                                              : Profile::Work;
+        const double switchMs = ApplyPlan(profile);
         if (switchMs >= 0.0) {
-            TraceSwitch(decision.fullPower, switchMs, inputs.idleMs);
+            TraceSwitch(profile, switchMs, inputs.idleMs);
         }
         // Exemptions only change with the exempt set or group membership
         // (rebuilt by each process scan); probe ticks usually change neither.
-        if (decision.unthrottleVersion != m_lastUnthrottleVersion || m_throttleGeneration != m_groupGeneration) {
-            ApplyThrottling(decision.unthrottle);
-            m_lastUnthrottleVersion = decision.unthrottleVersion;
+        if (decision.throttleVersion != m_lastThrottleVersion || m_throttleGeneration != m_groupGeneration) {
+            ApplyThrottling(decision);
+            m_lastThrottleVersion = decision.throttleVersion;
             m_throttleGeneration = m_groupGeneration;
         }
 
@@ -1253,8 +1294,8 @@ public:
     // Restore everything this engine changed: calm plan, OS-managed throttling.
     void GoDormant() {
         RestoreAllThrottling();
-        if (m_engaged || !m_planFull.has_value() || *m_planFull) {
-            static_cast<void>(ApplyPlan(false));
+        if (m_engaged || !m_profile.has_value() || *m_profile != Profile::Rest) {
+            static_cast<void>(ApplyPlan(Profile::Rest));
         }
         if (m_engaged) {
             SaveHistory(GetTickCount64(), true);
@@ -1275,10 +1316,11 @@ public:
         m_lastAudioSample = 0;
         m_capabilities.Close();
         m_flagRoots.clear();
+        m_windowRoots.clear();
         m_lastGpuSample = 0;
         m_probeUntil = 0;
         m_fullscreenProbeUntil = 0;
-        m_lastUnthrottleVersion = 0;
+        m_lastThrottleVersion = 0;
         ++m_groupGeneration;
         m_foregroundPid = 0;
         m_lastFull = false;
@@ -1298,6 +1340,10 @@ private:
         DWORD dc = 0;
     };
 
+    // Never: exempt from power throttling. Nap: EcoQoS with timer resolution
+    // requests ignored (App Nap).
+    enum class Throttle : uint8_t { Os, Never, Nap };
+
     struct Proc {
         std::wstring exe;
         std::wstring path;
@@ -1316,9 +1362,13 @@ private:
         double lastPercent = 0.0;
         double lastCores = 0.0;
         unsigned seenGeneration = 0;
-        bool exempt = false;
+        // Power throttling Hoverdock set (Os = untouched, Windows decides).
+        Throttle throttle = Throttle::Os;
         bool haveOriginal = false;
         PROCESS_POWER_THROTTLING_STATE original{};
+        // Has a taskbar-eligible window, and one is showing.
+        bool windowed = false;
+        bool windowVisible = false;
         // Live audio stream, camera and microphone use.
         bool audio = false;
         bool camera = false;
@@ -1332,48 +1382,59 @@ private:
         std::wstring name;
         autopower::AppSample sample;
         std::vector<DWORD> pids;
+        // Only a window root: tracked for App Nap, skipped by GPU sampling
+        // and not kept open between scans.
+        bool napOnly = false;
     };
 
-    // Low power values: the Power saver plan's, so Automatic at rest is
-    // exactly Hoverdock's Low Power for the processor.
+    // Rest values: mostly the Power saver plan's (Hoverdock's Low Power).
     void ReadBaseline() {
         for (size_t index = 0; index < kPlanSettingCount; ++index) {
             const PlanSetting& setting = kPlanSettings[index];
             Baseline& base = m_baseline[index];
-            if (setting.lowFixed) {
-                base = {setting.lowFallback, setting.lowFallback};
+            if (setting.rest != kFromPowerSaver) {
+                base = {setting.rest, setting.rest};
                 continue;
             }
             if (PowerReadACValueIndex(nullptr, &kPowerSaverPlan, setting.subgroup, &setting.setting, &base.ac) !=
-                ERROR_SUCCESS) {
-                base.ac = setting.lowFallback;
+                    ERROR_SUCCESS &&
+                (!setting.optional ||
+                    PowerReadACValueIndex(nullptr, &kBalancedPlan, setting.subgroup, &setting.setting, &base.ac) !=
+                        ERROR_SUCCESS)) {
+                base.ac = setting.restFallback;
             }
             if (PowerReadDCValueIndex(nullptr, &kPowerSaverPlan, setting.subgroup, &setting.setting, &base.dc) !=
-                ERROR_SUCCESS) {
-                base.dc = setting.lowFallback;
+                    ERROR_SUCCESS &&
+                (!setting.optional ||
+                    PowerReadDCValueIndex(nullptr, &kBalancedPlan, setting.subgroup, &setting.setting, &base.dc) !=
+                        ERROR_SUCCESS)) {
+                base.dc = setting.restFallback;
             }
         }
     }
 
-    // Writes the plan for full or low power; returns how long the switch took
-    // in ms, or -1 when nothing had to change.
-    double ApplyPlan(bool full) {
-        if (m_planFull.has_value() && *m_planFull == full) {
+    // Writes the plan for a profile; returns how long the switch took in ms,
+    // or -1 when nothing had to change.
+    double ApplyPlan(Profile profile) {
+        if (m_profile.has_value() && *m_profile == profile) {
             return -1.0;
         }
         const ULONGLONG start = Now100ns();
         // Each write is a power-service round trip: skip values already in the
-        // plan (the 100% maximum state is the same in both modes).
+        // plan (several values are shared between profiles).
         bool wrote = false;
         bool failed = false;
         int writes = 0;
         for (size_t index = 0; index < kPlanSettingCount; ++index) {
             const Baseline& base = m_baseline[index];
             const PlanSetting& setting = kPlanSettings[index];
-            const DWORD ac = full ? setting.highValue : base.ac;
-            const DWORD dc = full ? setting.highValue : base.dc;
+            const DWORD wanted = profile == Profile::Game ? setting.game
+                : profile == Profile::Work                ? setting.work
+                                                          : kAsRest;
+            const DWORD ac = wanted == kAsRest ? base.ac : wanted;
+            const DWORD dc = wanted == kAsRest ? base.dc : wanted;
             Written& written = m_written[index];
-            if (written.valid && written.ac == ac && written.dc == dc) {
+            if (m_unsupported[index] || (written.valid && written.ac == ac && written.dc == dc)) {
                 continue;
             }
             const bool acOk =
@@ -1381,9 +1442,10 @@ private:
             const bool dcOk =
                 PowerWriteDCValueIndex(nullptr, &kAutoPlan, setting.subgroup, &setting.setting, dc) == ERROR_SUCCESS;
             writes += 2;
+            written = {acOk && dcOk, ac, dc};
             // Settings this Windows build lacks (E-core variants) are not
-            // retried: values that never change between modes are settled.
-            written = {(acOk && dcOk) || setting.lowFixed, ac, dc};
+            // retried on every switch.
+            m_unsupported[index] = setting.optional && !acOk && !dcOk;
             wrote = wrote || acOk || dcOk;
             failed = failed || !acOk || !dcOk;
         }
@@ -1395,7 +1457,7 @@ private:
         if (failed && !wrote) {
             Trace(L"Plan values could not be written; only throttling is managed.");
         }
-        m_planFull = full;
+        m_profile = profile;
         const double totalMs = MsSince(start);
         m_lastWrites = writes;
         m_lastWriteMs = writeMs;
@@ -1404,15 +1466,15 @@ private:
 
     // Switch timing (DebugView / debugger output): how long the power service
     // took, and how soon after the user's last input the switch landed.
-    void TraceSwitch(bool full, double ms, uint64_t idleMs) {
+    void TraceSwitch(Profile profile, double ms, uint64_t idleMs) {
         ++m_switches;
         m_switchTotalMs += ms;
         m_switchMaxMs = (std::max)(m_switchMaxMs, ms);
         wchar_t line[256]{};
         swprintf_s(line,
-            L"Switched to %ls power in %.1f ms (%d writes %.1f ms, activate %.1f ms; %llu ms after input; "
+            L"Switched to the %ls profile in %.1f ms (%d writes %.1f ms, activate %.1f ms; %llu ms after input; "
             L"average %.1f ms, slowest %.1f ms over %u switches).",
-            full ? L"high" : L"low", ms, m_lastWrites, m_lastWriteMs, ms - m_lastWriteMs,
+            ProfileLabel(profile), ms, m_lastWrites, m_lastWriteMs, ms - m_lastWriteMs,
             static_cast<unsigned long long>(idleMs), m_switchTotalMs / m_switches, m_switchMaxMs, m_switches);
         Trace(line);
     }
@@ -1587,12 +1649,53 @@ private:
         proc.registeredGame = !proc.path.empty() && m_registeredGames.contains(proc.path);
     }
 
-    bool IsAppRoot(DWORD pid, const Proc& proc) const {
-        if (proc.kind == autopower::AppKind::Creative || proc.kind == autopower::AppKind::Game ||
-            proc.kind == autopower::AppKind::Ai || proc.registeredGame || m_flagRoots.contains(pid)) {
+    static bool Classified(const Proc& proc) noexcept {
+        return proc.kind == autopower::AppKind::Creative || proc.kind == autopower::AppKind::Game ||
+            proc.kind == autopower::AppKind::Ai || proc.registeredGame;
+    }
+
+    // Root that boost decisions need (classified, a signal, or focused);
+    // window roots exist only so hidden apps can be napped.
+    bool IsDemandRoot(DWORD pid, const Proc& proc) const {
+        if (Classified(proc) || m_flagRoots.contains(pid)) {
             return true;
         }
         return pid == m_foregroundPid && proc.kind != autopower::AppKind::NeverGame;
+    }
+
+    bool IsAppRoot(DWORD pid, const Proc& proc) const {
+        return IsDemandRoot(pid, proc) || m_windowRoots.contains(pid);
+    }
+
+    // The process or an ancestor it folds into is a game, creative tool or
+    // AI runtime.
+    bool InClassifiedApp(DWORD pid) const {
+        DWORD current = pid;
+        for (int depth = 0; depth < 6 && current != 0; ++depth) {
+            const auto it = m_procs.find(current);
+            if (it == m_procs.end()) {
+                break;
+            }
+            if (Classified(it->second)) {
+                return true;
+            }
+            current = FoldParent(current);
+        }
+        return false;
+    }
+
+    // Topmost ancestor with the same executable (a multi-process app's
+    // window owned by a child).
+    DWORD SameAppTopOf(DWORD pid) const {
+        DWORD current = pid;
+        for (int depth = 0; depth < 6; ++depth) {
+            const DWORD parent = FoldParent(current);
+            if (parent == 0 || m_procs.at(parent).exe != m_procs.at(current).exe) {
+                break;
+            }
+            current = parent;
+        }
+        return current;
     }
 
     // Parent a process folds into, or 0 (no live parent, a recycled pid, or a
@@ -1717,11 +1820,23 @@ private:
 
         // Audio, camera and microphone users become apps of their own (with
         // their helpers), so they can be exempted and credited.
+        // So do apps with windows, so they can be napped while hidden.
         RefreshSignals(now);
+        RefreshWindows();
         m_flagRoots.clear();
         for (const auto& [pid, proc] : m_procs) {
             if (proc.audio || proc.camera || proc.mic) {
                 m_flagRoots.insert(TopOf(pid));
+            }
+        }
+        // A window's app is its owner process (or a same-executable parent),
+        // never the launcher that started it, so its identity is the same
+        // focused or not. Windows of a creative tool's or game's helpers stay
+        // part of that app.
+        m_windowRoots.clear();
+        for (const auto& [pid, proc] : m_procs) {
+            if (proc.windowed && !InClassifiedApp(pid)) {
+                m_windowRoots.insert(SameAppTopOf(pid));
             }
         }
 
@@ -1745,10 +1860,15 @@ private:
                 group.sample.kind = rootProc.kind;
                 group.sample.registeredGame = rootProc.registeredGame;
                 group.sample.knownDemanding = m_history.IsKnown(rootProc.exe, m_today);
+                group.napOnly = !IsDemandRoot(root, rootProc);
+            } else if (group.napOnly && IsDemandRoot(root, rootProc)) {
+                group.napOnly = false;
             }
             group.sample.audioActive = group.sample.audioActive || proc.audio;
             group.sample.cameraActive = group.sample.cameraActive || proc.camera;
             group.sample.micActive = group.sample.micActive || proc.mic;
+            group.sample.windowed = group.sample.windowed || proc.windowed;
+            group.sample.windowVisible = group.sample.windowVisible || proc.windowVisible;
             group.pids.push_back(pid);
             m_groupOfPid[pid] = rootProc.exe;
         }
@@ -1776,10 +1896,13 @@ private:
             MeasureGroup(group, false);
         }
 
-        // Handles are only kept for app groups and exempted processes; CPU
-        // time for everything else comes from the next scan.
+        // Handles are only kept for app groups (not nap-only ones) and
+        // throttled processes; CPU time for everything else comes from the
+        // next scan.
         for (auto& [pid, proc] : m_procs) {
-            if (!proc.exempt && !m_groupOfPid.contains(pid)) {
+            const auto key = m_groupOfPid.find(pid);
+            const bool sampled = key != m_groupOfPid.end() && !m_groups.at(key->second).napOnly;
+            if (proc.throttle == Throttle::Os && !sampled) {
                 CloseProc(proc);
                 proc.openFailed = false;
             }
@@ -1799,6 +1922,45 @@ private:
             }
         }
         return false;
+    }
+
+    // Taskbar-eligible top-level windows per process: visible, unowned (or
+    // app windows), not tool windows. Showing = not minimized and not cloaked
+    // (another virtual desktop, a suspended app).
+    void RefreshWindows() {
+        for (auto& [pid, proc] : m_procs) {
+            proc.windowed = false;
+            proc.windowVisible = false;
+        }
+        EnumWindows(
+            [](HWND window, LPARAM param) -> BOOL {
+                auto* procs = reinterpret_cast<std::unordered_map<DWORD, Proc>*>(param);
+                if (IsWindowVisible(window) == FALSE) {
+                    return TRUE;
+                }
+                const LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+                const bool appWindow = (exStyle & WS_EX_APPWINDOW) != 0 ||
+                    (GetWindow(window, GW_OWNER) == nullptr && (exStyle & WS_EX_TOOLWINDOW) == 0);
+                if (!appWindow) {
+                    return TRUE;
+                }
+                DWORD pid = 0;
+                GetWindowThreadProcessId(window, &pid);
+                const auto it = procs->find(pid);
+                if (it == procs->end()) {
+                    return TRUE;
+                }
+                it->second.windowed = true;
+                if (!it->second.windowVisible && IsIconic(window) == FALSE) {
+                    DWORD cloaked = 0;
+                    if (FAILED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)))) {
+                        cloaked = 0;
+                    }
+                    it->second.windowVisible = cloaked == 0;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&m_procs));
     }
 
     void RefreshSignals(ULONGLONG now) {
@@ -1869,7 +2031,9 @@ private:
             } else {
                 m_gpuLoads.clear();
                 for (const auto& [key, group] : m_groups) {
-                    add(group);
+                    if (!group.napOnly) {
+                        add(group);
+                    }
                 }
             }
             if (m_kmt.SampleGlobal() >= kGpuBusyGatePercent) {
@@ -1950,26 +2114,30 @@ private:
         MeasureGroup(group->second, true);
     }
 
-    void SetExempt(DWORD pid, Proc& proc, bool exempt) {
-        if (proc.exempt == exempt) {
+    void SetThrottle(DWORD pid, Proc& proc, Throttle throttle) {
+        if (proc.throttle == throttle) {
             return;
         }
-        if (exempt) {
+        if (throttle != Throttle::Os) {
             if (!OpenProc(pid, proc, true)) {
                 return;
             }
-            proc.original = {};
-            proc.original.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-            proc.haveOriginal = GetProcessInformation(proc.handle, ProcessPowerThrottling, &proc.original,
-                                    sizeof(proc.original)) != FALSE;
+            if (proc.throttle == Throttle::Os) {
+                proc.original = {};
+                proc.original.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+                proc.haveOriginal = GetProcessInformation(proc.handle, ProcessPowerThrottling, &proc.original,
+                                        sizeof(proc.original)) != FALSE;
+            }
             PROCESS_POWER_THROTTLING_STATE state{};
             state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-            // Control bits set with state bits clear: never throttle.
+            // Control bits with state bits clear: never throttle; with state
+            // bits set: run as EcoQoS and ignore timer resolution requests.
             state.ControlMask =
                 PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
-            state.StateMask = 0;
-            proc.exempt =
-                SetProcessInformation(proc.handle, ProcessPowerThrottling, &state, sizeof(state)) != FALSE;
+            state.StateMask = throttle == Throttle::Nap ? state.ControlMask : 0;
+            if (SetProcessInformation(proc.handle, ProcessPowerThrottling, &state, sizeof(state)) != FALSE) {
+                proc.throttle = throttle;
+            }
             return;
         }
         if (proc.handle != nullptr && proc.canSet) {
@@ -1981,32 +2149,48 @@ private:
             }
             static_cast<void>(SetProcessInformation(proc.handle, ProcessPowerThrottling, &state, sizeof(state)));
         }
-        proc.exempt = false;
+        proc.throttle = Throttle::Os;
         proc.haveOriginal = false;
     }
 
-    void ApplyThrottling(const std::vector<std::wstring>& keys) {
-        std::unordered_set<DWORD> wanted;
-        for (const std::wstring& key : keys) {
-            const auto it = m_groups.find(key);
-            if (it != m_groups.end()) {
-                wanted.insert(it->second.pids.begin(), it->second.pids.end());
+    void ApplyThrottling(const autopower::Decision& decision) {
+        std::unordered_map<DWORD, Throttle> wanted;
+        const auto mark = [this, &wanted](const std::vector<std::wstring>& keys, Throttle throttle) {
+            for (const std::wstring& key : keys) {
+                const auto it = m_groups.find(key);
+                if (it != m_groups.end()) {
+                    for (const DWORD pid : it->second.pids) {
+                        wanted[pid] = throttle;
+                    }
+                }
             }
-        }
+        };
+        mark(decision.unthrottle, Throttle::Never);
+        mark(decision.nap, Throttle::Nap);
+        size_t napped = 0;
         for (auto& [pid, proc] : m_procs) {
-            SetExempt(pid, proc, wanted.contains(pid));
+            const auto it = wanted.find(pid);
+            SetThrottle(pid, proc, it != wanted.end() ? it->second : Throttle::Os);
+            napped += proc.throttle == Throttle::Nap ? 1 : 0;
+        }
+        if (napped != m_lastNapped) {
+            Trace(L"Napping " + std::to_wstring(decision.nap.size()) + L" hidden app(s), " +
+                std::to_wstring(napped) + L" process(es).");
+            m_lastNapped = napped;
         }
     }
 
     void RestoreAllThrottling() {
         for (auto& [pid, proc] : m_procs) {
-            SetExempt(pid, proc, false);
+            SetThrottle(pid, proc, Throttle::Os);
         }
+        m_lastNapped = 0;
     }
 
     Baseline m_baseline[kPlanSettingCount]{};
     Written m_written[kPlanSettingCount]{};
-    std::optional<bool> m_planFull;
+    bool m_unsupported[kPlanSettingCount]{};
+    std::optional<Profile> m_profile;
     bool m_engaged = false;
     DWORD m_cpuCount = 1;
     DWORD m_foregroundPid = 0;
@@ -2017,7 +2201,7 @@ private:
     int m_fullscreenCache = -1;
     unsigned m_groupGeneration = 0;
     unsigned m_throttleGeneration = 0;
-    uint64_t m_lastUnthrottleVersion = 0;
+    uint64_t m_lastThrottleVersion = 0;
     unsigned m_generation = 0;
     bool m_lastFull = false;
     std::wstring m_lastApp;
@@ -2039,6 +2223,7 @@ private:
     ULONGLONG m_lastAudioSample = 0;
     CapabilityWatcher m_capabilities;
     std::unordered_set<DWORD> m_flagRoots;
+    std::unordered_set<DWORD> m_windowRoots;
     Gamepads m_gamepads;
     DWORD m_gamepadTick = 0;
     bool m_gamepadSeen = false;
@@ -2053,6 +2238,7 @@ private:
     int m_lastWrites = 0;
     double m_lastWriteMs = 0.0;
     std::vector<std::pair<DWORD, HANDLE>> m_gpuProcs;
+    size_t m_lastNapped = 0;
     autopower::Inputs m_inputs;
     autopower::Decision m_decision;
     uint32_t m_today = 0;

@@ -44,6 +44,10 @@ Inputs At(uint64_t nowMs, uint64_t idleMs, std::vector<AppSample> apps) {
     return inputs;
 }
 
+bool Napped(const Decision& decision, const wchar_t* key) {
+    return std::find(decision.nap.begin(), decision.nap.end(), key) != decision.nap.end();
+}
+
 bool Unthrottled(const Decision& decision, const wchar_t* key) {
     return std::find(decision.unthrottle.begin(), decision.unthrottle.end(), key) != decision.unthrottle.end();
 }
@@ -476,6 +480,10 @@ void TestReusedDecisionMatchesFresh() {
     for (uint64_t tick = 0; tick < 60; ++tick) {
         blender.cpuCores = tick % 7 < 4 ? 3.0 : 0.0;
         spotify.audioActive = tick % 11 < 5;
+        spotify.windowed = true;
+        spotify.windowVisible = tick % 9 < 2;
+        code.windowed = true;
+        code.windowVisible = code.foreground;
         code.foreground = tick % 13 > 8;
         game.foreground = !code.foreground;
         std::vector<AppSample> apps = {blender, code, spotify};
@@ -503,8 +511,85 @@ void TestReusedDecisionMatchesFresh() {
         EXPECT(decision.appKey == expected.appKey);
         EXPECT(decision.appName == expected.appName);
         EXPECT(decision.unthrottle == expected.unthrottle);
+        EXPECT(decision.nap == expected.nap);
         EXPECT(decision.confirmed == expected.confirmed);
     }
+}
+
+AppSample Minimized(const wchar_t* key, AppKind kind = AppKind::Other) {
+    AppSample app = App(key, kind);
+    app.windowed = true;
+    app.windowVisible = false;
+    return app;
+}
+
+void TestAppNap() {
+    // A minimized app is napped once it has been out of use for 30 s.
+    Policy policy;
+    AppSample notes = App(L"notes.exe", AppKind::Other, true);
+    notes.windowed = true;
+    notes.windowVisible = true;
+    EXPECT(!Napped(policy.Update(At(1000, 0, {notes})), L"notes.exe"));
+    notes = Minimized(L"notes.exe");
+    EXPECT(!Napped(policy.Update(At(20000, 0, {notes})), L"notes.exe"));
+    Decision decision = policy.Update(At(31500, 0, {notes}));
+    EXPECT(Napped(decision, L"notes.exe"));
+    EXPECT(!Unthrottled(decision, L"notes.exe"));
+    EXPECT(!decision.fullPower);
+    // Restored to the screen: woken at once.
+    notes.windowVisible = true;
+    EXPECT(!Napped(policy.Update(At(32000, 0, {notes})), L"notes.exe"));
+
+    // A window that is open (even behind others) is never napped, and
+    // windowless background processes are left to Windows.
+    Policy visible;
+    AppSample open = App(L"open.exe", AppKind::Other);
+    open.windowed = true;
+    open.windowVisible = true;
+    const AppSample service = App(L"agent.exe", AppKind::Other);
+    static_cast<void>(visible.Update(At(1000, 0, {open, service})));
+    decision = visible.Update(At(100000, 0, {open, service}));
+    EXPECT(decision.nap.empty());
+
+    // Exempt: audio, calls, games, creative tools, AI runtimes, shell.
+    Policy exempt;
+    AppSample music = Minimized(L"spotify.exe", AppKind::NeverGame);
+    music.audioActive = true;
+    AppSample call = Minimized(L"zoom.exe", AppKind::NeverGame);
+    call.micActive = true;
+    const AppSample game = Minimized(L"game.exe", AppKind::Game);
+    const AppSample blender = Minimized(L"blender.exe", AppKind::Creative);
+    const AppSample ollama = Minimized(L"ollama app.exe", AppKind::Ai);
+    const AppSample shell = Minimized(L"explorer.exe", AppKind::NeverGame);
+    const std::vector<AppSample> apps = {music, call, game, blender, ollama, shell};
+    static_cast<void>(exempt.Update(At(1000, 0, apps)));
+    decision = exempt.Update(At(100000, 0, apps));
+    EXPECT(decision.nap.empty());
+
+    // Work the user started keeps running: busy and focused minutes ago.
+    Policy work;
+    AppSample build = App(L"build.exe", AppKind::Other, true);
+    build.windowed = true;
+    build.windowVisible = true;
+    static_cast<void>(work.Update(At(1000, 0, {build})));
+    build = Minimized(L"build.exe");
+    build.cpuCores = 4.0;
+    EXPECT(!Napped(work.Update(At(120000, 0, {build})), L"build.exe"));
+    // Once it goes quiet, or the grace period ends, it naps.
+    build.cpuCores = 0.1;
+    EXPECT(Napped(work.Update(At(121000, 0, {build})), L"build.exe"));
+    build.cpuCores = 4.0;
+    EXPECT(Napped(work.Update(At(1000 + 10 * 60 * 1000 + 1, 0, {build})), L"build.exe"));
+
+    // Busy since launch without ever being focused (an updater): napped.
+    Policy updater;
+    AppSample setup = Minimized(L"updater.exe");
+    setup.cpuCores = 2.0;
+    static_cast<void>(updater.Update(At(1000, 0, {setup})));
+    EXPECT(Napped(updater.Update(At(40000, 0, {setup})), L"updater.exe"));
+
+    EXPECT(autopower::NeverNap(L"textinputhost.exe"));
+    EXPECT(!autopower::NeverNap(L"notes.exe"));
 }
 
 void TestHistory() {
@@ -569,6 +654,7 @@ int main() {
     TestCallsAudioAndAi();
     TestLongJobConfirmedOnceAndRelabelled();
     TestReusedDecisionMatchesFresh();
+    TestAppNap();
     TestHistory();
     if (g_failures != 0) {
         std::fprintf(stderr, "AutoPowerPolicyTests: %d failure(s)\n", g_failures);
