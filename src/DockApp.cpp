@@ -2594,7 +2594,7 @@ int DockApp::Run() {
         StartRefreshTimer();
     }
     Log(L"Dock initialized.");
-    // MFT file index (background, low priority) + Win+Space.
+    // MFT file index (background, low priority) + Ctrl+Space.
     StartSearchServices();
     // Startup transient allocations (icon extraction temps, shell queries) stay
     // committed in the CRT heap; hand fully-free pages back to the OS once.
