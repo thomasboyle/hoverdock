@@ -49,11 +49,12 @@ public:
     // Re-evaluate now with a fresh load sample (foreground changed, energy
     // mode picked).
     void Wake() noexcept;
-    // Called for every mouse (low-level hook) and keyboard (raw input) event.
-    // Costs two relaxed atomic operations unless the engine asked to be woken
-    // by input, which it does whenever it is not already at high power: the
-    // next input then starts a short fast probe of the focused app.
-    void NoteInput() noexcept;
+    // Called for every mouse (low-level hook) and keyboard (raw input) event;
+    // commit = a click or key, the inputs that start work. Costs a few relaxed
+    // atomic operations unless the engine asked to be woken: by a commit when
+    // not at High Power (starts a short probe of the focused app), or by any
+    // input while a creative tool is focused or the machine is parked.
+    void NoteInput(bool commit) noexcept;
     // Keyboard input reaches NoteInput too (raw input registered), so no
     // keyboard fallback polling is needed.
     void SetKeyboardInputAvailable(bool available) noexcept;
@@ -66,7 +67,7 @@ public:
 
 private:
     void ThreadMain();
-    void Signal(bool forceSample) noexcept;
+    void Signal(bool forceSample, bool commit = false) noexcept;
     // Active power plan change (GUID_ACTIVE_POWERSCHEME) from the power service.
     static ULONG CALLBACK PlanChanged(PVOID context, ULONG type, PVOID setting);
 
@@ -76,7 +77,9 @@ private:
     bool m_stop = false;
     bool m_woken = false;
     bool m_forceSample = false;
+    bool m_commitWake = false;
     std::atomic<bool> m_wantInput{false};
+    std::atomic<bool> m_wantCommit{false};
     std::atomic<bool> m_keyboardInput{false};
     std::atomic<DWORD> m_hookInputTick{0};
     // 0 = unknown (poll the active plan), 1 = ours active, 2 = another plan.

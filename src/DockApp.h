@@ -795,6 +795,9 @@ private:
     void RegisterSystemResumeNotifications();
     void UnregisterSystemResumeNotifications() noexcept;
     LRESULT HandlePowerBroadcast(WPARAM wParam, LPARAM lParam);
+    // Raw keyboard input only while Automatic can use it (engaged, not at
+    // High Power), so games and the other modes never route keys through us.
+    void SyncAutoPowerKeyboard(bool wanted) noexcept;
     void LogInputMouse(UINT message, POINT screenPoint, int icon) const;
     void Log(const std::wstring& message) const;
 
@@ -1240,6 +1243,7 @@ private:
     std::atomic<bool> m_updateInstalling{false};
     PerfProfiler m_perfProfiler;
     AutoPowerEngine m_autoPower;
+    bool m_autoPowerKeyboard = false;
     std::wstring m_perfStatus;
     // Set only after a profile finishes writing. Clicking the path opens it.
     std::wstring m_perfSavedLog;
