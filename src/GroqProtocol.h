@@ -19,6 +19,9 @@ inline constexpr char kDefaultModel[] = "qwen/qwen3.8-27b";
 // Groq's server-side browser_search runs on the GPT-OSS models only; other
 // models reach it through a local web_search function backed by this model.
 inline constexpr char kSearchModel[] = "openai/gpt-oss-20b";
+// Rate limits are per model, so a search that hits kSearchModel's limit is
+// retried on this one (same browser_search tool, separate token budget).
+inline constexpr char kSearchFallbackModel[] = "openai/gpt-oss-120b";
 inline constexpr char kSearchToolName[] = "web_search";
 
 namespace json {
@@ -88,7 +91,18 @@ enum class SearchMode : uint8_t { None, Function, Builtin };
 [[nodiscard]] std::string SystemPrompt(std::string_view today, SearchMode search);
 [[nodiscard]] std::string BuildChatRequest(std::string_view model, const std::vector<Message>& messages,
     SearchMode search, bool stream);
-[[nodiscard]] std::string BuildSearchRequest(std::string_view query);
+[[nodiscard]] std::string BuildSearchRequest(std::string_view query, std::string_view model = kSearchModel);
+// Case/whitespace-insensitive key for caching search outcomes.
+[[nodiscard]] std::string SearchCacheKey(std::string_view query);
+
+struct RateLimit {
+    // Wait suggested by Groq (retry-after header or the error message); 0 when unknown.
+    uint64_t retryAfterMs = 0;
+    // A per-day limit: retrying within the session is pointless.
+    bool daily = false;
+};
+// Reads a 429's retry-after header value and error body.
+[[nodiscard]] RateLimit ParseRateLimit(std::string_view retryAfter, std::string_view errorBody);
 // Query argument of a web_search tool call ("" when unparsable).
 [[nodiscard]] std::string SearchQueryFromArguments(std::string_view arguments);
 

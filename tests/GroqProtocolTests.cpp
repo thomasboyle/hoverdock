@@ -100,6 +100,9 @@ void TestRequest() {
     const auto search = groq::json::Parse(groq::BuildSearchRequest("weather \"today\""));
     EXPECT(search.has_value() && search->Str("model") == groq::kSearchModel && search->Str("tool_choice") == "required");
     EXPECT(search.has_value() && search->Get("max_completion_tokens")->number == 1536);
+    const auto fallback = groq::json::Parse(groq::BuildSearchRequest("q", groq::kSearchFallbackModel));
+    EXPECT(fallback.has_value() && fallback->Str("model") == "openai/gpt-oss-120b");
+    EXPECT(groq::SearchCacheKey("  Weather\tIN  London \n") == "weather in london");
     // The date goes last so the stable instructions form a cacheable prefix.
     const std::string prompt = groq::SystemPrompt("Tuesday, 21 October 2026", groq::SearchMode::Function);
     EXPECT(prompt.ends_with("Today is Tuesday, 21 October 2026."));
@@ -234,12 +237,30 @@ void TestThinking() {
     EXPECT(groq::StripThinking("A <think>x</think>B") == "A B");
 }
 
+void TestRateLimit() {
+    const std::string perMinute =
+        R"({"error":{"message":"Rate limit reached for model `openai/gpt-oss-20b` in organization `org_1` service )"
+        R"(tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7713, Requested 3021. Please try again )"
+        R"(in 20.505s. Need more tokens? Upgrade to Dev Tier today","type":"tokens","code":"rate_limit_exceeded"}})";
+    groq::RateLimit limit = groq::ParseRateLimit("", perMinute);
+    EXPECT(!limit.daily && limit.retryAfterMs == 20505);
+    limit = groq::ParseRateLimit(" 3", perMinute);
+    EXPECT(limit.retryAfterMs == 3000);
+    EXPECT(groq::ParseRateLimit("", R"({"error":{"message":"Please try again in 1m2.5s."}})").retryAfterMs == 62500);
+    EXPECT(groq::ParseRateLimit("", R"({"error":{"message":"Please try again in 450ms."}})").retryAfterMs == 450);
+    const groq::RateLimit daily = groq::ParseRateLimit("",
+        R"({"error":{"message":"Rate limit reached on tokens per day (TPD): Limit 200000. Please try again in 7m12s."}})");
+    EXPECT(daily.daily && daily.retryAfterMs == 432000);
+    EXPECT(groq::ParseRateLimit("", "not json").retryAfterMs == 0);
+}
+
 }  // namespace
 
 int main() {
     TestJson();
     TestUtf8();
     TestRequest();
+    TestRateLimit();
     TestStream();
     TestSearchResponse();
     TestThinking();
