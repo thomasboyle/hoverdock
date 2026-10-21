@@ -68,7 +68,17 @@ struct Message {
     std::string content;
     std::string toolCallId;
     std::vector<ToolCall> toolCalls;
+    // User images as data: (or https:) URLs; sent as a multimodal content array.
+    std::vector<std::string> images;
 };
+
+// Most images a request may carry (Qwen 3.8 27B on Groq accepts 3).
+inline constexpr size_t kMaxImages = 3;
+[[nodiscard]] std::string Base64(std::string_view bytes);
+// "data:<mime>;base64,<...>"
+[[nodiscard]] std::string DataUrl(std::string_view mime, std::string_view bytes);
+// Prompt used when the user attaches images without typing a question.
+[[nodiscard]] std::string DefaultImagePrompt(size_t imageCount);
 
 enum class SearchMode : uint8_t { None, Function, Builtin };
 

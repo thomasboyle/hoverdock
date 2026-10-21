@@ -141,6 +141,24 @@ void TestSearchResponse() {
     EXPECT(groq::ErrorMessage("oops\nbad") == "oops bad");
 }
 
+void TestImages() {
+    EXPECT(groq::Base64("") == "");
+    EXPECT(groq::Base64("f") == "Zg==");
+    EXPECT(groq::Base64("fo") == "Zm8=");
+    EXPECT(groq::Base64("foo") == "Zm9v");
+    EXPECT(groq::Base64(std::string("\xFF\x00\x10\x80", 4)) == "/wAQgA==");
+    EXPECT(groq::DataUrl("image/jpeg", "foob") == "data:image/jpeg;base64,Zm9vYg==");
+    groq::Message user{"user", "What is this?", {}, {}, {"data:image/jpeg;base64,AAAA", "a", "b", "dropped"}};
+    const auto body = groq::json::Parse(groq::BuildChatRequest(groq::kDefaultModel, {user}, groq::SearchMode::None, true));
+    EXPECT(body.has_value());
+    if (body.has_value()) {
+        const groq::json::Value* content = body->Get("messages")->items[0].Get("content");
+        EXPECT(content != nullptr && content->IsArray() && content->items.size() == 1 + groq::kMaxImages);
+        EXPECT(content->items[0].Str("type") == "text" && content->items[0].Str("text") == "What is this?");
+        EXPECT(content->items[1].Get("image_url")->Str("url") == "data:image/jpeg;base64,AAAA");
+    }
+}
+
 void TestThinking() {
     EXPECT(groq::StripThinking("<think>plan</think>\n\nAnswer") == "Answer");
     EXPECT(groq::StripThinking("<think>still going").empty());
@@ -156,6 +174,7 @@ int main() {
     TestStream();
     TestSearchResponse();
     TestThinking();
+    TestImages();
     if (g_failures == 0) {
         std::printf("GroqProtocolTests: all passed\n");
         return 0;

@@ -64,6 +64,7 @@ Your taskbar pins are imported automatically, so your dock is ready the first ti
 | Show a result in File Explorer | **Shift + Enter** (Ctrl + click) |
 | Copy a result's path | **Ctrl + C** |
 | Ask AI about what you typed | **Ctrl + Enter** (Esc goes back to results) |
+| Attach an image for AI | **Ctrl + V** an image, or click 📎 in the search bar |
 
 ### Search
 
@@ -76,6 +77,8 @@ Win+Space normally switches keyboard layout. If you rely on that, set `SearchHot
 ### Ask AI
 
 Type a question into Search and press **Ctrl + Enter**. The answer streams into the panel as rich text: headings, lists, tables, syntax-highlighted code blocks (with a **Copy** button), clickable links and images. Scroll with the mouse wheel or the arrow keys, and press **Ctrl + C** to copy the whole answer. When the model looks something up online, a **Sources** badge appears at the bottom; click it to see, and open, every page it used.
+
+To ask about a picture, paste it with **Ctrl + V** (a screenshot, a copied image, or image files copied in Explorer) or click the 📎 button in the search bar to pick files. Up to 3 images ride along with your question as thumbnails under the bar; click a thumbnail's × or press **Backspace** on an empty query to remove one. Press **Ctrl + Enter** with no text to just have the images described. Images are downscaled and sent only to Groq with your question.
 
 Answers come from [Groq](https://console.groq.com) using your own API key (creating one is free):
 

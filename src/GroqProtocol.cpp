@@ -497,7 +497,17 @@ std::string BuildChatRequest(std::string_view model, const std::vector<Message>&
         out += R"({"role":)";
         json::AppendQuoted(out, message.role);
         out += R"(,"content":)";
-        if (message.content.empty() && !message.toolCalls.empty()) {
+        if (!message.images.empty()) {
+            out += R"([{"type":"text","text":)";
+            json::AppendQuoted(out, message.content);
+            out.push_back('}');
+            for (size_t i = 0; i < message.images.size() && i < kMaxImages; ++i) {
+                out += R"(,{"type":"image_url","image_url":{"url":)";
+                json::AppendQuoted(out, message.images[i]);
+                out += "}}";
+            }
+            out.push_back(']');
+        } else if (message.content.empty() && !message.toolCalls.empty()) {
             out += "null";
         } else {
             json::AppendQuoted(out, message.content);
@@ -549,6 +559,47 @@ std::string BuildSearchRequest(std::string_view query) {
     out += R"(}],"tools":[{"type":"browser_search"}],"tool_choice":"required","reasoning_effort":"low",)"
            R"("max_completion_tokens":2048,"stream":false})";
     return out;
+}
+
+std::string Base64(std::string_view bytes) {
+    static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 3 <= bytes.size(); i += 3) {
+        const uint32_t v = (static_cast<uint32_t>(static_cast<unsigned char>(bytes[i])) << 16U) |
+            (static_cast<uint32_t>(static_cast<unsigned char>(bytes[i + 1])) << 8U) |
+            static_cast<uint32_t>(static_cast<unsigned char>(bytes[i + 2]));
+        out.push_back(kAlphabet[(v >> 18U) & 63U]);
+        out.push_back(kAlphabet[(v >> 12U) & 63U]);
+        out.push_back(kAlphabet[(v >> 6U) & 63U]);
+        out.push_back(kAlphabet[v & 63U]);
+    }
+    const size_t rest = bytes.size() - i;
+    if (rest > 0) {
+        uint32_t v = static_cast<uint32_t>(static_cast<unsigned char>(bytes[i])) << 16U;
+        if (rest == 2) {
+            v |= static_cast<uint32_t>(static_cast<unsigned char>(bytes[i + 1])) << 8U;
+        }
+        out.push_back(kAlphabet[(v >> 18U) & 63U]);
+        out.push_back(kAlphabet[(v >> 12U) & 63U]);
+        out.push_back(rest == 2 ? kAlphabet[(v >> 6U) & 63U] : '=');
+        out.push_back('=');
+    }
+    return out;
+}
+
+std::string DataUrl(std::string_view mime, std::string_view bytes) {
+    std::string out = "data:";
+    out += mime;
+    out += ";base64,";
+    out += Base64(bytes);
+    return out;
+}
+
+std::string DefaultImagePrompt(size_t imageCount) {
+    return imageCount > 1 ? "Describe these images and point out anything notable."
+                          : "Describe this image and point out anything notable.";
 }
 
 std::string SearchQueryFromArguments(std::string_view arguments) {

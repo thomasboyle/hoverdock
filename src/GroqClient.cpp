@@ -256,7 +256,7 @@ bool RunWebSearch(const std::wstring& apiKey, const std::string& query, const st
 }
 
 void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std::wstring apiKey, std::wstring model,
-    std::wstring prompt) {
+    std::wstring prompt, std::vector<std::string> images) {
     Publisher publisher(session, reply, message);
     const std::string modelUtf8 = groq::WideToUtf8(model);
     groq::SearchMode searchMode =
@@ -264,7 +264,7 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
 
     std::vector<groq::Message> messages;
     messages.push_back({"system", groq::SystemPrompt(TodayText(), searchMode), {}, {}});
-    messages.push_back({"user", groq::WideToUtf8(prompt), {}, {}});
+    messages.push_back({"user", groq::WideToUtf8(prompt), {}, {}, std::move(images)});
     std::vector<groq::Source> sources;
     std::vector<std::wstring> imageUrls;
     bool searched = false;
@@ -531,11 +531,11 @@ bool DecodeImage(const std::string& bytes, UINT maxWidth, UINT maxHeight, AiImag
 namespace GroqClient {
 
 void AskAsync(std::shared_ptr<AiSession> session, HWND reply, UINT message, std::wstring apiKey, std::wstring model,
-    std::wstring prompt) {
+    std::wstring prompt, std::vector<std::string> images) {
     std::thread([session = std::move(session), reply, message, apiKey = std::move(apiKey), model = std::move(model),
-                    prompt = std::move(prompt)]() mutable {
+                    prompt = std::move(prompt), images = std::move(images)]() mutable {
         try {
-            AskWorker(session, reply, message, apiKey, model, prompt);
+            AskWorker(session, reply, message, apiKey, model, prompt, std::move(images));
         } catch (...) {
             Publisher(session, reply, message).Fail(L"Something went wrong while asking AI.");
         }

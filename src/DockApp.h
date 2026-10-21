@@ -2,6 +2,7 @@
 
 #include "DockConfig.h"
 #include "AiAnswerView.h"
+#include "AiAttachments.h"
 #include "GroqClient.h"
 #include "InstalledApps.h"
 #include "NotificationBadges.h"
@@ -178,6 +179,8 @@ private:
     static constexpr UINT kAiImageMessage = WM_APP + 41;
     // Dock Settings AI rows: wParam = SearchMode to open Search in.
     static constexpr UINT kOpenSearchEntryMessage = WM_APP + 42;
+    // AI image attachment prepared: lParam owns an AiAttachmentReply.
+    static constexpr UINT kAiAttachmentMessage = WM_APP + 43;
     static constexpr UINT_PTR kWeatherTimerId = 10;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
@@ -684,6 +687,14 @@ private:
     [[nodiscard]] bool AiPointerIsLink(POINT client) const;
     void ScrollAi(int delta);
     void CopyAiAnswer();
+    // Image attachments for the AI question (paste, picker), DockSearch.cpp.
+    void AddAiAttachments(std::vector<AiAttachmentSource> sources);
+    void ApplyAiAttachment(std::unique_ptr<AiAttachmentReply> reply);
+    void RemoveAiAttachment(size_t index);
+    void ClearAiAttachments();
+    void PickAiAttachments();
+    [[nodiscard]] LONG AttachStripHeight(float scale) const noexcept;
+    void PaintAttachStrip(uint8_t* pixels, int width, int height, float scale, LONG top, LONG left);
     void OpenSearchEntry(SearchMode mode);
     void BuildSearchEntryRows();
     void CommitSearchEntry();
@@ -1102,6 +1113,21 @@ private:
     RECT m_aiBadge{};
     RECT m_aiKeyButton{};
     std::vector<RECT> m_aiSourceRects;
+    struct AiAttachment {
+        uint64_t id = 0;
+        std::wstring name;
+        std::string dataUrl;  // empty while preparing
+        std::vector<uint8_t> thumb;
+        UINT thumbExtent = 0;
+    };
+    std::vector<AiAttachment> m_aiAttachments;
+    uint64_t m_aiAttachmentCounter = 0;
+    // Ctrl+Enter pressed while images were still being prepared.
+    bool m_aiAskWhenReady = false;
+    std::wstring m_aiAttachNotice;
+    bool m_searchPickerOpen = false;
+    RECT m_searchAttachButton{};
+    std::vector<RECT> m_aiAttachRemoveRects;
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;
     WeatherService m_weather;

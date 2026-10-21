@@ -56,10 +56,10 @@ namespace GroqClient {
 
 inline constexpr wchar_t kDefaultModel[] = L"qwen/qwen3.8-27b";
 
-// Streams an answer for `prompt`. Posts `message` (wParam = session->id)
-// to `reply` whenever the session state changes.
+// Streams an answer for `prompt` (plus attached images as data: URLs). Posts
+// `message` (wParam = session->id) to `reply` whenever the session state changes.
 void AskAsync(std::shared_ptr<AiSession> session, HWND reply, UINT message, std::wstring apiKey,
-    std::wstring model, std::wstring prompt);
+    std::wstring model, std::wstring prompt, std::vector<std::string> images = {});
 
 // Downloads an http(s) image and decodes it (WIC) to fit maxWidth x maxHeight.
 // Posts `message` with lParam = AiImageReply* (receiver owns it).

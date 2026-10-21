@@ -4,6 +4,7 @@
 
 #include "DockApp.h"
 #include "DockTheme.hlsli"
+#include "GroqProtocol.h"
 
 #include <ShlObj.h>
 #include <Shellapi.h>
@@ -28,6 +29,7 @@ void FillSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT 
     float radius, float alpha, uint8_t blue, uint8_t green, uint8_t red);
 HFONT CreateFlyoutFont(int pixelHeight, int weight);
 void SetFlyoutChromeInkForGlass(const uint8_t* pixels, int width, int height) noexcept;
+void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept;
 IDWriteFactory* FlyoutDWriteFactory();
 bool EnsureWindowCapturable(HWND window);
 void ClearPopupLayeredCorners(HWND window);
@@ -66,6 +68,7 @@ constexpr wchar_t kGlyphChat[] = L"\uE8BD";
 constexpr wchar_t kGlyphKey[] = L"\uE8D7";
 constexpr wchar_t kGlyphSettings[] = L"\uE713";
 constexpr wchar_t kGlyphLink[] = L"\uE71B";
+constexpr wchar_t kGlyphAttach[] = L"\uE723";
 
 int Px(float value, float scale) noexcept {
     return static_cast<int>(std::lround(value * scale));
@@ -82,20 +85,23 @@ struct SearchMetrics {
     LONG iconSize = 0;
     LONG glyphBox = 0;
     LONG radius = 0;
+    // Attached-image strip under the bar (0 when nothing is attached).
+    LONG strip = 0;
 
     [[nodiscard]] LONG HeightFor(int rows) const noexcept {
-        return rows <= 0 ? barHeight : listTop + rows * rowHeight + listBottomPad;
+        return rows <= 0 ? barHeight + strip : listTop + rows * rowHeight + listBottomPad;
     }
 };
 
-SearchMetrics MetricsFor(float scale, LONG availableWidth) {
+SearchMetrics MetricsFor(float scale, LONG availableWidth, LONG strip = 0) {
     SearchMetrics m;
     m.scale = scale;
     m.width = std::min<LONG>(Px(680.0F, scale), std::max<LONG>(Px(360.0F, scale), availableWidth));
     m.pad = Px(10.0F, scale);
     m.barHeight = Px(60.0F, scale);
     m.rowHeight = Px(54.0F, scale);
-    m.listTop = m.barHeight + 1 + Px(6.0F, scale);
+    m.strip = strip;
+    m.listTop = m.barHeight + strip + 1 + Px(6.0F, scale);
     m.listBottomPad = Px(8.0F, scale);
     m.iconSize = Px(34.0F, scale);
     m.glyphBox = Px(40.0F, scale);
@@ -470,7 +476,8 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
     case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE) {
             const HWND newlyActive = reinterpret_cast<HWND>(lParam);
-            if (newlyActive != app->m_window && newlyActive != app->m_inputWindow) {
+            // The image picker is modal on this window: stay open behind it.
+            if (newlyActive != app->m_window && newlyActive != app->m_inputWindow && !app->m_searchPickerOpen) {
                 app->CloseSearch();
             }
         } else if (app->IsSearchOpen()) {
@@ -514,12 +521,18 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
         break;
 
     case WM_SETCURSOR:
-        if (LOWORD(lParam) == HTCLIENT && app->m_searchMode == SearchMode::Ai) {
+        if (LOWORD(lParam) == HTCLIENT) {
             POINT cursor{};
-            if (GetCursorPos(&cursor) != FALSE && ScreenToClient(window, &cursor) != FALSE &&
-                app->AiPointerIsLink(cursor)) {
-                SetCursor(LoadCursorW(nullptr, IDC_HAND));
-                return TRUE;
+            if (GetCursorPos(&cursor) != FALSE && ScreenToClient(window, &cursor) != FALSE) {
+                bool hand = PointIn(app->m_searchAttachButton, cursor);
+                for (const RECT& remove : app->m_aiAttachRemoveRects) {
+                    hand = hand || PointIn(remove, cursor);
+                }
+                hand = hand || (app->m_searchMode == SearchMode::Ai && app->AiPointerIsLink(cursor));
+                if (hand) {
+                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    return TRUE;
+                }
             }
         }
         break;
@@ -528,7 +541,13 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const bool moved = app->m_searchMouse.x >= 0 &&
             (point.x != app->m_searchMouse.x || point.y != app->m_searchMouse.y);
+        const bool wasOverAttach = PointIn(app->m_searchAttachButton, app->m_searchMouse);
         app->m_searchMouse = point;
+        if (wasOverAttach != PointIn(app->m_searchAttachButton, point)) {
+            app->PaintSearch();
+            TRACKMOUSEEVENT leave{sizeof(leave), TME_LEAVE, window, 0};
+            TrackMouseEvent(&leave);
+        }
         if (app->m_searchMode == SearchMode::Ai) {
             const int hover = app->AiHoverTarget(point);
             if (hover != app->m_aiHover) {
@@ -548,15 +567,28 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
         return 0;
     }
 
-    case WM_MOUSELEAVE:
-        if (app->m_aiHover >= 0) {
+    case WM_MOUSELEAVE: {
+        const bool wasOverAttach = PointIn(app->m_searchAttachButton, app->m_searchMouse);
+        app->m_searchMouse = {-1, -1};
+        if (app->m_aiHover >= 0 || wasOverAttach) {
             app->m_aiHover = -1;
             app->PaintSearch();
         }
         return 0;
+    }
 
     case WM_LBUTTONUP: {
         const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (PointIn(app->m_searchAttachButton, point)) {
+            app->PickAiAttachments();
+            return 0;
+        }
+        for (size_t i = 0; i < app->m_aiAttachRemoveRects.size(); ++i) {
+            if (PointIn(app->m_aiAttachRemoveRects[i], point)) {
+                app->RemoveAiAttachment(i);
+                return 0;
+            }
+        }
         if (app->m_searchMode == SearchMode::Ai) {
             app->HandleAiClick(point);
             return 0;
@@ -725,7 +757,7 @@ bool DockApp::SearchScreenOrigin(POINT& origin, SIZE& size, float& scale) const 
     if (hostWidth <= 0) {
         return false;
     }
-    const SearchMetrics m = MetricsFor(scale, hostWidth - margin * 2);
+    const SearchMetrics m = MetricsFor(scale, hostWidth - margin * 2, AttachStripHeight(scale));
     const int rows = m_searchMode == SearchMode::Ai ? kMaxVisibleRows
                                                     : std::min(static_cast<int>(m_searchRows.size()), kMaxVisibleRows);
     size = {m.width, m.HeightFor(rows)};
@@ -865,7 +897,7 @@ void DockApp::PaintSearch() {
         return;
     }
     EnsureSearchFonts(scale);
-    const SearchMetrics m = MetricsFor(scale, size.cx);
+    const SearchMetrics m = MetricsFor(scale, size.cx, AttachStripHeight(scale));
     const int width = static_cast<int>(size.cx);
     const int height = static_cast<int>(size.cy);
     const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
@@ -901,9 +933,22 @@ void DockApp::PaintSearch() {
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
     const LONG textLeft = glyphRect.right + Px(6.0F, scale);
     LONG textRight = width - Px(18.0F, scale);
+    // Paperclip: attach images to the AI question (not while editing a setting).
+    m_searchAttachButton = {};
+    if (m_searchMode == SearchMode::Search || m_searchMode == SearchMode::Ai) {
+        const LONG box = Px(34.0F, scale);
+        m_searchAttachButton = {textRight - box, (m.barHeight - box) / 2, textRight, (m.barHeight + box) / 2};
+        if (PointIn(m_searchAttachButton, m_searchMouse)) {
+            FillSquircleColorPremul(pixels, width, height, m_searchAttachButton, static_cast<float>(box) * 0.5F,
+                0.14F, inkB, inkG, inkR);
+        }
+        DrawFlyoutText(pixels, width, height, m_searchAttachButton, m_searchGlyphFont, kGlyphAttach,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE, 190);
+        textRight = m_searchAttachButton.left - Px(8.0F, scale);
+    }
     // Right-hand key hint: how to ask AI / leave the answer / save an entry.
     const wchar_t* hint = nullptr;
-    if (m_searchMode == SearchMode::Search && !Trimmed(m_searchText).empty()) {
+    if (m_searchMode == SearchMode::Search && (!Trimmed(m_searchText).empty() || !m_aiAttachments.empty())) {
         hint = L"Ask AI  Ctrl+\u21B5";
     } else if (m_searchMode == SearchMode::Ai) {
         hint = L"Esc  Back to results";
@@ -965,6 +1010,12 @@ void DockApp::PaintSearch() {
             static_cast<int>(textWidth), static_cast<int>(lineHeight));
     }
 
+    // ---- attached images ----
+    m_aiAttachRemoveRects.clear();
+    if (m.strip > 0) {
+        PaintAttachStrip(pixels, width, height, scale, m.barHeight, barLeft);
+    }
+
     // ---- results ----
     m_searchRowRects.clear();
     const int rows = m_searchMode == SearchMode::Ai ? 0 : static_cast<int>(m_searchRows.size());
@@ -972,8 +1023,9 @@ void DockApp::PaintSearch() {
         PaintSearchAi(pixels, width, height, scale, m.listTop);
     }
     if (rows > 0) {
-        FillRectColorPremul(pixels, width, height, {Px(16.0F, scale), m.barHeight, width - Px(16.0F, scale),
-            m.barHeight + 1}, 0.14F, inkB, inkG, inkR);
+        const LONG separatorY = m.listTop - 1 - Px(6.0F, scale);
+        FillRectColorPremul(pixels, width, height, {Px(16.0F, scale), separatorY, width - Px(16.0F, scale),
+            separatorY + 1}, 0.14F, inkB, inkG, inkR);
         m_searchScroll = std::clamp(m_searchScroll, 0, std::max(0, rows - kMaxVisibleRows));
         const int visible = std::min(rows - m_searchScroll, kMaxVisibleRows);
         for (int v = 0; v < visible; ++v) {
@@ -1126,10 +1178,11 @@ bool DockApp::HandleSearchKey(WPARAM key) {
         } else if (ai) {
             ExitAiState();
             SearchTextChanged();
-        } else if (!m_searchText.empty()) {
+        } else if (!m_searchText.empty() || !m_aiAttachments.empty()) {
             m_searchText.clear();
             m_searchCaret = 0;
             m_searchSelectAll = false;
+            ClearAiAttachments();
             SearchTextChanged();
         } else {
             CloseSearch();
@@ -1205,6 +1258,10 @@ bool DockApp::HandleSearchKey(WPARAM key) {
         return true;
     case VK_BACK:
     case VK_DELETE: {
+        if (key == VK_BACK && m_searchText.empty() && !entry && !m_aiAttachments.empty()) {
+            RemoveAiAttachment(m_aiAttachments.size() - 1);
+            return true;
+        }
         if (m_searchSelectAll) {
             m_searchText.clear();
             m_searchCaret = 0;
@@ -1235,6 +1292,12 @@ bool DockApp::HandleSearchKey(WPARAM key) {
         return true;
     }
     if (key == 'V') {
+        // Images (copied files or bitmap data) attach to the AI question.
+        std::vector<AiAttachmentSource> images;
+        if (!entry && AiAttachments::ReadClipboard(m_searchWindow, images)) {
+            AddAiAttachments(std::move(images));
+            return true;
+        }
         std::wstring pasted;
         if (OpenClipboard(m_searchWindow) != FALSE) {
             if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
@@ -1318,6 +1381,7 @@ void DockApp::SearchTextChanged() {
     if (m_searchMode == SearchMode::Ai) {
         ExitAiState();
     }
+    m_aiAttachNotice.clear();
     const uint64_t request = ++m_searchRequestId;
     if (Trimmed(m_searchText).empty()) {
         m_searchRows.clear();
@@ -1613,7 +1677,7 @@ void DockApp::ApplySearchIcons(std::unique_ptr<SearchIconReply> reply) {
 
 void DockApp::AskAi() {
     const std::wstring prompt = Trimmed(m_searchText);
-    if (prompt.empty() || m_searchWindow == nullptr) {
+    if ((prompt.empty() && m_aiAttachments.empty()) || m_searchWindow == nullptr) {
         return;
     }
     ExitAiState();
@@ -1634,13 +1698,29 @@ void DockApp::AskAi() {
         return;
     }
     m_aiModel = m_config.AiModel();
+    SetTimer(m_searchWindow, kAiSpinnerTimerId, kAiSpinnerMs, nullptr);
+    std::vector<std::string> images;
+    for (const AiAttachment& attachment : m_aiAttachments) {
+        if (attachment.dataUrl.empty()) {
+            // Ask as soon as the last image is ready (ApplyAiAttachment).
+            SecureZeroMemory(apiKey.data(), apiKey.size() * sizeof(wchar_t));
+            m_aiAskWhenReady = true;
+            m_aiState.status = L"Preparing images\u2026";
+            PaintSearch();
+            return;
+        }
+        images.push_back(attachment.dataUrl);
+    }
+    const std::wstring question =
+        prompt.empty() ? groq::Utf8ToWide(groq::DefaultImagePrompt(images.size())) : prompt;
     auto session = std::make_shared<AiSession>();
     session->id = ++m_aiSessionCounter;
     m_aiSession = session;
     m_aiState.status = L"Thinking\u2026";
-    GroqClient::AskAsync(std::move(session), m_window, kAiUpdateMessage, std::move(apiKey), m_aiModel, prompt);
-    SetTimer(m_searchWindow, kAiSpinnerTimerId, kAiSpinnerMs, nullptr);
-    Log(L"AI: asking " + m_aiModel + L" (" + std::to_wstring(prompt.size()) + L" chars).");
+    GroqClient::AskAsync(std::move(session), m_window, kAiUpdateMessage, std::move(apiKey), m_aiModel, question,
+        std::move(images));
+    Log(L"AI: asking " + m_aiModel + L" (" + std::to_wstring(question.size()) + L" chars, " +
+        std::to_wstring(m_aiAttachments.size()) + L" images).");
     PaintSearch();
 }
 
@@ -1704,6 +1784,7 @@ void DockApp::ExitAiState() noexcept {
     if (m_searchMode == SearchMode::Ai) {
         m_searchMode = SearchMode::Search;
     }
+    m_aiAskWhenReady = false;
     m_aiState = AiSnapshot{};
     m_aiNeedsKey = false;
     m_aiShowSources = false;
@@ -1987,6 +2068,165 @@ void DockApp::CopyAiAnswer() {
         }
     }
     CopyTextToClipboard(m_searchWindow, text);
+}
+
+// ---- AI image attachments --------------------------------------------------------------
+
+LONG DockApp::AttachStripHeight(float scale) const noexcept {
+    if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry ||
+        (m_aiAttachments.empty() && m_aiAttachNotice.empty())) {
+        return 0;
+    }
+    return Px(60.0F, scale);
+}
+
+void DockApp::AddAiAttachments(std::vector<AiAttachmentSource> sources) {
+    m_aiAttachNotice.clear();
+    const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+    const auto thumbExtent = static_cast<UINT>(Px(44.0F, scale));
+    for (AiAttachmentSource& source : sources) {
+        if (m_aiAttachments.size() >= groq::kMaxImages) {
+            m_aiAttachNotice = L"Up to " + std::to_wstring(groq::kMaxImages) + L" images per question.";
+            break;
+        }
+        AiAttachment attachment;
+        attachment.id = ++m_aiAttachmentCounter;
+        attachment.name = source.name;
+        m_aiAttachments.push_back(attachment);
+        AiAttachments::PrepareAsync(m_window, kAiAttachmentMessage, attachment.id, std::move(source), thumbExtent);
+    }
+    Log(L"AI: " + std::to_wstring(m_aiAttachments.size()) + L" image attachment(s).");
+    if (IsSearchOpen()) {
+        PaintSearch();
+    }
+}
+
+void DockApp::ApplyAiAttachment(std::unique_ptr<AiAttachmentReply> reply) {
+    if (reply == nullptr) {
+        return;
+    }
+    const auto found = std::find_if(m_aiAttachments.begin(), m_aiAttachments.end(),
+        [&](const AiAttachment& attachment) { return attachment.id == reply->id; });
+    if (found == m_aiAttachments.end()) {
+        return;  // removed while it was being prepared
+    }
+    if (reply->dataUrl.empty()) {
+        m_aiAttachNotice = reply->error.empty() ? L"That image couldn't be attached." : reply->error;
+        m_aiAttachments.erase(found);
+    } else {
+        found->dataUrl = std::move(reply->dataUrl);
+        found->thumb = std::move(reply->thumb);
+        found->thumbExtent = reply->thumbExtent;
+    }
+    const bool allReady = std::all_of(m_aiAttachments.begin(), m_aiAttachments.end(),
+        [](const AiAttachment& attachment) { return !attachment.dataUrl.empty(); });
+    if (m_aiAskWhenReady && allReady && m_searchMode == SearchMode::Ai) {
+        m_aiAskWhenReady = false;
+        AskAi();
+        return;
+    }
+    if (IsSearchOpen()) {
+        PaintSearch();
+    }
+}
+
+void DockApp::RemoveAiAttachment(size_t index) {
+    if (index >= m_aiAttachments.size()) {
+        return;
+    }
+    m_aiAttachments.erase(m_aiAttachments.begin() + static_cast<ptrdiff_t>(index));
+    m_aiAttachNotice.clear();
+    if (m_aiAskWhenReady && m_searchMode == SearchMode::Ai) {
+        // The question was waiting on images; re-evaluate with what is left.
+        m_aiAskWhenReady = false;
+        AskAi();
+        return;
+    }
+    if (IsSearchOpen()) {
+        PaintSearch();
+    }
+}
+
+void DockApp::ClearAiAttachments() {
+    m_aiAttachments.clear();
+    m_aiAttachNotice.clear();
+    m_aiAskWhenReady = false;
+}
+
+void DockApp::PickAiAttachments() {
+    if (m_searchWindow == nullptr || m_searchPickerOpen) {
+        return;
+    }
+    m_searchPickerOpen = true;
+    KillTimer(m_searchWindow, kCaretTimerId);
+    std::vector<std::wstring> paths = AiAttachments::PickFiles(m_searchWindow);
+    m_searchPickerOpen = false;
+    if (!IsSearchOpen()) {
+        return;
+    }
+    ForceForeground(m_searchWindow);
+    SetTimer(m_searchWindow, kCaretTimerId, kCaretBlinkMs, nullptr);
+    std::vector<AiAttachmentSource> sources;
+    for (std::wstring& path : paths) {
+        const size_t slash = path.find_last_of(L"\\/");
+        std::wstring name = slash == std::wstring::npos ? path : path.substr(slash + 1);
+        sources.push_back({std::move(name), std::move(path), {}});
+    }
+    if (sources.empty()) {
+        PaintSearch();
+        return;
+    }
+    AddAiAttachments(std::move(sources));
+}
+
+void DockApp::PaintAttachStrip(uint8_t* pixels, int width, int height, float scale, LONG top, LONG left) {
+    const uint8_t inkR = g_flyoutInkR;
+    const uint8_t inkG = g_flyoutInkG;
+    const uint8_t inkB = g_flyoutInkB;
+    const LONG strip = AttachStripHeight(scale);
+    const LONG thumb = Px(44.0F, scale);
+    const LONG thumbTop = top + (strip - thumb) / 2;
+    LONG x = left + Px(4.0F, scale);
+    bool preparing = false;
+    for (const AiAttachment& attachment : m_aiAttachments) {
+        const RECT rect{x, thumbTop, x + thumb, thumbTop + thumb};
+        const bool ready = !attachment.dataUrl.empty() && attachment.thumbExtent == static_cast<UINT>(thumb) &&
+            attachment.thumb.size() == static_cast<size_t>(thumb) * static_cast<size_t>(thumb) * 4U;
+        if (ready) {
+            CompositePremul(pixels, width, height, static_cast<int>(rect.left), static_cast<int>(rect.top),
+                attachment.thumb.data(), static_cast<int>(thumb), static_cast<int>(thumb));
+        } else {
+            preparing = preparing || attachment.dataUrl.empty();
+            FillSquircleColorPremul(pixels, width, height, rect, static_cast<float>(thumb) * 0.22F, 0.12F, inkB, inkG,
+                inkR);
+            DrawFlyoutText(pixels, width, height, rect, m_searchSubFont,
+                attachment.dataUrl.empty() ? std::wstring(L"\u2026") : std::wstring(L"IMG"),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE, 170);
+        }
+        // Remove badge on the top-right corner.
+        const LONG radius = Px(9.0F, scale);
+        const LONG cx = rect.right - Px(3.0F, scale);
+        const LONG cy = rect.top + Px(3.0F, scale);
+        const RECT badge{cx - radius, cy - radius, cx + radius, cy + radius};
+        FillSquircleColorPremul(pixels, width, height, badge, static_cast<float>(radius), 0.88F, 0x2C, 0x2A, 0x2A);
+        SetFlyoutChromeInk(255, 255, 255);
+        DrawFlyoutText(pixels, width, height, badge, m_searchSubFont, L"\u00D7", DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            255);
+        SetFlyoutChromeInk(inkR, inkG, inkB);
+        const LONG grow = Px(3.0F, scale);
+        m_aiAttachRemoveRects.push_back({badge.left - grow, badge.top - grow, badge.right + grow, badge.bottom + grow});
+        x = rect.right + Px(12.0F, scale);
+    }
+    std::wstring caption = m_aiAttachNotice;
+    if (caption.empty() && !m_aiAttachments.empty()) {
+        const size_t count = m_aiAttachments.size();
+        caption = count == 1 ? std::wstring(L"1 image") : std::to_wstring(count) + L" images";
+        caption += preparing ? L" \u00B7 preparing\u2026"
+                             : (count == 1 ? L" \u00B7 Ctrl+Enter to ask about it"
+                                           : L" \u00B7 Ctrl+Enter to ask about them");
+    }
+    DrawFlyoutText(pixels, width, height, {x + Px(2.0F, scale), top, width - Px(20.0F, scale), top + strip},
+        m_searchSubFont, caption, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
 }
 
 // ---- Dock Settings entries (Groq API key / AI model) ------------------------------------

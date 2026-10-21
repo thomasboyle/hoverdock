@@ -57,6 +57,7 @@ add_executable(Dock WIN32
     src/AiAnswerView.cpp
     src/GroqProtocol.cpp
     src/GroqClient.cpp
+    src/AiAttachments.cpp
 )
 
 file(GLOB _dock_media_headers

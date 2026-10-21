@@ -3784,6 +3784,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         OpenSearchEntry(static_cast<SearchMode>(wParam));
         return 0;
 
+    case kAiAttachmentMessage:
+        ApplyAiAttachment(std::unique_ptr<AiAttachmentReply>(reinterpret_cast<AiAttachmentReply*>(lParam)));
+        return 0;
+
     case kTrayIconsMessage: {
         std::unique_ptr<std::vector<TrayNotifyIcon>> icons(reinterpret_cast<std::vector<TrayNotifyIcon>*>(lParam));
         m_trayIconsInFlight.store(false);
