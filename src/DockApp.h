@@ -490,7 +490,9 @@ private:
         const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
         const RECT* dirty = nullptr, bool preservePopupShadow = false) noexcept;
     void QueueSettingsPaint(bool hoverOnly = false);
-    [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false) const noexcept;
+    // allowCc=false keeps the plain dock material even while Dock Settings has CC shapes.
+    [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false,
+        bool allowCc = true) const noexcept;
     // `alsoExclude` keeps another visible popup (Search) out of the sample.
     [[nodiscard]] bool TryBakePopupGlass(POINT origin, LONG width, LONG height,
         uint8_t* pixels, size_t byteCount, bool dockFace, bool popupShadow = false,
@@ -663,6 +665,12 @@ private:
     void DestroySearchFonts() noexcept;
     void StartSearchServices();
     void StopSearchServices() noexcept;
+    // Search panel glass: the dock's own material and corner (live-refreshed
+    // by TickLivePopupGlass as target 3).
+    [[nodiscard]] float DockCornerRadiusPx(float scale) const noexcept;
+    [[nodiscard]] bool BakeSearchGlass(POINT origin, SIZE size, uint8_t* pixels, size_t bytes);
+    [[nodiscard]] bool SearchGlassLiveReady(POINT& origin, SIZE& size) const;
+    void ApplySearchLiveGlass(std::vector<uint8_t>& glass);
     // AI answers in Search (Ctrl+Enter), DockSearch.cpp.
     void AskAi();
     void ApplyAiUpdate(uint64_t sessionId);
@@ -1172,7 +1180,8 @@ private:
     int m_livePopupGlassPending = -1;
     // Plate still owes a GPU bake after a dirty desktop frame (0 settings, 1 quick
     // settings, 2 context). Cleared when the bake is submitted or the pixels match.
-    bool m_popupGlassDirty[3] = {};
+    // Live glass targets: 0 Dock Settings, 1 Quick Settings, 2 context menu, 3 Search.
+    bool m_popupGlassDirty[4] = {};
     RECT m_frostSliderTrack{};
     // Dock Settings Control Centre glass shapes (window px) and picker state.
     std::vector<Renderer::CcShapeDesc> m_dsCcDescs;

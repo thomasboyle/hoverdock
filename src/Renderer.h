@@ -154,6 +154,9 @@ public:
         float radius = 0.0F;
     };
     void SetCcShapes(const std::vector<CcShapeDesc>& shapes) { m_ccShapes = shapes; }
+    // Corner radius (device px) for the next panel bake only; 0 keeps
+    // DOCK_CORNER_RADIUS_PT. Consumed at bake start like the CC shapes.
+    void SetPanelCornerRadius(float radiusPx) noexcept { m_panelCornerRadiusPx = radiusPx; }
     // Estimated face luminance per shape from the last CC bake (drives ink choice).
     [[nodiscard]] const std::vector<float>& CcFaceLuma() const noexcept { return m_ccFaceLuma; }
     void CancelLiveGlassPanelBake() noexcept;
@@ -435,6 +438,7 @@ private:
     UINT64 m_panelFenceValue = 0;
     bool m_panelBakePending = false;
     std::vector<CcShapeDesc> m_ccShapes;
+    float m_panelCornerRadiusPx = 0.0F;
     std::vector<float> m_ccFaceLuma;
     void UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept;
     int m_panelBakeTag = -1;

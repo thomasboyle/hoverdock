@@ -9,7 +9,7 @@ cbuffer FrameData : register(b0)
     float4 scene0; // output width, output height, glass alpha, dock scale
     float4 scene1; // fx bitmask | icon count, DPI scale, dev bounds, backdrop valid
     float4 scene2; // pointer glint x, y (output px), strength 0..1, unused
-    float4 scene3; // dock: chrome ink darkness 0 (white) .. 1 (black), unused x3
+    float4 scene3; // dock: chrome ink darkness 0 (white) .. 1 (black); panels: y = corner radius px (0 = default)
 };
 
 struct IconInstance
@@ -638,6 +638,11 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // silhouette (Dock27Shape) with an analytic outward normal.
     float2 halfSize = max(outputSize * 0.5 - marginDev, float2(1.0, 1.0));
     float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
+    // Panels may override the radius (device px, scene3.y), e.g. Search uses the dock's own corner.
+    if (isPanel && scene3.y > 0.0)
+    {
+        cornerRadius = max(min(scene3.y, halfSize.y), 1.0);
+    }
     float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
     float dockS = 1.0;
     float2 dockNrm = float2(0.0, 1.0);
@@ -1041,6 +1046,11 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float marginDev = max(1.0 - panelOn, popupShadowOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     float2 halfSize = max(outputSize * 0.5 - marginDev, float2(1.0, 1.0));
     float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
+    // Panels may override the radius (device px, scene3.y), e.g. Search uses the dock's own corner.
+    if (isPanel && scene3.y > 0.0)
+    {
+        cornerRadius = max(min(scene3.y, halfSize.y), 1.0);
+    }
     float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
     float dockS = 1.0;
     float2 dockNrm = float2(0.0, 1.0);

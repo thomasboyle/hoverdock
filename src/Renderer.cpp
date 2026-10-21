@@ -3955,6 +3955,7 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
     bool lightPlate, std::vector<uint8_t>& outBgra, float faceMilkBoost, float glintX,
     float glintY, float glintStrength)
 {
+    const float panelCornerRadius = std::exchange(m_panelCornerRadiusPx, 0.0F);
     outBgra.clear();
     if (m_device == nullptr || m_queue == nullptr || m_panelCommandList == nullptr ||
         m_glassPipeline == nullptr || m_blurPipeline == nullptr || m_blurVPipeline == nullptr ||
@@ -4025,6 +4026,8 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         m_panelMappedConstants->scene2[1] = glintY;
         m_panelMappedConstants->scene2[2] = (std::max)(0.0F, (std::min)(glintStrength, 1.0F));
         m_panelMappedConstants->scene2[3] = (std::max)(0.0F, (std::min)(faceMilkBoost, 1.0F));
+        std::fill(std::begin(m_panelMappedConstants->scene3), std::end(m_panelMappedConstants->scene3), 0.0F);
+        m_panelMappedConstants->scene3[1] = (std::max)(panelCornerRadius, 0.0F);
         if ((fxFlags & DOCK_FX_CC) != 0) {
             UploadCcShapes(width, height, dpiScale);
         }
@@ -4339,6 +4342,7 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
     UINT fxFlags, float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC,
     bool lightPlate, int tag, bool* skippedUnchanged)
 {
+    const float panelCornerRadius = std::exchange(m_panelCornerRadiusPx, 0.0F);
     if (skippedUnchanged != nullptr) {
         *skippedUnchanged = false;
     }
@@ -4475,6 +4479,8 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         m_panelMappedConstants->scene1[3] = 1.0F;
         std::fill(std::begin(m_panelMappedConstants->scene2),
             std::end(m_panelMappedConstants->scene2), 0.0F);
+        std::fill(std::begin(m_panelMappedConstants->scene3), std::end(m_panelMappedConstants->scene3), 0.0F);
+        m_panelMappedConstants->scene3[1] = (std::max)(panelCornerRadius, 0.0F);
         if ((fxFlags & DOCK_FX_CC) != 0) {
             UploadCcShapes(width, height, dpiScale);
         }

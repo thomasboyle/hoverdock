@@ -7616,7 +7616,7 @@ void DockApp::RebuildSettingsPopup() {
 }
 
 
-UINT DockApp::PackPopupGlassFxFlags(bool dockFace, bool popupShadow) const noexcept
+UINT DockApp::PackPopupGlassFxFlags(bool dockFace, bool popupShadow, bool allowCc) const noexcept
 {
     // Same packing as the dock frame (frost<<16 | halo<<8 | fx), plus PANEL so
     // GlassPS fills the plate without the dock shadow margin. Halo slots stay 0
@@ -7655,7 +7655,8 @@ UINT DockApp::PackPopupGlassFxFlags(bool dockFace, bool popupShadow) const noexc
     constexpr UINT haloSlots = 0u;
     UINT frostByte =
         static_cast<UINT>(std::lround(std::clamp(frostAmount, 0.0f, 1.0f) * 255.0f));
-    if ((popupShadow && !m_qsCcShapes.empty()) || (dockFace && !popupShadow && !m_dsCcDescs.empty())) {
+    if (allowCc &&
+        ((popupShadow && !m_qsCcShapes.empty()) || (dockFace && !popupShadow && !m_dsCcDescs.empty()))) {
         // Quick Settings / Dock Settings: macOS 26 Control Centre material (own blur/lens stack).
         glassFx |= DOCK_FX_CC;
         frostByte = 0;
@@ -7699,7 +7700,8 @@ bool DockApp::TickLivePopupGlass()
     const bool settingsOpen = IsDockSettingsOpen();
     const bool overflowOpen = IsOverflowOpen();
     const bool contextOpen = IsContextMenuOpen();
-    if (!settingsOpen && !overflowOpen && !contextOpen) {
+    const bool searchOpen = IsSearchOpen();
+    if (!settingsOpen && !overflowOpen && !contextOpen && !searchOpen) {
         if (m_livePopupGlassPending >= 0) {
             m_renderer.CancelLiveGlassPanelBake();
             m_livePopupGlassPending = -1;
@@ -7747,6 +7749,9 @@ bool DockApp::TickLivePopupGlass()
                     PaintOverflowHoverFast();
                 }
             }
+        } else if (done == 3 && searchOpen) {
+            ApplySearchLiveGlass(glass);
+            didWork = true;
         } else if (done == 2 && contextOpen && !m_contextBaseBits.empty()) {
             if (glass.size() == m_contextGlass.size() &&
                 m_contextGlassSize.cx == m_contextSize.cx &&
@@ -7773,6 +7778,9 @@ bool DockApp::TickLivePopupGlass()
     if (!contextOpen) {
         m_popupGlassDirty[2] = false;
     }
+    if (!searchOpen) {
+        m_popupGlassDirty[3] = false;
+    }
 
     const float frostAmount = m_config.FrostAmount();
     // Dock-face popups use the dock's glass alpha curve (same Frost slider).
@@ -7783,9 +7791,10 @@ bool DockApp::TickLivePopupGlass()
     const UINT dockFaceFlags = PackPopupGlassFxFlags(true);
     const UINT contextFlags = PackPopupGlassFxFlags(false);
 
-    for (int target = 0; target < 3; ++target) {
+    const UINT searchFlags = PackPopupGlassFxFlags(true, false, false);
+    for (int target = 0; target < 4; ++target) {
         const UINT fxFlags = target == 1 ? PackPopupGlassFxFlags(true, true)
-            : (target == 2 ? contextFlags : dockFaceFlags);
+            : (target == 2 ? contextFlags : (target == 3 ? searchFlags : dockFaceFlags));
         const float glassAlpha = target == 2 ? contextAlpha : settingsAlpha;
         POINT origin{};
         LONG width = 0;
@@ -7803,6 +7812,13 @@ bool DockApp::TickLivePopupGlass()
             if (OverflowScreenOrigin(origin, caret) && OverflowGlassValid(origin)) {
                 width = m_overflowSize.cx;
                 height = m_overflowSize.cy;
+                ready = width > 0 && height > 0;
+            }
+        } else if (target == 3 && searchOpen) {
+            SIZE searchSize{};
+            if (SearchGlassLiveReady(origin, searchSize)) {
+                width = searchSize.cx;
+                height = searchSize.cy;
                 ready = width > 0 && height > 0;
             }
         } else if (target == 2 && contextOpen && !m_contextGlass.empty() &&
@@ -7828,10 +7844,11 @@ bool DockApp::TickLivePopupGlass()
         m_renderer.SetCcShapes(target == 0 ? m_dsCcDescs
                                            : (target == 1 ? m_qsCcDescs
                                                           : std::vector<Renderer::CcShapeDesc>{}));
+        m_renderer.SetPanelCornerRadius(target == 3 ? DockCornerRadiusPx(dpiScale) : 0.0F);
         if (m_renderer.BeginLiveGlassPanelBake(screenRect, static_cast<UINT>(width),
                 static_cast<UINT>(height), fxFlags, glassAlpha, dpiScale, m_settingsWindow,
-                m_overflowWindow, m_contextWindow, target != 2 && m_config.LightPanels(), target,
-                &unchanged)) {
+                m_overflowWindow, target == 3 ? m_searchWindow : m_contextWindow,
+                target != 2 && m_config.LightPanels(), target, &unchanged)) {
             m_popupGlassDirty[target] = false;
             m_lastPopupGlassRefreshMs = GetTickCount64();
             didWork = true;

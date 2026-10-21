@@ -779,6 +779,79 @@ void DockApp::DestroySearchFonts() noexcept {
     m_searchFontScale = 0.0F;
 }
 
+// ---- glass ------------------------------------------------------------------------
+
+// The dock's corner in device px: the macOS 27 silhouette radius (0.738 S over a
+// 1.752 S pill, kDock27CornerS / kDock27HeightS in Shaders.hlsl) of the live pill.
+float DockApp::DockCornerRadiusPx(float scale) const noexcept {
+    constexpr float kDockCornerToHeight = 0.738F / 1.752F;
+    const float pill = static_cast<float>(m_dockHeight) - 2.0F * static_cast<float>(DockShadowMarginPx(scale));
+    if (m_dockHeight <= 1 || pill <= 0.0F) {
+        return DOCK_CORNER_RADIUS_PT * scale;
+    }
+    return pill * kDockCornerToHeight;
+}
+
+// Same GlassPS material as the dock bar (PANEL | DOCK_FACE without the Control
+// Centre shapes): tint, frost, lens, rim and superellipse corners all match.
+bool DockApp::BakeSearchGlass(POINT origin, SIZE size, uint8_t* pixels, size_t bytes) {
+    if (!m_rendererInitialized || pixels == nullptr || size.cx <= 0 || size.cy <= 0 ||
+        bytes != static_cast<size_t>(size.cx) * static_cast<size_t>(size.cy) * 4U) {
+        return false;
+    }
+    const float frost = m_config.FrostAmount();
+    const float glassAlpha = DOCK_GLASS_ALPHA + (1.0F - DOCK_GLASS_ALPHA) * frost;
+    const float dpiScale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+    const RECT screenRect{origin.x, origin.y, origin.x + size.cx, origin.y + size.cy};
+    m_renderer.SetCcShapes({});
+    m_renderer.SetPanelCornerRadius(DockCornerRadiusPx(dpiScale));
+    std::vector<uint8_t> glass;
+    if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(size.cx), static_cast<UINT>(size.cy),
+            PackPopupGlassFxFlags(true, false, false), glassAlpha, dpiScale, m_settingsWindow, m_overflowWindow,
+            m_searchWindow, m_config.LightPanels(), glass) ||
+        glass.size() != bytes) {
+        return false;
+    }
+    std::memcpy(pixels, glass.data(), bytes);
+    return true;
+}
+
+bool DockApp::SearchGlassLiveReady(POINT& origin, SIZE& size) const {
+    if (!IsSearchOpen() || m_searchSize.cx <= 0 || m_searchSize.cy <= 0 ||
+        m_searchGlassOrigin.x != m_searchOrigin.x || m_searchGlassOrigin.y != m_searchOrigin.y) {
+        return false;
+    }
+    const auto glass = m_searchGlass.find(m_searchSize.cy);
+    const size_t bytes = static_cast<size_t>(m_searchSize.cx) * static_cast<size_t>(m_searchSize.cy) * 4U;
+    if (glass == m_searchGlass.end() || glass->second.size() != bytes || m_searchBits.size() != bytes) {
+        return false;
+    }
+    origin = m_searchOrigin;
+    size = m_searchSize;
+    return true;
+}
+
+// A live rebake finished: swap the new backdrop under the panel without
+// re-rendering its text (glass-only pixels take the new bake; the next full
+// paint, at the latest the caret blink, refreshes the rest).
+void DockApp::ApplySearchLiveGlass(std::vector<uint8_t>& glass) {
+    POINT origin{};
+    SIZE size{};
+    if (!SearchGlassLiveReady(origin, size)) {
+        return;
+    }
+    std::vector<uint8_t>& cached = m_searchGlass[size.cy];
+    SIZE presentSize = size;
+    if (!ApplyLivePopupGlass(glass, size, cached, m_searchBits, m_searchBits, presentSize)) {
+        return;
+    }
+    // Other heights were baked against the old desktop.
+    std::erase_if(m_searchGlass, [&](const auto& entry) { return entry.first != size.cy; });
+    m_searchLayerDib.contentValid = false;
+    PresentLayeredBits(m_searchWindow, origin, size.cx, size.cy, m_searchBits.data(), m_searchBits.size(),
+        m_searchLayerDib);
+}
+
 // ---- painting ---------------------------------------------------------------------
 
 void DockApp::PaintSearch() {
@@ -804,10 +877,11 @@ void DockApp::PaintSearch() {
     std::vector<uint8_t>& glass = m_searchGlass[size.cy];
     if (glass.size() != bytes) {
         glass.assign(bytes, 0);
-        if (!TryBakePopupGlass(origin, size.cx, size.cy, glass.data(), bytes, false, false, m_searchWindow)) {
+        if (!BakeSearchGlass(origin, size, glass.data(), bytes)) {
+            // No GPU bake: a neutral plate in the dock's silhouette.
             std::fill(glass.begin(), glass.end(), static_cast<uint8_t>(0));
             FillSquircleColorPremul(glass.data(), width, height, {0, 0, size.cx, size.cy},
-                static_cast<float>(m.radius), 0.94F, 46, 42, 42);
+                DockCornerRadiusPx(scale), 0.90F, 0xC8, 0xC4, 0xC4);
         }
     }
     m_searchBits = glass;
