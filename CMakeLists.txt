@@ -210,6 +210,7 @@ set_property(TARGET Dock PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_D
 #   GroqProtocolTests      Groq request/stream/source handling (portable)
 #   AiPipelineBench        AI answer streaming/request benchmark (portable)
 #   AutoPowerPolicyTests   Automatic energy mode decisions (portable)
+#   AutoPowerPolicyBench   Automatic energy mode per-tick decision cost (portable)
 option(DOCK_BUILD_TESTS "Build the Search engine tests" OFF)
 if(DOCK_BUILD_TESTS)
     enable_testing()
@@ -240,6 +241,8 @@ if(DOCK_BUILD_TESTS)
     # Automatic energy mode: app classification and full-power decisions (portable).
     add_dock_test(AutoPowerPolicyTests tests/AutoPowerPolicyTests.cpp src/AutoPowerPolicy.cpp)
     add_test(NAME AutoPowerPolicyTests COMMAND AutoPowerPolicyTests)
+    # Automatic energy mode per-tick decision benchmark; not a CTest.
+    add_dock_test(AutoPowerPolicyBench tests/AutoPowerPolicyBench.cpp src/AutoPowerPolicy.cpp)
 endif()
 
 # Signed PawnIO IntelMSR blob header (third_party/pawnio/IntelMsrBin.h).
