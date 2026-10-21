@@ -582,17 +582,108 @@ std::string BuildChatRequest(std::string_view model, const std::vector<Message>&
     return out;
 }
 
-std::string BuildSearchRequest(std::string_view query) {
+std::string BuildSearchRequest(std::string_view query, std::string_view model) {
     std::string out = R"({"model":)";
-    json::AppendQuoted(out, kSearchModel);
+    json::AppendQuoted(out, model);
     out += R"(,"messages":[{"role":"user","content":)";
-    std::string prompt = "Search the web for: ";
+    // Every page browser_search opens is loaded into the model's context and
+    // billed against the (small) per-minute token limit, so answer from the
+    // result snippets and open pages only as a last resort.
+    std::string prompt = "Search the web once for: ";
     prompt += query;
-    prompt += "\n\nReply with at most 8 terse bullets of the key facts (names, figures, dates), each noting its page.";
+    prompt +=
+        "\n\nAnswer from the search result snippets. Open at most one page, and only if the snippets lack the "
+        "answer. Reply with at most 8 terse bullets of the key facts (names, figures, dates), each noting its page.";
     json::AppendQuoted(out, prompt);
     out += R"(}],"tools":[{"type":"browser_search"}],"tool_choice":"required","reasoning_effort":"low",)"
            R"("max_completion_tokens":1536,"stream":false})";
     return out;
+}
+
+std::string SearchCacheKey(std::string_view query) {
+    std::string key;
+    key.reserve(query.size());
+    bool space = false;
+    for (const char c : query) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            space = !key.empty();
+            continue;
+        }
+        if (space) {
+            key.push_back(' ');
+            space = false;
+        }
+        key.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
+    }
+    return key;
+}
+
+namespace {
+
+// "2", "7.66s", "1m2.5s", "450ms" -> milliseconds; nullopt when unparsable.
+std::optional<uint64_t> ParseDuration(std::string_view text) {
+    double total = 0.0;
+    bool any = false;
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t start = i;
+        while (i < text.size() && ((text[i] >= '0' && text[i] <= '9') || text[i] == '.')) {
+            ++i;
+        }
+        if (i == start) {
+            break;
+        }
+        const double value = std::strtod(std::string(text.substr(start, i - start)).c_str(), nullptr);
+        if (text.substr(i).starts_with("ms")) {
+            total += value;
+            i += 2;
+        } else if (text.substr(i).starts_with("h")) {
+            total += value * 3600000.0;
+            ++i;
+        } else if (text.substr(i).starts_with("m")) {
+            total += value * 60000.0;
+            ++i;
+        } else {
+            total += value * 1000.0;
+            if (i < text.size() && text[i] == 's') {
+                ++i;
+            }
+        }
+        any = true;
+    }
+    if (!any || total < 0.0 || total > 86400000.0) {
+        return std::nullopt;
+    }
+    return static_cast<uint64_t>(total + 0.5);
+}
+
+}  // namespace
+
+RateLimit ParseRateLimit(std::string_view retryAfter, std::string_view errorBody) {
+    RateLimit limit;
+    const std::string message = ErrorMessage(errorBody);
+    limit.daily = message.find("per day") != std::string::npos || message.find("(TPD)") != std::string::npos ||
+        message.find("(RPD)") != std::string::npos;
+    while (!retryAfter.empty() && retryAfter.front() == ' ') {
+        retryAfter.remove_prefix(1);
+    }
+    if (const auto header = ParseDuration(retryAfter)) {
+        limit.retryAfterMs = *header;
+        return limit;
+    }
+    // Groq's message: "... Please try again in 7.66s. Need more tokens? ..."
+    constexpr std::string_view kMarker = "try again in ";
+    if (const size_t at = message.find(kMarker); at != std::string::npos) {
+        std::string_view rest = std::string_view(message).substr(at + kMarker.size());
+        rest = rest.substr(0, rest.find_first_of(" ,"));
+        if (!rest.empty() && rest.back() == '.') {
+            rest.remove_suffix(1);
+        }
+        if (const auto parsed = ParseDuration(rest)) {
+            limit.retryAfterMs = *parsed;
+        }
+    }
+    return limit;
 }
 
 std::string Base64(std::string_view bytes) {

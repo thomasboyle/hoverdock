@@ -30,7 +30,13 @@ constexpr ULONGLONG kPublishIntervalMs = 50;
 // Tool rounds before the model must answer without tools. Every round re-sends
 // the whole conversation (images and earlier results included) as input.
 constexpr int kMaxToolRounds = 2;
-constexpr size_t kMaxCallsPerRound = 2;
+// One browser_search per round: each can use thousands of the search model's
+// per-minute tokens, so parallel searches mostly just trip the rate limit.
+constexpr size_t kMaxCallsPerRound = 1;
+// Longest per-minute rate-limit wait we sit out before giving up.
+constexpr uint64_t kMaxRetryWaitMs = 12000;
+constexpr ULONGLONG kSearchCacheMs = 10ULL * 60ULL * 1000ULL;
+constexpr size_t kSearchCacheSize = 32;
 
 class WinHttpHandle {
 public:
@@ -55,6 +61,7 @@ struct HttpResult {
     DWORD status = 0;
     std::string errorBody;
     std::wstring error;
+    std::wstring retryAfter;
     bool cancelled = false;
 };
 
@@ -82,6 +89,14 @@ bool ReadResponse(HINTERNET request, const std::function<void(std::string_view)>
         return false;
     }
     const bool success = result.status >= 200 && result.status <= 299;
+    if (result.status == 429) {
+        wchar_t retryAfter[64]{};
+        DWORD retryAfterSize = sizeof(retryAfter);
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_RETRY_AFTER, WINHTTP_HEADER_NAME_BY_INDEX, retryAfter,
+                &retryAfterSize, WINHTTP_NO_HEADER_INDEX) != FALSE) {
+            result.retryAfter = retryAfter;
+        }
+    }
     std::string buffer(16U * 1024U, '\0');
     size_t total = 0;
     while (true) {
@@ -238,20 +253,126 @@ std::vector<AiSource> WideSources(const std::vector<groq::Source>& sources) {
     return out;
 }
 
-// One browser_search round trip on the GPT-OSS search model.
+groq::RateLimit RateLimitOf(const HttpResult& result) {
+    return groq::ParseRateLimit(groq::WideToUtf8(result.retryAfter), result.errorBody);
+}
+
+// A 429 worth sitting out: per-minute (not per-day) with a short suggested wait.
+bool ShortRateLimit(const HttpResult& result, uint64_t& waitMs) {
+    if (result.status != 429) {
+        return false;
+    }
+    const groq::RateLimit limit = RateLimitOf(result);
+    if (limit.daily || limit.retryAfterMs > kMaxRetryWaitMs) {
+        return false;
+    }
+    waitMs = std::max<uint64_t>(limit.retryAfterMs, 1000);
+    return true;
+}
+
+// Sleeps in short slices; false when cancelled.
+bool WaitForRetry(uint64_t waitMs, const std::atomic<bool>& cancelled) {
+    const ULONGLONG until = GetTickCount64() + waitMs;
+    while (GetTickCount64() < until) {
+        if (cancelled.load()) {
+            return false;
+        }
+        Sleep(100);
+    }
+    return !cancelled.load();
+}
+
+std::wstring RetryStatus(uint64_t waitMs) {
+    return L"Groq\u2019s rate limit was reached. Retrying in " + std::to_wstring((waitMs + 999) / 1000) +
+        L" s\u2026";
+}
+
+struct CachedSearch {
+    std::string key;
+    groq::SearchOutcome outcome;
+    ULONGLONG at = 0;
+};
+
+std::mutex g_searchCacheMutex;
+std::vector<CachedSearch> g_searchCache;
+
+bool CachedSearchOutcome(const std::string& key, groq::SearchOutcome& outcome) {
+    const std::lock_guard lock(g_searchCacheMutex);
+    const ULONGLONG now = GetTickCount64();
+    std::erase_if(g_searchCache, [&](const CachedSearch& entry) { return now - entry.at > kSearchCacheMs; });
+    for (const CachedSearch& entry : g_searchCache) {
+        if (entry.key == key) {
+            outcome = entry.outcome;
+            return true;
+        }
+    }
+    return false;
+}
+
+void CacheSearchOutcome(std::string key, const groq::SearchOutcome& outcome) {
+    const std::lock_guard lock(g_searchCacheMutex);
+    std::erase_if(g_searchCache, [&](const CachedSearch& entry) { return entry.key == key; });
+    if (g_searchCache.size() >= kSearchCacheSize) {
+        g_searchCache.erase(g_searchCache.begin());
+    }
+    g_searchCache.push_back({std::move(key), outcome, GetTickCount64()});
+}
+
+bool PostSearch(const std::wstring& apiKey, const std::string& query, const char* model,
+    const std::atomic<bool>& cancelled, std::string& body, HttpResult& result) {
+    body.clear();
+    result = HttpResult{};
+    return PostChat(apiKey, groq::BuildSearchRequest(query, model),
+        [&](std::string_view chunk) { body.append(chunk); }, cancelled, result);
+}
+
+// One browser_search round trip. Repeat queries come from a short-lived cache;
+// a rate-limited search moves to the fallback model (its own budget), then
+// sits out one short per-minute wait before giving up.
 bool RunWebSearch(const std::wstring& apiKey, const std::string& query, const std::atomic<bool>& cancelled,
-    groq::SearchOutcome& outcome, std::wstring& error) {
+    const std::function<void(const std::wstring&)>& onStatus, groq::SearchOutcome& outcome, std::wstring& error) {
+    const std::string key = groq::SearchCacheKey(query);
+    if (CachedSearchOutcome(key, outcome)) {
+        return true;
+    }
     std::string body;
     HttpResult result;
-    const bool ok = PostChat(apiKey, groq::BuildSearchRequest(query),
-        [&](std::string_view chunk) { body.append(chunk); }, cancelled, result);
+    const char* model = groq::kSearchModel;
+    bool ok = PostSearch(apiKey, query, model, cancelled, body, result);
+    if (!ok && !result.cancelled && result.status == 429) {
+        HttpResult primary = std::move(result);
+        model = groq::kSearchFallbackModel;
+        ok = PostSearch(apiKey, query, model, cancelled, body, result);
+        if (!ok && !result.cancelled && result.status != 429) {
+            result = std::move(primary);
+            model = groq::kSearchModel;
+        } else if (!ok && !result.cancelled) {
+            uint64_t primaryWait = 0;
+            uint64_t fallbackWait = 0;
+            const bool primaryShort = ShortRateLimit(primary, primaryWait);
+            const bool fallbackShort = ShortRateLimit(result, fallbackWait);
+            if (primaryShort || fallbackShort) {
+                const bool usePrimary = primaryShort && (!fallbackShort || primaryWait <= fallbackWait);
+                const uint64_t waitMs = usePrimary ? primaryWait : fallbackWait;
+                model = usePrimary ? groq::kSearchModel : groq::kSearchFallbackModel;
+                onStatus(RetryStatus(waitMs));
+                if (!WaitForRetry(waitMs, cancelled)) {
+                    return false;
+                }
+                ok = PostSearch(apiKey, query, model, cancelled, body, result);
+            }
+        }
+    }
     if (!ok) {
-        error = result.cancelled ? std::wstring() : DescribeFailure(result, groq::Utf8ToWide(groq::kSearchModel));
+        error = result.cancelled ? std::wstring() : DescribeFailure(result, groq::Utf8ToWide(model));
         return false;
     }
     if (!groq::ParseSearchResponse(body, outcome)) {
         error = L"The web search returned an unreadable reply.";
         return false;
+    }
+    if (!outcome.summary.empty() || !outcome.sources.empty()) {
+        CacheSearchOutcome(key, outcome);
     }
     return true;
 }
@@ -270,6 +391,7 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
     std::vector<std::wstring> imageUrls;
     bool searched = false;
     bool toolsRetried = false;
+    bool rateRetried = false;
 
     for (int round = 0; round <= kMaxToolRounds; ++round) {
         const groq::SearchMode mode =
@@ -309,6 +431,17 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
             return;
         }
         if (!ok) {
+            // A short per-minute limit: wait it out once rather than failing the answer.
+            uint64_t waitMs = 0;
+            if (!rateRetried && ShortRateLimit(result, waitMs)) {
+                rateRetried = true;
+                publisher.Update([&](AiSnapshot& state) { state.status = RetryStatus(waitMs); });
+                if (!WaitForRetry(waitMs, publisher.CancelFlag())) {
+                    return;
+                }
+                --round;
+                continue;
+            }
             // Some models reject tool definitions: answer without web search instead.
             if (result.status == 400 && mode != groq::SearchMode::None && !toolsRetried &&
                 result.errorBody.find("tool") != std::string::npos) {
@@ -358,7 +491,10 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
                     });
                     groq::SearchOutcome outcome;
                     std::wstring error;
-                    if (RunWebSearch(apiKey, query, publisher.CancelFlag(), outcome, error)) {
+                    const auto onStatus = [&](const std::wstring& status) {
+                        publisher.Update([&](AiSnapshot& state) { state.status = status; });
+                    };
+                    if (RunWebSearch(apiKey, query, publisher.CancelFlag(), onStatus, outcome, error)) {
                         std::vector<size_t> numbers;
                         for (const groq::Source& source : outcome.sources) {
                             groq::AddSource(sources, source);
