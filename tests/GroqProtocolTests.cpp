@@ -70,8 +70,9 @@ void TestRequest() {
         EXPECT(parsed->Get("tools")->items[0].Get("function")->Str("name") == "web_search");
         EXPECT(parsed->Get("temperature")->number == 0.8);
         EXPECT(parsed->Get("top_p")->number == 0.95);
-        EXPECT(parsed->Str("reasoning_effort") == "medium");
+        EXPECT(parsed->Str("reasoning_effort") == "low");
         EXPECT(parsed->Str("reasoning_format") == "parsed");
+        EXPECT(parsed->Get("max_completion_tokens")->number == 4096);
     }
     // Assistant history drops reasoning; content that was only thinking becomes null.
     std::vector<groq::Message> history = {
@@ -95,9 +96,14 @@ void TestRequest() {
     const auto builtin = groq::json::Parse(
         groq::BuildChatRequest("openai/gpt-oss-120b", messages, groq::SearchMode::Builtin, false));
     EXPECT(builtin.has_value() && builtin->Get("tools")->items[0].Str("type") == "browser_search" &&
-        builtin->Str("reasoning_effort") == "medium" && builtin->Get("reasoning_format") == nullptr);
+        builtin->Str("reasoning_effort") == "low" && builtin->Get("reasoning_format") == nullptr);
     const auto search = groq::json::Parse(groq::BuildSearchRequest("weather \"today\""));
     EXPECT(search.has_value() && search->Str("model") == groq::kSearchModel && search->Str("tool_choice") == "required");
+    EXPECT(search.has_value() && search->Get("max_completion_tokens")->number == 1536);
+    // The date goes last so the stable instructions form a cacheable prefix.
+    const std::string prompt = groq::SystemPrompt("Tuesday, 21 October 2026", groq::SearchMode::Function);
+    EXPECT(prompt.ends_with("Today is Tuesday, 21 October 2026."));
+    EXPECT(prompt.find("web_search") != std::string::npos);
     EXPECT(groq::SearchQueryFromArguments(R"({"query":"a b"})") == "a b");
     EXPECT(groq::SearchQueryFromArguments("not json").empty());
     EXPECT(groq::HasBuiltinSearch("openai/gpt-oss-20b") && !groq::HasBuiltinSearch(groq::kDefaultModel));
@@ -159,6 +165,20 @@ void TestSearchResponse() {
     EXPECT(outcome.images.size() == 1);
     const auto result = groq::json::Parse(groq::BuildToolResult("q", outcome, {3, 1}));
     EXPECT(result.has_value() && result->Get("results")->items[1].Get("n")->number == 1.0);
+
+    // Tool results are re-sent every round: capped to a compact top-N.
+    groq::SearchOutcome big;
+    big.summary = std::string(9000, 'x');
+    for (int i = 0; i < 10; ++i) {
+        big.sources.push_back({"T", "https://e.example/" + std::to_string(i), std::string(700, 's')});
+        big.images.push_back("https://img.example/" + std::to_string(i) + ".png");
+    }
+    const std::string bigText = groq::BuildToolResult("q", big, {});
+    const auto bigResult = groq::json::Parse(bigText);
+    EXPECT(bigResult.has_value() && bigResult->Get("results")->items.size() == 5 &&
+        bigResult->Get("images")->items.size() == 2 && bigResult->Str("summary").size() <= 2400 + 3 &&
+        bigResult->Get("results")->items[0].Str("snippet").size() <= 280 + 3);
+    EXPECT(bigText.size() < 4500);
     EXPECT(groq::ErrorMessage(R"({"error":{"message":"Invalid API Key"}})") == "Invalid API Key");
     EXPECT(groq::ErrorMessage("oops\nbad") == "oops bad");
 }

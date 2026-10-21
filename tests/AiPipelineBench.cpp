@@ -279,7 +279,7 @@ int main() {
             stream.size());
     }
 
-    // W2: three ~300 KB JPEG data URLs (typical 1568 px screenshots).
+    // W2: three ~300 KB JPEG data URLs (typical 1280 px screenshots).
     std::string jpeg(300000, '\0');
     for (size_t i = 0; i < jpeg.size(); ++i) {
         jpeg[i] = static_cast<char>((i * 2654435761U) >> 13U);

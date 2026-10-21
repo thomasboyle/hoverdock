@@ -19,8 +19,9 @@ namespace {
 
 constexpr size_t kMaxSourceBytes = 20U * 1024U * 1024U;
 constexpr UINT kMaxSourceSide = 16384;
-// Long edge sent to the model: enough for text in screenshots, small payload.
-constexpr UINT kMaxSentSide = 1568;
+// Long edge sent to the model. Qwen spends ~1 input token per 28x28 px on
+// every round, so 1280 keeps screenshot text legible at ~2/3 the cost of 1568.
+constexpr UINT kMaxSentSide = 1280;
 constexpr float kJpegQuality = 0.86F;
 
 template <typename T>

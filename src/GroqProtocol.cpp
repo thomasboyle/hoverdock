@@ -449,12 +449,18 @@ bool IsHttpUrl(std::string_view url) {
     return url.starts_with("https://") || url.starts_with("http://");
 }
 
+// web_search results are re-sent as input on every later round, so keep them
+// to the summary plus the top few results (the full list still shows in Sources).
+constexpr size_t kToolSummaryBytes = 2400;
+constexpr size_t kToolResults = 5;
+constexpr size_t kToolSnippetBytes = 280;
+constexpr size_t kToolImages = 2;
+
 void AppendTools(std::string& out, SearchMode search) {
     if (search == SearchMode::Function) {
         out += R"(,"tools":[{"type":"function","function":{"name":"web_search","description":)"
-               R"("Search the web for current or specific information. Returns numbered results with titles, URLs, )"
-               R"(snippets and a summary, plus related image URLs.","parameters":{"type":"object","properties":)"
-               R"({"query":{"type":"string","description":"A focused web search query."}},"required":["query"]}}}])"
+               R"("Search the web. Returns a summary, numbered results and image URLs.","parameters":)"
+               R"({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}])"
                R"(,"tool_choice":"auto")";
     } else if (search == SearchMode::Builtin) {
         out += R"(,"tools":[{"type":"browser_search"}])";
@@ -474,28 +480,24 @@ bool SupportsReasoningEffort(std::string_view model) noexcept {
 }
 
 std::string SystemPrompt(std::string_view today, SearchMode search) {
+    // Stable text first and the date last, so the prompt prefix stays cacheable.
     std::string prompt =
-        "You are the AI assistant built into Hoverdock, a Windows desktop dock. The user typed this into the "
-        "dock's Spotlight-style search bar and pressed Ctrl+Enter, so answer directly and concisely and lead with "
-        "the answer. Today's date is ";
-    prompt += today;
-    prompt +=
-        ".\n\nFormat replies as GitHub-flavoured Markdown: short paragraphs, **bold** for key terms, headings only "
-        "for long answers, bullet or numbered lists for steps, tables for comparisons, fenced code blocks with a "
-        "language tag for any code, commands or file contents, and descriptive [links](https://example.com) where "
-        "useful. Never use LaTeX or HTML; write maths in plain Unicode (e.g. x\xC2\xB2 + y\xC2\xB2, \xE2\x88\x9A" "2).";
+        "You are Hoverdock's assistant, answering a question typed into a Windows dock's search bar. Lead with the "
+        "answer and keep it brief; expand only when asked or when the task needs it.\n"
+        "Use GitHub Markdown: short paragraphs, **bold** key terms, lists for steps, tables for comparisons, fenced "
+        "code with a language tag, [links](url). No LaTeX or HTML; write maths in plain Unicode (x\xC2\xB2, "
+        "\xE2\x88\x9A" "2).";
     if (search == SearchMode::Function) {
         prompt +=
-            "\n\nYou have a web_search tool. Call it when the answer depends on current events, recent releases, "
-            "prices, weather, sports, live data or specific facts you are not sure of, or when the user asks you to "
-            "look something up. Otherwise answer from your own knowledge without searching. When you use results, "
-            "cite them inline as [n](url) using the result numbers. You may embed one relevant picture with "
-            "![description](url), but only with an image URL returned by web_search.";
+            "\nCall web_search only for current events, live data or facts you are unsure of; otherwise answer "
+            "from knowledge. Cite results inline as [n](url). You may embed one returned image as ![alt](url).";
     } else if (search == SearchMode::Builtin) {
         prompt +=
-            "\n\nUse browser_search when the answer depends on current or specific facts you are not sure of. Cite "
-            "the pages you used inline as [n](url) links.";
+            "\nUse browser_search only for current or uncertain facts. Cite pages inline as [n](url).";
     }
+    prompt += "\nToday is ";
+    prompt += today;
+    prompt += '.';
     return prompt;
 }
 
@@ -559,10 +561,12 @@ std::string BuildChatRequest(std::string_view model, const std::vector<Message>&
     }
     out.push_back(']');
     AppendTools(out, search);
-    // Medium thinking. Qwen returns it in a separate `reasoning` field
-    // (parsed) so `content` is the final answer only; GPT-OSS always does.
+    // Reasoning is billed at the output rate and medium effort spent several
+    // times the answer's tokens on short dock questions, so think briefly.
+    // Qwen returns it in a separate `reasoning` field (parsed) so `content` is
+    // the final answer only; GPT-OSS always does.
     if (SupportsReasoningEffort(model)) {
-        out += R"(,"reasoning_effort":"medium")";
+        out += R"(,"reasoning_effort":"low")";
         if (!HasBuiltinSearch(model)) {
             out += R"(,"reasoning_format":"parsed")";
         }
@@ -572,8 +576,8 @@ std::string BuildChatRequest(std::string_view model, const std::vector<Message>&
     if (model.find("qwen") != std::string_view::npos) {
         out += R"(,"top_p":0.95)";
     }
-    // Room for the reasoning tokens as well as the answer.
-    out += R"(,"max_completion_tokens":8192)";
+    // Room for brief reasoning plus the answer; caps runaway generations.
+    out += R"(,"max_completion_tokens":4096)";
     out += stream ? R"(,"stream":true})" : R"(,"stream":false})";
     return out;
 }
@@ -584,12 +588,10 @@ std::string BuildSearchRequest(std::string_view query) {
     out += R"(,"messages":[{"role":"user","content":)";
     std::string prompt = "Search the web for: ";
     prompt += query;
-    prompt +=
-        "\n\nReport the key facts that answer it as concise bullet points with specific names, figures and dates, "
-        "noting which page each fact came from.";
+    prompt += "\n\nReply with at most 8 terse bullets of the key facts (names, figures, dates), each noting its page.";
     json::AppendQuoted(out, prompt);
     out += R"(}],"tools":[{"type":"browser_search"}],"tool_choice":"required","reasoning_effort":"low",)"
-           R"("max_completion_tokens":2048,"stream":false})";
+           R"("max_completion_tokens":1536,"stream":false})";
     return out;
 }
 
@@ -724,9 +726,9 @@ std::string BuildToolResult(std::string_view query, const SearchOutcome& outcome
     std::string out = R"({"query":)";
     json::AppendQuoted(out, query);
     out += R"(,"summary":)";
-    json::AppendQuoted(out, TruncateUtf8(outcome.summary, 6000));
+    json::AppendQuoted(out, TruncateUtf8(outcome.summary, kToolSummaryBytes));
     out += R"(,"results":[)";
-    for (size_t i = 0; i < outcome.sources.size() && i < 8; ++i) {
+    for (size_t i = 0; i < outcome.sources.size() && i < kToolResults; ++i) {
         const Source& source = outcome.sources[i];
         if (i > 0) {
             out.push_back(',');
@@ -738,11 +740,11 @@ std::string BuildToolResult(std::string_view query, const SearchOutcome& outcome
         out += R"(,"url":)";
         json::AppendQuoted(out, source.url);
         out += R"(,"snippet":)";
-        json::AppendQuoted(out, TruncateUtf8(source.snippet, 600));
+        json::AppendQuoted(out, TruncateUtf8(source.snippet, kToolSnippetBytes));
         out.push_back('}');
     }
     out += R"(],"images":[)";
-    for (size_t i = 0; i < outcome.images.size() && i < 4; ++i) {
+    for (size_t i = 0; i < outcome.images.size() && i < kToolImages; ++i) {
         if (i > 0) {
             out.push_back(',');
         }

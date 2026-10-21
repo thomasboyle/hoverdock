@@ -27,9 +27,10 @@ constexpr size_t kMaxStreamBytes = 8U * 1024U * 1024U;
 constexpr size_t kMaxImageBytes = 8U * 1024U * 1024U;
 constexpr UINT kMaxImageSide = 16384;
 constexpr ULONGLONG kPublishIntervalMs = 50;
-// Tool rounds before the model must answer without tools.
-constexpr int kMaxToolRounds = 3;
-constexpr size_t kMaxCallsPerRound = 3;
+// Tool rounds before the model must answer without tools. Every round re-sends
+// the whole conversation (images and earlier results included) as input.
+constexpr int kMaxToolRounds = 2;
+constexpr size_t kMaxCallsPerRound = 2;
 
 class WinHttpHandle {
 public:
