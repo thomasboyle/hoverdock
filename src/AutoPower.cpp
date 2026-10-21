@@ -92,8 +92,19 @@ constexpr size_t kPlanSettingCount = sizeof(kPlanSettings) / sizeof(kPlanSetting
 // slower when the user is away and nothing demanding runs. Mouse input wakes
 // either at once through the dock's mouse hook.
 constexpr DWORD kTickMs = 1500;
+// Keyboard-only fallback poll when raw keyboard input is unavailable.
 constexpr DWORD kCreativeTickMs = 500;
 constexpr DWORD kParkedTickMs = 10000;
+constexpr DWORD kParkedEventTickMs = 30000;
+// Input in a focused app that is not at high power starts a short probe:
+// its CPU is read every 100 ms (a few handle reads, no process scan), so
+// work the user just started is confirmed in ~300 ms.
+constexpr DWORD kProbeTickMs = 100;
+constexpr ULONGLONG kProbeMs = 2000;
+// An unknown fullscreen app is checked for 3D load every 250 ms for the
+// first few seconds after it takes focus.
+constexpr DWORD kFullscreenProbeTickMs = 250;
+constexpr ULONGLONG kFullscreenProbeMs = 3000;
 // Plan polling when GUID_ACTIVE_POWERSCHEME notifications are unavailable.
 constexpr DWORD kDormantTickMs = 2000;
 // Timer wakes can land a little early; still count them as a full interval.
@@ -289,8 +300,10 @@ private:
 struct TickResult {
     AutoPowerStatus status;
     DWORD waitMs = kTickMs;
-    // Ask the mouse hook to wake the engine on the next input.
+    // Wake on the next input of any kind (pointer motion included).
     bool wantInput = false;
+    // Wake on the next click or key (starts a probe).
+    bool wantCommit = false;
 };
 
 // Everything the worker owns. Lives only on the worker thread.
@@ -310,7 +323,10 @@ public:
 
     // One evaluation: status to publish and how long to sleep. hookInputTick
     // is the GetTickCount of the last hook-reported input (0 = none).
-    TickResult Tick(bool forceLoadSample, bool planActive, DWORD hookInputTick) {
+    // commitWake: woken by a click or key (work may be starting);
+    // keyboardInput: keyboard input reaches NoteInput too.
+    TickResult Tick(bool forceLoadSample, bool planActive, DWORD hookInputTick, bool commitWake,
+        bool keyboardInput) {
         TickResult result;
         AutoPowerStatus& status = result.status;
         if (!planActive) {
@@ -329,11 +345,21 @@ public:
         }
 
         const ULONGLONG now = GetTickCount64();
+        m_fullscreenCache = -1;
         const DWORD foregroundPid = ForegroundPid();
-        if (forceLoadSample || foregroundPid != m_foregroundPid || now - m_lastLoadSample >= kLoadSampleMs ||
-            m_groups.empty()) {
+        const bool focusChanged = foregroundPid != m_foregroundPid;
+        if (focusChanged) {
+            m_fullscreenProbeUntil = now + kFullscreenProbeMs;
+        }
+        if (commitWake && !m_lastFull) {
+            m_probeUntil = now + kProbeMs;
+        }
+        const bool probing = now < m_probeUntil;
+        if (forceLoadSample || focusChanged || now - m_lastLoadSample >= kLoadSampleMs || m_groups.empty()) {
             m_foregroundPid = foregroundPid;
             SampleLoads(now);
+        } else if (probing || now < m_fullscreenProbeUntil) {
+            SampleForeground(now);
         }
 
         autopower::Inputs inputs;
@@ -346,10 +372,12 @@ public:
         inputs.apps.reserve(m_groups.size());
         const auto foregroundGroup = m_groupOfPid.find(foregroundPid);
         const std::wstring foregroundKey = foregroundGroup != m_groupOfPid.end() ? foregroundGroup->second : L"";
+        // Fullscreen state only matters for an app that could be an unknown
+        // game: known games, creative tools and browsers/players skip it.
         bool fullscreen = false;
         bool exclusive = false;
-        if (!foregroundKey.empty()) {
-            fullscreen = ForegroundIsFullscreen();
+        if (ForegroundCouldBeUnknownGame()) {
+            fullscreen = ForegroundFullscreen();
             QUERY_USER_NOTIFICATION_STATE state{};
             exclusive = SUCCEEDED(SHQueryUserNotificationState(&state)) && state == QUNS_RUNNING_D3D_FULL_SCREEN;
         }
@@ -362,8 +390,21 @@ public:
         }
 
         const autopower::Decision decision = m_policy.Update(inputs);
+        for (auto& [key, group] : m_groups) {
+            group.sample.freshLoad = false;
+        }
+        if (decision.fullPower) {
+            // Already at high power: nothing left for the probe to find.
+            m_probeUntil = 0;
+        }
         ApplyPlan(decision.fullPower);
-        ApplyThrottling(decision.unthrottle);
+        // Exemptions only change with the exempt set or group membership
+        // (rebuilt by each process scan); probe ticks usually change neither.
+        if (decision.unthrottle != m_lastUnthrottle || m_throttleGeneration != m_groupGeneration) {
+            ApplyThrottling(decision.unthrottle);
+            m_lastUnthrottle = decision.unthrottle;
+            m_throttleGeneration = m_groupGeneration;
+        }
 
         status.fullPower = decision.fullPower;
         status.reason = decision.reason;
@@ -384,14 +425,28 @@ public:
             demandingRunning = demandingRunning || group.sample.kind == autopower::AppKind::Creative ||
                 group.sample.kind == autopower::AppKind::Game || group.sample.registeredGame;
         }
-        if (!decision.fullPower && creativeFocused) {
-            result.waitMs = kCreativeTickMs;
-            result.wantInput = true;
-        } else if (!decision.fullPower && !demandingRunning && inputs.idleMs > m_policy.Settings().heavyIdleMs) {
-            // Away from the desk with nothing demanding open: only input or
-            // a focus change (both events) can create demand.
-            result.waitMs = kParkedTickMs;
-            result.wantInput = true;
+        if (!decision.fullPower) {
+            // A click or key starts a probe, so arm that wake unless one runs.
+            result.wantCommit = now >= m_probeUntil;
+            if (creativeFocused) {
+                // Driving a creative tool is any input, pointer motion too.
+                result.wantInput = true;
+                if (!keyboardInput) {
+                    result.waitMs = kCreativeTickMs;
+                }
+            } else if (!demandingRunning && inputs.idleMs > m_policy.Settings().heavyIdleMs) {
+                // Away from the desk with nothing demanding open: only input
+                // or a focus change (both events) can create demand.
+                result.wantInput = true;
+                result.waitMs = keyboardInput ? kParkedEventTickMs : kParkedTickMs;
+            }
+        }
+        if (now < m_probeUntil) {
+            result.waitMs = (std::min)(result.waitMs, static_cast<DWORD>(
+                (std::min)(static_cast<ULONGLONG>(kProbeTickMs), m_probeUntil - now)));
+        }
+        if (now < m_fullscreenProbeUntil && ForegroundCouldBeUnknownGame() && ForegroundFullscreen()) {
+            result.waitMs = (std::min)(result.waitMs, kFullscreenProbeTickMs);
         }
         return result;
     }
@@ -416,6 +471,10 @@ public:
         m_gpu.Close();
         m_gpuLoads.clear();
         m_lastGpuSample = 0;
+        m_probeUntil = 0;
+        m_fullscreenProbeUntil = 0;
+        m_lastUnthrottle.clear();
+        ++m_groupGeneration;
         m_foregroundPid = 0;
         m_lastFull = false;
         m_lastApp.clear();
@@ -696,7 +755,7 @@ private:
     double CpuPercent(Proc& proc, ULONGLONG now) {
         // Too short an interval (a focus change right after a sample) is
         // quantum noise: keep the last reading until a fair window passes.
-        if (proc.lastCpuTick != 0 && now - proc.lastCpuTick < 250) {
+        if (proc.lastCpuTick != 0 && now - proc.lastCpuTick < 50) {
             return proc.lastPercent;
         }
         FILETIME created{}, exited{}, kernel{}, user{};
@@ -766,6 +825,7 @@ private:
         // Group processes under their app roots; only roots get sampled.
         m_groups.clear();
         m_groupOfPid.clear();
+        ++m_groupGeneration;
         for (auto& [pid, proc] : m_procs) {
             const DWORD root = RootOf(pid);
             const auto rootIt = m_procs.find(root);
@@ -799,45 +859,9 @@ private:
             }
         }
 
-        // GPU engine counters are costly: only read them when a creative tool
-        // could be rendering, or a fullscreen app might be an unknown game.
-        bool creativeRunning = false;
-        for (const auto& [key, group] : m_groups) {
-            creativeRunning = creativeRunning || group.sample.kind == autopower::AppKind::Creative;
-        }
-        // An unknown fullscreen app is only a game with 3D load: probe every
-        // sample until decided. Renders only need the slower cadence.
-        bool fullscreenProbe = false;
-        const auto foreground = m_groupOfPid.find(m_foregroundPid);
-        if (foreground != m_groupOfPid.end()) {
-            const Group& group = m_groups[foreground->second];
-            fullscreenProbe = group.sample.kind == autopower::AppKind::Other && !group.sample.registeredGame &&
-                ForegroundIsFullscreen();
-        }
-        if (fullscreenProbe || (creativeRunning && now - m_lastGpuSample >= kGpuSampleMs)) {
-            m_gpu.Sample(m_gpuLoads);
-            m_lastGpuSample = now;
-        } else if (!fullscreenProbe && !creativeRunning) {
-            m_gpuLoads.clear();
-        }
+        SampleGpu(now);
         for (auto& [key, group] : m_groups) {
-            double cpu = 0.0;
-            double gpu = 0.0;
-            double gpu3d = 0.0;
-            for (const DWORD pid : group.pids) {
-                Proc& proc = m_procs[pid];
-                if (OpenProc(pid, proc)) {
-                    cpu += CpuPercent(proc, now);
-                }
-                const auto load = m_gpuLoads.find(pid);
-                if (load != m_gpuLoads.end()) {
-                    gpu = (std::max)(gpu, load->second.any);
-                    gpu3d = (std::max)(gpu3d, load->second.threeD);
-                }
-            }
-            group.sample.cpuPercent = (std::min)(cpu, 100.0);
-            group.sample.gpuPercent = gpu;
-            group.sample.gpu3dPercent = gpu3d;
+            MeasureGroup(group, now);
         }
 
         // Handles are only kept for app groups and exempted processes.
@@ -849,6 +873,82 @@ private:
                 proc.lastPercent = 0.0;
             }
         }
+    }
+
+    // Focused app without a known kind: fullscreen + 3D load could make it a game.
+    bool ForegroundCouldBeUnknownGame() const {
+        const auto foreground = m_groupOfPid.find(m_foregroundPid);
+        if (foreground == m_groupOfPid.end()) {
+            return false;
+        }
+        const auto group = m_groups.find(foreground->second);
+        return group != m_groups.end() && group->second.sample.kind == autopower::AppKind::Other &&
+            !group->second.sample.registeredGame;
+    }
+
+    // Foreground fullscreen state, read at most once per tick.
+    bool ForegroundFullscreen() {
+        if (m_fullscreenCache < 0) {
+            m_fullscreenCache = ForegroundIsFullscreen() ? 1 : 0;
+        }
+        return m_fullscreenCache == 1;
+    }
+
+    // GPU engine counters are the costliest read: renders only need the slow
+    // cadence; an unknown fullscreen app is probed fast right after focus.
+    void SampleGpu(ULONGLONG now) {
+        bool creativeRunning = false;
+        for (const auto& [key, group] : m_groups) {
+            creativeRunning = creativeRunning || group.sample.kind == autopower::AppKind::Creative;
+        }
+        const bool probe = ForegroundCouldBeUnknownGame() && ForegroundFullscreen();
+        if (!probe && !creativeRunning) {
+            m_gpuLoads.clear();
+            return;
+        }
+        const ULONGLONG interval = !probe ? kGpuSampleMs
+            : now < m_fullscreenProbeUntil ? static_cast<ULONGLONG>(kFullscreenProbeTickMs) - 50
+                                           : kLoadSampleMs;
+        if (m_lastGpuSample == 0 || now - m_lastGpuSample >= interval) {
+            m_gpu.Sample(m_gpuLoads);
+            m_lastGpuSample = now;
+        }
+    }
+
+    void MeasureGroup(Group& group, ULONGLONG now) {
+        double cpu = 0.0;
+        double gpu = 0.0;
+        double gpu3d = 0.0;
+        for (const DWORD pid : group.pids) {
+            Proc& proc = m_procs[pid];
+            if (OpenProc(pid, proc)) {
+                cpu += CpuPercent(proc, now);
+            }
+            const auto load = m_gpuLoads.find(pid);
+            if (load != m_gpuLoads.end()) {
+                gpu = (std::max)(gpu, load->second.any);
+                gpu3d = (std::max)(gpu3d, load->second.threeD);
+            }
+        }
+        group.sample.cpuPercent = (std::min)(cpu, 100.0);
+        group.sample.gpuPercent = gpu;
+        group.sample.gpu3dPercent = gpu3d;
+        group.sample.freshLoad = true;
+    }
+
+    // Probe tick: re-measure only the focused app from handles already open
+    // (no process scan), plus a GPU read when an unknown fullscreen app is due.
+    void SampleForeground(ULONGLONG now) {
+        const auto foreground = m_groupOfPid.find(m_foregroundPid);
+        if (foreground == m_groupOfPid.end()) {
+            return;
+        }
+        const auto group = m_groups.find(foreground->second);
+        if (group == m_groups.end()) {
+            return;
+        }
+        SampleGpu(now);
+        MeasureGroup(group->second, now);
     }
 
     void SetExempt(DWORD pid, Proc& proc, bool exempt) {
@@ -913,6 +1013,12 @@ private:
     DWORD m_foregroundPid = 0;
     ULONGLONG m_lastLoadSample = 0;
     ULONGLONG m_lastGpuSample = 0;
+    ULONGLONG m_probeUntil = 0;
+    ULONGLONG m_fullscreenProbeUntil = 0;
+    int m_fullscreenCache = -1;
+    unsigned m_groupGeneration = 0;
+    unsigned m_throttleGeneration = 0;
+    std::vector<std::wstring> m_lastUnthrottle;
     unsigned m_generation = 0;
     bool m_lastFull = false;
     std::wstring m_lastApp;
@@ -974,6 +1080,7 @@ void AutoPowerEngine::Start(HWND notifyHwnd, UINT notifyMsg, bool adoptBalanced)
         m_stop = false;
         m_woken = false;
         m_forceSample = false;
+        m_commitWake = false;
         m_notifyHwnd = notifyHwnd;
         m_notifyMsg = notifyMsg;
         m_status = {};
@@ -1011,19 +1118,26 @@ void AutoPowerEngine::Wake() noexcept {
     Signal(true);
 }
 
-void AutoPowerEngine::NoteInput() noexcept {
-    if (!m_wantInput.load(std::memory_order_relaxed) || !m_wantInput.exchange(false)) {
-        return;
-    }
+void AutoPowerEngine::NoteInput(bool commit) noexcept {
+    // Every input is stamped: GetLastInputInfo lags behind hooks and raw input.
     m_hookInputTick.store(GetTickCount(), std::memory_order_relaxed);
-    Signal(false);
+    const bool any = m_wantInput.load(std::memory_order_relaxed) && m_wantInput.exchange(false);
+    const bool starts = commit && m_wantCommit.load(std::memory_order_relaxed) && m_wantCommit.exchange(false);
+    if (any || starts) {
+        Signal(false, starts);
+    }
 }
 
-void AutoPowerEngine::Signal(bool forceSample) noexcept {
+void AutoPowerEngine::SetKeyboardInputAvailable(bool available) noexcept {
+    m_keyboardInput.store(available, std::memory_order_relaxed);
+}
+
+void AutoPowerEngine::Signal(bool forceSample, bool commit) noexcept {
     {
         std::lock_guard lock(m_mutex);
         m_woken = true;
         m_forceSample = m_forceSample || forceSample;
+        m_commitWake = m_commitWake || commit;
     }
     m_wake.notify_all();
 }
@@ -1069,13 +1183,16 @@ void AutoPowerEngine::ThreadMain() {
     {
         Engine engine;
         bool forceSample = true;
+        bool commitWake = false;
         for (;;) {
             const int planState = m_planState.load();
             const bool planActive = planState == 0 ? ActivePlanIs(kAutoPlan) : planState == 1;
-            const TickResult result =
-                engine.Tick(forceSample, planActive, m_hookInputTick.load(std::memory_order_relaxed));
+            const TickResult result = engine.Tick(forceSample, planActive,
+                m_hookInputTick.load(std::memory_order_relaxed), commitWake,
+                m_keyboardInput.load(std::memory_order_relaxed));
             const AutoPowerStatus& status = result.status;
             m_wantInput.store(status.engaged && result.wantInput, std::memory_order_relaxed);
+            m_wantCommit.store(status.engaged && result.wantCommit, std::memory_order_relaxed);
             HWND notifyHwnd = nullptr;
             UINT notifyMsg = 0;
             {
@@ -1103,10 +1220,13 @@ void AutoPowerEngine::ThreadMain() {
                 break;
             }
             forceSample = m_forceSample;
+            commitWake = m_commitWake;
+            m_commitWake = false;
             m_forceSample = false;
             m_woken = false;
         }
         m_wantInput.store(false);
+        m_wantCommit.store(false);
         if (notify != nullptr) {
             PowerSettingUnregisterNotification(notify);
         }

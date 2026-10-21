@@ -60,6 +60,9 @@ struct AppSample {
     // Busiest GPU engine of any type, and the busiest 3D engine (0-100).
     double gpuPercent = 0.0;
     double gpu3dPercent = 0.0;
+    // Load figures were measured for this update. Re-evaluations that reuse
+    // an earlier reading (input or focus ticks) must not count as new load.
+    bool freshLoad = true;
 };
 
 struct Inputs {
@@ -84,12 +87,14 @@ struct Tuning {
     uint64_t interactIdleMs = 5000;
     // Heavy foreground work stops counting once the user walks away.
     uint64_t heavyIdleMs = 5 * 60 * 1000;
-    // Sustained load thresholds: above the threshold for at least sustainMs
-    // (two load samples apart) so an app launch or a single spike never boosts.
+    // Sustained load: at least sustainSamples fresh busy samples spanning
+    // sustainMs, so an app launch or a single spike never boosts. With the
+    // engine's 100 ms probe after input this confirms in ~300 ms.
     double renderCpuPercent = 15.0;
     double renderGpuPercent = 25.0;
     double heavyCpuPercent = 35.0;
-    uint64_t sustainMs = 1500;
+    uint64_t sustainMs = 300;
+    int sustainSamples = 2;
     // Borderless fullscreen counts as a game above this 3D engine load.
     double fullscreenGame3dPercent = 20.0;
     // Hold after demand stops, per reason.
@@ -126,6 +131,8 @@ private:
         // When the current busy run started (0 = not busy).
         uint64_t renderSinceMs = 0;
         uint64_t heavySinceMs = 0;
+        int renderSamples = 0;
+        int heavySamples = 0;
         // Update generation that last saw this app (exited apps are dropped).
         uint64_t seenGeneration = 0;
         bool exemptNow = false;

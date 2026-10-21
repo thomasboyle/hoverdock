@@ -3118,7 +3118,9 @@ LRESULT CALLBACK DockApp::ContextWindowProcedure(HWND window, UINT message, WPAR
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
         // Automatic energy mode: wakes its engine only when it asked for input.
-        s_instance->m_autoPower.NoteInput();
+        // Clicks are commits (they start work); motion and wheel are not.
+        s_instance->m_autoPower.NoteInput(wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
+            wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN);
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         if (wParam == WM_MOUSEMOVE && !s_instance->IsDragActive() &&
             s_instance->NeedsHookPointerPost(mouse->pt)) {
@@ -3846,12 +3848,21 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         ApplyBluetoothSnapshot();
         return 0;
 
-    case kAutoPowerMessage:
+    case WM_INPUT:
+        // Raw keyboard sink for the Automatic energy mode; DefWindowProc
+        // below frees the input data.
+        m_autoPower.NoteInput(true);
+        break;
+
+    case kAutoPowerMessage: {
+        const AutoPowerStatus autoPower = m_autoPower.Status();
+        SyncAutoPowerKeyboard(autoPower.engaged && !autoPower.fullPower);
         // Only the Power page shows the Automatic mode's live state.
         if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Power) {
             QueueOverflowPaint();
         }
         return 0;
+    }
 
     case kSpeedTestMessage:
         // Progress only matters while the Wi-Fi page shows it.
@@ -4000,6 +4011,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         StopShellFlyoutWatch();
         StopSearchServices();
         m_perfProfiler.Stop();
+        SyncAutoPowerKeyboard(false);
         m_autoPower.Stop();
         DestroyDockSettings();
         BeginOverflowHide(false);
@@ -14197,6 +14209,24 @@ void DockApp::UnregisterSystemResumeNotifications() noexcept {
         }
         m_sessionNotifyRegistered = false;
     }
+}
+
+void DockApp::SyncAutoPowerKeyboard(bool wanted) noexcept {
+    if (wanted == m_autoPowerKeyboard || m_window == nullptr) {
+        return;
+    }
+    RAWINPUTDEVICE keyboard{0x01, 0x06, wanted ? static_cast<DWORD>(RIDEV_INPUTSINK) : static_cast<DWORD>(RIDEV_REMOVE),
+        wanted ? m_window : nullptr};
+    const bool ok = RegisterRawInputDevices(&keyboard, 1, sizeof(keyboard)) != FALSE;
+    if (wanted) {
+        // Without the sink the engine falls back to polling for keyboard input.
+        m_autoPower.SetKeyboardInputAvailable(ok);
+        if (!ok) {
+            Log(L"Raw keyboard input unavailable; Automatic polls for keyboard-only input.");
+            return;
+        }
+    }
+    m_autoPowerKeyboard = wanted && ok;
 }
 
 LRESULT DockApp::HandlePowerBroadcast(WPARAM wParam, LPARAM lParam) {

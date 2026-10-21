@@ -170,8 +170,10 @@ void TestBackgroundRenderBoosts() {
     Decision decision = policy.Update(At(1000, 0, {blender, browser}));
     EXPECT(!decision.fullPower);
     EXPECT(Unthrottled(decision, L"blender.exe"));
-    EXPECT(!policy.Update(At(1500, 0, {blender, browser})).fullPower);
-    EXPECT(!policy.Update(At(2000, 0, {blender, browser})).fullPower);
+    AppSample staleBlender = blender;
+    staleBlender.freshLoad = false;
+    EXPECT(!policy.Update(At(1500, 0, {staleBlender, browser})).fullPower);
+    EXPECT(!policy.Update(At(2000, 0, {staleBlender, browser})).fullPower);
 
     decision = policy.Update(At(2500, 0, {blender, browser}));
     EXPECT(decision.fullPower);
@@ -215,6 +217,44 @@ void TestHeavyForegroundWork() {
     EXPECT(!background.Update(At(2500, 0, {indexer})).fullPower);
 }
 
+void TestFastProbeConfirmsInMilliseconds() {
+    // After input the engine samples the focused app every 100 ms: sustained
+    // load is confirmed ~300 ms after it starts.
+    Policy policy;
+    AppSample build = App(L"devenv.exe", AppKind::Other, true);
+    build.cpuPercent = 80.0;
+    EXPECT(!policy.Update(At(1000, 50, {build})).fullPower);
+    EXPECT(!policy.Update(At(1100, 150, {build})).fullPower);
+    EXPECT(!policy.Update(At(1200, 250, {build})).fullPower);
+    const Decision decision = policy.Update(At(1300, 350, {build}));
+    EXPECT(decision.fullPower);
+    EXPECT(decision.reason == BoostReason::Heavy);
+
+    // A creative export started from the UI is confirmed just as fast.
+    Policy render;
+    AppSample resolve = App(L"resolve.exe", AppKind::Creative);
+    resolve.gpuPercent = 95.0;
+    static_cast<void>(render.Update(At(1000, 60000, {resolve})));
+    EXPECT(!render.Update(At(1100, 60000, {resolve})).fullPower);
+    EXPECT(render.Update(At(1300, 60000, {resolve})).reason == BoostReason::Render);
+}
+
+void TestShortSpikeNeverBoosts() {
+    Policy policy;
+    AppSample app = App(L"explorer2.exe", AppKind::Other, true);
+    app.cpuPercent = 90.0;
+    static_cast<void>(policy.Update(At(1000, 0, {app})));
+    static_cast<void>(policy.Update(At(1100, 0, {app})));
+    static_cast<void>(policy.Update(At(1200, 0, {app})));
+    app.cpuPercent = 2.0;
+    EXPECT(!policy.Update(At(1300, 0, {app})).fullPower);
+    app.cpuPercent = 90.0;
+    // The run restarts from scratch after the dip.
+    EXPECT(!policy.Update(At(1400, 0, {app})).fullPower);
+    EXPECT(!policy.Update(At(1600, 0, {app})).fullPower);
+    EXPECT(policy.Update(At(1700, 0, {app})).fullPower);
+}
+
 void TestForegroundWinsAttribution() {
     Policy policy;
     AppSample blender = App(L"blender.exe", AppKind::Creative);
@@ -254,6 +294,8 @@ int main() {
     TestCreativeInteractionBoosts();
     TestBackgroundRenderBoosts();
     TestHeavyForegroundWork();
+    TestFastProbeConfirmsInMilliseconds();
+    TestShortSpikeNeverBoosts();
     TestForegroundWinsAttribution();
     TestExitedAppReleasesImmediately();
     TestResetClearsHolds();
