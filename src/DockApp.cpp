@@ -7795,11 +7795,11 @@ bool DockApp::TickLivePopupGlass()
     const UINT dockFaceFlags = PackPopupGlassFxFlags(true);
     const UINT contextFlags = PackPopupGlassFxFlags(false);
 
-    const UINT searchFlags = PackPopupGlassFxFlags(true, false, false);
+    const UINT searchFlags = SearchGlassFxFlags();
     for (int target = 0; target < 4; ++target) {
         const UINT fxFlags = target == 1 ? PackPopupGlassFxFlags(true, true)
             : (target == 2 ? contextFlags : (target == 3 ? searchFlags : dockFaceFlags));
-        const float glassAlpha = target == 2 ? contextAlpha : settingsAlpha;
+        const float glassAlpha = target == 2 ? contextAlpha : (target == 3 ? 1.0F : settingsAlpha);
         POINT origin{};
         LONG width = 0;
         LONG height = 0;
@@ -7852,7 +7852,7 @@ bool DockApp::TickLivePopupGlass()
         if (m_renderer.BeginLiveGlassPanelBake(screenRect, static_cast<UINT>(width),
                 static_cast<UINT>(height), fxFlags, glassAlpha, dpiScale, m_settingsWindow,
                 m_overflowWindow, target == 3 ? m_searchWindow : m_contextWindow,
-                target != 2 && m_config.LightPanels(), target, &unchanged)) {
+                target == 3 ? m_searchLightTheme : (target != 2 && m_config.LightPanels()), target, &unchanged)) {
             m_popupGlassDirty[target] = false;
             m_lastPopupGlassRefreshMs = GetTickCount64();
             didWork = true;

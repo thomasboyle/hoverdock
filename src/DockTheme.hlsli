@@ -115,3 +115,13 @@
 // shapes read from the panel instance buffer; see CcGlass in Shaders.hlsl).
 // Halo bits 8-13 are unused for panels, so bit 10 is free.
 #define DOCK_FX_CC 0x400u
+// With PANEL | DOCK_FACE: macOS Spotlight material for the Search panel - the
+// dock silhouette with a wide frost (per-pass sigma = SPOTLIGHT_BLUR_PX / 2,
+// full 5H + 5V stack), 180% vibrancy and the system light/dark fill (scene0.w).
+#define DOCK_FX_SPOTLIGHT 0x800u
+#define DOCK_SPOTLIGHT_BLUR_PX 24.0f
+#define DOCK_SPOTLIGHT_SATURATION 1.8f
+#define DOCK_SPOTLIGHT_LIGHT_FILL 0.965f
+#define DOCK_SPOTLIGHT_LIGHT_ALPHA 0.72f
+#define DOCK_SPOTLIGHT_DARK_FILL 0.118f
+#define DOCK_SPOTLIGHT_DARK_ALPHA 0.70f

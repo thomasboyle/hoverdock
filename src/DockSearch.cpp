@@ -674,6 +674,11 @@ bool DockApp::OpenSearch() {
         ClearPopupLayeredCorners(m_searchWindow);
     }
 
+    const bool lightTheme = SystemUsesLightApps();
+    if (lightTheme != m_searchLightTheme) {
+        m_searchLightTheme = lightTheme;
+        m_searchGlass.clear();
+    }
     // Like Spotlight: reopen with the previous query selected.
     m_searchSelectAll = !m_searchText.empty();
     m_searchCaret = m_searchText.size();
@@ -824,23 +829,37 @@ float DockApp::DockCornerRadiusPx(float scale) const noexcept {
     return pill * kDockCornerToHeight;
 }
 
-// Same GlassPS material as the dock bar (PANEL | DOCK_FACE without the Control
-// Centre shapes): tint, frost, lens, rim and superellipse corners all match.
+UINT DockApp::SearchGlassFxFlags() const noexcept {
+    // Spotlight always runs the full blur stack, whatever the dock's Frost slider says.
+    constexpr UINT kFrostMask = 0xFFU << 16U;
+    return (PackPopupGlassFxFlags(true, false, false) & ~kFrostMask) | (0xFFU << 16U) | DOCK_FX_BLUR |
+        DOCK_FX_SPOTLIGHT;
+}
+
+bool DockApp::SystemUsesLightApps() noexcept {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+               L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS &&
+        value != 0;
+}
+
+// Dock silhouette and corners with the macOS Spotlight material: wide frost,
+// 180% vibrancy and a light or dark fill following the Windows app theme.
 bool DockApp::BakeSearchGlass(POINT origin, SIZE size, uint8_t* pixels, size_t bytes) {
     if (!m_rendererInitialized || pixels == nullptr || size.cx <= 0 || size.cy <= 0 ||
         bytes != static_cast<size_t>(size.cx) * static_cast<size_t>(size.cy) * 4U) {
         return false;
     }
-    const float frost = m_config.FrostAmount();
-    const float glassAlpha = DOCK_GLASS_ALPHA + (1.0F - DOCK_GLASS_ALPHA) * frost;
+    const float glassAlpha = 1.0F;
     const float dpiScale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
     const RECT screenRect{origin.x, origin.y, origin.x + size.cx, origin.y + size.cy};
     m_renderer.SetCcShapes({});
     m_renderer.SetPanelCornerRadius(DockCornerRadiusPx(dpiScale));
     std::vector<uint8_t> glass;
     if (!m_renderer.BakeGlassPanel(screenRect, static_cast<UINT>(size.cx), static_cast<UINT>(size.cy),
-            PackPopupGlassFxFlags(true, false, false), glassAlpha, dpiScale, m_settingsWindow, m_overflowWindow,
-            m_searchWindow, m_config.LightPanels(), glass) ||
+            SearchGlassFxFlags(), glassAlpha, dpiScale, m_settingsWindow, m_overflowWindow, m_searchWindow,
+            m_searchLightTheme, glass) ||
         glass.size() != bytes) {
         return false;
     }
@@ -910,10 +929,11 @@ void DockApp::PaintSearch() {
     if (glass.size() != bytes) {
         glass.assign(bytes, 0);
         if (!BakeSearchGlass(origin, size, glass.data(), bytes)) {
-            // No GPU bake: a neutral plate in the dock's silhouette.
+            // No GPU bake: the Spotlight fill alone in the dock's silhouette.
             std::fill(glass.begin(), glass.end(), static_cast<uint8_t>(0));
+            const auto shade = static_cast<uint8_t>(m_searchLightTheme ? 240 : 38);
             FillSquircleColorPremul(glass.data(), width, height, {0, 0, size.cx, size.cy},
-                DockCornerRadiusPx(scale), 0.90F, 0xC8, 0xC4, 0xC4);
+                DockCornerRadiusPx(scale), 0.94F, shade, shade, shade);
         }
     }
     m_searchBits = glass;
