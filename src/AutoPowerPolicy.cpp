@@ -244,13 +244,24 @@ uint64_t Policy::HoldMs(BoostReason reason) const noexcept {
 }
 
 BoostReason Policy::Demand(const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track) const {
-    // Busy-run start times; nowMs is never 0 in practice, keep 0 as "idle".
+    // Busy runs advance only on fresh load samples; nowMs is never 0 in
+    // practice, keep 0 as "idle".
     const uint64_t stamp = (std::max)(nowMs, uint64_t{1});
-    const bool renderBusy = app.kind == AppKind::Creative &&
-        (app.cpuPercent >= m_tuning.renderCpuPercent || app.gpuPercent >= m_tuning.renderGpuPercent);
-    track.renderSinceMs = renderBusy ? (track.renderSinceMs != 0 ? track.renderSinceMs : stamp) : 0;
-    const bool heavyBusy = app.foreground && app.cpuPercent >= m_tuning.heavyCpuPercent;
-    track.heavySinceMs = heavyBusy ? (track.heavySinceMs != 0 ? track.heavySinceMs : stamp) : 0;
+    if (app.freshLoad) {
+        const bool renderBusy = app.kind == AppKind::Creative &&
+            (app.cpuPercent >= m_tuning.renderCpuPercent || app.gpuPercent >= m_tuning.renderGpuPercent);
+        track.renderSinceMs = renderBusy ? (track.renderSinceMs != 0 ? track.renderSinceMs : stamp) : 0;
+        track.renderSamples = renderBusy ? track.renderSamples + 1 : 0;
+    }
+    // Heavy work only counts in the foreground; losing focus ends the run.
+    if (!app.foreground) {
+        track.heavySinceMs = 0;
+        track.heavySamples = 0;
+    } else if (app.freshLoad) {
+        const bool heavyBusy = app.cpuPercent >= m_tuning.heavyCpuPercent;
+        track.heavySinceMs = heavyBusy ? (track.heavySinceMs != 0 ? track.heavySinceMs : stamp) : 0;
+        track.heavySamples = heavyBusy ? track.heavySamples + 1 : 0;
+    }
 
     if (app.foreground) {
         const bool fullscreenGame = app.fullscreen && app.kind == AppKind::Other &&
@@ -266,10 +277,10 @@ BoostReason Policy::Demand(const AppSample& app, uint64_t nowMs, uint64_t idleMs
             return BoostReason::Creative;
         }
     }
-    if (track.renderSinceMs != 0 && stamp - track.renderSinceMs >= m_tuning.sustainMs) {
+    if (track.renderSamples >= m_tuning.sustainSamples && stamp - track.renderSinceMs >= m_tuning.sustainMs) {
         return BoostReason::Render;
     }
-    if (track.heavySinceMs != 0 && stamp - track.heavySinceMs >= m_tuning.sustainMs &&
+    if (track.heavySamples >= m_tuning.sustainSamples && stamp - track.heavySinceMs >= m_tuning.sustainMs &&
         idleMs <= m_tuning.heavyIdleMs) {
         return BoostReason::Heavy;
     }

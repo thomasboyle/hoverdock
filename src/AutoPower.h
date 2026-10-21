@@ -49,10 +49,14 @@ public:
     // Re-evaluate now with a fresh load sample (foreground changed, energy
     // mode picked).
     void Wake() noexcept;
-    // Called from the dock's low-level mouse hook. Costs one relaxed atomic
-    // load unless the engine asked to be woken by input (a focused creative
-    // tool waiting to be driven, or an idle machine parked on a slow poll).
+    // Called for every mouse (low-level hook) and keyboard (raw input) event.
+    // Costs two relaxed atomic operations unless the engine asked to be woken
+    // by input, which it does whenever it is not already at high power: the
+    // next input then starts a short fast probe of the focused app.
     void NoteInput() noexcept;
+    // Keyboard input reaches NoteInput too (raw input registered), so no
+    // keyboard fallback polling is needed.
+    void SetKeyboardInputAvailable(bool available) noexcept;
 
     [[nodiscard]] AutoPowerStatus Status() const;
 
@@ -73,6 +77,7 @@ private:
     bool m_woken = false;
     bool m_forceSample = false;
     std::atomic<bool> m_wantInput{false};
+    std::atomic<bool> m_keyboardInput{false};
     std::atomic<DWORD> m_hookInputTick{0};
     // 0 = unknown (poll the active plan), 1 = ours active, 2 = another plan.
     std::atomic<int> m_planState{0};

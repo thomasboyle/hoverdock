@@ -2596,6 +2596,14 @@ int DockApp::Run() {
             ScheduleConfigSave();
         }
         m_autoPower.Start(m_window, kAutoPowerMessage, adoptBalanced);
+        // Keyboard input wakes the engine as instantly as the mouse hook does.
+        // Raw input sink: no global hook, and keys still reach their app.
+        RAWINPUTDEVICE keyboard{0x01, 0x06, RIDEV_INPUTSINK, m_window};
+        const bool keyboardInput = RegisterRawInputDevices(&keyboard, 1, sizeof(keyboard)) != FALSE;
+        if (!keyboardInput) {
+            Log(L"Raw keyboard input unavailable; Automatic polls for keyboard-only input.");
+        }
+        m_autoPower.SetKeyboardInputAvailable(keyboardInput);
     }
 
     GetCursorPos(&m_lastCursor);
@@ -3846,6 +3854,12 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         ApplyBluetoothSnapshot();
         return 0;
 
+    case WM_INPUT:
+        // Raw keyboard sink for the Automatic energy mode; DefWindowProc
+        // below frees the input data.
+        m_autoPower.NoteInput();
+        break;
+
     case kAutoPowerMessage:
         // Only the Power page shows the Automatic mode's live state.
         if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Power) {
@@ -4000,6 +4014,10 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         StopShellFlyoutWatch();
         StopSearchServices();
         m_perfProfiler.Stop();
+        {
+            RAWINPUTDEVICE keyboard{0x01, 0x06, RIDEV_REMOVE, nullptr};
+            static_cast<void>(RegisterRawInputDevices(&keyboard, 1, sizeof(keyboard)));
+        }
         m_autoPower.Stop();
         DestroyDockSettings();
         BeginOverflowHide(false);

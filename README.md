@@ -104,7 +104,7 @@ Quick Settings → **Power** → **Energy Mode** works like the macOS menu. **Lo
   - **Heavy work in the focused app**, such as a compile.
 - Games and creative tools are never throttled by Windows' background power saving (EcoQoS) while they run.
 
-The Automatic row shows **High Power** while it's boosting an app and **Low Power** the rest of the time. Each boost is held a few seconds after the work stops, so power doesn't flicker on and off. Picking Low or High Power hands control back to Windows and undoes everything Automatic changed. If you were on Balanced (which Hoverdock already showed as Automatic), it moves you to the Automatic plan once. Uninstalling Hoverdock switches you back to Balanced and removes the plan.
+The Automatic row shows **High Power** while it's boosting an app and **Low Power** the rest of the time. It reacts in milliseconds: switching to a game or touching the mouse or keyboard in a creative tool goes to High Power straight away, and work you start (an export, a render, a build) is confirmed within about a third of a second. Each boost is held a few seconds after the work stops, so power doesn't flicker on and off. Picking Low or High Power hands control back to Windows and undoes everything Automatic changed. If you were on Balanced (which Hoverdock already showed as Automatic), it moves you to the Automatic plan once. Uninstalling Hoverdock switches you back to Balanced and removes the plan.
 
 ## Build it yourself
 
