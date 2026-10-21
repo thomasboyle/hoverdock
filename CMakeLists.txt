@@ -53,6 +53,11 @@ add_executable(Dock WIN32
     src/FileSearch.cpp
     src/SearchHotkey.cpp
     src/DockSearch.cpp
+    src/AiMarkdown.cpp
+    src/AiAnswerView.cpp
+    src/GroqProtocol.cpp
+    src/GroqClient.cpp
+    src/AiAttachments.cpp
 )
 
 file(GLOB _dock_media_headers
@@ -139,6 +144,7 @@ target_link_libraries(Dock PRIVATE
     wbemuuid
     pdh
     dbghelp
+    crypt32
 )
 
 set(DOCK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.hlsl")
@@ -198,6 +204,9 @@ set_property(TARGET Dock PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_D
 #   FileSearchIndexBench   query benchmark at real-volume scale
 #   FileSearchServiceTests real-disk MFT/journal/helper integration (elevated)
 #   TrayIconsTests         system tray detection against the live shell
+#   AiMarkdownTests        AI answer Markdown parser (portable)
+#   GroqProtocolTests      Groq request/stream/source handling (portable)
+#   AiPipelineBench        AI answer streaming/request benchmark (portable)
 option(DOCK_BUILD_TESTS "Build the Search engine tests" OFF)
 if(DOCK_BUILD_TESTS)
     enable_testing()
@@ -218,6 +227,13 @@ if(DOCK_BUILD_TESTS)
     target_link_libraries(TrayIconsTests PRIVATE ole32 oleaut32 shell32 user32 gdi32 advapi32 dwmapi
         powrprof wlanapi dxva2 UIAutomationCore propsys shlwapi)
     add_test(NAME FileSearchIndexTests COMMAND FileSearchIndexTests)
+    # Search AI answers: Markdown parsing and the Groq protocol (portable).
+    add_dock_test(AiMarkdownTests tests/AiMarkdownTests.cpp src/AiMarkdown.cpp)
+    add_dock_test(GroqProtocolTests tests/GroqProtocolTests.cpp src/GroqProtocol.cpp)
+    # AI answer pipeline benchmark (streaming parse/convert, request JSON); not a CTest.
+    add_dock_test(AiPipelineBench tests/AiPipelineBench.cpp src/AiMarkdown.cpp src/GroqProtocol.cpp)
+    add_test(NAME AiMarkdownTests COMMAND AiMarkdownTests)
+    add_test(NAME GroqProtocolTests COMMAND GroqProtocolTests)
 endif()
 
 # Signed PawnIO IntelMSR blob header (third_party/pawnio/IntelMsrBin.h).

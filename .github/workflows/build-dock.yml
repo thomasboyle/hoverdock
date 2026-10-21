@@ -33,6 +33,8 @@ jobs:
           out\bin\Release\FileSearchIndexBench.exe || exit /b 1
           out\bin\Release\FileSearchServiceTests.exe || exit /b 1
           out\bin\Release\TrayIconsTests.exe || exit /b 1
+          out\bin\Release\AiMarkdownTests.exe || exit /b 1
+          out\bin\Release\GroqProtocolTests.exe || exit /b 1
 
       - name: Install NSIS
         shell: powershell

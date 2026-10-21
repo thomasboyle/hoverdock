@@ -25,6 +25,14 @@ public:
     void SetDockScale(float scale) noexcept;
     [[nodiscard]] const std::wstring& Path() const noexcept;
     [[nodiscard]] std::wstring TypeSafeApiKey() const;
+    // Groq key for Search's AI answers (Ctrl+Enter). GROQ_API_KEY wins over
+    // dock.ini, where the key is stored DPAPI-encrypted for this Windows user.
+    [[nodiscard]] std::wstring GroqApiKey() const;
+    [[nodiscard]] bool GroqApiKeyFromEnvironment() const;
+    void SetGroqApiKey(std::wstring key);
+    // Groq model id; empty in dock.ini means the default (qwen/qwen3.8-27b).
+    [[nodiscard]] std::wstring AiModel() const;
+    void SetAiModel(std::wstring model);
     // Win+Space opens dock Search (dock.ini SearchHotkey=0 leaves Win+Space
     // to the Windows input-language switcher).
     [[nodiscard]] bool SearchHotkey() const noexcept;
@@ -91,6 +99,8 @@ private:
     bool m_followsTaskbarPins = true;
     float m_dockScale = 1.0F;
     std::wstring m_typeSafeApiKey;
+    std::wstring m_groqApiKey;
+    std::wstring m_aiModel;
     bool m_searchHotkey = true;
     bool m_launchAtStartup = false;
     bool m_checkForUpdates = true;

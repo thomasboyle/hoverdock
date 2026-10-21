@@ -1,6 +1,9 @@
 #pragma once
 
 #include "DockConfig.h"
+#include "AiAnswerView.h"
+#include "AiAttachments.h"
+#include "GroqClient.h"
 #include "InstalledApps.h"
 #include "NotificationBadges.h"
 #include "Renderer.h"
@@ -100,7 +103,8 @@ private:
 
     // Spotlight-style Search panel rows.
     struct SearchRow {
-        enum class Kind : uint8_t { App, File, Folder, Web, EnableMft, Info };
+        // Link opens `path` (a URL); Ai asks the AI about the query.
+        enum class Kind : uint8_t { App, File, Folder, Web, EnableMft, Info, Link, Ai };
         Kind kind = Kind::Info;
         std::wstring title;
         std::wstring subtitle;
@@ -115,6 +119,10 @@ private:
         std::vector<LaunchTarget> targets;
         std::vector<std::wstring> names;
     };
+
+    // What the Search panel is showing: results, an AI answer, or a one-line
+    // entry for a Dock Settings value (Groq API key / AI model).
+    enum class SearchMode : uint8_t { Search, Ai, KeyEntry, ModelEntry };
 
     struct SearchIconReply {
         UINT extent = 0;
@@ -165,6 +173,14 @@ private:
     static constexpr UINT kSearchIconMessage = WM_APP + 37;
     static constexpr UINT kSearchAppsMessage = WM_APP + 38;
     static constexpr UINT kSearchMftAccessMessage = WM_APP + 39;
+    // AI answer progress: wParam = AiSession id (state read from the session).
+    static constexpr UINT kAiUpdateMessage = WM_APP + 40;
+    // AI answer image decoded: lParam owns an AiImageReply.
+    static constexpr UINT kAiImageMessage = WM_APP + 41;
+    // Dock Settings AI rows: wParam = SearchMode to open Search in.
+    static constexpr UINT kOpenSearchEntryMessage = WM_APP + 42;
+    // AI image attachment prepared: lParam owns an AiAttachmentReply.
+    static constexpr UINT kAiAttachmentMessage = WM_APP + 43;
     static constexpr UINT_PTR kWeatherTimerId = 10;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
@@ -333,6 +349,8 @@ private:
         QsColorSat,
         QsColorVal,
         QsColorReset,
+        AiApiKey,
+        AiModel,
     };
 
     struct SettingsHit {
@@ -475,7 +493,9 @@ private:
         const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
         const RECT* dirty = nullptr, bool preservePopupShadow = false) noexcept;
     void QueueSettingsPaint(bool hoverOnly = false);
-    [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false) const noexcept;
+    // allowCc=false keeps the plain dock material even while Dock Settings has CC shapes.
+    [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false,
+        bool allowCc = true) const noexcept;
     // `alsoExclude` keeps another visible popup (Search) out of the sample.
     [[nodiscard]] bool TryBakePopupGlass(POINT origin, LONG width, LONG height,
         uint8_t* pixels, size_t byteCount, bool dockFace, bool popupShadow = false,
@@ -648,6 +668,37 @@ private:
     void DestroySearchFonts() noexcept;
     void StartSearchServices();
     void StopSearchServices() noexcept;
+    // Search panel glass: the dock's own material and corner (live-refreshed
+    // by TickLivePopupGlass as target 3).
+    [[nodiscard]] float DockCornerRadiusPx(float scale) const noexcept;
+    [[nodiscard]] bool BakeSearchGlass(POINT origin, SIZE size, uint8_t* pixels, size_t bytes);
+    [[nodiscard]] bool SearchGlassLiveReady(POINT& origin, SIZE& size) const;
+    void ApplySearchLiveGlass(std::vector<uint8_t>& glass);
+    // AI answers in Search (Ctrl+Enter), DockSearch.cpp.
+    void AskAi();
+    void ApplyAiUpdate(uint64_t sessionId);
+    void ApplyAiImage(std::unique_ptr<AiImageReply> image);
+    void RequestAiImages();
+    // Stops the answer and returns to plain Search state (no repaint/query).
+    void ExitAiState() noexcept;
+    void PaintSearchAi(uint8_t* pixels, int width, int height, float scale, LONG listTop);
+    bool HandleAiClick(POINT client);
+    [[nodiscard]] int AiHoverTarget(POINT client) const;
+    [[nodiscard]] bool AiPointerIsLink(POINT client) const;
+    void ScrollAi(int delta);
+    void CopyAiAnswer();
+    // Image attachments for the AI question (paste, picker), DockSearch.cpp.
+    void AddAiAttachments(std::vector<AiAttachmentSource> sources);
+    void ApplyAiAttachment(std::unique_ptr<AiAttachmentReply> reply);
+    void RemoveAiAttachment(size_t index);
+    void ClearAiAttachments();
+    void PickAiAttachments();
+    [[nodiscard]] LONG AttachStripHeight(float scale) const noexcept;
+    void PaintAttachStrip(uint8_t* pixels, int width, int height, float scale, LONG top, LONG left);
+    void OpenSearchEntry(SearchMode mode);
+    void BuildSearchEntryRows();
+    void CommitSearchEntry();
+    void ExitSearchEntry(bool refresh);
     [[nodiscard]] std::vector<LaunchTarget> CollectLaunchTargets(
         const std::vector<DisplayApp>& displayApps,
         const std::vector<RunningWindow>& runningWindows) const;
@@ -1041,7 +1092,42 @@ private:
     HFONT m_searchSubFont = nullptr;
     HFONT m_searchGlyphFont = nullptr;
     HFONT m_searchBigGlyphFont = nullptr;
+    HFONT m_searchSmallGlyphFont = nullptr;
     LayerPresentDib m_searchLayerDib{};
+    // ---- Search AI answers ----
+    SearchMode m_searchMode = SearchMode::Search;
+    std::wstring m_searchSavedText;
+    bool m_aiAskAfterKey = false;
+    std::unique_ptr<AiAnswerView> m_aiView;
+    std::shared_ptr<AiSession> m_aiSession;
+    uint64_t m_aiSessionCounter = 0;
+    AiSnapshot m_aiState;
+    std::wstring m_aiModel;
+    bool m_aiNeedsKey = false;
+    int m_aiScroll = 0;
+    int m_aiSpinner = 0;
+    bool m_aiShowSources = false;
+    int m_aiSourcesScroll = 0;
+    int m_aiHover = -1;
+    RECT m_aiViewport{};
+    RECT m_aiBadge{};
+    RECT m_aiKeyButton{};
+    std::vector<RECT> m_aiSourceRects;
+    struct AiAttachment {
+        uint64_t id = 0;
+        std::wstring name;
+        std::string dataUrl;  // empty while preparing
+        std::vector<uint8_t> thumb;
+        UINT thumbExtent = 0;
+    };
+    std::vector<AiAttachment> m_aiAttachments;
+    uint64_t m_aiAttachmentCounter = 0;
+    // Ctrl+Enter pressed while images were still being prepared.
+    bool m_aiAskWhenReady = false;
+    std::wstring m_aiAttachNotice;
+    bool m_searchPickerOpen = false;
+    RECT m_searchAttachButton{};
+    std::vector<RECT> m_aiAttachRemoveRects;
     InstalledAppCatalog m_installedApps;
     SystemTray m_tray;
     WeatherService m_weather;
@@ -1120,7 +1206,8 @@ private:
     int m_livePopupGlassPending = -1;
     // Plate still owes a GPU bake after a dirty desktop frame (0 settings, 1 quick
     // settings, 2 context). Cleared when the bake is submitted or the pixels match.
-    bool m_popupGlassDirty[3] = {};
+    // Live glass targets: 0 Dock Settings, 1 Quick Settings, 2 context menu, 3 Search.
+    bool m_popupGlassDirty[4] = {};
     RECT m_frostSliderTrack{};
     // Dock Settings Control Centre glass shapes (window px) and picker state.
     std::vector<Renderer::CcShapeDesc> m_dsCcDescs;
