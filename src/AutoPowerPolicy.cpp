@@ -301,13 +301,22 @@ bool Policy::Sustained(const Run& run, uint64_t stamp, bool known) const noexcep
     return run.samples >= m_tuning.sustainSamples && stamp - run.sinceMs >= m_tuning.sustainMs;
 }
 
-BoostReason Policy::Demand(const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track) const {
+bool Policy::FirstDemand(Run& run) noexcept {
+    const bool first = !run.confirmed;
+    run.confirmed = true;
+    return first;
+}
+
+BoostReason Policy::Demand(
+    const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track, bool& newRun) const {
+    newRun = false;
     // Busy runs advance only on fresh load samples; nowMs is never 0 in
     // practice, keep 0 as "idle".
     const uint64_t stamp = (std::max)(nowMs, uint64_t{1});
     const auto advance = [stamp](Run& run, bool busy) {
         run.sinceMs = busy ? (run.sinceMs != 0 ? run.sinceMs : stamp) : 0;
         run.samples = busy ? run.samples + 1 : 0;
+        run.confirmed = busy && run.confirmed;
     };
     const bool gameKind = app.kind == AppKind::Game || app.registeredGame;
     if (app.freshLoad) {
@@ -357,16 +366,20 @@ BoostReason Policy::Demand(const AppSample& app, uint64_t nowMs, uint64_t idleMs
     }
     const bool known = app.knownDemanding;
     if (Sustained(track.render, stamp, known)) {
+        newRun = FirstDemand(track.render);
         return BoostReason::Render;
     }
     if (Sustained(track.call, stamp, known)) {
+        newRun = FirstDemand(track.call);
         return BoostReason::Call;
     }
     if (Sustained(track.ai, stamp, known)) {
+        newRun = FirstDemand(track.ai);
         return BoostReason::Ai;
     }
     // Games are handled above (an away player must not fall back to Heavy).
     if (!isGame && !gameKind && Sustained(track.heavy, stamp, known) && idleMs <= m_tuning.heavyIdleMs) {
+        newRun = FirstDemand(track.heavy);
         return BoostReason::Heavy;
     }
     return BoostReason::None;
@@ -391,22 +404,26 @@ Decision Policy::Update(const Inputs& inputs) {
             foreground = &app;
         }
         track.name = app.name;
-        const BoostReason demand = Demand(app, now, inputs.idleMs, track);
-        const bool wasActive = track.reason != BoostReason::None && track.holdUntilMs > now;
-        const bool sustainedWork = demand == BoostReason::Heavy || demand == BoostReason::Render ||
-            demand == BoostReason::Ai || demand == BoostReason::Call;
-        if (sustainedWork && (!wasActive || track.reason != demand)) {
+        bool newRun = false;
+        const BoostReason demand = Demand(app, now, inputs.idleMs, track, newRun);
+        if (newRun) {
             decision.confirmed.push_back(app.key);
         }
         if (demand != BoostReason::None) {
-            const bool expired = track.holdUntilMs <= now;
-            if (expired || demand >= track.reason) {
+            if (demand >= track.reason || track.reasonUntilMs <= now) {
                 track.reason = demand;
             }
+            if (demand == track.reason) {
+                track.reasonUntilMs = (std::max)(track.reasonUntilMs, now + HoldMs(demand));
+            }
             track.holdUntilMs = (std::max)(track.holdUntilMs, now + HoldMs(demand));
+            track.lastDemand = demand;
             track.lastDemandMs = now;
         } else if (track.holdUntilMs <= now) {
             track.reason = BoostReason::None;
+        } else if (track.reasonUntilMs <= now && track.lastDemand != BoostReason::None) {
+            track.reason = track.lastDemand;
+            track.reasonUntilMs = track.holdUntilMs;
         }
         track.exemptNow = app.kind == AppKind::Game || app.kind == AppKind::Creative || app.kind == AppKind::Ai ||
             app.registeredGame || app.audioActive || app.cameraActive || app.micActive;

@@ -804,27 +804,34 @@ public:
     }
 
     // True when camera / microphone use may have changed since the last call.
+    // Each store has its own key and event: a fired notification is used up
+    // and re-armed, while the other store's pending one is left alone.
     bool Refresh() {
-        if (m_failed) {
-            return false;
-        }
-        if (m_event == nullptr) {
-            m_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (m_event == nullptr) {
-                m_failed = true;
-                return false;
+        bool changed = false;
+        for (size_t index = 0; index < 2; ++index) {
+            Store& store = m_stores[index];
+            if (store.failed) {
+                continue;
             }
-            Arm();
-            Read();
-            return true;
+            if (store.event == nullptr) {
+                store.event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (store.event == nullptr ||
+                    RegOpenKeyExW(HKEY_CURRENT_USER, kStores[index], 0, KEY_READ | KEY_NOTIFY, &store.key) !=
+                        ERROR_SUCCESS) {
+                    store.key = nullptr;
+                    store.failed = true;
+                    continue;
+                }
+            } else if (WaitForSingleObject(store.event, 0) != WAIT_OBJECT_0) {
+                continue;
+            }
+            ResetEvent(store.event);
+            static_cast<void>(RegNotifyChangeKeyValue(store.key, TRUE,
+                REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, store.event, TRUE));
+            ReadStore(store.key, index == 0 ? m_camera : m_microphone);
+            changed = true;
         }
-        if (WaitForSingleObject(m_event, 0) != WAIT_OBJECT_0) {
-            return false;
-        }
-        ResetEvent(m_event);
-        Arm();
-        Read();
-        return true;
+        return changed;
     }
 
     [[nodiscard]] const InUse& Camera() const noexcept {
@@ -835,15 +842,14 @@ public:
     }
 
     void Close() noexcept {
-        for (HKEY& key : m_keys) {
-            if (key != nullptr) {
-                RegCloseKey(key);
-                key = nullptr;
+        for (Store& store : m_stores) {
+            if (store.key != nullptr) {
+                RegCloseKey(store.key);
             }
-        }
-        if (m_event != nullptr) {
-            CloseHandle(m_event);
-            m_event = nullptr;
+            if (store.event != nullptr) {
+                CloseHandle(store.event);
+            }
+            store = {};
         }
         m_camera = {};
         m_microphone = {};
@@ -855,18 +861,11 @@ private:
         L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone",
     };
 
-    void Arm() {
-        for (size_t index = 0; index < 2; ++index) {
-            if (m_keys[index] == nullptr &&
-                RegOpenKeyExW(HKEY_CURRENT_USER, kStores[index], 0, KEY_READ | KEY_NOTIFY, &m_keys[index]) !=
-                    ERROR_SUCCESS) {
-                m_keys[index] = nullptr;
-                continue;
-            }
-            static_cast<void>(RegNotifyChangeKeyValue(m_keys[index], TRUE,
-                REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, m_event, TRUE));
-        }
-    }
+    struct Store {
+        HKEY key = nullptr;
+        HANDLE event = nullptr;
+        bool failed = false;
+    };
 
     static bool EntryInUse(HKEY parent, const wchar_t* sub) {
         ULONGLONG start = 0;
@@ -926,14 +925,7 @@ private:
         RegCloseKey(desktop);
     }
 
-    void Read() {
-        ReadStore(m_keys[0], m_camera);
-        ReadStore(m_keys[1], m_microphone);
-    }
-
-    HANDLE m_event = nullptr;
-    HKEY m_keys[2] = {nullptr, nullptr};
-    bool m_failed = false;
+    Store m_stores[2];
     InUse m_camera;
     InUse m_microphone;
 };
@@ -1403,7 +1395,7 @@ private:
         m_switchMaxMs = (std::max)(m_switchMaxMs, ms);
         wchar_t line[256]{};
         swprintf_s(line,
-            L"Switched to %s power in %.1f ms (%d writes %.1f ms, activate %.1f ms; %llu ms after input; "
+            L"Switched to %ls power in %.1f ms (%d writes %.1f ms, activate %.1f ms; %llu ms after input; "
             L"average %.1f ms, slowest %.1f ms over %u switches).",
             full ? L"high" : L"low", ms, m_lastWrites, m_lastWriteMs, ms - m_lastWriteMs,
             static_cast<unsigned long long>(idleMs), m_switchTotalMs / m_switches, m_switchMaxMs, m_switches);

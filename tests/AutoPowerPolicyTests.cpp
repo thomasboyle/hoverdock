@@ -427,6 +427,38 @@ void TestCallsAudioAndAi() {
     EXPECT(torch.Update(At(1300, 0, {python})).reason == BoostReason::Ai);
 }
 
+void TestLongJobConfirmedOnceAndRelabelled() {
+    // Driving a creative tool, then letting an export run: the export is
+    // remembered once (not every sample), and shows as a render once the
+    // interaction hold lapses.
+    Policy policy;
+    AppSample blender = App(L"blender.exe", AppKind::Creative, true);
+    blender.cpuCores = 4.0;
+    blender.cpuPercent = 50.0;
+    size_t confirmations = 0;
+    Decision decision;
+    for (uint64_t tick = 0; tick < 20; ++tick) {
+        const uint64_t now = 1000 + tick * 1500;
+        decision = policy.Update(At(now, tick < 2 ? 50 : (tick - 1) * 1500, {blender}));
+        confirmations += decision.confirmed.size();
+        EXPECT(decision.fullPower);
+    }
+    EXPECT(confirmations == 1);
+    EXPECT(decision.reason == BoostReason::Render);
+
+    // A dip ends the run; the next run is a new episode.
+    blender.cpuCores = 0.0;
+    blender.cpuPercent = 0.0;
+    static_cast<void>(policy.Update(At(40000, 60000, {blender})));
+    blender.cpuCores = 4.0;
+    blender.cpuPercent = 50.0;
+    confirmations = 0;
+    for (uint64_t tick = 0; tick < 4; ++tick) {
+        confirmations += policy.Update(At(41000 + tick * 1500, 60000, {blender})).confirmed.size();
+    }
+    EXPECT(confirmations == 1);
+}
+
 void TestHistory() {
     History history;
     EXPECT(!history.IsKnown(L"cargo.exe", 100));
@@ -487,6 +519,7 @@ int main() {
     TestKnownDemandingAppsBoostSooner();
     TestAwayFromGameReleases();
     TestCallsAudioAndAi();
+    TestLongJobConfirmedOnceAndRelabelled();
     TestHistory();
     if (g_failures != 0) {
         std::fprintf(stderr, "AutoPowerPolicyTests: %d failure(s)\n", g_failures);

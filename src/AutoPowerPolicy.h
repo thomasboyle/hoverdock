@@ -173,16 +173,22 @@ public:
     }
 
 private:
-    // A run of consecutive fresh busy samples.
+    // A run of consecutive fresh busy samples; confirmed once it first
+    // demanded power (reported to History once per run).
     struct Run {
         uint64_t sinceMs = 0;
         int samples = 0;
+        bool confirmed = false;
     };
 
     struct Track {
         std::wstring name;
         BoostReason reason = BoostReason::None;
+        // Hold of the app as a whole, and of the reason shown for it: a lower
+        // demand outlasting a higher one takes over the label.
         uint64_t holdUntilMs = 0;
+        uint64_t reasonUntilMs = 0;
+        BoostReason lastDemand = BoostReason::None;
         uint64_t lastDemandMs = 0;
         Run render;
         Run heavy;
@@ -193,8 +199,11 @@ private:
         bool exemptNow = false;
     };
 
-    [[nodiscard]] BoostReason Demand(const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track) const;
+    // newRun: the returned demand is a sustained run demanding for the first time.
+    [[nodiscard]] BoostReason Demand(
+        const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track, bool& newRun) const;
     [[nodiscard]] bool Sustained(const Run& run, uint64_t stamp, bool known) const noexcept;
+    static bool FirstDemand(Run& run) noexcept;
     [[nodiscard]] uint64_t HoldMs(BoostReason reason) const noexcept;
 
     Tuning m_tuning;
