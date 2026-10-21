@@ -31,10 +31,12 @@ const GUID kAutoPlan = {0xa5cc14c9, 0x7d82, 0x4ffc, {0xa6, 0x98, 0x22, 0x5b, 0xe
 constexpr wchar_t kAutoPlanText[] = L"a5cc14c9-7d82-4ffc-a698-225beed1e73f";
 constexpr wchar_t kAutoPlanName[] = L"Hoverdock Automatic";
 constexpr wchar_t kAutoPlanDescription[] =
-    L"Managed by Hoverdock: balanced by default, full performance for games and creative work.";
+    L"Managed by Hoverdock: low power by default, high power for games and creative work.";
 // SCHEME_BALANCED (GUID_TYPICAL_POWER_SAVINGS).
 const GUID kBalancedPlan = {0x381b4222, 0xf694, 0x41f0, {0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e}};
 constexpr wchar_t kBalancedPlanText[] = L"381b4222-f694-41f0-9685-ff5bb260df2e";
+// SCHEME_MAX (GUID_MAX_POWER_SAVINGS): Hoverdock's Low Power mode.
+const GUID kPowerSaverPlan = {0xa1841308, 0x3541, 0x4fab, {0xbc, 0x81, 0xf7, 0x15, 0x56, 0xf2, 0x0b, 0x4a}};
 
 // GUID_ACTIVE_POWERSCHEME: notified with the new plan's GUID on every switch.
 const GUID kActiveSchemeSetting = {0x31f9f286, 0x5084, 0x42fe, {0xb7, 0x20, 0x2b, 0x02, 0x64, 0x99, 0x37, 0x63}};
@@ -50,28 +52,37 @@ struct PlanSubscription {
 const GUID kProcessorSubgroup = {0x54533251, 0x82be, 0x4824, {0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00}};
 const GUID kPcieSubgroup = {0x501a4d13, 0x42af, 0x4429, {0x9f, 0xd1, 0xa8, 0x21, 0x8c, 0x26, 0x8e, 0x20}};
 
-// Plan values written while full power is demanded. Calm values are read
-// from Balanced, so the plan is exactly Balanced the rest of the time.
+// Processor policy the plan switches between. High power matches Hoverdock's
+// High Power mode; low power is read from the Power saver plan (Hoverdock's
+// Low Power mode), with lowFallback used when a machine has no Power saver
+// plan (many Modern Standby laptops only ship Balanced). Display, sleep and
+// other settings stay as in Balanced.
 struct PlanSetting {
     const GUID* subgroup;
     GUID setting;
-    DWORD fullValue;
+    DWORD highValue;
+    DWORD lowFallback;
 };
 
 const PlanSetting kPlanSettings[] = {
-    // Maximum processor state (P-cores / class 0, E-cores / class 1).
-    {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xec}}, 100},
-    {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xed}}, 100},
-    // Processor performance boost mode: Aggressive.
-    {&kProcessorSubgroup, {0xbe337238, 0x0d82, 0x4146, {0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7}}, 2},
-    // Energy performance preference: 0 = favour performance (both classes).
-    {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x63}}, 0},
-    {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x64}}, 0},
-    // Core parking minimum cores: 100% (no parking, both classes).
-    {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x83}}, 100},
-    {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x84}}, 100},
-    // PCI Express link state power management: Off (no GPU/NVMe link wake latency).
-    {&kPcieSubgroup, {0xee12f906, 0xd277, 0x404b, {0xb6, 0xda, 0xe5, 0xfa, 0x1a, 0x57, 0x6d, 0xf5}}, 0},
+    // Minimum processor state (P-cores / class 0, E-cores / class 1).
+    {&kProcessorSubgroup, {0x893dee8e, 0x2bef, 0x41e0, {0x89, 0xc6, 0xb5, 0x5d, 0x09, 0x29, 0x96, 0x4c}}, 100, 5},
+    {&kProcessorSubgroup, {0x893dee8e, 0x2bef, 0x41e0, {0x89, 0xc6, 0xb5, 0x5d, 0x09, 0x29, 0x96, 0x4d}}, 100, 5},
+    // Maximum processor state.
+    {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xec}}, 100, 100},
+    {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xed}}, 100, 100},
+    // Processor performance boost mode: Aggressive / Disabled.
+    {&kProcessorSubgroup, {0xbe337238, 0x0d82, 0x4146, {0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7}}, 2, 0},
+    // Processor performance boost policy (0-100).
+    {&kProcessorSubgroup, {0x45bcc044, 0xd885, 0x43e2, {0x86, 0x05, 0xee, 0x0e, 0xc6, 0xe9, 0x6b, 0x59}}, 100, 0},
+    // Energy performance preference: 0 = favour performance, 100 = efficiency.
+    {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x63}}, 0, 80},
+    {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x64}}, 0, 80},
+    // Core parking minimum cores: 100% (no parking) / park freely.
+    {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x83}}, 100, 5},
+    {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x84}}, 100, 5},
+    // PCI Express link state power management: Off / Maximum power savings.
+    {&kPcieSubgroup, {0xee12f906, 0xd277, 0x404b, {0xb6, 0xda, 0xe5, 0xfa, 0x1a, 0x57, 0x6d, 0xf5}}, 0, 2},
 };
 
 constexpr size_t kPlanSettingCount = sizeof(kPlanSettings) / sizeof(kPlanSettings[0]);
@@ -160,14 +171,13 @@ bool PlanExists() {
 }
 
 bool EnsurePlan() {
-    if (PlanExists()) {
-        return true;
-    }
-    if (!RunPowercfg(std::wstring(L"/duplicatescheme ") + kBalancedPlanText + L" " + kAutoPlanText) ||
-        !PlanExists()) {
+    if (!PlanExists() &&
+        (!RunPowercfg(std::wstring(L"/duplicatescheme ") + kBalancedPlanText + L" " + kAutoPlanText) ||
+            !PlanExists())) {
         Trace(L"Could not create the Hoverdock Automatic plan.");
         return false;
     }
+    // Rewritten every time so plans created by earlier versions stay accurate.
     static_cast<void>(PowerWriteFriendlyName(nullptr, &kAutoPlan, nullptr, nullptr,
         reinterpret_cast<UCHAR*>(const_cast<wchar_t*>(kAutoPlanName)), sizeof(kAutoPlanName)));
     static_cast<void>(PowerWriteDescription(nullptr, &kAutoPlan, nullptr, nullptr,
@@ -361,7 +371,7 @@ public:
         if (status.fullPower != m_lastFull || status.appName != m_lastApp) {
             Trace(status.fullPower ? L"Full power for " + status.appName + L" (" +
                     autopower::ReasonLabel(status.reason) + L")"
-                                   : std::wstring(L"Balanced."));
+                                   : std::wstring(L"Low power."));
             m_lastFull = status.fullPower;
             m_lastApp = status.appName;
         }
@@ -413,7 +423,6 @@ public:
 
 private:
     struct Baseline {
-        bool valid = false;
         DWORD ac = 0;
         DWORD dc = 0;
     };
@@ -450,14 +459,20 @@ private:
         std::vector<DWORD> pids;
     };
 
+    // Low power values: the Power saver plan's, so Automatic at rest is
+    // exactly Hoverdock's Low Power for the processor.
     void ReadBaseline() {
         for (size_t index = 0; index < kPlanSettingCount; ++index) {
             const PlanSetting& setting = kPlanSettings[index];
             Baseline& base = m_baseline[index];
-            base.valid = PowerReadACValueIndex(nullptr, &kBalancedPlan, setting.subgroup, &setting.setting,
-                             &base.ac) == ERROR_SUCCESS &&
-                PowerReadDCValueIndex(nullptr, &kBalancedPlan, setting.subgroup, &setting.setting, &base.dc) ==
-                    ERROR_SUCCESS;
+            if (PowerReadACValueIndex(nullptr, &kPowerSaverPlan, setting.subgroup, &setting.setting, &base.ac) !=
+                ERROR_SUCCESS) {
+                base.ac = setting.lowFallback;
+            }
+            if (PowerReadDCValueIndex(nullptr, &kPowerSaverPlan, setting.subgroup, &setting.setting, &base.dc) !=
+                ERROR_SUCCESS) {
+                base.dc = setting.lowFallback;
+            }
         }
     }
 
@@ -466,17 +481,14 @@ private:
             return;
         }
         // Each write is a power-service round trip: skip values already in the
-        // plan (Balanced's 100% maximum state equals the full-power value).
+        // plan (the 100% maximum state is the same in both modes).
         bool wrote = false;
         bool failed = false;
         for (size_t index = 0; index < kPlanSettingCount; ++index) {
             const Baseline& base = m_baseline[index];
-            if (!base.valid) {
-                continue;
-            }
             const PlanSetting& setting = kPlanSettings[index];
-            const DWORD ac = full ? setting.fullValue : base.ac;
-            const DWORD dc = full ? setting.fullValue : base.dc;
+            const DWORD ac = full ? setting.highValue : base.ac;
+            const DWORD dc = full ? setting.highValue : base.dc;
             Written& written = m_written[index];
             if (written.valid && written.ac == ac && written.dc == dc) {
                 continue;

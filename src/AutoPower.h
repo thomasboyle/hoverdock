@@ -11,13 +11,15 @@
 #include <thread>
 
 // The Automatic energy mode. Choosing Automatic in Quick Settings activates
-// the "Hoverdock Automatic" power plan (a copy of Balanced); while that plan
-// is active this engine runs on a background thread and:
+// the "Hoverdock Automatic" power plan (a copy of Balanced for display and
+// sleep); while that plan is active this engine runs on a background thread
+// and:
 //   - samples the foreground app, user input, and per-app CPU / GPU load,
 //   - asks autopower::Policy whether demanding work needs full power,
-//   - switches the plan's processor policy between Balanced (efficient) and
-//     full performance (EPP 0, aggressive boost, no core parking, PCIe ASPM
-//     off) on both AC and battery,
+//   - switches the plan's processor policy between low power (the Power saver
+//     plan's processor settings, as efficient as Hoverdock's Low Power) and
+//     high power (minimum state 100%, EPP 0, aggressive boost, no core
+//     parking, PCIe ASPM off) on both AC and battery,
 //   - exempts games and creative tools from Windows power throttling
 //     (EcoQoS) so a minimized export or a focused game is never slowed.
 // Picking Low or High Power (or another plan in Windows) makes the engine go

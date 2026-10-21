@@ -5391,14 +5391,15 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             {0, L'\uE945', L"High Power"},
         };
         static const std::wstring kNoTrailing;
-        static const std::wstring kFullPower = L"Full Power";
-        // Automatic shows when it is currently giving an app full power.
+        static const std::wstring kHighPower = L"High Power";
+        static const std::wstring kLowPower = L"Low Power";
+        // Automatic shows which power level it is running at right now.
         const AutoPowerStatus autoPower = m_autoPower.Status();
-        const bool autoFull = autoPower.engaged && autoPower.fullPower;
+        const std::wstring& autoLevel =
+            !autoPower.engaged ? kNoTrailing : (autoPower.fullPower ? kHighPower : kLowPower);
         for (const ModeRow& mode : kModeRows) {
-            const bool automaticRow = mode.mode == 1;
             menuItem(mode.glyph, m_qsCache.powerMode == mode.mode, false, mode.label,
-                automaticRow && autoFull ? kFullPower : kNoTrailing, 0, TrayFlyoutHitKind::PowerMode, mode.mode);
+                mode.mode == 1 ? autoLevel : kNoTrailing, 0, TrayFlyoutHitKind::PowerMode, mode.mode);
         }
         hairline();
         menuSection(L"Using Significant Energy");

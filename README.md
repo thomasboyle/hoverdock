@@ -96,15 +96,15 @@ Your config lives at `%LOCALAPPDATA%\LiquidGlassDock\dock.ini`.
 
 Quick Settings → **Power** → **Energy Mode** works like the macOS menu. **Low Power** uses Windows' Power saver plan and **High Power** uses Ultimate Performance. **Automatic** switches to a *Hoverdock Automatic* power plan, and while that plan is active Hoverdock manages it for you:
 
-- Most of the time it behaves exactly like Windows' Balanced plan.
-- When an app needs full power, the processor goes flat out (performance-first energy preference, aggressive boost, no core parking, PCIe link power saving off), on mains or battery. Full power kicks in for:
+- Most of the time it runs the processor exactly like **Low Power** (Windows' Power saver processor settings), so general use is as efficient as possible. Display and sleep settings stay as in Balanced.
+- When an app needs full power, it switches the processor to **High Power** (no down-clocking, performance-first energy preference, aggressive boost, no core parking, PCIe link power saving off), on mains or battery. High Power kicks in for:
   - **Games in focus**: anything in a Steam, Epic, GOG, Xbox, Riot, Ubisoft, EA or Rockstar library, games Windows Game Bar recognises, exclusive fullscreen apps, and borderless fullscreen apps with real 3D load.
   - **Creative tools you're driving**, such as Premiere Pro, After Effects, DaVinci Resolve, Blender, Cinema 4D, Unreal, Unity, Photoshop or Ableton. Scrubbing a timeline, orbiting a viewport or painting keeps them at full power.
   - **Renders and exports**: a creative tool doing sustained CPU or GPU work, even when it's minimised.
   - **Heavy work in the focused app**, such as a compile.
 - Games and creative tools are never throttled by Windows' background power saving (EcoQoS) while they run.
 
-The Automatic row shows **Full Power** while it's boosting an app. Each boost is held a few seconds after the work stops, so power doesn't flicker on and off. Picking Low or High Power hands control back to Windows and undoes everything Automatic changed. If you were on Balanced (which Hoverdock already showed as Automatic), it moves you to the Automatic plan once. Uninstalling Hoverdock switches you back to Balanced and removes the plan.
+The Automatic row shows **High Power** while it's boosting an app and **Low Power** the rest of the time. Each boost is held a few seconds after the work stops, so power doesn't flicker on and off. Picking Low or High Power hands control back to Windows and undoes everything Automatic changed. If you were on Balanced (which Hoverdock already showed as Automatic), it moves you to the Automatic plan once. Uninstalling Hoverdock switches you back to Balanced and removes the plan.
 
 ## Build it yourself
 
