@@ -580,19 +580,49 @@ std::vector<std::wstring_view> SplitRow(std::wstring_view line) {
     return cells;
 }
 
-bool StartsTable(const std::vector<std::wstring_view>& lines, size_t i) {
+// Source lines; at the top level it records how far the parser has looked, so
+// an incremental update knows which earlier decisions cannot change.
+struct LineList {
+    std::vector<std::wstring_view> lines;
+    bool track = false;
+    mutable size_t seen = 0;  // highest index read + 1
+
+    std::wstring_view operator[](size_t i) const {
+        if (track && i + 1 > seen) {
+            seen = i + 1;
+        }
+        return lines[i];
+    }
+    [[nodiscard]] size_t size() const noexcept { return lines.size(); }
+};
+
+bool StartsTable(const LineList& lines, size_t i) {
     return i + 1 < lines.size() && lines[i].find(L'|') != std::wstring_view::npos &&
         IsTableDelimiter(lines[i + 1]) && SplitRow(lines[i]).size() >= 1;
 }
 
+}  // namespace
+
+struct ParseCheckpoint {
+    size_t line = 0;
+    std::vector<size_t> listIndents;
+    size_t blocks = 0;
+    size_t seen = 0;
+};
+
+namespace {
+
 class BlockParser {
 public:
-    explicit BlockParser(std::vector<Block>& out) : m_out(out) {}
+    explicit BlockParser(std::vector<Block>& out, std::vector<ParseCheckpoint>* checkpoints = nullptr)
+        : m_out(out), m_checkpoints(checkpoints) {}
 
-    void Parse(const std::vector<std::wstring_view>& lines, int quote) {
-        std::vector<size_t> listIndents;
-        size_t i = 0;
+    void Parse(const LineList& lines, int quote, size_t start = 0, std::vector<size_t> listIndents = {}) {
+        size_t i = start;
         while (i < lines.size()) {
+            if (quote == 0 && m_checkpoints != nullptr) {
+                m_checkpoints->push_back({i, listIndents, m_out.size(), lines.seen});
+            }
             const std::wstring_view line = lines[i];
             if (IsBlank(line)) {
                 ++i;
@@ -635,14 +665,14 @@ public:
                 continue;
             }
             if (trimmed.front() == L'>') {
-                std::vector<std::wstring_view> inner;
+                LineList inner;
                 while (i < lines.size() && !IsBlank(lines[i]) && !LeftTrim(lines[i]).empty() &&
                        LeftTrim(lines[i]).front() == L'>') {
                     std::wstring_view body = LeftTrim(lines[i]).substr(1);
                     if (!body.empty() && body.front() == L' ') {
                         body.remove_prefix(1);
                     }
-                    inner.push_back(body);
+                    inner.lines.push_back(body);
                     ++i;
                 }
                 if (quote < kMaxQuoteDepth) {
@@ -680,7 +710,7 @@ private:
         }
     }
 
-    size_t ParseFence(const std::vector<std::wstring_view>& lines, size_t i, wchar_t fenceChar,
+    size_t ParseFence(const LineList& lines, size_t i, wchar_t fenceChar,
         size_t fenceLength, int quote) {
         const size_t indent = IndentOf(lines[i]);
         const std::wstring_view info = TrimView(LeftTrim(lines[i]).substr(fenceLength));
@@ -737,7 +767,7 @@ private:
         return i;
     }
 
-    size_t ParseMath(const std::vector<std::wstring_view>& lines, size_t i, int quote) {
+    size_t ParseMath(const LineList& lines, size_t i, int quote) {
         Block block;
         block.kind = BlockKind::Code;
         block.language = L"math";
@@ -776,7 +806,7 @@ private:
         return i;
     }
 
-    static bool InterruptsParagraph(const std::vector<std::wstring_view>& lines, size_t i) {
+    static bool InterruptsParagraph(const LineList& lines, size_t i) {
         const std::wstring_view line = lines[i];
         wchar_t fenceChar = 0;
         size_t fenceLength = 0;
@@ -789,7 +819,7 @@ private:
             (IsListItem(line, marker) && !marker.content.empty()) || StartsTable(lines, i);
     }
 
-    size_t ParseListItem(const std::vector<std::wstring_view>& lines, size_t i, const ListMarker& marker,
+    size_t ParseListItem(const LineList& lines, size_t i, const ListMarker& marker,
         std::vector<size_t>& listIndents, int quote) {
         while (!listIndents.empty() && marker.indent + 1 < listIndents.back()) {
             listIndents.pop_back();
@@ -871,7 +901,7 @@ private:
         text.append(body.substr(0, end));
     }
 
-    size_t ParseTable(const std::vector<std::wstring_view>& lines, size_t i, int quote) {
+    size_t ParseTable(const LineList& lines, size_t i, int quote) {
         Block block;
         block.kind = BlockKind::Table;
         block.quote = quote;
@@ -905,7 +935,7 @@ private:
         return i;
     }
 
-    size_t ParseParagraph(const std::vector<std::wstring_view>& lines, size_t i, int quote) {
+    size_t ParseParagraph(const LineList& lines, size_t i, int quote) {
         std::wstring text;
         AppendLine(text, lines[i]);
         ++i;
@@ -935,7 +965,29 @@ private:
     }
 
     std::vector<Block>& m_out;
+    std::vector<ParseCheckpoint>* m_checkpoints;
 };
+
+LineList SplitLines(std::wstring_view markdown) {
+    LineList list;
+    size_t start = 0;
+    while (start <= markdown.size()) {
+        size_t end = markdown.find(L'\n', start);
+        if (end == std::wstring_view::npos) {
+            end = markdown.size();
+        }
+        std::wstring_view line = markdown.substr(start, end - start);
+        if (!line.empty() && line.back() == L'\r') {
+            line.remove_suffix(1);
+        }
+        list.lines.push_back(line);
+        if (end == markdown.size()) {
+            break;
+        }
+        start = end + 1;
+    }
+    return list;
+}
 
 // ---- code highlighting -----------------------------------------------------------
 
@@ -1047,26 +1099,63 @@ InlineText ParseInline(std::wstring_view text, std::vector<InlineImage>* images)
 }
 
 std::vector<Block> Parse(std::wstring_view markdown) {
-    std::vector<std::wstring_view> lines;
-    size_t start = 0;
-    while (start <= markdown.size()) {
-        size_t end = markdown.find(L'\n', start);
-        if (end == std::wstring_view::npos) {
-            end = markdown.size();
-        }
-        std::wstring_view line = markdown.substr(start, end - start);
-        if (!line.empty() && line.back() == L'\r') {
-            line.remove_suffix(1);
-        }
-        lines.push_back(line);
-        if (end == markdown.size()) {
-            break;
-        }
-        start = end + 1;
-    }
+    const LineList lines = SplitLines(markdown);
     std::vector<Block> blocks;
     BlockParser(blocks).Parse(lines, 0);
     return blocks;
+}
+
+IncrementalParser::IncrementalParser() = default;
+IncrementalParser::~IncrementalParser() = default;
+
+const std::vector<Block>& IncrementalParser::Update(std::wstring_view markdown) {
+    size_t resume = 0;
+    const bool appended = !m_text.empty() && markdown.size() >= m_text.size() && markdown.starts_with(m_text);
+    // Line starts: only the old last line onwards can have changed.
+    if (!appended || m_lineStarts.empty()) {
+        m_lineStarts.assign(1, 0);
+    } else {
+        m_lineStarts.pop_back();
+        if (m_lineStarts.empty()) {
+            m_lineStarts.push_back(0);
+        }
+    }
+    for (size_t at = markdown.find(L'\n', m_lineStarts.back()); at != std::wstring_view::npos;
+         at = markdown.find(L'\n', at + 1)) {
+        m_lineStarts.push_back(at + 1);
+    }
+    LineList lines;
+    lines.track = true;
+    lines.lines.reserve(m_lineStarts.size());
+    for (size_t i = 0; i < m_lineStarts.size(); ++i) {
+        const size_t end = i + 1 < m_lineStarts.size() ? m_lineStarts[i + 1] - 1 : markdown.size();
+        std::wstring_view line = markdown.substr(m_lineStarts[i], end - m_lineStarts[i]);
+        if (!line.empty() && line.back() == L'\r') {
+            line.remove_suffix(1);
+        }
+        lines.lines.push_back(line);
+    }
+    if (appended) {
+        // Steps that never read the old last line (which may have grown) are final.
+        while (resume < m_checkpoints.size() && m_checkpoints[resume].seen < m_lineCount) {
+            ++resume;
+        }
+        resume = resume == 0 ? 0 : resume - 1;
+    }
+    if (!appended || resume == 0) {
+        m_blocks.clear();
+        m_checkpoints.clear();
+        BlockParser(m_blocks, &m_checkpoints).Parse(lines, 0);
+    } else {
+        ParseCheckpoint from = std::move(m_checkpoints[resume]);
+        m_checkpoints.resize(resume);
+        m_blocks.resize(from.blocks);
+        lines.seen = from.seen;
+        BlockParser(m_blocks, &m_checkpoints).Parse(lines, 0, from.line, std::move(from.listIndents));
+    }
+    m_text.assign(markdown);
+    m_lineCount = lines.size();
+    return m_blocks;
 }
 
 bool IsSafeUrl(std::wstring_view url) {

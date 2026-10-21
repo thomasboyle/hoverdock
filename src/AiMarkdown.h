@@ -71,6 +71,29 @@ struct InlineImage {
 };
 
 [[nodiscard]] std::vector<Block> Parse(std::wstring_view markdown);
+
+struct ParseCheckpoint;
+
+// Parse() for append-only streams: each Update returns exactly Parse(markdown),
+// but when markdown extends the previous text only the trailing blocks whose
+// source could still change are re-parsed.
+class IncrementalParser {
+public:
+    IncrementalParser();
+    ~IncrementalParser();
+    IncrementalParser(const IncrementalParser&) = delete;
+    IncrementalParser& operator=(const IncrementalParser&) = delete;
+
+    const std::vector<Block>& Update(std::wstring_view markdown);
+    [[nodiscard]] const std::vector<Block>& Blocks() const noexcept { return m_blocks; }
+
+private:
+    std::wstring m_text;
+    size_t m_lineCount = 0;
+    std::vector<size_t> m_lineStarts;
+    std::vector<Block> m_blocks;
+    std::vector<ParseCheckpoint> m_checkpoints;
+};
 [[nodiscard]] InlineText ParseInline(std::wstring_view text, std::vector<InlineImage>* images = nullptr);
 
 // True for URLs the UI may open or fetch: http(s) and mailto only.

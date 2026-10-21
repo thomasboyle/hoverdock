@@ -321,16 +321,16 @@ void AiAnswerView::SetMarkdown(const std::wstring& markdown) {
         return;
     }
     m_markdown = markdown;
-    m_blocks = aimd::Parse(m_markdown);
-    m_codes.clear();
-    for (const aimd::Block& block : m_blocks) {
+    // Streaming appends: only the trailing blocks are re-parsed.
+    size_t codes = 0;
+    for (const aimd::Block& block : m_parser.Update(m_markdown)) {
         if (block.kind == aimd::BlockKind::Code) {
-            m_codes.push_back(block.code);
+            ++codes;
         } else if (block.kind == aimd::BlockKind::Image) {
             static_cast<void>(ImageIndex(block.url));
         }
     }
-    if (m_copiedCode != static_cast<size_t>(-1) && m_copiedCode >= m_codes.size()) {
+    if (m_copiedCode != static_cast<size_t>(-1) && m_copiedCode >= codes) {
         m_copiedCode = static_cast<size_t>(-1);
     }
     m_dirty = true;
@@ -338,8 +338,7 @@ void AiAnswerView::SetMarkdown(const std::wstring& markdown) {
 
 void AiAnswerView::Clear() {
     m_markdown.clear();
-    m_blocks.clear();
-    m_codes.clear();
+    m_parser.Update(m_markdown);
     m_imagesData.clear();
     m_allowedImages.clear();
     m_copiedCode = static_cast<size_t>(-1);
@@ -400,7 +399,13 @@ bool AiAnswerView::SetImage(AiImageReply& reply) {
 }
 
 std::wstring AiAnswerView::CodeText(size_t code) const {
-    return code < m_codes.size() ? m_codes[code] : std::wstring();
+    size_t index = 0;
+    for (const aimd::Block& block : m_parser.Blocks()) {
+        if (block.kind == aimd::BlockKind::Code && index++ == code) {
+            return block.code;
+        }
+    }
+    return {};
 }
 
 void AiAnswerView::SetCopied(size_t code) {
@@ -499,7 +504,7 @@ void AiAnswerView::AddText(IDWriteTextLayout* layout, int x, int y, int width, u
 int AiAnswerView::LayoutCode(size_t blockIndex, size_t codeIndex, int x, int y, int width) {
     const float scale = m_layoutScale;
     auto P = [scale](float value) { return static_cast<int>(std::lround(value * scale)); };
-    const aimd::Block& block = m_blocks[blockIndex];
+    const aimd::Block& block = Blocks()[blockIndex];
     const int pad = P(12.0F);
     const int header = P(28.0F);
     const float labelSize = 12.0F * scale;
@@ -738,7 +743,7 @@ int AiAnswerView::LayoutBlock(size_t index, size_t codeIndex, int x, int w) {
     const float scale = m_layoutScale;
     auto P = [scale](float value) { return static_cast<int>(std::lround(value * scale)); };
     const float body = 15.0F * scale;
-    const aimd::Block& block = m_blocks[index];
+    const aimd::Block& block = Blocks()[index];
     const int quote = std::min(block.quote, 4);
     switch (block.kind) {
     case aimd::BlockKind::Paragraph:
@@ -820,15 +825,15 @@ void AiAnswerView::Layout(int width, float scale, const std::wstring& bodyFace) 
     // Streaming only appends, so all but the last block or two are unchanged:
     // reuse their layouts (DirectWrite layout, hit rects, highlighting).
     std::vector<BlockLayout> next;
-    next.reserve(m_blocks.size());
+    next.reserve(Blocks().size());
     int y = 0;
     bool first = true;
     aimd::BlockKind previous = aimd::BlockKind::Paragraph;
     int previousQuote = 0;
     int previousBottom = 0;
     size_t codeIndex = 0;
-    for (size_t index = 0; index < m_blocks.size(); ++index) {
-        const aimd::Block& block = m_blocks[index];
+    for (size_t index = 0; index < Blocks().size(); ++index) {
+        const aimd::Block& block = Blocks()[index];
         if (!first) {
             int gap = P(10.0F);
             if (block.kind == aimd::BlockKind::ListItem && previous == aimd::BlockKind::ListItem) {

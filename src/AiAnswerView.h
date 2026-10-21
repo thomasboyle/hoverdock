@@ -47,7 +47,7 @@ public:
     // image renders as a link, so injected text can't trigger requests.
     void SetAllowedImages(const std::vector<std::wstring>& urls) { m_allowedImages = urls; }
     void Clear();
-    [[nodiscard]] bool Empty() const noexcept { return m_blocks.empty(); }
+    [[nodiscard]] bool Empty() const noexcept { return m_parser.Blocks().empty(); }
     [[nodiscard]] const std::wstring& Markdown() const noexcept { return m_markdown; }
 
     // Image URLs (http/https) still to fetch; each is returned once.
@@ -119,7 +119,7 @@ private:
 
     void ReleaseLayout() noexcept;
     static void ReleaseBlock(BlockLayout& layout) noexcept;
-    // Lays out m_blocks[index] at y = 0 into the scratch item lists; returns its height.
+    // Lays out Blocks()[index] at y = 0 into the scratch item lists; returns its height.
     int LayoutBlock(size_t index, size_t codeIndex, int x, int width);
     void ReleaseFormats() noexcept;
     bool EnsureFactory();
@@ -138,8 +138,8 @@ private:
         const AiInk& ink);
 
     std::wstring m_markdown;
-    std::vector<aimd::Block> m_blocks;
-    std::vector<std::wstring> m_codes;
+    aimd::IncrementalParser m_parser;
+    [[nodiscard]] const std::vector<aimd::Block>& Blocks() const noexcept { return m_parser.Blocks(); }
     std::vector<Image> m_imagesData;
     std::vector<std::wstring> m_allowedImages;
     size_t m_copiedCode = static_cast<size_t>(-1);

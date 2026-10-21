@@ -3,6 +3,8 @@
 #include "AiMarkdown.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <random>
 #include <string>
 
 namespace {
@@ -169,6 +171,40 @@ void TestBlockEquality() {
     }
 }
 
+// Streaming equivalence: IncrementalParser::Update(prefix) == Parse(prefix) for
+// every prefix of random structured Markdown cut into random chunks.
+void TestIncrementalParser(unsigned seed, int documents) {
+    static const wchar_t* const kPieces[] = {L"# Title\n", L"## Sub\n", L"Para **bold** and `code` ",
+        L"[link](https://a.b) ", L"text\n", L"\n", L"\n\n", L"- item\n", L"  - nested\n", L"    - deep\n",
+        L"1. one\n", L"2) two\n", L"- [x] done\n", L"> quote\n", L"> > deeper\n", L"```py\n", L"```\n",
+        L"~~~\n", L"x = 1  # c\n", L"$$\n", L"$$ a $$\n", L"| a | b |\n", L"|---|:-:|\n", L"| 1 | 2 |\n",
+        L"---\n", L"***\n", L"Setext\n===\n", L"Under\n--\n", L"![img](https://i.x/a.png)\n", L"  indented cont\n",
+        L"line with two spaces  \n", L"trailing\\\n", L"*a **b** c*", L"_snake_case_ ", L"\t- tab item\n",
+        L"\r\n", L"\u4E2D\u6587 ", L"\U0001F600", L"<br>", L"| x |\n"};
+    std::mt19937 rng(seed);
+    for (int doc = 0; doc < documents; ++doc) {
+        std::wstring text;
+        const int pieces = 1 + static_cast<int>(rng() % 40);
+        for (int i = 0; i < pieces; ++i) {
+            text += kPieces[rng() % (sizeof(kPieces) / sizeof(kPieces[0]))];
+        }
+        aimd::IncrementalParser incremental;
+        size_t at = 0;
+        while (at < text.size()) {
+            at = std::min(text.size(), at + 1 + rng() % 12);
+            const std::wstring prefix = text.substr(0, at);
+            if (!(incremental.Update(prefix) == aimd::Parse(prefix))) {
+                std::fprintf(stderr, "incremental mismatch: seed %u doc %d at %zu\n", seed, doc, at);
+                ++g_failures;
+                return;
+            }
+        }
+        // A non-append edit falls back to a full parse.
+        const std::wstring edited = L"Different start\n\n" + text;
+        EXPECT(incremental.Update(edited) == aimd::Parse(edited));
+    }
+}
+
 void TestSafeUrl() {
     EXPECT(aimd::IsSafeUrl(L"https://a.b"));
     EXPECT(aimd::IsSafeUrl(L"mailto:x@y.z"));
@@ -189,6 +225,8 @@ int main() {
     TestHighlight();
     TestSafeUrl();
     TestBlockEquality();
+    const char* fuzzDocs = std::getenv("AIMD_FUZZ_DOCS");
+    TestIncrementalParser(1, fuzzDocs != nullptr ? std::atoi(fuzzDocs) : 400);
     if (g_failures == 0) {
         std::printf("AiMarkdownTests: all passed\n");
         return 0;

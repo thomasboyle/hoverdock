@@ -595,34 +595,36 @@ std::string BuildSearchRequest(std::string_view query) {
 
 std::string Base64(std::string_view bytes) {
     static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve((bytes.size() + 2) / 3 * 4);
+    std::string out((bytes.size() + 2) / 3 * 4, '\0');
+    char* o = out.data();
+    const auto* in = reinterpret_cast<const unsigned char*>(bytes.data());
     size_t i = 0;
-    for (; i + 3 <= bytes.size(); i += 3) {
-        const uint32_t v = (static_cast<uint32_t>(static_cast<unsigned char>(bytes[i])) << 16U) |
-            (static_cast<uint32_t>(static_cast<unsigned char>(bytes[i + 1])) << 8U) |
-            static_cast<uint32_t>(static_cast<unsigned char>(bytes[i + 2]));
-        out.push_back(kAlphabet[(v >> 18U) & 63U]);
-        out.push_back(kAlphabet[(v >> 12U) & 63U]);
-        out.push_back(kAlphabet[(v >> 6U) & 63U]);
-        out.push_back(kAlphabet[v & 63U]);
+    for (; i + 3 <= bytes.size(); i += 3, o += 4) {
+        const uint32_t v = (static_cast<uint32_t>(in[i]) << 16U) | (static_cast<uint32_t>(in[i + 1]) << 8U) |
+            static_cast<uint32_t>(in[i + 2]);
+        o[0] = kAlphabet[(v >> 18U) & 63U];
+        o[1] = kAlphabet[(v >> 12U) & 63U];
+        o[2] = kAlphabet[(v >> 6U) & 63U];
+        o[3] = kAlphabet[v & 63U];
     }
     const size_t rest = bytes.size() - i;
     if (rest > 0) {
-        uint32_t v = static_cast<uint32_t>(static_cast<unsigned char>(bytes[i])) << 16U;
+        uint32_t v = static_cast<uint32_t>(in[i]) << 16U;
         if (rest == 2) {
-            v |= static_cast<uint32_t>(static_cast<unsigned char>(bytes[i + 1])) << 8U;
+            v |= static_cast<uint32_t>(in[i + 1]) << 8U;
         }
-        out.push_back(kAlphabet[(v >> 18U) & 63U]);
-        out.push_back(kAlphabet[(v >> 12U) & 63U]);
-        out.push_back(rest == 2 ? kAlphabet[(v >> 6U) & 63U] : '=');
-        out.push_back('=');
+        o[0] = kAlphabet[(v >> 18U) & 63U];
+        o[1] = kAlphabet[(v >> 12U) & 63U];
+        o[2] = rest == 2 ? kAlphabet[(v >> 6U) & 63U] : '=';
+        o[3] = '=';
     }
     return out;
 }
 
 std::string DataUrl(std::string_view mime, std::string_view bytes) {
-    std::string out = "data:";
+    std::string out;
+    out.reserve(5 + mime.size() + 8 + (bytes.size() + 2) / 3 * 4);
+    out += "data:";
     out += mime;
     out += ";base64,";
     out += Base64(bytes);
