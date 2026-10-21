@@ -41,6 +41,8 @@ public:
     }
     WinHttpHandle(const WinHttpHandle&) = delete;
     WinHttpHandle& operator=(const WinHttpHandle&) = delete;
+    WinHttpHandle(WinHttpHandle&& other) noexcept : m_handle(other.m_handle) { other.m_handle = nullptr; }
+    WinHttpHandle& operator=(WinHttpHandle&&) = delete;
     [[nodiscard]] HINTERNET Get() const noexcept { return m_handle; }
     explicit operator bool() const noexcept { return m_handle != nullptr; }
 
