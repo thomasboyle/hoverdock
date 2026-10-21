@@ -105,7 +105,48 @@ struct TickDriver {
     }
 };
 
-void Run(size_t groupCount) {
+// The engine's current tick (reused inputs/decision; knownDemanding resolved
+// when groups are built and when history records). Same workload, same
+// observable decisions as TickDriver.
+struct EngineDriver {
+    autopower::Policy policy;
+    autopower::History history;
+    autopower::Inputs inputs;
+    autopower::Decision decision;
+    std::vector<std::wstring> lastUnthrottle;
+    unsigned changes = 0;
+
+    void Tick(std::unordered_map<std::wstring, Group>& groups, const std::wstring& foregroundKey, uint64_t now,
+        uint64_t idle, uint32_t day) {
+        inputs.nowMs = now;
+        inputs.idleMs = idle;
+        inputs.apps.resize(groups.size());
+        size_t slot = 0;
+        for (const auto& [key, group] : groups) {
+            AppSample& app = inputs.apps[slot++];
+            app = group.sample;
+            app.foreground = key == foregroundKey;
+        }
+        policy.Update(inputs, decision);
+        for (auto& [key, group] : groups) {
+            group.sample.freshLoad = false;
+        }
+        for (const std::wstring& key : decision.confirmed) {
+            static_cast<void>(history.Record(key, day));
+            const auto group = groups.find(key);
+            if (group != groups.end()) {
+                group->second.sample.knownDemanding = history.IsKnown(key, day);
+            }
+        }
+        if (decision.unthrottle != lastUnthrottle) {
+            lastUnthrottle = decision.unthrottle;
+            ++changes;
+        }
+    }
+};
+
+template <typename Driver>
+void Run(const char* label, size_t groupCount) {
     constexpr int kTicks = 20000;
     constexpr int kRuns = 7;
     std::vector<double> nsPerTick;
@@ -113,7 +154,7 @@ void Run(size_t groupCount) {
     unsigned checksum = 0;
     for (int run = 0; run < kRuns + 1; ++run) {
         auto groups = MakeGroups(groupCount);
-        TickDriver driver;
+        Driver driver;
         const std::wstring foreground = groups.begin()->first;
         const auto start = std::chrono::steady_clock::now();
         const unsigned long long allocsBefore = g_allocations.load();
@@ -140,7 +181,8 @@ void Run(size_t groupCount) {
     }
     std::sort(nsPerTick.begin(), nsPerTick.end());
     std::sort(allocsPerTick.begin(), allocsPerTick.end());
-    std::printf("groups=%zu  ns/tick median=%.1f min=%.1f max=%.1f  allocs/tick=%.2f  (check %u)\n", groupCount,
+    std::printf("%-7s groups=%zu  ns/tick median=%.1f min=%.1f max=%.1f  allocs/tick=%.2f  (check %u)\n", label,
+        groupCount,
         nsPerTick[nsPerTick.size() / 2], nsPerTick.front(), nsPerTick.back(), allocsPerTick[allocsPerTick.size() / 2],
         checksum);
 }
@@ -148,7 +190,11 @@ void Run(size_t groupCount) {
 }  // namespace
 
 int main() {
-    Run(8);
-    Run(64);
+    // frozen: the tick as first benchmarked (738a384); engine: the tick as
+    // AutoPowerEngine runs it now.
+    Run<TickDriver>("frozen", 8);
+    Run<TickDriver>("frozen", 64);
+    Run<EngineDriver>("engine", 8);
+    Run<EngineDriver>("engine", 64);
     return 0;
 }

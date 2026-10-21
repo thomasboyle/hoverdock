@@ -386,10 +386,20 @@ BoostReason Policy::Demand(
 }
 
 Decision Policy::Update(const Inputs& inputs) {
+    Decision decision;
+    Update(inputs, decision);
+    return decision;
+}
+
+void Policy::Update(const Inputs& inputs, Decision& decision) {
     const uint64_t now = inputs.nowMs;
     const uint64_t generation = ++m_generation;
 
-    Decision decision;
+    decision.fullPower = false;
+    decision.reason = BoostReason::None;
+    decision.appKey.clear();
+    decision.appName.clear();
+    decision.confirmed.clear();
     const AppSample* foreground = nullptr;
     for (const AppSample& app : inputs.apps) {
         if (app.key.empty()) {
@@ -403,7 +413,9 @@ Decision Policy::Update(const Inputs& inputs) {
         if (app.foreground && foreground == nullptr) {
             foreground = &app;
         }
-        track.name = app.name;
+        if (track.name != app.name) {
+            track.name = app.name;
+        }
         bool newRun = false;
         const BoostReason demand = Demand(app, now, inputs.idleMs, track, newRun);
         if (newRun) {
@@ -429,7 +441,11 @@ Decision Policy::Update(const Inputs& inputs) {
             app.registeredGame || app.audioActive || app.cameraActive || app.micActive;
     }
 
-    decision.unthrottle.reserve(m_tracks.size());
+    // Filled in place: the strings keep their capacity from earlier updates.
+    if (decision.unthrottle.capacity() < m_tracks.size()) {
+        decision.unthrottle.reserve(m_tracks.size());
+    }
+    size_t exempt = 0;
     const std::wstring* bestKey = nullptr;
     const Track* best = nullptr;
     for (auto it = m_tracks.begin(); it != m_tracks.end();) {
@@ -443,7 +459,12 @@ Decision Policy::Update(const Inputs& inputs) {
         ++it;
         const bool active = track.reason != BoostReason::None && track.holdUntilMs > now;
         if (track.exemptNow || active) {
-            decision.unthrottle.push_back(key);
+            if (exempt < decision.unthrottle.size()) {
+                decision.unthrottle[exempt] = key;
+            } else {
+                decision.unthrottle.push_back(key);
+            }
+            ++exempt;
         }
         if (!active) {
             continue;
@@ -465,6 +486,7 @@ Decision Policy::Update(const Inputs& inputs) {
             bestKey = &key;
         }
     }
+    decision.unthrottle.resize(exempt);
     if (best != nullptr) {
         decision.fullPower = true;
         decision.reason = best->reason;
@@ -472,7 +494,6 @@ Decision Policy::Update(const Inputs& inputs) {
         decision.appName = best->name;
     }
     std::sort(decision.unthrottle.begin(), decision.unthrottle.end());
-    return decision;
 }
 
 void Policy::Reset() noexcept {

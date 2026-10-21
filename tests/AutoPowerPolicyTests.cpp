@@ -459,6 +459,37 @@ void TestLongJobConfirmedOnceAndRelabelled() {
     EXPECT(confirmations == 1);
 }
 
+void TestReusedDecisionMatchesFresh() {
+    // The engine reuses one Decision across updates; it must always equal a
+    // freshly built one, including when the exempt set shrinks.
+    Policy fresh;
+    Policy reused;
+    Decision decision;
+    AppSample blender = App(L"blender.exe", AppKind::Creative);
+    AppSample game = App(L"a-very-long-game-executable-name.exe", AppKind::Game, true);
+    AppSample spotify = App(L"spotify.exe", AppKind::NeverGame);
+    AppSample code = App(L"code.exe", AppKind::Other);
+    for (uint64_t tick = 0; tick < 60; ++tick) {
+        blender.cpuCores = tick % 7 < 4 ? 3.0 : 0.0;
+        spotify.audioActive = tick % 11 < 5;
+        code.foreground = tick % 13 > 8;
+        game.foreground = !code.foreground;
+        std::vector<AppSample> apps = {blender, code, spotify};
+        if (tick % 17 < 12) {
+            apps.push_back(game);
+        }
+        const Inputs inputs = At(1000 + tick * 700, (tick % 5) * 2000, apps);
+        const Decision expected = fresh.Update(inputs);
+        reused.Update(inputs, decision);
+        EXPECT(decision.fullPower == expected.fullPower);
+        EXPECT(decision.reason == expected.reason);
+        EXPECT(decision.appKey == expected.appKey);
+        EXPECT(decision.appName == expected.appName);
+        EXPECT(decision.unthrottle == expected.unthrottle);
+        EXPECT(decision.confirmed == expected.confirmed);
+    }
+}
+
 void TestHistory() {
     History history;
     EXPECT(!history.IsKnown(L"cargo.exe", 100));
@@ -520,6 +551,7 @@ int main() {
     TestAwayFromGameReleases();
     TestCallsAudioAndAi();
     TestLongJobConfirmedOnceAndRelabelled();
+    TestReusedDecisionMatchesFresh();
     TestHistory();
     if (g_failures != 0) {
         std::fprintf(stderr, "AutoPowerPolicyTests: %d failure(s)\n", g_failures);

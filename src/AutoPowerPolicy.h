@@ -166,6 +166,9 @@ public:
     explicit Policy(const Tuning& tuning) : m_tuning(tuning) {}
 
     [[nodiscard]] Decision Update(const Inputs& inputs);
+    // Same, into a caller-owned decision whose buffers are reused (the
+    // engine's per-tick path: no allocations once warmed up).
+    void Update(const Inputs& inputs, Decision& decision);
     void Reset() noexcept;
 
     [[nodiscard]] const Tuning& Settings() const noexcept {

@@ -461,9 +461,10 @@ public:
         }
     }
 
-    void Forget(const std::unordered_set<DWORD>& alive) {
+    template <typename Alive>
+    void Forget(const Alive& alive) {
         for (auto it = m_pids.begin(); it != m_pids.end();) {
-            it = alive.contains(it->first) ? std::next(it) : m_pids.erase(it);
+            it = alive(it->first) ? std::next(it) : m_pids.erase(it);
         }
     }
 
@@ -1097,6 +1098,7 @@ public:
         status.engaged = true;
         const ULONGLONG now = GetTickCount64();
         const uint32_t today = Today();
+        m_today = today;
         if (!m_engaged) {
             m_engaged = true;
             m_planFull.reset();
@@ -1125,7 +1127,9 @@ public:
             SampleForeground(now);
         }
 
-        autopower::Inputs inputs;
+        // Inputs and decision are members so their strings and vectors keep
+        // their capacity: a tick allocates nothing once warmed up.
+        autopower::Inputs& inputs = m_inputs;
         inputs.nowMs = now;
         inputs.idleMs = IdleMs();
         // The hook sees input before GetLastInputInfo is updated.
@@ -1142,9 +1146,8 @@ public:
         if (m_gamepadSeen) {
             inputs.idleMs = (std::min)(inputs.idleMs, static_cast<uint64_t>(GetTickCount() - m_gamepadTick));
         }
-        inputs.apps.reserve(m_groups.size());
         const auto foregroundGroup = m_groupOfPid.find(foregroundPid);
-        const std::wstring foregroundKey = foregroundGroup != m_groupOfPid.end() ? foregroundGroup->second : L"";
+        const std::wstring* foregroundKey = foregroundGroup != m_groupOfPid.end() ? &foregroundGroup->second : nullptr;
         // Fullscreen state only matters for an app that could be an unknown
         // game: known games, creative tools and browsers/players skip it.
         bool fullscreen = false;
@@ -1154,21 +1157,27 @@ public:
             QUERY_USER_NOTIFICATION_STATE state{};
             exclusive = SUCCEEDED(SHQueryUserNotificationState(&state)) && state == QUNS_RUNNING_D3D_FULL_SCREEN;
         }
+        inputs.apps.resize(m_groups.size());
+        size_t slot = 0;
         for (const auto& [key, group] : m_groups) {
-            autopower::AppSample app = group.sample;
-            app.foreground = key == foregroundKey;
+            autopower::AppSample& app = inputs.apps[slot++];
+            app = group.sample;
+            app.foreground = foregroundKey != nullptr && key == *foregroundKey;
             app.fullscreen = app.foreground && fullscreen;
             app.exclusiveFullscreen = app.foreground && exclusive;
-            app.knownDemanding = m_history.IsKnown(key, today);
-            inputs.apps.push_back(std::move(app));
         }
 
-        const autopower::Decision decision = m_policy.Update(inputs);
+        m_policy.Update(inputs, m_decision);
+        const autopower::Decision& decision = m_decision;
         for (auto& [key, group] : m_groups) {
             group.sample.freshLoad = false;
         }
         for (const std::wstring& key : decision.confirmed) {
             m_historyDirty = m_history.Record(key, today) || m_historyDirty;
+            const auto group = m_groups.find(key);
+            if (group != m_groups.end()) {
+                group->second.sample.knownDemanding = m_history.IsKnown(key, today);
+            }
         }
         SaveHistory(now, false);
         if (decision.fullPower) {
@@ -1198,7 +1207,7 @@ public:
             m_lastApp = status.appName;
         }
 
-        const auto foregroundApp = m_groups.find(foregroundKey);
+        const auto foregroundApp = foregroundKey != nullptr ? m_groups.find(*foregroundKey) : m_groups.end();
         const bool creativeFocused = foregroundApp != m_groups.end() &&
             foregroundApp->second.sample.kind == autopower::AppKind::Creative;
         bool demandingRunning = false;
@@ -1690,18 +1699,15 @@ private:
             it->second.seenGeneration = generation;
             UpdateCpu(it->second, entry.cpu, stamp);
         }
-        std::unordered_set<DWORD> alive;
-        alive.reserve(m_procs.size());
         for (auto it = m_procs.begin(); it != m_procs.end();) {
             if (it->second.seenGeneration != generation) {
                 CloseProc(it->second);
                 it = m_procs.erase(it);
             } else {
-                alive.insert(it->first);
                 ++it;
             }
         }
-        m_kmt.Forget(alive);
+        m_kmt.Forget([this](DWORD pid) { return m_procs.contains(pid); });
 
         // Audio, camera and microphone users become apps of their own (with
         // their helpers), so they can be exempted and credited.
@@ -1730,6 +1736,7 @@ private:
                 group.sample.name = rootProc.display;
                 group.sample.kind = rootProc.kind;
                 group.sample.registeredGame = rootProc.registeredGame;
+                group.sample.knownDemanding = m_history.IsKnown(rootProc.exe, m_today);
             }
             group.sample.audioActive = group.sample.audioActive || proc.audio;
             group.sample.cameraActive = group.sample.cameraActive || proc.camera;
@@ -1747,6 +1754,7 @@ private:
                     group.sample.key = it->second.exe;
                     group.sample.name = it->second.display;
                     group.sample.kind = it->second.kind;
+                    group.sample.knownDemanding = m_history.IsKnown(it->second.exe, m_today);
                 }
                 group.pids.push_back(m_foregroundPid);
                 m_groupOfPid[m_foregroundPid] = it->second.exe;
@@ -1838,7 +1846,8 @@ private:
     // Without them, PDH counters keep the old, sparser cadence.
     void SampleGpu(ULONGLONG now, Group* only) {
         if (m_kmt.Usable()) {
-            std::vector<std::pair<DWORD, HANDLE>> procs;
+            std::vector<std::pair<DWORD, HANDLE>>& procs = m_gpuProcs;
+            procs.clear();
             const auto add = [this, &procs](const Group& group) {
                 for (const DWORD pid : group.pids) {
                     Proc& proc = m_procs[pid];
@@ -2033,6 +2042,10 @@ private:
     double m_switchMaxMs = 0.0;
     int m_lastWrites = 0;
     double m_lastWriteMs = 0.0;
+    std::vector<std::pair<DWORD, HANDLE>> m_gpuProcs;
+    autopower::Inputs m_inputs;
+    autopower::Decision m_decision;
+    uint32_t m_today = 0;
     autopower::Policy m_policy;
 };
 
