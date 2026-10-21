@@ -3782,6 +3782,14 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             SyncSearchHotkeyForFullscreen();
             return 0;
         }
+        // Open on the monitor under the cursor, like the dock's edge-show:
+        // the dock moves there and Search sits above it at that monitor's DPI.
+        if (!IsSearchOpen()) {
+            POINT cursor{};
+            if (GetCursorPos(&cursor) != FALSE) {
+                static_cast<void>(AdoptMonitorForCursor(cursor));
+            }
+        }
         ToggleSearch();
         return 0;
 
