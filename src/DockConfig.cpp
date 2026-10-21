@@ -1016,6 +1016,7 @@ bool DockConfig::Load() {
     m_depthShade = true;
     m_lightPanels = false;
     m_handsFree = true;
+    m_autoPowerAdopted = false;
     m_qsIconColor = kDefaultQsIconColor;
     m_qsLayout.clear();
     m_lastInstalledVersion.clear();
@@ -1107,6 +1108,10 @@ bool DockConfig::Load() {
         const auto handsFree = dockSection->second.find(L"handsfree");
         if (handsFree != dockSection->second.end()) {
             m_handsFree = ParseBoolean(handsFree->second);
+        }
+        const auto autoPowerAdopted = dockSection->second.find(L"autopoweradopted");
+        if (autoPowerAdopted != dockSection->second.end()) {
+            m_autoPowerAdopted = ParseBoolean(autoPowerAdopted->second);
         }
         const auto qsIconColor = dockSection->second.find(L"quicksettingsiconcolor");
         if (qsIconColor != dockSection->second.end()) {
@@ -1201,6 +1206,7 @@ bool DockConfig::Save() const {
     contents << L"DepthShade=" << (m_depthShade ? L"1" : L"0") << L"\n";
     contents << L"LightPanels=" << (m_lightPanels ? L"1" : L"0") << L"\n";
     contents << L"HandsFree=" << (m_handsFree ? L"1" : L"0") << L"\n";
+    contents << L"AutoPowerAdopted=" << (m_autoPowerAdopted ? L"1" : L"0") << L"\n";
     {
         wchar_t colorText[16]{};
         swprintf_s(colorText, L"%06X", m_qsIconColor & 0xFFFFFFU);
@@ -1379,6 +1385,14 @@ bool DockConfig::HandsFree() const noexcept {
 
 void DockConfig::SetHandsFree(bool enabled) noexcept {
     m_handsFree = enabled;
+}
+
+bool DockConfig::AutoPowerAdopted() const noexcept {
+    return m_autoPowerAdopted;
+}
+
+void DockConfig::SetAutoPowerAdopted(bool adopted) noexcept {
+    m_autoPowerAdopted = adopted;
 }
 
 unsigned DockConfig::QsIconColor() const noexcept {

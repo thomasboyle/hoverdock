@@ -66,6 +66,10 @@ public:
     // setting queues ONE disable/enable of 111E on the Bluetooth worker.
     [[nodiscard]] bool HandsFree() const noexcept;
     void SetHandsFree(bool enabled) noexcept;
+    // True once Balanced has been moved onto the Hoverdock Automatic plan
+    // (one time only, so a later deliberate Balanced choice sticks).
+    [[nodiscard]] bool AutoPowerAdopted() const noexcept;
+    void SetAutoPowerAdopted(bool adopted) noexcept;
     // Quick Settings accent / icon colour (0xRRGGBB). Default #98A869 keeps the
     // shipped look; dock.ini key QuickSettingsIconColor=RRGGBB.
     static constexpr unsigned kDefaultQsIconColor = 0x98A869U;
@@ -114,6 +118,7 @@ private:
     bool m_depthShade = true;
     bool m_lightPanels = false;
     bool m_handsFree = true;
+    bool m_autoPowerAdopted = false;
     unsigned m_qsIconColor = kDefaultQsIconColor;
     std::wstring m_qsLayout;
     std::wstring m_lastInstalledVersion;

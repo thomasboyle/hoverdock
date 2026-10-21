@@ -173,6 +173,10 @@ Section "Uninstall"
   ; copy under Program Files is admin-owned and stays until removed by an admin.
   nsExec::Exec `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "Get-ScheduledTask -TaskName 'HoverdockMftIndex-*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$$false"`
   Pop $0
+  ; Automatic energy mode plan (fixed GUID): hand the machine back to
+  ; Balanced when it is the active plan, then delete it.
+  nsExec::Exec `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "if ((powercfg /getactivescheme) -match 'a5cc14c9-7d82-4ffc-a698-225beed1e73f') { powercfg /setactive SCHEME_BALANCED }; powercfg /delete a5cc14c9-7d82-4ffc-a698-225beed1e73f"`
+  Pop $0
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
   Delete "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk"
