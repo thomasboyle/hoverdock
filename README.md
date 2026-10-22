@@ -131,6 +131,23 @@ The Automatic row shows **High Power** while it's boosting an app and **Low Powe
 - **Meters:** unplug the charger to measure the whole machine from the battery. Plugged in, it reads the processor's own energy counters.
 - **Results:** the outcome appears under the button, for example "Automatic used less energy in 4, more in 0, no clear difference in 2 of 6 tests". A difference only counts when it's bigger than the run-to-run noise (95% confidence). **Open summary** shows the full table. Every reading is saved in `runs.csv` in a `Hoverdock-energy-<date>` folder next to `Dock.exe`.
 
+**Tuning Automatic for your machine: the power profiler.** With the dock running, open an elevated terminal in the folder that holds `Dock.exe` and run `.\Dock.exe --power-profile`. A console window shows progress. It takes about 50 minutes with your hands off the keyboard and mouse (`--quick` takes about 20), and Ctrl+C stops it at any point. Your plan is restored when it finishes or stops, and the temporary plan it uses is deleted. It writes a `Hoverdock-profile-<date>` folder next to `Dock.exe` (or under `%LOCALAPPDATA%\Hoverdock\Profiles`):
+
+- **What's in the folder:**
+  - the processor's capabilities (Speed Shift, energy preference, activity window), Windows' power mode overlay and timer resolution
+  - every power plan's processor settings
+  - a once-a-second timeline of package power, effective clocks per core, idle-state residency, core parking, wake-ups and timer resolution
+  - the busiest processes by CPU and by wake-ups
+  - the engine's own decisions and every plan value it writes
+  - powercfg's energy report
+- **The runs:**
+  - the machine exactly as it is
+  - Balanced, Power saver and Automatic under the benchmark's workloads
+  - a sweep of the engine's rest-profile settings (energy preference, boost mode, activity window, parking, PCIe) on a temporary copy of its plan
+
+  `summary.md` has the headline tables. Share the whole folder, zipped, when reporting an issue with Automatic.
+- **Live mode:** `.\Dock.exe --power-profile --live 15` records the timeline, processes and engine decisions for 15 minutes while you use the PC normally, without changing any plan.
+
 ## Build it yourself
 
 You need Windows 10 (19041+), Visual Studio 2022, and CMake 3.25+. No vcpkg, no NuGet, no extra SDKs. Just the Windows SDK.

@@ -202,6 +202,9 @@ constexpr ULONGLONG kProbeMs = 2000;
 // first few seconds after it takes focus.
 constexpr DWORD kFullscreenProbeTickMs = 250;
 constexpr ULONGLONG kFullscreenProbeMs = 3000;
+// Power profiler diagnostics: how often the engine looks for its event.
+constexpr ULONGLONG kDiagCheckMs = 2000;
+constexpr const wchar_t* kProfilerEventName = L"Local\\HoverdockPowerProfiler";
 // Plan polling when GUID_ACTIVE_POWERSCHEME notifications are unavailable.
 constexpr DWORD kDormantTickMs = 2000;
 // Timer wakes can land a little early; still count them as a full interval.
@@ -1170,6 +1173,7 @@ public:
         }
         status.engaged = true;
         const ULONGLONG now = GetTickCount64();
+        RefreshDiagnostics(now);
         const uint32_t today = Today();
         m_today = today;
         if (!m_engaged) {
@@ -1341,7 +1345,65 @@ public:
         if (now < m_fullscreenProbeUntil && ForegroundCouldBeUnknownGame() && ForegroundFullscreen()) {
             result.waitMs = (std::min)(result.waitMs, kFullscreenProbeTickMs);
         }
+        if (m_diag) {
+            const autopower::AppSample* fg = foregroundEntry != nullptr ? &foregroundEntry->sample : nullptr;
+            wchar_t line[768]{};
+            swprintf_s(line,
+                L"diag tick profile=%ls full=%d reason=%ls app=%ls interactive=%d iapp=%ls away=%d displayOff=%d "
+                L"idleMs=%llu fg=%ls fgKind=%d fgCores=%.3f fgCpuPct=%.2f fgGpu=%.1f fg3d=%.1f fgFull=%d "
+                L"probe=%d nap=%zu coalesce=%zu unthrottle=%zu groups=%zu waitMs=%lu wantInput=%d",
+                ProfileLabel(profile), decision.fullPower ? 1 : 0, autopower::ReasonLabel(decision.reason),
+                decision.appName.empty() ? L"-" : decision.appName.c_str(), decision.interactive ? 1 : 0,
+                decision.interactiveName.empty() ? L"-" : decision.interactiveName.c_str(), decision.away ? 1 : 0,
+                displayOff ? 1 : 0, static_cast<unsigned long long>(inputs.idleMs),
+                fg != nullptr ? foregroundEntry->key.c_str() : L"-", fg != nullptr ? static_cast<int>(fg->kind) : -1,
+                fg != nullptr ? fg->cpuCores : 0.0, fg != nullptr ? fg->cpuPercent : 0.0,
+                fg != nullptr ? fg->gpuPercent : 0.0, fg != nullptr ? fg->gpu3dPercent : 0.0,
+                fullscreen ? 1 : 0, now < m_probeUntil ? 1 : 0, decision.nap.size(), decision.coalesce.size(),
+                decision.unthrottle.size(), m_groups.size(), static_cast<unsigned long>(result.waitMs),
+                result.wantInput ? 1 : 0);
+            Trace(line);
+        }
         return result;
+    }
+
+    // Diagnostics for the power profiler (Dock.exe --power-profile): while
+    // its named event exists, every tick and every plan write is traced.
+    void RefreshDiagnostics(ULONGLONG now) {
+        if (m_diagCheckedAt != 0 && now - m_diagCheckedAt < kDiagCheckMs) {
+            return;
+        }
+        m_diagCheckedAt = now;
+        const HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, kProfilerEventName);
+        const bool wanted = event != nullptr;
+        if (event != nullptr) {
+            CloseHandle(event);
+        }
+        if (wanted == m_diag) {
+            return;
+        }
+        m_diag = wanted;
+        Trace(wanted ? L"diag on" : L"diag off");
+        if (!wanted) {
+            return;
+        }
+        for (size_t index = 0; index < kPlanSettingCount; ++index) {
+            const PlanSetting& setting = kPlanSettings[index];
+            wchar_t line[256]{};
+            swprintf_s(line,
+                L"diag baseline idx=%zu setting=%08lx-%04x-%04x restAc=%lu restDc=%lu work=%ld game=%ld "
+                L"interactive=%ld away=%ld unsupported=%d",
+                index, static_cast<unsigned long>(setting.setting.Data1), setting.setting.Data2,
+                setting.setting.Data3, m_baseline[index].ac, m_baseline[index].dc, DiagValue(setting.work),
+                DiagValue(setting.game), DiagValue(setting.interactive), DiagValue(setting.away),
+                m_unsupported[index] ? 1 : 0);
+            Trace(line);
+        }
+    }
+
+    // Plan table values for the trace: -1 = as at rest.
+    static long DiagValue(DWORD value) noexcept {
+        return value == kAsRest ? -1L : static_cast<long>(value);
     }
 
     // Restore everything this engine changed: calm plan, OS-managed throttling.
@@ -1517,6 +1579,13 @@ private:
                 PowerWriteDCValueIndex(nullptr, &kAutoPlan, setting.subgroup, &setting.setting, dc) == ERROR_SUCCESS;
             writes += 2;
             written = {acOk && dcOk, ac, dc};
+            if (m_diag) {
+                wchar_t line[192]{};
+                swprintf_s(line, L"diag write profile=%ls idx=%zu setting=%08lx ac=%lu dc=%lu acOk=%d dcOk=%d",
+                    ProfileLabel(profile), index, static_cast<unsigned long>(setting.setting.Data1), ac, dc,
+                    acOk ? 1 : 0, dcOk ? 1 : 0);
+                Trace(line);
+            }
             // Settings this Windows build lacks (E-core variants) are not
             // retried on every switch.
             m_unsupported[index] = setting.optional && !acOk && !dcOk;
@@ -2356,6 +2425,8 @@ private:
     std::wstring m_lastApp;
     std::wstring m_lastInteractive;
     bool m_lastAway = false;
+    bool m_diag = false;
+    ULONGLONG m_diagCheckedAt = 0;
     bool m_registeredLoaded = false;
     ULONGLONG m_registeredAt = 0;
     std::unordered_set<std::wstring> m_registeredGames;

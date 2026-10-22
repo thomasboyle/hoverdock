@@ -48,6 +48,7 @@ add_executable(Dock WIN32
     src/PerfBoost.cpp
     src/PerfProfiler.cpp
     src/EnergyBench.cpp
+    src/PowerProfiler.cpp
     src/AutoPower.cpp
     src/AutoPowerPolicy.cpp
     src/RecycleBin.cpp
