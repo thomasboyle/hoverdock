@@ -285,6 +285,40 @@ float MeasureText(HFONT font, const std::wstring& text) {
     return width;
 }
 
+// Height of `text` in `font` word-wrapped to `maxWidth` pixels.
+float MeasureWrappedTextHeight(HFONT font, const std::wstring& text, float maxWidth) {
+    if (text.empty() || font == nullptr) {
+        return 0.0F;
+    }
+    IDWriteFactory* factory = FlyoutDWriteFactory();
+    LOGFONTW logFont{};
+    if (factory == nullptr || GetObjectW(font, sizeof(logFont), &logFont) == 0) {
+        return 0.0F;
+    }
+    const float size = static_cast<float>(logFont.lfHeight < 0 ? -logFont.lfHeight : logFont.lfHeight);
+    IDWriteTextFormat* format = nullptr;
+    if (FAILED(factory->CreateTextFormat(logFont.lfFaceName, nullptr,
+            static_cast<DWRITE_FONT_WEIGHT>(std::clamp(logFont.lfWeight, 1L, 999L)), DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, size, L"", &format)) ||
+        format == nullptr) {
+        return 0.0F;
+    }
+    format->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    IDWriteTextLayout* layout = nullptr;
+    float height = 0.0F;
+    if (SUCCEEDED(factory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), format,
+            std::max(1.0F, maxWidth), 100000.0F, &layout)) &&
+        layout != nullptr) {
+        DWRITE_TEXT_METRICS metrics{};
+        if (SUCCEEDED(layout->GetMetrics(&metrics))) {
+            height = metrics.height;
+        }
+        layout->Release();
+    }
+    format->Release();
+    return height;
+}
+
 HFONT CreateGlyphFont(int pixelHeight) {
     // Segoe Fluent Icons (Windows 11) is a superset of Segoe MDL2 Assets.
     const wchar_t* face = L"Segoe Fluent Icons";
@@ -1927,8 +1961,14 @@ void DockApp::PaintSearchAi(uint8_t* pixels, int width, int height, float scale,
         const LONG glyphSize = Px(28.0F, scale);
         DrawFlyoutText(pixels, width, height, {view.left, view.top, view.left + glyphSize, view.top + glyphSize},
             m_searchGlyphFont, kGlyphInfo, DT_CENTER | DT_VCENTER | DT_SINGLELINE, 220);
-        const RECT textRect{view.left + glyphSize + Px(10.0F, scale), view.top + Px(3.0F, scale), view.right,
-            view.top + Px(120.0F, scale)};
+        const LONG textLeft = view.left + glyphSize + Px(10.0F, scale);
+        const LONG textTop = view.top + Px(3.0F, scale);
+        // Fit the whole message; leave room for the key button below it when shown.
+        const LONG buttonRoom = m_aiNeedsKey ? Px(44.0F, scale) : 0;
+        const LONG measured = static_cast<LONG>(std::ceil(MeasureWrappedTextHeight(m_searchTitleFont,
+            m_aiState.error, static_cast<float>(view.right - textLeft)))) + Px(4.0F, scale);
+        const RECT textRect{textLeft, textTop, view.right,
+            std::max(textTop + Px(24.0F, scale), std::min(textTop + measured, view.bottom - buttonRoom))};
         DrawFlyoutText(pixels, width, height, textRect, m_searchTitleFont, m_aiState.error,
             DT_LEFT | DT_TOP | DT_WORDBREAK, 235);
         if (m_aiNeedsKey) {

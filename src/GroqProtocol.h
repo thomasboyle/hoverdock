@@ -89,9 +89,12 @@ enum class SearchMode : uint8_t { None, Function, Builtin };
 // Models that accept reasoning_effort low/medium/high (others reject it with a 400).
 [[nodiscard]] bool SupportsReasoningEffort(std::string_view model) noexcept;
 [[nodiscard]] std::string SystemPrompt(std::string_view today, SearchMode search);
+inline constexpr uint32_t kChatMaxTokens = 4096;
+inline constexpr uint32_t kSearchMaxTokens = 1536;
 [[nodiscard]] std::string BuildChatRequest(std::string_view model, const std::vector<Message>& messages,
-    SearchMode search, bool stream);
-[[nodiscard]] std::string BuildSearchRequest(std::string_view query, std::string_view model = kSearchModel);
+    SearchMode search, bool stream, uint32_t maxTokens = kChatMaxTokens);
+[[nodiscard]] std::string BuildSearchRequest(std::string_view query, std::string_view model = kSearchModel,
+    uint32_t maxTokens = kSearchMaxTokens);
 // Case/whitespace-insensitive key for caching search outcomes.
 [[nodiscard]] std::string SearchCacheKey(std::string_view query);
 
@@ -100,6 +103,10 @@ struct RateLimit {
     uint64_t retryAfterMs = 0;
     // A per-day limit: retrying within the session is pointless.
     bool daily = false;
+    // "Request too large ... output tokens per minute (OTPM): Limit N": the
+    // request's max tokens alone exceed the per-minute budget, so waiting
+    // cannot help; retry with max_completion_tokens below N. 0 otherwise.
+    uint32_t outputTokenLimit = 0;
 };
 // Reads a 429's retry-after header value and error body.
 [[nodiscard]] RateLimit ParseRateLimit(std::string_view retryAfter, std::string_view errorBody);

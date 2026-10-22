@@ -189,6 +189,10 @@ std::wstring DescribeFailure(const HttpResult& result, const std::wstring& model
     case 413:
         return L"The question is too long for the model.";
     case 429:
+        if (const uint32_t limit = groq::ParseRateLimit({}, result.errorBody).outputTokenLimit; limit != 0) {
+            return L"Your Groq plan allows \u201C" + model + L"\u201D only " + std::to_wstring(limit) +
+                L" output tokens per minute, too few for this answer. Pick another model in Dock Settings \u203A AI.";
+        }
         return L"Groq's rate limit was reached. Try again in a moment." +
             (detail.empty() ? std::wstring() : L"\n\n" + detail);
     default:
@@ -257,13 +261,54 @@ groq::RateLimit RateLimitOf(const HttpResult& result) {
     return groq::ParseRateLimit(groq::WideToUtf8(result.retryAfter), result.errorBody);
 }
 
+// Output-token caps learned from "Request too large ... (OTPM)" errors, per model,
+// so later requests fit the account's per-minute output budget up front.
+std::mutex g_outputCapMutex;
+std::vector<std::pair<std::string, uint32_t>> g_outputCaps;
+
+uint32_t MaxTokensFor(const std::string& model, uint32_t fallback) {
+    const std::lock_guard lock(g_outputCapMutex);
+    for (const auto& [name, cap] : g_outputCaps) {
+        if (name == model) {
+            return std::min(cap, fallback);
+        }
+    }
+    return fallback;
+}
+
+// True when `result` is an OTPM "request too large" error and a smaller cap
+// than `current` was recorded for `model`, i.e. a retry can succeed.
+bool LearnOutputCap(const HttpResult& result, const std::string& model, uint32_t current) {
+    if (result.status != 429 && result.status != 413) {
+        return false;
+    }
+    const uint32_t limit = RateLimitOf(result).outputTokenLimit;
+    if (limit == 0) {
+        return false;
+    }
+    // A margin under the limit: Groq's estimate of a request's output is not exactly max tokens.
+    const uint32_t cap = std::max<uint32_t>(limit > 100 ? limit - limit / 10 : limit, 1);
+    if (cap >= current) {
+        return false;
+    }
+    const std::lock_guard lock(g_outputCapMutex);
+    for (auto& [name, known] : g_outputCaps) {
+        if (name == model) {
+            known = std::min(known, cap);
+            return true;
+        }
+    }
+    g_outputCaps.emplace_back(model, cap);
+    return true;
+}
+
 // A 429 worth sitting out: per-minute (not per-day) with a short suggested wait.
 bool ShortRateLimit(const HttpResult& result, uint64_t& waitMs) {
     if (result.status != 429) {
         return false;
     }
     const groq::RateLimit limit = RateLimitOf(result);
-    if (limit.daily || limit.retryAfterMs > kMaxRetryWaitMs) {
+    if (limit.daily || limit.outputTokenLimit != 0 || limit.retryAfterMs > kMaxRetryWaitMs) {
         return false;
     }
     waitMs = std::max<uint64_t>(limit.retryAfterMs, 1000);
@@ -320,10 +365,20 @@ void CacheSearchOutcome(std::string key, const groq::SearchOutcome& outcome) {
 
 bool PostSearch(const std::wstring& apiKey, const std::string& query, const char* model,
     const std::atomic<bool>& cancelled, std::string& body, HttpResult& result) {
-    body.clear();
-    result = HttpResult{};
-    return PostChat(apiKey, groq::BuildSearchRequest(query, model),
-        [&](std::string_view chunk) { body.append(chunk); }, cancelled, result);
+    const std::string modelName = model;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        body.clear();
+        result = HttpResult{};
+        const uint32_t maxTokens = MaxTokensFor(modelName, groq::kSearchMaxTokens);
+        if (PostChat(apiKey, groq::BuildSearchRequest(query, model, maxTokens),
+                [&](std::string_view chunk) { body.append(chunk); }, cancelled, result)) {
+            return true;
+        }
+        if (result.cancelled || !LearnOutputCap(result, modelName, maxTokens)) {
+            return false;
+        }
+    }
+    return false;
 }
 
 // One browser_search round trip. Repeat queries come from a short-lived cache;
@@ -396,7 +451,8 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
     for (int round = 0; round <= kMaxToolRounds; ++round) {
         const groq::SearchMode mode =
             round == kMaxToolRounds && searchMode == groq::SearchMode::Function ? groq::SearchMode::None : searchMode;
-        const std::string body = groq::BuildChatRequest(modelUtf8, messages, mode, true);
+        const uint32_t maxTokens = MaxTokensFor(modelUtf8, groq::kChatMaxTokens);
+        const std::string body = groq::BuildChatRequest(modelUtf8, messages, mode, true, maxTokens);
         groq::StreamParser parser;
         ULONGLONG lastPublish = 0;
         size_t publishedBytes = 0;
@@ -431,6 +487,11 @@ void AskWorker(std::shared_ptr<AiSession> session, HWND reply, UINT message, std
             return;
         }
         if (!ok) {
+            // The request's output budget alone exceeds the per-minute limit: shrink it and resend.
+            if (LearnOutputCap(result, modelUtf8, maxTokens)) {
+                --round;
+                continue;
+            }
             // A short per-minute limit: wait it out once rather than failing the answer.
             uint64_t waitMs = 0;
             if (!rateRetried && ShortRateLimit(result, waitMs)) {

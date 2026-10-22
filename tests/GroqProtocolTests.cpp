@@ -102,6 +102,11 @@ void TestRequest() {
     EXPECT(search.has_value() && search->Get("max_completion_tokens")->number == 1536);
     const auto fallback = groq::json::Parse(groq::BuildSearchRequest("q", groq::kSearchFallbackModel));
     EXPECT(fallback.has_value() && fallback->Str("model") == "openai/gpt-oss-120b");
+    const auto capped = groq::json::Parse(groq::BuildSearchRequest("q", groq::kSearchModel, 900));
+    EXPECT(capped.has_value() && capped->Get("max_completion_tokens")->number == 900);
+    const auto cappedChat =
+        groq::json::Parse(groq::BuildChatRequest("qwen/qwen3.8-27b", messages, groq::SearchMode::None, false, 900));
+    EXPECT(cappedChat.has_value() && cappedChat->Get("max_completion_tokens")->number == 900);
     EXPECT(groq::SearchCacheKey("  Weather\tIN  London \n") == "weather in london");
     // The date goes last so the stable instructions form a cacheable prefix.
     const std::string prompt = groq::SystemPrompt("Tuesday, 21 October 2026", groq::SearchMode::Function);
@@ -252,6 +257,12 @@ void TestRateLimit() {
         R"({"error":{"message":"Rate limit reached on tokens per day (TPD): Limit 200000. Please try again in 7m12s."}})");
     EXPECT(daily.daily && daily.retryAfterMs == 432000);
     EXPECT(groq::ParseRateLimit("", "not json").retryAfterMs == 0);
+    EXPECT(limit.outputTokenLimit == 0);
+    const groq::RateLimit tooLarge = groq::ParseRateLimit("",
+        R"({"error":{"message":"Request too large for model `qwen/qwen3.8-27b` in organization `org_1` service tier )"
+        R"(`on_demand` on output tokens per minute (OTPM): Limit 1000, Requested 1282. The request's expected output )"
+        R"(tokens exceed the enforced limit; reduce max_tokens (or the request's expected output).","type":"tokens"}})");
+    EXPECT(tooLarge.outputTokenLimit == 1000 && !tooLarge.daily);
 }
 
 }  // namespace

@@ -502,7 +502,7 @@ std::string SystemPrompt(std::string_view today, SearchMode search) {
 }
 
 std::string BuildChatRequest(std::string_view model, const std::vector<Message>& messages, SearchMode search,
-    bool stream) {
+    bool stream, uint32_t maxTokens) {
     std::string out = R"({"model":)";
     json::AppendQuoted(out, model);
     out += R"(,"messages":[)";
@@ -577,12 +577,13 @@ std::string BuildChatRequest(std::string_view model, const std::vector<Message>&
         out += R"(,"top_p":0.95)";
     }
     // Room for brief reasoning plus the answer; caps runaway generations.
-    out += R"(,"max_completion_tokens":4096)";
+    out += R"(,"max_completion_tokens":)";
+    out += std::to_string(maxTokens);
     out += stream ? R"(,"stream":true})" : R"(,"stream":false})";
     return out;
 }
 
-std::string BuildSearchRequest(std::string_view query, std::string_view model) {
+std::string BuildSearchRequest(std::string_view query, std::string_view model, uint32_t maxTokens) {
     std::string out = R"({"model":)";
     json::AppendQuoted(out, model);
     out += R"(,"messages":[{"role":"user","content":)";
@@ -596,7 +597,9 @@ std::string BuildSearchRequest(std::string_view query, std::string_view model) {
         "answer. Reply with at most 8 terse bullets of the key facts (names, figures, dates), each noting its page.";
     json::AppendQuoted(out, prompt);
     out += R"(}],"tools":[{"type":"browser_search"}],"tool_choice":"required","reasoning_effort":"low",)"
-           R"("max_completion_tokens":1536,"stream":false})";
+           R"("max_completion_tokens":)";
+    out += std::to_string(maxTokens);
+    out += R"(,"stream":false})";
     return out;
 }
 
@@ -664,6 +667,20 @@ RateLimit ParseRateLimit(std::string_view retryAfter, std::string_view errorBody
     const std::string message = ErrorMessage(errorBody);
     limit.daily = message.find("per day") != std::string::npos || message.find("(TPD)") != std::string::npos ||
         message.find("(RPD)") != std::string::npos;
+    // Groq: "Request too large for model `m` ... on output tokens per minute (OTPM): Limit 1000, Requested 1282."
+    if (const size_t otpm = message.find("(OTPM)"); otpm != std::string::npos &&
+        message.find("Request too large") != std::string::npos) {
+        constexpr std::string_view kLimit = "Limit ";
+        if (const size_t at = message.find(kLimit, otpm); at != std::string::npos) {
+            uint64_t value = 0;
+            size_t i = at + kLimit.size();
+            while (i < message.size() && message[i] >= '0' && message[i] <= '9' && value < 100000000) {
+                value = value * 10 + static_cast<uint64_t>(message[i] - '0');
+                ++i;
+            }
+            limit.outputTokenLimit = static_cast<uint32_t>(value);
+        }
+    }
     while (!retryAfter.empty() && retryAfter.front() == ' ') {
         retryAfter.remove_prefix(1);
     }
