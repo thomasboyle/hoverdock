@@ -1,7 +1,5 @@
 ﻿#include "DockApp.h"
-#include "EnergyBench.h"
 #include "FileSearch.h"
-#include "PowerProfiler.h"
 #include "SystemTemps.h"
 
 #include <Windows.h>
@@ -82,18 +80,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv != nullptr) {
-        // Dock Settings energy benchmark workload (run from a renamed copy of this exe).
-        if (argc >= 3 && _wcsicmp(argv[1], L"--energy-bench-worker") == 0) {
-            const int result = RunEnergyBenchWorker(argc, argv);
-            LocalFree(argv);
-            return result;
-        }
-        // Power profiler for tuning the Automatic engine (runs beside the dock).
-        if (HasArg(argc, argv, L"--power-profile")) {
-            const int result = RunPowerProfiler(argc, argv);
-            LocalFree(argv);
-            return result;
-        }
         if ((HasArg(argc, argv, L"--cpu-sensor") || HasArg(argc, argv, L"--run"))) {
             LocalFree(argv);
             return RunCpuSensorWorker();

@@ -2458,8 +2458,6 @@ DockApp::~DockApp() {
     RevokeTrashDropTarget();
     UnregisterTrashNotify();
     StopSearchServices();
-    m_energyBench.Stop();
-    m_autoPower.Stop();
     DestroyDockSettings();
     DestroyOverflowPopup();
     DestroyContextMenu();
@@ -2587,16 +2585,8 @@ int DockApp::Run() {
     RefreshTrash(true);
     RegisterForegroundWatch();
     StartCursorWatch();
-    // Automatic energy mode. Hoverdock has always shown Balanced as
-    // Automatic, so move Balanced onto the managed plan once.
-    {
-        const bool adoptBalanced = !m_config.AutoPowerAdopted();
-        if (adoptBalanced) {
-            m_config.SetAutoPowerAdopted(true);
-            ScheduleConfigSave();
-        }
-        m_autoPower.Start(m_window, kAutoPowerMessage, adoptBalanced);
-    }
+    // Earlier versions ran Automatic on a custom "Hoverdock Automatic" plan.
+    std::thread(RemoveLegacyAutomaticPowerPlan).detach();
 
     GetCursorPos(&m_lastCursor);
     m_lastPointerSampleAt = QpcSeconds();
@@ -3117,12 +3107,6 @@ LRESULT CALLBACK DockApp::ContextWindowProcedure(HWND window, UINT message, WPAR
 
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
-        // Automatic energy mode: wakes its engine only when it asked for input.
-        // Clicks and the wheel are commits (they start work: a scroll renders
-        // the page); motion is not.
-        s_instance->m_autoPower.NoteInput(wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
-            wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN || wParam == WM_MOUSEWHEEL ||
-            wParam == WM_MOUSEHWHEEL);
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         if (wParam == WM_MOUSEMOVE && !s_instance->IsDragActive() &&
             s_instance->NeedsHookPointerPost(mouse->pt)) {
@@ -3864,22 +3848,6 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         ApplyBluetoothSnapshot();
         return 0;
 
-    case WM_INPUT:
-        // Raw keyboard sink for the Automatic energy mode; DefWindowProc
-        // below frees the input data.
-        m_autoPower.NoteInput(true);
-        break;
-
-    case kAutoPowerMessage: {
-        const AutoPowerStatus autoPower = m_autoPower.Status();
-        SyncAutoPowerKeyboard(autoPower.engaged && !autoPower.fullPower);
-        // Only the Power page shows the Automatic mode's live state.
-        if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Power) {
-            QueueOverflowPaint();
-        }
-        return 0;
-    }
-
     case kSpeedTestMessage:
         // Progress only matters while the Wi-Fi page shows it.
         if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Wifi) {
@@ -3938,10 +3906,6 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             if (!IsDockSettingsOpen()) {
                 OpenDockSettings();
             }
-        } else if (wParam == kEnergyBenchTimerId) {
-            TickEnergyBench();
-        } else if (wParam == kPowerProfileTimerId) {
-            TickPowerProfile();
         } else if (wParam == kResumeZOrderTimerId) {
             ReassertOverlayZOrder();
             if (--m_resumeZOrderPasses <= 0) {
@@ -4032,10 +3996,6 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         UnregisterSystemResumeNotifications();
         StopShellFlyoutWatch();
         StopSearchServices();
-        // Before the engine stops: the benchmark puts the user's power plan back.
-        m_energyBench.Stop();
-        SyncAutoPowerKeyboard(false);
-        m_autoPower.Stop();
         DestroyDockSettings();
         BeginOverflowHide(false);
         DestroyOverflowPopup();
@@ -7355,21 +7315,6 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
         }
         return 0;
 
-    case WM_SETCURSOR:
-        if (app != nullptr) {
-            POINT cursor{};
-            if (GetCursorPos(&cursor) && ScreenToClient(window, &cursor)) {
-                const int hit = app->SettingsHitIndex(cursor);
-                if (hit >= 0 &&
-                    (app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::PowerProfileLog ||
-                        app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::EnergyBenchLog)) {
-                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
-                    return TRUE;
-                }
-            }
-        }
-        break;
-
     default:
         break;
     }
@@ -7464,32 +7409,6 @@ bool DockApp::SettingsGlassValid(POINT origin) const noexcept {
         std::abs(m_settingsGlassFrost - m_config.FrostAmount()) < 0.001F;
 }
 
-// The profiler runs in its own process: when it exits, show where it saved.
-void DockApp::TickPowerProfile() {
-    if (m_powerProfiler.IsRunning()) {
-        return;
-    }
-    KillTimer(m_window, kPowerProfileTimerId);
-    m_powerProfileFolder = m_powerProfiler.LastResult();
-    m_powerProfileStatus = m_powerProfileFolder.empty() ? L"The power profiler closed without saving results."
-                                                        : L"Saved " + m_powerProfileFolder;
-    Log(L"Power profiler finished: " + m_powerProfileStatus);
-    if (IsDockSettingsOpen()) {
-        QueueSettingsPaint();
-    }
-}
-
-void DockApp::TickEnergyBench() {
-    if (!m_energyBench.IsRunning()) {
-        KillTimer(m_window, kEnergyBenchTimerId);
-        Log(L"Energy benchmark finished: " + m_energyBench.Status().result);
-    }
-    // The countdown only needs painting while the panel is showing.
-    if (IsDockSettingsOpen()) {
-        QueueSettingsPaint();
-    }
-}
-
 void DockApp::QueueSettingsPaint(bool hoverOnly) {
     // Coalesce rapid hover transitions into a single repaint, mirroring the
     // Quick Settings popup path. Hover moves only need the cheap base-copy +
@@ -7529,9 +7448,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         FillSquirclePremul(pixels, width, height, bubble, static_cast<float>(side) * 0.5F, 0.55F);
         break;
     }
-    case SettingsHitKind::CheckNow:
-    case SettingsHitKind::PowerProfile:
-    case SettingsHitKind::EnergyBench: {
+    case SettingsHitKind::CheckNow: {
         // Capsule modules: dark wash in the exact pill (round caps), inset
         // 1px. A squircle of the same radius bulged past the rounded ends.
         const float h = static_cast<float>(hit.bounds.bottom - hit.bounds.top);
@@ -7541,9 +7458,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
             radius, 0.10F, 36, 34, 33);
         break;
     }
-    case SettingsHitKind::QsColorReset:
-    case SettingsHitKind::PowerProfileLog:
-    case SettingsHitKind::EnergyBenchLog: {
+    case SettingsHitKind::QsColorReset: {
         SetFlyoutChromeInk(33, 34, 36);
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
@@ -8288,71 +8203,6 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
             SetUpdateStatus(L"Already checking for updates...");
         }
         break;
-    case SettingsHitKind::PowerProfile: {
-        if (m_powerProfiler.IsRunning()) {
-            m_powerProfiler.RequestStop();
-            m_powerProfileStatus = L"Stopping\u2026 the profiler puts your power plan back and saves what it measured.";
-            Log(L"Power profiler stopping.");
-        } else if (m_energyBench.IsRunning()) {
-            m_powerProfileStatus = L"Stop the energy benchmark first: both switch power plans.";
-        } else {
-            m_powerProfileFolder.clear();
-            bool elevated = false;
-            if (m_powerProfiler.Start(elevated)) {
-                m_powerProfileStatus = elevated
-                    ? L"Profiling, about 50 minutes, hands off. Progress shows in the profiler's window."
-                    : L"Profiling without admin rights (less data), about 50 minutes, hands off.";
-                Log(L"Power profiler started.");
-                if (m_window != nullptr) {
-                    SetTimer(m_window, kPowerProfileTimerId, 2000, nullptr);
-                }
-            } else {
-                m_powerProfileStatus = L"Could not start the power profiler.";
-                Log(L"Power profiler failed to start.");
-            }
-        }
-        QueueSettingsPaint();
-        break;
-    }
-    case SettingsHitKind::EnergyBench:
-        if (m_energyBench.IsRunning()) {
-            m_energyBench.RequestStop();
-            Log(L"Energy benchmark stopping.");
-        } else if (m_powerProfiler.IsRunning()) {
-            m_powerProfileStatus = L"Stop the power profiler first: both switch power plans.";
-        } else if (m_energyBench.Start()) {
-            Log(L"Energy benchmark started.");
-        }
-        if (m_window != nullptr) {
-            SetTimer(m_window, kEnergyBenchTimerId, 1000, nullptr);
-        }
-        QueueSettingsPaint();
-        break;
-    case SettingsHitKind::EnergyBenchLog: {
-        const std::wstring summary = m_energyBench.Status().summaryPath;
-        if (summary.empty()) {
-            break;
-        }
-        std::thread([summary]() {
-            // No app for .md: show the file in Explorer instead.
-            if (reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", summary.c_str(), nullptr, nullptr,
-                    SW_SHOWNORMAL)) <= 32) {
-                const std::wstring parameters = L"/select,\"" + summary + L"\"";
-                ShellExecuteW(nullptr, L"open", L"explorer.exe", parameters.c_str(), nullptr, SW_SHOWNORMAL);
-            }
-        }).detach();
-        break;
-    }
-    case SettingsHitKind::PowerProfileLog: {
-        if (m_powerProfileFolder.empty()) {
-            break;
-        }
-        const std::wstring folder = m_powerProfileFolder;
-        std::thread([folder]() {
-            ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        }).detach();
-        break;
-    }
     }
 }
 
@@ -8452,7 +8302,6 @@ void DockApp::PaintSettingsPopup() {
     const LONG frostRowHeight = P(58.0F);
     const LONG buttonHeight = P(44.0F);
     const LONG colorHeight = P(166.0F);
-    const LONG statusHeight = P(46.0F);
     const LONG subHeight = P(15.0F);
     const LONG labelHeight = P(18.0F);
     const LONG switchWidth = P(44.0F);
@@ -8530,14 +8379,8 @@ void DockApp::PaintSettingsPopup() {
     const RECT colorRect{padding, contentY, padding + moduleWidth, contentY + colorHeight};
     contentY = colorRect.bottom + gutter;
     const RECT checkRect{padding, contentY, padding + moduleWidth, contentY + buttonHeight};
-    contentY = checkRect.bottom + gutter;
-    const RECT perfRect{padding, contentY, padding + moduleWidth, contentY + buttonHeight};
-    contentY = perfRect.bottom + gutter;
-    const RECT benchRect{padding, contentY, padding + moduleWidth, contentY + buttonHeight};
-    const LONG statusTop = benchRect.bottom + gutter;
-    // Energy benchmark step / outcome: up to two lines under the perf path.
-    const LONG benchLineHeight = subHeight * 2L + P(6.0F);
-    contentY = statusTop + statusHeight + subHeight + benchLineHeight + padding;  // version, update, perf, bench
+    const LONG statusTop = checkRect.bottom + gutter;
+    contentY = statusTop + subHeight * 2L + 6L + padding;  // version, update status
     m_settingsSize.cx = panelWidth;
     m_settingsSize.cy = contentY;
 
@@ -8562,8 +8405,6 @@ void DockApp::PaintSettingsPopup() {
         addShape(glassRect, static_cast<float>(moduleRadius));
         addShape(colorRect, static_cast<float>(moduleRadius));
         addShape(checkRect, static_cast<float>(buttonHeight) * 0.5F);
-        addShape(perfRect, static_cast<float>(buttonHeight) * 0.5F);
-        addShape(benchRect, static_cast<float>(buttonHeight) * 0.5F);
     }
 
     // WM_CLOSE / external destroy can kill the HWND while leaving a dangling
@@ -8771,10 +8612,6 @@ void DockApp::PaintSettingsPopup() {
     const uint8_t accentR = static_cast<uint8_t>((accentRgb >> 16) & 0xFFU);
     const uint8_t accentG = static_cast<uint8_t>((accentRgb >> 8) & 0xFFU);
     const uint8_t accentB = static_cast<uint8_t>(accentRgb & 0xFFU);
-    uint8_t onAccentR = 30;
-    uint8_t onAccentG = 33;
-    uint8_t onAccentB = 24;
-    CcOnAccentInk(accentR, accentG, accentB, onAccentR, onAccentG, onAccentB);
 
     LONG y = padding;
     RECT titleBounds{padding, y, panelWidth - padding - closeExtent - 8, y + headerHeight};
@@ -8937,25 +8774,6 @@ void DockApp::PaintSettingsPopup() {
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 150 : 255);
     pushHit(SettingsHitKind::CheckNow, checkRect);
 
-    const bool profiling = m_powerProfiler.IsRunning();
-    if (profiling) {
-        // Active capsule: accent fill inset 2pt so the glass rim stays visible.
-        const float capRadius = static_cast<float>(buttonHeight) * 0.5F - static_cast<float>(P(2.0F));
-        FillPillColorPremul(pixels, width, height,
-            static_cast<float>(perfRect.left) + static_cast<float>(buttonHeight) * 0.5F,
-            static_cast<float>(perfRect.right) - static_cast<float>(buttonHeight) * 0.5F,
-            0.5F * static_cast<float>(perfRect.top + perfRect.bottom), capRadius, 0.98F,
-            accentB, accentG, accentR);
-        SetFlyoutChromeInk(onAccentR, onAccentG, onAccentB);
-    }
-    DrawFlyoutText(pixels, width, height, perfRect, labelFont,
-        !profiling                       ? L"Run power profiler"
-            : m_powerProfiler.IsStopping() ? L"Stopping\u2026"
-                                           : L"Stop power profiler",
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
-    SetFlyoutChromeInk(inkR, inkG, inkB);
-    pushHit(SettingsHitKind::PowerProfile, perfRect);
-
     std::string current = Updater::CurrentVersion();
     std::wstring wideVersion(current.begin(), current.end());
     RECT versionBounds{padding, statusTop, panelWidth - padding, statusTop + subHeight};
@@ -8965,78 +8783,6 @@ void DockApp::PaintSettingsPopup() {
         versionBounds.bottom + 2 + subHeight + 4};
     DrawFlyoutText(pixels, width, height, statusBounds, statusFont, m_updateStatus,
         DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
-    if (!m_powerProfileStatus.empty() || profiling) {
-        std::wstring perfLine = m_powerProfileStatus;
-        if (profiling && perfLine.empty()) {
-            perfLine = L"Profiling\u2026";
-        }
-        RECT perfStatusBounds{padding, statusBounds.bottom, panelWidth - padding,
-            statusTop + statusHeight + subHeight};
-        const bool savedLink = !profiling && !m_powerProfileFolder.empty();
-        const std::wstring savedPrefix = L"Saved ";
-        const int underlineFrom = savedLink && perfLine.starts_with(savedPrefix)
-            ? static_cast<int>(savedPrefix.size())
-            : -1;
-        DrawFlyoutText(pixels, width, height, perfStatusBounds, statusFont, perfLine,
-            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 210, underlineFrom);
-        if (savedLink) {
-            pushHit(SettingsHitKind::PowerProfileLog, perfStatusBounds);
-        }
-    }
-
-    // ---- Energy benchmark: Start / Stop with a live countdown -----------------
-    {
-        const EnergyBenchStatus bench = m_energyBench.Status();
-        if (bench.running) {
-            const float capRadius = static_cast<float>(buttonHeight) * 0.5F - static_cast<float>(P(2.0F));
-            FillPillColorPremul(pixels, width, height,
-                static_cast<float>(benchRect.left) + static_cast<float>(buttonHeight) * 0.5F,
-                static_cast<float>(benchRect.right) - static_cast<float>(buttonHeight) * 0.5F,
-                0.5F * static_cast<float>(benchRect.top + benchRect.bottom), capRadius, 0.98F,
-                accentB, accentG, accentR);
-            SetFlyoutChromeInk(onAccentR, onAccentG, onAccentB);
-        }
-        std::wstring benchLabel = L"Start energy benchmark";
-        if (bench.stopping) {
-            benchLabel = L"Stopping\u2026";
-        } else if (bench.running) {
-            const auto left = static_cast<long long>(std::ceil(bench.secondsLeft));
-            wchar_t clock[32]{};
-            if (left >= 3600) {
-                swprintf_s(clock, L"%lld:%02lld:%02lld", left / 3600, left % 3600 / 60, left % 60);
-            } else {
-                swprintf_s(clock, L"%lld:%02lld", left / 60, left % 60);
-            }
-            benchLabel = L"Stop benchmark \u00B7 " + std::wstring(clock) + L" left";
-        }
-        DrawFlyoutText(pixels, width, height, benchRect, labelFont, benchLabel,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
-        SetFlyoutChromeInk(inkR, inkG, inkB);
-        pushHit(SettingsHitKind::EnergyBench, benchRect);
-
-        const LONG benchStatusTop = statusTop + statusHeight + subHeight;
-        const RECT benchStatusBounds{padding, benchStatusTop, panelWidth - padding, benchStatusTop + benchLineHeight};
-        std::wstring benchLine;
-        int benchUnderline = -1;
-        const bool summaryLink = !bench.running && !bench.summaryPath.empty();
-        if (bench.running) {
-            benchLine = bench.step;
-        } else if (!bench.result.empty()) {
-            benchLine = bench.result;
-            if (summaryLink) {
-                benchLine += L" ";
-                benchUnderline = static_cast<int>(benchLine.size());
-                benchLine += L"Open summary";
-            }
-        } else {
-            benchLine = L"Compares Automatic with Balanced on scripted workloads (about 30 min, hands off).";
-        }
-        DrawFlyoutText(pixels, width, height, benchStatusBounds, statusFont, benchLine,
-            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, bench.failed ? 235 : 210, benchUnderline);
-        if (summaryLink) {
-            pushHit(SettingsHitKind::EnergyBenchLog, benchStatusBounds);
-        }
-    }
 
     g_flyoutTextHalo = false;
     const size_t bytes = pixelCount * 4U;
@@ -14223,8 +13969,6 @@ void CALLBACK DockApp::ForegroundWinEventProc(HWINEVENTHOOK, DWORD, HWND hwnd, L
         PostMessageW(s_instance->m_window, kBadgeSeenMessage, reinterpret_cast<WPARAM>(hwnd), 0);
     }
     s_instance->m_renderer.RequestBackdropRefresh();
-    // A focused game must be at full power before its first frame.
-    s_instance->m_autoPower.Wake();
     s_instance->SyncSearchHotkeyForFullscreen();
     if (s_instance->m_visibility == VisibilityState::Hidden ||
         s_instance->m_visibility == VisibilityState::Hiding) {
@@ -14351,24 +14095,6 @@ void DockApp::UnregisterSystemResumeNotifications() noexcept {
         }
         m_sessionNotifyRegistered = false;
     }
-}
-
-void DockApp::SyncAutoPowerKeyboard(bool wanted) noexcept {
-    if (wanted == m_autoPowerKeyboard || m_window == nullptr) {
-        return;
-    }
-    RAWINPUTDEVICE keyboard{0x01, 0x06, wanted ? static_cast<DWORD>(RIDEV_INPUTSINK) : static_cast<DWORD>(RIDEV_REMOVE),
-        wanted ? m_window : nullptr};
-    const bool ok = RegisterRawInputDevices(&keyboard, 1, sizeof(keyboard)) != FALSE;
-    if (wanted) {
-        // Without the sink the engine falls back to polling for keyboard input.
-        m_autoPower.SetKeyboardInputAvailable(ok);
-        if (!ok) {
-            Log(L"Raw keyboard input unavailable; Automatic polls for keyboard-only input.");
-            return;
-        }
-    }
-    m_autoPowerKeyboard = wanted && ok;
 }
 
 LRESULT DockApp::HandlePowerBroadcast(WPARAM wParam, LPARAM lParam) {

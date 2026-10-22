@@ -113,6 +113,10 @@ constexpr int kToggleRefreshRate = 7;
 // duplicated. The duplicate receives a normal, enumerable scheme GUID.
 const GUID kUltimatePowerSchemeSource = {
     0xe9a42b02, 0xd5df, 0x448d, {0xaa, 0x00, 0x03, 0xf1, 0x47, 0x49, 0xeb, 0x61}};
+// {a5cc14c9-7d82-4ffc-a698-225beed1e73f} "Hoverdock Automatic", the plan older
+// versions created for the Automatic energy mode. Removed on startup.
+const GUID kLegacyAutomaticPowerScheme = {
+    0xa5cc14c9, 0x7d82, 0x4ffc, {0xa6, 0x98, 0x22, 0x5b, 0xee, 0xd1, 0xe7, 0x3f}};
 
 struct DeviceShareMode;
 
@@ -1248,6 +1252,31 @@ bool FindUltimatePowerScheme(GUID& scheme) {
     return false;
 }
 
+// Runs powercfg.exe hidden with the given arguments; true on exit code 0.
+bool RunPowercfg(const std::wstring& arguments) {
+    wchar_t system[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(system, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return false;
+    }
+    std::wstring commandLine = L"\"" + std::wstring(system) + L"\\powercfg.exe\" " + arguments;
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+            &startup, &process) == FALSE) {
+        return false;
+    }
+    const DWORD wait = WaitForSingleObject(process.hProcess, 10000);
+    DWORD exitCode = ERROR_PROCESS_ABORTED;
+    if (wait == WAIT_OBJECT_0) {
+        GetExitCodeProcess(process.hProcess, &exitCode);
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return wait == WAIT_OBJECT_0 && exitCode == ERROR_SUCCESS;
+}
+
 bool DuplicateUltimatePowerScheme() {
     return RunPowercfg(L"/duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61");
 }
@@ -1281,11 +1310,16 @@ void QueryPower(QuickSettingsCache& cache) {
     LocalFree(scheme);
 }
 
+// Automatic is Windows' Balanced plan with its factory settings.
+bool ActivateFactoryBalanced() {
+    // Best effort: a policy-locked Balanced plan still becomes active as is.
+    static_cast<void>(PowerRestoreIndividualDefaultPowerScheme(&GUID_TYPICAL_POWER_SAVINGS));
+    return PowerSetActiveScheme(nullptr, &GUID_TYPICAL_POWER_SAVINGS) == ERROR_SUCCESS;
+}
+
 bool SetPowerMode(int mode) {
-    // Automatic is the Hoverdock Automatic plan, run by AutoPowerEngine;
-    // plain Balanced is the fallback when the plan cannot be created.
-    if (mode == 1 && AutoPowerEngine::Activate()) {
-        return true;
+    if (mode == 1) {
+        return ActivateFactoryBalanced();
     }
     GUID ultimate{};
     const GUID* scheme = &GUID_TYPICAL_POWER_SAVINGS;
@@ -4293,6 +4327,25 @@ void CcDrawSlider(uint8_t* pixels, int width, int height, RECT track, float leve
 
 }  // namespace dock_detail
 
+void RemoveLegacyAutomaticPowerPlan() {
+    GUID* active = nullptr;
+    if (PowerGetActiveScheme(nullptr, &active) == ERROR_SUCCESS && active != nullptr) {
+        const bool legacyActive = IsEqualGUID(*active, kLegacyAutomaticPowerScheme) != FALSE;
+        LocalFree(active);
+        if (legacyActive) {
+            static_cast<void>(ActivateFactoryBalanced());
+        }
+    }
+    static_cast<void>(PowerDeleteScheme(nullptr, &kLegacyAutomaticPowerScheme));
+    // The removed engine's learned app history.
+    wchar_t appData[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", appData, MAX_PATH);
+    if (length != 0 && length < MAX_PATH) {
+        const std::wstring history = std::wstring(appData) + L"\\LiquidGlassDock\\autopower-history.txt";
+        static_cast<void>(DeleteFileW(history.c_str()));
+    }
+}
+
 QsModuleOrder DefaultQsModuleOrder() noexcept {
     QsModuleOrder order{};
     for (size_t index = 0; index < kQsModuleCount; ++index) {
@@ -5391,15 +5444,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             {0, L'\uE945', L"High Power"},
         };
         static const std::wstring kNoTrailing;
-        static const std::wstring kHighPower = L"High Power";
-        static const std::wstring kLowPower = L"Low Power";
-        // Automatic shows which power level it is running at right now.
-        const AutoPowerStatus autoPower = m_autoPower.Status();
-        const std::wstring& autoLevel =
-            !autoPower.engaged ? kNoTrailing : (autoPower.fullPower ? kHighPower : kLowPower);
         for (const ModeRow& mode : kModeRows) {
-            menuItem(mode.glyph, m_qsCache.powerMode == mode.mode, false, mode.label,
-                mode.mode == 1 ? autoLevel : kNoTrailing, 0, TrayFlyoutHitKind::PowerMode, mode.mode);
+            menuItem(mode.glyph, m_qsCache.powerMode == mode.mode, false, mode.label, kNoTrailing, 0,
+                TrayFlyoutHitKind::PowerMode, mode.mode);
         }
         hairline();
         menuSection(L"Using Significant Energy");
@@ -6114,7 +6161,6 @@ void DockApp::ApplyQuickSettingsCommand(const TrayFlyoutHit& hit, UINT message) 
         if (SetPowerMode(hit.index)) {
             m_qsCache.powerMode = hit.index;
             m_qsCache.stamp = 0;
-            m_autoPower.Wake();
             QueueOverflowPaint();
         }
         break;

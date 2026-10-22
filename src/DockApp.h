@@ -1,7 +1,6 @@
 #pragma once
 
 #include "DockConfig.h"
-#include "AutoPower.h"
 #include "AiAnswerView.h"
 #include "AiAttachments.h"
 #include "GroqClient.h"
@@ -17,8 +16,6 @@
 #include "QuickSettingsPanel.h"
 #include "Weather.h"
 #include "SpeedTest.h"
-#include "EnergyBench.h"
-#include "PowerProfiler.h"
 #include "PerfBoost.h"
 
 #include <Windows.h>
@@ -183,8 +180,6 @@ private:
     static constexpr UINT kOpenSearchEntryMessage = WM_APP + 42;
     // AI image attachment prepared: lParam owns an AiAttachmentReply.
     static constexpr UINT kAiAttachmentMessage = WM_APP + 43;
-    // Automatic energy mode status changed (AutoPowerEngine worker, no payload).
-    static constexpr UINT kAutoPowerMessage = WM_APP + 44;
     static constexpr UINT_PTR kWeatherTimerId = 10;
     static constexpr UINT_PTR kRefreshTimerId = 1;
     static constexpr UINT_PTR kDeferredRefreshTimerId = 2;
@@ -210,9 +205,6 @@ private:
     // Post-wake topmost re-assertion: Explorer/DWM reshuffle z-order for a
     // few seconds after resume/unlock, which can sink the dock under windows.
     static constexpr UINT_PTR kResumeZOrderTimerId = 23;
-    // Dock Settings energy benchmark: 1 s countdown while it runs.
-    static constexpr UINT_PTR kEnergyBenchTimerId = 24;
-    static constexpr UINT_PTR kPowerProfileTimerId = 25;
     static constexpr UINT kResumeZOrderIntervalMs = 1000;
     static constexpr int kResumeZOrderPasses = 4;
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
@@ -348,10 +340,6 @@ private:
         HandsFree,
         LightPanels,
         CheckNow,
-        PowerProfile,
-        PowerProfileLog,
-        EnergyBench,
-        EnergyBenchLog,
         Close,
         QsColorSwatch,
         QsColorHue,
@@ -502,9 +490,6 @@ private:
         const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
         const RECT* dirty = nullptr, bool preservePopupShadow = false) noexcept;
     void QueueSettingsPaint(bool hoverOnly = false);
-    // Energy benchmark countdown tick: repaints Dock Settings, notes the finish.
-    void TickEnergyBench();
-    void TickPowerProfile();
     // allowCc=false keeps the plain dock material even while Dock Settings has CC shapes.
     [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false,
         bool allowCc = true) const noexcept;
@@ -804,9 +789,6 @@ private:
     void RegisterSystemResumeNotifications();
     void UnregisterSystemResumeNotifications() noexcept;
     LRESULT HandlePowerBroadcast(WPARAM wParam, LPARAM lParam);
-    // Raw keyboard input only while Automatic can use it (engaged, not at
-    // High Power), so games and the other modes never route keys through us.
-    void SyncAutoPowerKeyboard(bool wanted) noexcept;
     void LogInputMouse(UINT message, POINT screenPoint, int icon) const;
     void Log(const std::wstring& message) const;
 
@@ -1256,13 +1238,6 @@ private:
     std::wstring m_updateStatus = L"Checking for updates...";
     std::atomic<bool> m_updateInFlight{false};
     std::atomic<bool> m_updateInstalling{false};
-    PowerProfilerLauncher m_powerProfiler;
-    EnergyBenchmark m_energyBench;
-    AutoPowerEngine m_autoPower;
-    bool m_autoPowerKeyboard = false;
-    std::wstring m_powerProfileStatus;
-    // Set only after a power profile finishes writing. Clicking the path opens it.
-    std::wstring m_powerProfileFolder;
     double m_lastUpdateCheck = 0.0;
     std::wstring m_overflowGlyphKey;
     std::vector<uint8_t> m_overflowGlyphGear;

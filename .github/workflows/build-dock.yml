@@ -35,7 +35,6 @@ jobs:
           out\bin\Release\TrayIconsTests.exe || exit /b 1
           out\bin\Release\AiMarkdownTests.exe || exit /b 1
           out\bin\Release\GroqProtocolTests.exe || exit /b 1
-          out\bin\Release\AutoPowerPolicyTests.exe || exit /b 1
 
       - name: Install NSIS
         shell: powershell

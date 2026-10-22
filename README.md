@@ -92,61 +92,15 @@ Your config lives at `%LOCALAPPDATA%\LiquidGlassDock\dock.ini`.
 
 > **Taskbar still hidden after a crash?** Launch `Dock.exe` once and quit it. Everything is restored.
 
-### Automatic energy mode
+### Energy mode
 
-Quick Settings → **Power** → **Energy Mode** works like the macOS menu. **Low Power** uses Windows' Power saver plan and **High Power** uses Ultimate Performance. **Automatic** switches to a *Hoverdock Automatic* power plan, and while that plan is active Hoverdock manages it for you:
+Quick Settings → **Power** → **Energy Mode** works like the macOS menu:
 
-It works the way a Mac does. Performance follows the work instead of a mode: the processor's own controller (Intel Speed Shift / AMD CPPC) picks clocks for each core every millisecond, and Hoverdock only sets how eagerly it does so.
+- **Automatic** uses Windows' **Balanced** plan with its factory default settings (choosing it resets Balanced to Windows' defaults).
+- **Low Power** uses Windows' Power saver plan.
+- **High Power** uses Ultimate Performance.
 
-- **At rest** the processor parks cores, keeps PCIe links in their deepest power saving and sets its minimum clock like Windows' Power saver (Hoverdock's **Low Power**), but its clocks race to idle. The energy preference sits below Balanced's, turbo is aggressive and the controller averages load over a short window. A burst of real work, such as opening a file or running a script, reaches turbo sooner than on Balanced, finishes, and lets the processor go back to sleep. Moving the cursor over an idle desktop still gets nothing. Windows' brief input boost (its latency-sensitivity hint, raised on every input including pointer motion) also follows Power saver. Display and sleep settings stay as in Balanced.
-- **The app you're using stays responsive**, like macOS's user-interactive tier. When the focused app does real work within a few seconds of a click, key press or scroll, or keeps a steady load while it covers the screen (a fullscreen animation, slideshow or player), Automatic switches to an interactive profile. Clocks and core parking stay as at rest, but Windows' input boost is back at full strength: every input unparks cores and raises performance at once, so a frame or a keystroke never waits for a core to wake up. macOS gets the same effect from frame deadlines that apps declare; Windows has no such API, so Hoverdock infers them from the focused app's load. The profile is released 5 seconds after the work stops. Pointer motion with no work behind it, and music or video playing while nobody touches the keyboard or mouse, stay at rest, whose fast clock ramp already keeps playback smooth.
-- **Hidden apps nap**, like App Nap. When every window of an app is minimized, on another desktop or completely covered by a maximized or fullscreen window, the app hasn't been used for 30 seconds, and it isn't doing work you just started, it runs in Windows' efficiency mode (EcoQoS) and its timer-resolution requests are ignored. That keeps it from waking the processor. It wakes within a second or two of a window coming back into view. Apps playing audio, on a call, games, creative tools, AI tools and Windows' shell are never napped.
-- **Apps you can see but aren't using get coalesced timers**, like macOS's timer tiers. Once a visible app has been out of focus for 10 seconds, Windows ignores its requests for 1 ms timer precision, so a chat app or a browser in the background stops waking the processor a thousand times a second. Its speed is untouched, and the same exemptions apply, plus anything visibly animating with real GPU load. Focusing it restores precise timers at once.
-- **When the display turns off**, nobody can see any window, so every app is treated as hidden and naps after 30 seconds, as on a Mac whose display has slept. Work you started keeps running however long you're away. With nothing demanding full power, the processor also moves to an away profile that favours efficiency (turbo only when the controller judges it efficient), since no one is waiting on a response. The first input or the display waking brings everything straight back.
-- **Demanding work** moves the processor to a performance-first profile with aggressive turbo, on mains or battery. Cores still clock down and park between bursts, so only the work in hand pays for the speed. **Games** get a profile that favours performance even more and keeps every core ready. Neither profile pins the clock at 100%; that's still Hoverdock's **High Power** mode. On a gaming laptop, pinning the CPU would take the GPU's share of the power budget. Automatic boosts for:
-  - **Games you're playing**: anything in a Steam, Epic, GOG, Xbox, Riot, Ubisoft, EA or Rockstar library, games Windows Game Bar recognises, exclusive fullscreen apps, and borderless fullscreen apps with real 3D load. If nobody touches the keyboard, mouse or an Xbox-compatible controller for 3 minutes (paused, or away from the keyboard in a menu), the game drops back to rest. The next input brings it straight back.
-  - **Creative tools you're driving**, such as Premiere Pro, After Effects, DaVinci Resolve, Blender, Cinema 4D, Unreal, Unity, Photoshop or Ableton. Scrubbing a timeline, orbiting a viewport or painting keeps them at full power. Just moving the pointer over the window doesn't: there has to be real CPU or GPU work behind the input.
-  - **Live audio in a creative tool**: a DAW playing back or recording, so audio never drops out.
-  - **Renders and exports**: a creative tool doing sustained CPU or GPU work, even when it's minimised.
-  - **Video calls**: an app using the camera that is doing real work (background blur, encoding), even in the background.
-  - **Local AI**: Ollama, LM Studio, llama.cpp, KoboldCpp, ComfyUI and similar tools under sustained load, or any app keeping a GPU compute engine busy (a PyTorch script, for example).
-  - **Heavy work in the focused app**, such as a compile. A single maxed-out thread counts too (a script, a spreadsheet recalculation), even though on a many-core processor that's only a few percent of the whole CPU.
-- Hoverdock remembers which apps have needed a boost for their work (in `autopower-history.txt` next to the dock's settings). Next time, one busy reading is enough for those apps to boost. Apps that haven't needed it for 30 days are forgotten.
-- Games, creative tools, AI tools, and apps that are playing audio or using the camera or microphone are never throttled by Windows' background power saving (EcoQoS).
-
-The Automatic row shows **High Power** while it's boosting an app and **Low Power** the rest of the time. It reacts in milliseconds: switching to a game or working in a creative tool boosts straight away, and work you start (an export, a render, a build) is confirmed within about a third of a second. CPU load for every process comes from a single system call, and GPU load comes from the kernel's graphics statistics. That keeps the GPU cheap enough to check all the time. The time each switch takes, and how many hidden apps are napping, are written to the debug output (visible in DebugView). Each boost is held a few seconds after the work stops, so power doesn't flicker on and off. Picking Low or High Power hands control back to Windows and undoes everything Automatic changed. If you were on Balanced (which Hoverdock already showed as Automatic), it moves you to the Automatic plan once. Uninstalling Hoverdock switches you back to Balanced and removes the plan.
-
-**Does it actually save energy on your machine?** Open Dock Settings and click **Start energy benchmark**. It runs the same scripted workloads under Windows **Balanced** (Automatic's engine switched off) and under **Automatic**, swapping which goes first each round, three times over. That takes about 30 minutes, and the button counts down the time left. Click it again to stop at any time. Your original power plan comes back when it finishes or stops.
-
-- **Before you start:** choose Automatic once (that creates its plan). While it runs, don't touch the keyboard or mouse, because input wakes the engine. Also keep the brightness and the charger as they are.
-- **Workloads:**
-  - an idle desktop
-  - the pointer moving
-  - a minimized app polling a fast timer, which App Nap should catch
-  - short UI-like bursts of work
-  - a 60 fps frame loop
-  - a fixed all-core job, measured as the energy to finish it
-
-  The work is identical under both plans. Burst time, missed frames and job time are reported next to energy, so a saving that comes from doing less shows up.
-- **Meters:** unplug the charger to measure the whole machine from the battery. Plugged in, it reads the processor's own energy counters.
-- **Results:** the outcome appears under the button, for example "Automatic used less energy in 4, more in 0, no clear difference in 2 of 6 tests". A difference only counts when it's bigger than the run-to-run noise (95% confidence). **Open summary** shows the full table. Every reading is saved in `runs.csv` in a `Hoverdock-energy-<date>` folder next to `Dock.exe`.
-
-**Tuning Automatic for your machine: the power profiler.** With the dock running, open Dock Settings and click **Run power profiler**. Allow the admin prompt so it can read the processor's energy counters; it still runs without admin, with less data. The profiler opens its own window to show progress. It takes about 50 minutes with your hands off the keyboard and mouse. **Stop power profiler** ends it early, as does Ctrl+C in its window. Your plan is restored when it finishes or stops, and the temporary plan it uses is deleted. When it's done, the folder it saved shows as a link under the button. You can also run it from an elevated terminal as `.\Dock.exe --power-profile`, adding `--quick` for a run of about 20 minutes. It writes a `Hoverdock-profile-<date>` folder next to `Dock.exe` (or under `%LOCALAPPDATA%\Hoverdock\Profiles`):
-
-- **What's in the folder:**
-  - the processor's capabilities (Speed Shift, energy preference, activity window), Windows' power mode overlay and timer resolution
-  - every power plan's processor settings
-  - a once-a-second timeline of package power, effective clocks per core, idle-state residency, core parking, wake-ups and timer resolution
-  - the busiest processes by CPU and by wake-ups
-  - the engine's own decisions and every plan value it writes
-  - powercfg's energy report
-- **The runs:**
-  - the machine exactly as it is
-  - Balanced, Power saver and Automatic under the benchmark's workloads
-  - a sweep of the engine's rest-profile settings (energy preference, boost mode, activity window, parking, PCIe) on a temporary copy of its plan
-
-  `summary.md` has the headline tables. Share the whole folder, zipped, when reporting an issue with Automatic.
-- **Live mode:** `.\Dock.exe --power-profile --live 15` records the timeline, processes and engine decisions for 15 minutes while you use the PC normally, without changing any plan.
+Older versions ran Automatic on a custom *Hoverdock Automatic* plan. Hoverdock now removes that plan on startup, moving you to the factory Balanced plan if it was active.
 
 ## Build it yourself
 

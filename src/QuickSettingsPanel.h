@@ -223,6 +223,9 @@ void RequestQuickSettingsCacheAsync(HWND notifyHwnd, UINT notifyMsg, QuickSettin
 bool ApplyQuickSettingsCacheResult(QuickSettingsCache& cache);
 // Open the mic capture client on a worker if the peak pump is not running.
 void EnsureQuickSettingsCaptureAsync() noexcept;
+// Older versions ran Automatic on a "Hoverdock Automatic" power plan: move off
+// it to Windows' factory Balanced plan, delete it and its app history. Blocking.
+void RemoveLegacyAutomaticPowerPlan();
 
 // Shared macOS 26 Control Centre controls + accent, used by Quick Settings and
 // Dock Settings (defined in QuickSettingsPanel.cpp).
