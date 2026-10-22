@@ -3119,9 +3119,11 @@ LRESULT CALLBACK DockApp::ContextWindowProcedure(HWND window, UINT message, WPAR
 LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && s_instance != nullptr && s_instance->m_window != nullptr) {
         // Automatic energy mode: wakes its engine only when it asked for input.
-        // Clicks are commits (they start work); motion and wheel are not.
+        // Clicks and the wheel are commits (they start work: a scroll renders
+        // the page); motion is not.
         s_instance->m_autoPower.NoteInput(wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
-            wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN);
+            wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN || wParam == WM_MOUSEWHEEL ||
+            wParam == WM_MOUSEHWHEEL);
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         if (wParam == WM_MOUSEMOVE && !s_instance->IsDragActive() &&
             s_instance->NeedsHookPointerPost(mouse->pt)) {

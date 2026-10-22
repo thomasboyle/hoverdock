@@ -63,8 +63,8 @@ public:
     // mode picked).
     void Wake() noexcept;
     // Called for every mouse (low-level hook) and keyboard (raw input) event;
-    // commit = a click or key, the inputs that start work. Costs a few relaxed
-    // atomic operations unless the engine asked to be woken: by a commit when
+    // commit = a click, wheel or key, the inputs that start work. Costs a few
+    // relaxed atomic operations unless the engine asked to be woken: by a commit when
     // not at High Power, or by any input while a creative tool or a released
     // game is focused or the machine is parked. Each such wake starts a short
     // probe of the focused app's load.
@@ -82,7 +82,8 @@ public:
 private:
     void ThreadMain();
     void Signal(bool forceSample, bool commit = false) noexcept;
-    // Active power plan change (GUID_ACTIVE_POWERSCHEME) from the power service.
+    // Active power plan (GUID_ACTIVE_POWERSCHEME) or console display state
+    // (GUID_CONSOLE_DISPLAY_STATE) change from the power service.
     static ULONG CALLBACK PlanChanged(PVOID context, ULONG type, PVOID setting);
 
     mutable std::mutex m_mutex;
@@ -98,6 +99,8 @@ private:
     std::atomic<DWORD> m_hookInputTick{0};
     // 0 = unknown (poll the active plan), 1 = ours active, 2 = another plan.
     std::atomic<int> m_planState{0};
+    // The console display is off (nobody can see the screen).
+    std::atomic<bool> m_displayOff{false};
     HWND m_notifyHwnd = nullptr;
     UINT m_notifyMsg = 0;
     AutoPowerStatus m_status;

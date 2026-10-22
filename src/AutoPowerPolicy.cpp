@@ -340,6 +340,28 @@ bool Policy::FirstDemand(Run& run) noexcept {
     return first;
 }
 
+bool Policy::Interactive(const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track) const {
+    const uint64_t stamp = (std::max)(nowMs, uint64_t{1});
+    // Covering the monitor with steady load (an animation, a slideshow, a
+    // fullscreen player) stands in for a frame deadline: Windows has no
+    // work-interval API that would announce one. Audio alone does not count:
+    // a focused music player would hold the profile for hours, and rest
+    // clocks already ramp fast enough for decoding.
+    if (!app.foreground || !app.fullscreen) {
+        track.frames = {};
+    } else if (app.freshLoad) {
+        const bool busy = app.cpuCores >= m_tuning.frameCores || app.gpu3dPercent >= m_tuning.frameGpu3dPercent;
+        track.frames.sinceMs = busy ? (track.frames.sinceMs != 0 ? track.frames.sinceMs : stamp) : 0;
+        track.frames.samples = busy ? track.frames.samples + 1 : 0;
+    }
+    if (!app.foreground) {
+        return false;
+    }
+    const bool driven = idleMs <= m_tuning.interactiveIdleMs &&
+        (app.cpuCores >= m_tuning.interactiveCores || app.gpu3dPercent >= m_tuning.interactiveGpu3dPercent);
+    return driven || Sustained(track.frames, stamp, false);
+}
+
 BoostReason Policy::Demand(
     const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track, bool& newRun) const {
     newRun = false;
@@ -439,7 +461,21 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
     decision.reason = BoostReason::None;
     decision.appKey.clear();
     decision.appName.clear();
+    decision.interactive = false;
+    decision.interactiveKey.clear();
+    decision.interactiveName.clear();
+    decision.away = false;
     decision.confirmed.clear();
+    if (!inputs.displayOff) {
+        m_displayOffSinceMs = 0;
+    } else if (m_displayOffSinceMs == 0) {
+        m_displayOffSinceMs = (std::max)(now, uint64_t{1});
+    }
+    // Nobody sees the screen while the display is off: no app is in use and
+    // every window is hidden. Grace for work the user started stops counting
+    // down while they are away.
+    const bool watched = !inputs.displayOff;
+    const uint64_t graceNow = watched ? now : m_displayOffSinceMs;
     // The engine passes the same apps in the same order tick after tick (the
     // groups only change on a process scan): each input slot remembers its
     // track, so a key is only hashed when the slot's app changes.
@@ -479,7 +515,7 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
         if (track.firstSeenMs == 0) {
             track.firstSeenMs = (std::max)(now, uint64_t{1});
         }
-        if (app.foreground) {
+        if (app.foreground && watched) {
             track.lastForegroundMs = (std::max)(now, uint64_t{1});
         }
         bool newRun = false;
@@ -503,18 +539,31 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
             track.reason = track.lastDemand;
             track.reasonUntilMs = track.holdUntilMs;
         }
+        if (!watched) {
+            track.frames = {};
+        } else if (Interactive(app, now, inputs.idleMs, track)) {
+            track.interactiveUntilMs = now + m_tuning.interactiveHoldMs;
+            track.lastInteractiveMs = (std::max)(now, uint64_t{1});
+        }
         track.exemptNow = app.kind == AppKind::Game || app.kind == AppKind::Creative || app.kind == AppKind::Ai ||
             app.registeredGame || app.audioActive || app.cameraActive || app.micActive;
         const bool boosting = track.reason != BoostReason::None && track.holdUntilMs > now;
         Track::Qos qos = Track::Qos::Os;
         if (track.exemptNow || boosting) {
             qos = Track::Qos::Never;
-        } else if (app.windowed && !app.windowVisible && !app.foreground && !NeverNap(app.key)) {
+        } else if (app.windowed && !(app.foreground && watched) && !NeverNap(app.key)) {
             const uint64_t lastUsed = (std::max)(track.lastForegroundMs, track.firstSeenMs);
-            const bool userWork = app.cpuCores >= m_tuning.napBusyCores && track.lastForegroundMs != 0 &&
-                now - track.lastForegroundMs < m_tuning.napBusyGraceMs;
-            if (now - lastUsed >= m_tuning.napAfterMs && !userWork) {
-                qos = Track::Qos::Nap;
+            const uint64_t unused = now - (std::min)(lastUsed, now);
+            if (!app.windowVisible || !watched) {
+                const bool userWork = app.cpuCores >= m_tuning.napBusyCores && track.lastForegroundMs != 0 &&
+                    graceNow - (std::min)(track.lastForegroundMs, graceNow) < m_tuning.napBusyGraceMs;
+                if (unused >= m_tuning.napAfterMs && !userWork) {
+                    qos = Track::Qos::Nap;
+                } else if (unused >= m_tuning.coalesceAfterMs) {
+                    qos = Track::Qos::Coalesce;
+                }
+            } else if (unused >= m_tuning.coalesceAfterMs && app.gpu3dPercent < m_tuning.coalesce3dPercent) {
+                qos = Track::Qos::Coalesce;
             }
         }
         listChanged = listChanged || qos != track.qos;
@@ -565,25 +614,58 @@ void Policy::Update(const Inputs& inputs, Decision& decision) {
         decision.appName = best->name;
     }
 
+    const std::wstring* interactiveKey = nullptr;
+    const Track* interactive = nullptr;
+    for (const Slot& slot : m_seen) {
+        const Track& track = *slot.track;
+        if (track.interactiveUntilMs <= now) {
+            continue;
+        }
+        const bool isForeground = &track == foreground;
+        bool better = interactive == nullptr;
+        if (!better && isForeground != (interactive == foreground)) {
+            better = isForeground;
+        } else if (!better && track.lastInteractiveMs != interactive->lastInteractiveMs) {
+            better = track.lastInteractiveMs > interactive->lastInteractiveMs;
+        } else if (!better) {
+            better = *slot.key < *interactiveKey;
+        }
+        if (better) {
+            interactive = &track;
+            interactiveKey = slot.key;
+        }
+    }
+    if (interactive != nullptr) {
+        decision.interactive = true;
+        decision.interactiveKey = *interactiveKey;
+        decision.interactiveName = interactive->name;
+    }
+    decision.away = !watched && !decision.fullPower && !decision.interactive;
+
     // The exempt list is rebuilt (and sorted) only when membership changes,
     // and copied out only to a decision that does not hold it already.
     if (listChanged) {
         m_unthrottle.clear();
         m_nap.clear();
+        m_coalesce.clear();
         for (const Slot& slot : m_seen) {
             if (slot.track->qos == Track::Qos::Never) {
                 m_unthrottle.push_back(*slot.key);
             } else if (slot.track->qos == Track::Qos::Nap) {
                 m_nap.push_back(*slot.key);
+            } else if (slot.track->qos == Track::Qos::Coalesce) {
+                m_coalesce.push_back(*slot.key);
             }
         }
         std::sort(m_unthrottle.begin(), m_unthrottle.end());
         std::sort(m_nap.begin(), m_nap.end());
+        std::sort(m_coalesce.begin(), m_coalesce.end());
         m_throttleVersion = ++g_throttleVersion;
     }
     if (decision.throttleVersion != m_throttleVersion) {
         decision.unthrottle = m_unthrottle;
         decision.nap = m_nap;
+        decision.coalesce = m_coalesce;
         decision.throttleVersion = m_throttleVersion;
     }
 }
@@ -595,6 +677,8 @@ void Policy::Reset() noexcept {
     m_seen.clear();
     m_unthrottle.clear();
     m_nap.clear();
+    m_coalesce.clear();
+    m_displayOffSinceMs = 0;
     m_throttleVersion = ++g_throttleVersion;
 }
 

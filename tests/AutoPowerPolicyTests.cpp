@@ -52,6 +52,10 @@ bool Unthrottled(const Decision& decision, const wchar_t* key) {
     return std::find(decision.unthrottle.begin(), decision.unthrottle.end(), key) != decision.unthrottle.end();
 }
 
+bool Coalesced(const Decision& decision, const wchar_t* key) {
+    return std::find(decision.coalesce.begin(), decision.coalesce.end(), key) != decision.coalesce.end();
+}
+
 void TestClassification() {
     EXPECT(ClassifyApp(L"adobe premiere pro.exe", L"") == AppKind::Creative);
     EXPECT(ClassifyApp(L"blender.exe", L"c:\\program files\\blender foundation\\blender 4.2\\blender.exe") ==
@@ -485,6 +489,7 @@ void TestReusedDecisionMatchesFresh() {
         code.windowed = true;
         code.windowVisible = code.foreground;
         code.foreground = tick % 13 > 8;
+        code.cpuCores = tick % 4 < 2 ? 0.3 : 0.0;
         game.foreground = !code.foreground;
         std::vector<AppSample> apps = {blender, code, spotify};
         if (tick % 17 < 12) {
@@ -497,6 +502,7 @@ void TestReusedDecisionMatchesFresh() {
             std::reverse(apps.begin(), apps.end());
         }
         Inputs inputs = At(1000 + tick * 700, (tick % 5) * 2000, apps);
+        inputs.displayOff = tick % 19 > 14;
         const Decision expected = fresh.Update(inputs);
         std::vector<std::wstring_view> keys;
         for (const AppSample& app : apps) {
@@ -510,8 +516,13 @@ void TestReusedDecisionMatchesFresh() {
         EXPECT(decision.reason == expected.reason);
         EXPECT(decision.appKey == expected.appKey);
         EXPECT(decision.appName == expected.appName);
+        EXPECT(decision.interactive == expected.interactive);
+        EXPECT(decision.interactiveKey == expected.interactiveKey);
+        EXPECT(decision.interactiveName == expected.interactiveName);
         EXPECT(decision.unthrottle == expected.unthrottle);
         EXPECT(decision.nap == expected.nap);
+        EXPECT(decision.coalesce == expected.coalesce);
+        EXPECT(decision.away == expected.away);
         EXPECT(decision.confirmed == expected.confirmed);
     }
 }
@@ -626,11 +637,249 @@ void TestHistory() {
     EXPECT(big.Size() <= History::kMaxEntries);
 }
 
+void TestTimerCoalescing() {
+    // A visible app the user is not using has its timers coalesced once it
+    // has been out of focus for 10 s; it is never napped (it can be seen).
+    Policy policy;
+    AppSample slack = App(L"slack.exe", AppKind::Other, true);
+    slack.windowed = true;
+    slack.windowVisible = true;
+    AppSample code = App(L"code.exe", AppKind::Other);
+    code.windowed = true;
+    code.windowVisible = true;
+    Decision decision = policy.Update(At(1000, 0, {slack, code}));
+    EXPECT(!Coalesced(decision, L"slack.exe"));
+    slack.foreground = false;
+    code.foreground = true;
+    decision = policy.Update(At(5000, 0, {slack, code}));
+    EXPECT(!Coalesced(decision, L"slack.exe"));
+    decision = policy.Update(At(11500, 0, {slack, code}));
+    EXPECT(Coalesced(decision, L"slack.exe"));
+    EXPECT(!Napped(decision, L"slack.exe"));
+    // The focused app never is.
+    EXPECT(!Coalesced(decision, L"code.exe"));
+    // Focused again: released at once.
+    slack.foreground = true;
+    code.foreground = false;
+    decision = policy.Update(At(12000, 0, {slack, code}));
+    EXPECT(!Coalesced(decision, L"slack.exe"));
+
+    // Visible animation (real 3D load), audio, calls, games, creative tools,
+    // AI tools and the shell keep precise timers.
+    Policy exempt;
+    AppSample animation = App(L"viewer.exe", AppKind::Other);
+    animation.windowed = true;
+    animation.windowVisible = true;
+    animation.gpu3dPercent = 30.0;
+    AppSample music = App(L"spotify.exe", AppKind::NeverGame);
+    music.windowed = true;
+    music.windowVisible = true;
+    music.audioActive = true;
+    AppSample shell = App(L"explorer.exe", AppKind::NeverGame);
+    shell.windowed = true;
+    shell.windowVisible = true;
+    const AppSample focused = App(L"notes.exe", AppKind::Other, true);
+    static_cast<void>(exempt.Update(At(1000, 0, {animation, music, shell, focused})));
+    decision = exempt.Update(At(60000, 0, {animation, music, shell, focused}));
+    EXPECT(decision.coalesce.empty());
+    EXPECT(decision.nap.empty());
+
+    // A hidden app waiting out its nap delay, or kept awake by work the
+    // user started, still has its timers coalesced.
+    Policy hidden;
+    AppSample build = App(L"build.exe", AppKind::Other, true);
+    build.windowed = true;
+    build.windowVisible = true;
+    static_cast<void>(hidden.Update(At(1000, 0, {build})));
+    build = Minimized(L"build.exe");
+    build.cpuCores = 4.0;
+    decision = hidden.Update(At(60000, 0, {build}));
+    EXPECT(!Napped(decision, L"build.exe"));
+    EXPECT(Coalesced(decision, L"build.exe"));
+}
+
+void TestDisplayOff() {
+    // With the display off nothing can be seen: the focused app and visible
+    // apps nap like hidden ones once unused for 30 s, and the machine is away.
+    Policy policy;
+    AppSample editor = App(L"editor.exe", AppKind::Other, true);
+    editor.windowed = true;
+    editor.windowVisible = true;
+    AppSample chat = App(L"chat.exe", AppKind::Other);
+    chat.windowed = true;
+    chat.windowVisible = true;
+    Inputs inputs = At(1000, 600000, {editor, chat});
+    Decision decision = policy.Update(inputs);
+    EXPECT(!decision.away);
+    inputs = At(2000, 601000, {editor, chat});
+    inputs.displayOff = true;
+    decision = policy.Update(inputs);
+    EXPECT(decision.away);
+    EXPECT(!Napped(decision, L"editor.exe"));
+    inputs.nowMs = 33000;
+    decision = policy.Update(inputs);
+    EXPECT(decision.away);
+    EXPECT(Napped(decision, L"editor.exe"));
+    EXPECT(Napped(decision, L"chat.exe"));
+    // Display back on: the focused app wakes at once, the other is visible
+    // again (coalesced, not napped).
+    inputs.nowMs = 34000;
+    inputs.displayOff = false;
+    decision = policy.Update(inputs);
+    EXPECT(!decision.away);
+    EXPECT(!Napped(decision, L"editor.exe"));
+    EXPECT(!Coalesced(decision, L"editor.exe"));
+    EXPECT(!Napped(decision, L"chat.exe"));
+    EXPECT(Coalesced(decision, L"chat.exe"));
+
+    // Work the user started keeps running however long they are away: time
+    // with the display off does not use up its grace.
+    Policy work;
+    AppSample build = App(L"build.exe", AppKind::Other, true);
+    build.windowed = true;
+    build.windowVisible = true;
+    // Busy enough to count as user work, below the Heavy boost threshold.
+    build.cpuCores = 0.6;
+    static_cast<void>(work.Update(At(1000, 0, {build})));
+    inputs = At(2000, 1000, {build});
+    inputs.displayOff = true;
+    static_cast<void>(work.Update(inputs));
+    inputs.nowMs = 2 * 60 * 60 * 1000;
+    decision = work.Update(inputs);
+    EXPECT(!Napped(decision, L"build.exe"));
+    // Once it goes quiet it naps.
+    inputs.apps[0].cpuCores = 0.0;
+    inputs.nowMs += 1000;
+    EXPECT(Napped(work.Update(inputs), L"build.exe"));
+
+    // Full power is never away: a background render keeps it.
+    Policy render;
+    AppSample resolve = App(L"resolve.exe", AppKind::Creative);
+    resolve.gpuPercent = 95.0;
+    inputs = At(1000, 600000, {resolve});
+    inputs.displayOff = true;
+    static_cast<void>(render.Update(inputs));
+    inputs.nowMs = 1400;
+    decision = render.Update(inputs);
+    EXPECT(decision.fullPower);
+    EXPECT(!decision.away);
+    EXPECT(Unthrottled(decision, L"resolve.exe"));
+
+    // Nobody watches a fullscreen animation with the display off.
+    Policy frames;
+    AppSample show = App(L"player.exe", AppKind::Other, true);
+    show.fullscreen = true;
+    show.cpuCores = 0.2;
+    inputs = At(1000, 600000, {show});
+    inputs.displayOff = true;
+    static_cast<void>(frames.Update(inputs));
+    inputs.nowMs = 1500;
+    EXPECT(!frames.Update(inputs).interactive);
+}
+
 void TestResetClearsHolds() {
     Policy policy;
     EXPECT(policy.Update(At(1000, 0, {App(L"game.exe", AppKind::Game, true)})).fullPower);
     policy.Reset();
     EXPECT(!policy.Update(At(1100, 0, {App(L"game.exe", AppKind::Game)})).fullPower);
+}
+
+void TestInteractiveTier() {
+    // Pointer motion over an idle app: nothing.
+    Policy idle;
+    Decision decision = idle.Update(At(1000, 0, {App(L"chrome.exe", AppKind::NeverGame, true)}));
+    EXPECT(!decision.interactive);
+    EXPECT(!decision.fullPower);
+
+    // Real work right after input (scrolling a page): interactive at once,
+    // without full power and without overriding the app's own throttling.
+    Policy driven;
+    AppSample chrome = App(L"chrome.exe", AppKind::NeverGame, true);
+    chrome.cpuCores = 0.4;
+    decision = driven.Update(At(1000, 50, {chrome}));
+    EXPECT(decision.interactive);
+    EXPECT(decision.interactiveKey == L"chrome.exe");
+    EXPECT(decision.interactiveName == L"chrome.exe");
+    EXPECT(!decision.fullPower);
+    EXPECT(!Unthrottled(decision, L"chrome.exe"));
+    // Held briefly after the work stops, then released.
+    chrome.cpuCores = 0.0;
+    EXPECT(driven.Update(At(4000, 3000, {chrome})).interactive);
+    EXPECT(!driven.Update(At(6100, 5100, {chrome})).interactive);
+
+    // The same load with the user away is not interactive.
+    Policy away;
+    chrome.cpuCores = 0.4;
+    EXPECT(!away.Update(At(1000, 60000, {chrome})).interactive);
+
+    // Background load never counts, even right after input.
+    Policy background;
+    AppSample indexer = App(L"indexer.exe", AppKind::Other);
+    indexer.cpuCores = 2.0;
+    EXPECT(!background.Update(At(1000, 0, {indexer})).interactive);
+
+    // Media playing in the focused app with nobody touching the input stays
+    // at rest (rest clocks already ramp fast enough to decode): a focused
+    // music player must not hold the interactive profile for hours.
+    Policy music;
+    AppSample player = App(L"spotify.exe", AppKind::NeverGame, true);
+    player.audioActive = true;
+    player.cpuCores = 0.12;
+    for (uint64_t tick = 0; tick < 10; ++tick) {
+        EXPECT(!music.Update(At(1000 + tick * 1500, 60000, {player})).interactive);
+    }
+
+    // Frame-paced work covering the monitor (a fullscreen animation) with
+    // nobody touching the input is interactive once its load is sustained.
+    Policy video;
+    player = App(L"player.exe", AppKind::Other, true);
+    player.fullscreen = true;
+    player.cpuCores = 0.12;
+    EXPECT(!video.Update(At(1000, 60000, {player})).interactive);
+    EXPECT(!video.Update(At(1100, 60000, {player})).interactive);
+    decision = video.Update(At(1400, 60000, {player}));
+    EXPECT(decision.interactive);
+    // Paused: released after the hold.
+    player.cpuCores = 0.0;
+    EXPECT(video.Update(At(3000, 60000, {player})).interactive);
+    EXPECT(!video.Update(At(6500, 60000, {player})).interactive);
+    // A reused reading is not new load and does not extend the run.
+    Policy stale;
+    player.cpuCores = 0.12;
+    static_cast<void>(stale.Update(At(1000, 60000, {player})));
+    player.freshLoad = false;
+    EXPECT(!stale.Update(At(1400, 60000, {player})).interactive);
+
+    // Fullscreen slideshow or animation with real 3D load counts as frames too.
+    Policy fullscreen;
+    AppSample show = App(L"powerpnt.exe", AppKind::NeverGame, true);
+    show.fullscreen = true;
+    show.gpu3dPercent = 8.0;
+    static_cast<void>(fullscreen.Update(At(1000, 60000, {show})));
+    EXPECT(fullscreen.Update(At(1500, 60000, {show})).interactive);
+    // Losing focus ends the frame run at once.
+    show.foreground = false;
+    static_cast<void>(fullscreen.Update(At(7000, 60000, {show, App(L"explorer.exe", AppKind::NeverGame, true)})));
+    show.foreground = true;
+    EXPECT(!fullscreen.Update(At(7100, 60000, {show})).interactive);
+
+    // Interactive and full power are independent: a background render keeps
+    // full power while the focused app is interactive, credited separately.
+    Policy both;
+    AppSample resolve = App(L"resolve.exe", AppKind::Creative);
+    resolve.gpuPercent = 95.0;
+    chrome.cpuCores = 0.4;
+    static_cast<void>(both.Update(At(1000, 0, {resolve, chrome})));
+    decision = both.Update(At(1400, 0, {resolve, chrome}));
+    EXPECT(decision.fullPower);
+    EXPECT(decision.appKey == L"resolve.exe");
+    EXPECT(decision.interactive);
+    EXPECT(decision.interactiveKey == L"chrome.exe");
+
+    // Reset drops interactive holds too.
+    driven.Reset();
+    chrome.cpuCores = 0.0;
+    EXPECT(!driven.Update(At(1100, 60000, {chrome})).interactive);
 }
 
 }  // namespace
@@ -656,6 +905,9 @@ int main() {
     TestReusedDecisionMatchesFresh();
     TestAppNap();
     TestHistory();
+    TestInteractiveTier();
+    TestTimerCoalescing();
+    TestDisplayOff();
     if (g_failures != 0) {
         std::fprintf(stderr, "AutoPowerPolicyTests: %d failure(s)\n", g_failures);
         return 1;

@@ -50,6 +50,8 @@ const GUID kPowerSaverPlan = {0xa1841308, 0x3541, 0x4fab, {0xbc, 0x81, 0xf7, 0x1
 
 // GUID_ACTIVE_POWERSCHEME: notified with the new plan's GUID on every switch.
 const GUID kActiveSchemeSetting = {0x31f9f286, 0x5084, 0x42fe, {0xb7, 0x20, 0x2b, 0x02, 0x64, 0x99, 0x37, 0x63}};
+// GUID_CONSOLE_DISPLAY_STATE: 0 off, 1 on, 2 dimmed.
+const GUID kDisplayStateSetting = {0x6fe69556, 0x704a, 0x47a0, {0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47}};
 
 // DEVICE_NOTIFY_CALLBACK and DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS (powrprof.h),
 // spelled out so the subscription does not depend on SDK header revisions.
@@ -62,13 +64,28 @@ struct PlanSubscription {
 const GUID kProcessorSubgroup = {0x54533251, 0x82be, 0x4824, {0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00}};
 const GUID kPcieSubgroup = {0x501a4d13, 0x42af, 0x4429, {0x9f, 0xd1, 0xa8, 0x21, 0x8c, 0x26, 0x8e, 0x20}};
 
-// Processor policy for the plan's three profiles. Like a Mac, performance
+// Processor policy for the plan's five profiles. Like a Mac, performance
 // follows the work rather than a mode: the processor's own controller (Intel
 // Speed Shift / AMD CPPC) picks clocks per core every millisecond, and each
 // profile only sets how eagerly it does so.
-//   Rest  Power saver's processor values (Hoverdock's Low Power), except that
-//         turbo stays available on an efficiency bias, so real work gets
-//         turbo the moment it runs while an idle cursor gets nothing.
+//   Rest  Power saver's parking, minimum state, PCIe link and input-boost
+//         values (Hoverdock's Low Power), but clocks that race to idle: an
+//         energy preference below Balanced's, aggressive turbo and a short
+//         activity window, so a burst of real work reaches turbo within a
+//         millisecond or two (sooner than on Balanced), finishes, and lets
+//         the package sleep again. An idle cursor still gets nothing.
+//   Away  the display is off and nothing demands power (macOS lets work
+//         wait while nobody watches): Rest, but an efficiency-first energy
+//         preference and turbo only when the controller judges it
+//         efficient. Background wake-ups finish at lower voltage, and the
+//         first input after the display wakes switches back to Rest.
+//   Interactive  the user is driving the focused app, or it animates
+//         fullscreen (macOS's user-interactive tier): Rest's clocks, parking
+//         and PCIe links, but Windows' input boost is at full strength, so
+//         every input unparks cores and raises performance at once and a
+//         frame or a keystroke never waits on a core waking up. Between
+//         inputs cores park as at rest: an unparked floor costs power and
+//         the boost already covers the moments that need it.
 //   Work  demanding work (creative, renders, builds, calls, AI, live audio):
 //         performance-first preference and aggressive turbo, but cores still
 //         clock down and park between bursts.
@@ -77,17 +94,25 @@ const GUID kPcieSubgroup = {0x501a4d13, 0x42af, 0x4429, {0x9f, 0xd1, 0xa8, 0x21,
 //         share of the power budget).
 // kFromPowerSaver reads the Power saver plan (restFallback when a machine has
 // none; many Modern Standby laptops only ship Balanced); kAsRest repeats the
-// rest value. Optional settings may not exist on every Windows build (E-core
+// rest value. kBelowBalanced reads the Balanced plan and goes kEppBelowBalanced
+// further toward performance, capped at restFallback (also used when Balanced
+// cannot be read). Optional settings may not exist on every Windows build (E-core
 // variants): their rest value falls back to Balanced's first, and a write
 // Windows refuses is not retried. Display, sleep and other settings stay as
 // in Balanced; Hoverdock's High Power mode remains the pinned maximum.
 constexpr DWORD kFromPowerSaver = 0xFFFFFFFF;
 constexpr DWORD kAsRest = 0xFFFFFFFE;
+constexpr DWORD kBelowBalanced = 0xFFFFFFFD;
+constexpr DWORD kEppBelowBalanced = 8;
 
-enum class Profile : uint8_t { Rest, Work, Game };
+enum class Profile : uint8_t { Away, Rest, Interactive, Work, Game };
 
 const wchar_t* ProfileLabel(Profile profile) noexcept {
-    return profile == Profile::Game ? L"game" : profile == Profile::Work ? L"work" : L"rest";
+    return profile == Profile::Game ? L"game"
+        : profile == Profile::Work  ? L"work"
+        : profile == Profile::Interactive ? L"interactive"
+        : profile == Profile::Away        ? L"away"
+                                          : L"rest";
 }
 
 struct PlanSetting {
@@ -98,6 +123,8 @@ struct PlanSetting {
     DWORD rest;
     DWORD restFallback;
     bool optional = false;
+    DWORD interactive = kAsRest;
+    DWORD away = kAsRest;
 };
 
 const PlanSetting kPlanSettings[] = {
@@ -108,22 +135,30 @@ const PlanSetting kPlanSettings[] = {
         kAsRest, kFromPowerSaver, 5},
     // Maximum processor state.
     {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xec}}, 100, 100,
-        kFromPowerSaver, 100},
+        kFromPowerSaver, 100, false, 100},
     {&kProcessorSubgroup, {0xbc5038f7, 0x23e0, 0x4960, {0x96, 0xda, 0x33, 0xab, 0xaf, 0x59, 0x35, 0xed}}, 100, 100,
-        kFromPowerSaver, 100},
-    // Processor performance boost mode: 2 Aggressive; 3 Efficient Enabled
-    // (turbo when the controller judges it efficient).
-    {&kProcessorSubgroup, {0xbe337238, 0x0d82, 0x4146, {0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7}}, 2, 2, 3,
-        3},
+        kFromPowerSaver, 100, false, 100},
+    // Processor performance boost mode: 2 Aggressive. At rest, Efficient
+    // Enabled (3) with Power saver's energy preference held short bursts near
+    // minimum clocks (6.5x slower than Balanced in the energy benchmark).
+    {&kProcessorSubgroup, {0xbe337238, 0x0d82, 0x4146, {0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7}}, 2, 2, 2,
+        2, false, kAsRest, 3},
     // Processor performance boost policy (0-100; processors without Speed
     // Shift / CPPC).
     {&kProcessorSubgroup, {0x45bcc044, 0xd885, 0x43e2, {0x86, 0x05, 0xee, 0x0e, 0xc6, 0xe9, 0x6b, 0x59}}, 100, 100,
-        kFromPowerSaver, 0},
+        kFromPowerSaver, 0, false, 60},
     // Energy performance preference: 0 = favour performance, 100 = efficiency.
+    // At rest, below Balanced's (at most 25): how fast Speed Shift / CPPC
+    // ramps a core that wakes with work, which is what bursts wait on.
     {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x63}}, 25, 10,
-        kFromPowerSaver, 80},
+        kBelowBalanced, 25, false, kAsRest, 60},
     {&kProcessorSubgroup, {0x36687f9e, 0xe3a5, 0x4dbf, {0xb1, 0xdc, 0x15, 0xeb, 0x38, 0x1c, 0x68, 0x64}}, 25, 10,
-        kFromPowerSaver, 80},
+        kBelowBalanced, 25, false, kAsRest, 60},
+    // Processor autonomous activity window (microseconds; 0 = hardware
+    // default): the span Speed Shift averages load over. A short window
+    // reaches turbo early in a burst and drops clocks as soon as it ends.
+    {&kProcessorSubgroup, {0xcfeda3d0, 0x7697, 0x4566, {0xa9, 0x22, 0xa9, 0x08, 0x6c, 0xd4, 0x9d, 0xfa}}, kAsRest,
+        kAsRest, 1000, 1000, true},
     // Core parking minimum cores (% kept unparked).
     {&kProcessorSubgroup, {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x83}}, 50, 100,
         kFromPowerSaver, 5},
@@ -134,17 +169,17 @@ const PlanSetting kPlanSettings[] = {
         kFromPowerSaver, 2},
     // Latency sensitivity hints (P-cores / E-cores): performance and unparked
     // cores Windows grants for 1-3 s whenever it raises a hint, which it does
-    // for every input, pointer motion included. While work runs they are at
-    // full strength; at rest they follow Power saver, so moving the cursor
-    // does not spin the processor up.
+    // for every input, pointer motion included. While work runs, or the user
+    // drives an interactive app, they are at full strength; at rest they
+    // follow Power saver, so moving the cursor does not spin the processor up.
     {&kProcessorSubgroup, {0x619b7505, 0x003b, 0x4e82, {0xb7, 0xa6, 0x4d, 0xd2, 0x9c, 0x30, 0x09, 0x71}}, 100, 100,
-        kFromPowerSaver, 0, true},
+        kFromPowerSaver, 0, true, 100},
     {&kProcessorSubgroup, {0x619b7505, 0x003b, 0x4e82, {0xb7, 0xa6, 0x4d, 0xd2, 0x9c, 0x30, 0x09, 0x72}}, 100, 100,
-        kFromPowerSaver, 0, true},
+        kFromPowerSaver, 0, true, 100},
     {&kProcessorSubgroup, {0x616cdaa5, 0x695e, 0x4545, {0x97, 0xad, 0x97, 0xdc, 0x2d, 0x1b, 0xdd, 0x88}}, 100, 100,
-        kFromPowerSaver, 0, true},
+        kFromPowerSaver, 0, true, 100},
     {&kProcessorSubgroup, {0x616cdaa5, 0x695e, 0x4545, {0x97, 0xad, 0x97, 0xdc, 0x2d, 0x1b, 0xdd, 0x89}}, 100, 100,
-        kFromPowerSaver, 0, true},
+        kFromPowerSaver, 0, true, 100},
 };
 
 constexpr size_t kPlanSettingCount = sizeof(kPlanSettings) / sizeof(kPlanSettings[0]);
@@ -1124,8 +1159,9 @@ public:
     // is the GetTickCount of the last hook-reported input (0 = none).
     // commitWake: woken by input that may start work (probe the focused app);
     // keyboardInput: keyboard input reaches NoteInput too.
+    // displayOff: the console display is off (nobody can see the screen).
     TickResult Tick(bool forceLoadSample, bool planActive, DWORD hookInputTick, bool commitWake,
-        bool keyboardInput) {
+        bool keyboardInput, bool displayOff) {
         TickResult result;
         AutoPowerStatus& status = result.status;
         if (!planActive) {
@@ -1168,6 +1204,7 @@ public:
         // their capacity: a tick allocates nothing once warmed up.
         autopower::Inputs& inputs = m_inputs;
         inputs.nowMs = now;
+        inputs.displayOff = displayOff;
         inputs.idleMs = IdleMs();
         // The hook sees input before GetLastInputInfo is updated.
         if (hookInputTick != 0) {
@@ -1224,10 +1261,14 @@ public:
             // Already at high power: nothing left for the probe to find.
             m_probeUntil = 0;
         }
-        // Games get the game profile; every other demand the work profile.
-        const Profile profile = !decision.fullPower ? Profile::Rest
-            : decision.reason == autopower::BoostReason::Game ? Profile::Game
-                                                              : Profile::Work;
+        // Games get the game profile, every other demand the work profile, an
+        // app the user is driving or watching the interactive profile, and a
+        // machine nobody watches the away profile.
+        const Profile profile = decision.fullPower
+            ? (decision.reason == autopower::BoostReason::Game ? Profile::Game : Profile::Work)
+            : decision.interactive ? Profile::Interactive
+            : decision.away        ? Profile::Away
+                                   : Profile::Rest;
         const double switchMs = ApplyPlan(profile);
         if (switchMs >= 0.0) {
             TraceSwitch(profile, switchMs, inputs.idleMs);
@@ -1249,6 +1290,15 @@ public:
                                    : std::wstring(L"Low power."));
             m_lastFull = status.fullPower;
             m_lastApp = status.appName;
+        }
+        if (decision.away != m_lastAway) {
+            Trace(decision.away ? L"Away: display off." : L"Back from away.");
+            m_lastAway = decision.away;
+        }
+        if (decision.interactiveKey != m_lastInteractive) {
+            Trace(decision.interactive ? L"Interactive: " + decision.interactiveName + L"."
+                                       : std::wstring(L"Interactive released."));
+            m_lastInteractive = decision.interactiveKey;
         }
 
         const bool creativeFocused = foregroundApp != m_groups.end() &&
@@ -1274,12 +1324,15 @@ public:
                 // or on its controller (polled).
                 result.wantInput = true;
                 result.waitMs = kGameAwayTickMs;
-            } else if (!demandingRunning && inputs.idleMs > m_policy.Settings().heavyIdleMs) {
+            } else if (!demandingRunning && !decision.interactive && inputs.idleMs > m_policy.Settings().heavyIdleMs) {
                 // Away from the desk with nothing demanding open: only input
                 // or a focus change (both events) can create demand.
                 result.wantInput = true;
                 result.waitMs = keyboardInput ? kParkedEventTickMs : kParkedTickMs;
             }
+            // Away: the first input (which also wakes the display) returns
+            // to the rest profile without waiting for a tick.
+            result.wantInput = result.wantInput || decision.away;
         }
         if (now < m_probeUntil) {
             result.waitMs = (std::min)(result.waitMs, static_cast<DWORD>(
@@ -1325,6 +1378,8 @@ public:
         m_foregroundPid = 0;
         m_lastFull = false;
         m_lastApp.clear();
+        m_lastInteractive.clear();
+        m_lastAway = false;
         m_gamepadSeen = false;
     }
 
@@ -1342,7 +1397,7 @@ private:
 
     // Never: exempt from power throttling. Nap: EcoQoS with timer resolution
     // requests ignored (App Nap).
-    enum class Throttle : uint8_t { Os, Never, Nap };
+    enum class Throttle : uint8_t { Os, Never, Coalesce, Nap };
 
     struct Proc {
         std::wstring exe;
@@ -1392,6 +1447,23 @@ private:
         for (size_t index = 0; index < kPlanSettingCount; ++index) {
             const PlanSetting& setting = kPlanSettings[index];
             Baseline& base = m_baseline[index];
+            if (setting.rest == kBelowBalanced) {
+                const auto below = [&](DWORD balanced) {
+                    const DWORD faster = balanced > kEppBelowBalanced ? balanced - kEppBelowBalanced : 0;
+                    return (std::min)(setting.restFallback, faster);
+                };
+                DWORD ac = 0;
+                DWORD dc = 0;
+                base.ac = PowerReadACValueIndex(nullptr, &kBalancedPlan, setting.subgroup, &setting.setting, &ac) ==
+                        ERROR_SUCCESS
+                    ? below(ac)
+                    : setting.restFallback;
+                base.dc = PowerReadDCValueIndex(nullptr, &kBalancedPlan, setting.subgroup, &setting.setting, &dc) ==
+                        ERROR_SUCCESS
+                    ? below(dc)
+                    : setting.restFallback;
+                continue;
+            }
             if (setting.rest != kFromPowerSaver) {
                 base = {setting.rest, setting.rest};
                 continue;
@@ -1430,6 +1502,8 @@ private:
             const PlanSetting& setting = kPlanSettings[index];
             const DWORD wanted = profile == Profile::Game ? setting.game
                 : profile == Profile::Work                ? setting.work
+                : profile == Profile::Interactive         ? setting.interactive
+                : profile == Profile::Away                ? setting.away
                                                           : kAsRest;
             const DWORD ac = wanted == kAsRest ? base.ac : wanted;
             const DWORD dc = wanted == kAsRest ? base.dc : wanted;
@@ -1925,42 +1999,99 @@ private:
     }
 
     // Taskbar-eligible top-level windows per process: visible, unowned (or
-    // app windows), not tool windows. Showing = not minimized and not cloaked
-    // (another virtual desktop, a suspended app).
+    // app windows), not tool windows. Showing = not minimized, not cloaked
+    // (another virtual desktop, a suspended app) and, like macOS App Nap, not
+    // occluded: EnumWindows walks the z-order top down, so once an opaque
+    // window covers a monitor's work area (maximized or fullscreen), windows
+    // further down that lie wholly on that monitor cannot be seen.
     void RefreshWindows() {
         for (auto& [pid, proc] : m_procs) {
             proc.windowed = false;
             proc.windowVisible = false;
         }
+        struct Walk {
+            std::unordered_map<DWORD, Proc>* procs;
+            std::vector<HMONITOR>* covered;
+        } walk{&m_procs, &m_coveredMonitors};
+        m_coveredMonitors.clear();
         EnumWindows(
             [](HWND window, LPARAM param) -> BOOL {
-                auto* procs = reinterpret_cast<std::unordered_map<DWORD, Proc>*>(param);
+                auto& walk = *reinterpret_cast<Walk*>(param);
                 if (IsWindowVisible(window) == FALSE) {
                     return TRUE;
                 }
                 const LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
                 const bool appWindow = (exStyle & WS_EX_APPWINDOW) != 0 ||
                     (GetWindow(window, GW_OWNER) == nullptr && (exStyle & WS_EX_TOOLWINDOW) == 0);
-                if (!appWindow) {
+                if (!appWindow || IsIconic(window) != FALSE) {
+                    if (appWindow) {
+                        DWORD pid = 0;
+                        GetWindowThreadProcessId(window, &pid);
+                        const auto it = walk.procs->find(pid);
+                        if (it != walk.procs->end()) {
+                            it->second.windowed = true;
+                        }
+                    }
                     return TRUE;
                 }
+                DWORD cloaked = 0;
+                if (FAILED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)))) {
+                    cloaked = 0;
+                }
+                // Visible bounds: GetWindowRect includes the invisible resize
+                // borders, which put a maximized window past the monitor edge.
+                RECT bounds{};
+                const bool haveBounds = SUCCEEDED(DwmGetWindowAttribute(
+                                            window, DWMWA_EXTENDED_FRAME_BOUNDS, &bounds, sizeof(bounds))) ||
+                    GetWindowRect(window, &bounds) != FALSE;
+                HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO info{};
+                info.cbSize = sizeof(info);
+                const bool haveMonitor = monitor != nullptr && GetMonitorInfoW(monitor, &info) != FALSE;
+                const bool onCovered = haveBounds && haveMonitor &&
+                    std::find(walk.covered->begin(), walk.covered->end(), monitor) != walk.covered->end() &&
+                    bounds.left >= info.rcMonitor.left && bounds.top >= info.rcMonitor.top &&
+                    bounds.right <= info.rcMonitor.right && bounds.bottom <= info.rcMonitor.bottom;
                 DWORD pid = 0;
                 GetWindowThreadProcessId(window, &pid);
-                const auto it = procs->find(pid);
-                if (it == procs->end()) {
-                    return TRUE;
+                const auto it = walk.procs->find(pid);
+                if (it != walk.procs->end()) {
+                    it->second.windowed = true;
+                    it->second.windowVisible = it->second.windowVisible || (cloaked == 0 && !onCovered);
                 }
-                it->second.windowed = true;
-                if (!it->second.windowVisible && IsIconic(window) == FALSE) {
-                    DWORD cloaked = 0;
-                    if (FAILED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)))) {
-                        cloaked = 0;
-                    }
-                    it->second.windowVisible = cloaked == 0;
+                if (cloaked == 0 && !onCovered && haveBounds && haveMonitor && CoversWorkArea(window, bounds, info)) {
+                    walk.covered->push_back(monitor);
                 }
                 return TRUE;
             },
-            reinterpret_cast<LPARAM>(&m_procs));
+            reinterpret_cast<LPARAM>(&walk));
+    }
+
+    // An opaque, non-shell window spanning the monitor's work area. Layered
+    // windows only count when Windows reports them fully opaque (per-pixel
+    // alpha windows report nothing and might be see-through).
+    static bool CoversWorkArea(HWND window, const RECT& bounds, const MONITORINFO& info) noexcept {
+        if (bounds.left > info.rcWork.left || bounds.top > info.rcWork.top || bounds.right < info.rcWork.right ||
+            bounds.bottom < info.rcWork.bottom) {
+            return false;
+        }
+        const LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if ((exStyle & WS_EX_TRANSPARENT) != 0) {
+            return false;
+        }
+        if ((exStyle & WS_EX_LAYERED) != 0) {
+            BYTE alpha = 255;
+            DWORD flags = 0;
+            if (GetLayeredWindowAttributes(window, nullptr, &alpha, &flags) == FALSE ||
+                (flags & LWA_COLORKEY) != 0 || ((flags & LWA_ALPHA) != 0 && alpha != 255)) {
+                return false;
+            }
+        }
+        wchar_t className[64]{};
+        return GetClassNameW(window, className, 64) == 0 ||
+            (std::wcscmp(className, L"Progman") != 0 && std::wcscmp(className, L"WorkerW") != 0 &&
+                std::wcscmp(className, L"Shell_TrayWnd") != 0 &&
+                std::wcscmp(className, L"Shell_SecondaryTrayWnd") != 0);
     }
 
     void RefreshSignals(ULONGLONG now) {
@@ -2130,11 +2261,22 @@ private:
             }
             PROCESS_POWER_THROTTLING_STATE state{};
             state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-            // Control bits with state bits clear: never throttle; with state
-            // bits set: run as EcoQoS and ignore timer resolution requests.
-            state.ControlMask =
-                PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
-            state.StateMask = throttle == Throttle::Nap ? state.ControlMask : 0;
+            if (throttle == Throttle::Coalesce) {
+                // Only the timer bit: execution speed stays as the app (or
+                // Windows) had it, so its own EcoQoS choices are kept.
+                const ULONG keep = proc.haveOriginal
+                    ? proc.original.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                    : 0;
+                state.ControlMask = keep | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+                state.StateMask = (proc.haveOriginal ? proc.original.StateMask & keep : 0) |
+                    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+            } else {
+                // Control bits with state bits clear: never throttle; with
+                // state bits set: run as EcoQoS and ignore timer resolution.
+                state.ControlMask =
+                    PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+                state.StateMask = throttle == Throttle::Nap ? state.ControlMask : 0;
+            }
             if (SetProcessInformation(proc.handle, ProcessPowerThrottling, &state, sizeof(state)) != FALSE) {
                 proc.throttle = throttle;
             }
@@ -2166,17 +2308,23 @@ private:
             }
         };
         mark(decision.unthrottle, Throttle::Never);
+        mark(decision.coalesce, Throttle::Coalesce);
         mark(decision.nap, Throttle::Nap);
         size_t napped = 0;
+        size_t coalesced = 0;
         for (auto& [pid, proc] : m_procs) {
             const auto it = wanted.find(pid);
             SetThrottle(pid, proc, it != wanted.end() ? it->second : Throttle::Os);
             napped += proc.throttle == Throttle::Nap ? 1 : 0;
+            coalesced += proc.throttle == Throttle::Coalesce ? 1 : 0;
         }
-        if (napped != m_lastNapped) {
+        if (napped != m_lastNapped || coalesced != m_lastCoalesced) {
             Trace(L"Napping " + std::to_wstring(decision.nap.size()) + L" hidden app(s), " +
-                std::to_wstring(napped) + L" process(es).");
+                std::to_wstring(napped) + L" process(es); coalescing timers of " +
+                std::to_wstring(decision.coalesce.size()) + L" app(s), " + std::to_wstring(coalesced) +
+                L" process(es).");
             m_lastNapped = napped;
+            m_lastCoalesced = coalesced;
         }
     }
 
@@ -2185,6 +2333,7 @@ private:
             SetThrottle(pid, proc, Throttle::Os);
         }
         m_lastNapped = 0;
+        m_lastCoalesced = 0;
     }
 
     Baseline m_baseline[kPlanSettingCount]{};
@@ -2205,6 +2354,8 @@ private:
     unsigned m_generation = 0;
     bool m_lastFull = false;
     std::wstring m_lastApp;
+    std::wstring m_lastInteractive;
+    bool m_lastAway = false;
     bool m_registeredLoaded = false;
     ULONGLONG m_registeredAt = 0;
     std::unordered_set<std::wstring> m_registeredGames;
@@ -2224,6 +2375,8 @@ private:
     CapabilityWatcher m_capabilities;
     std::unordered_set<DWORD> m_flagRoots;
     std::unordered_set<DWORD> m_windowRoots;
+    // Monitors covered by an opaque window during the current window walk.
+    std::vector<HMONITOR> m_coveredMonitors;
     Gamepads m_gamepads;
     DWORD m_gamepadTick = 0;
     bool m_gamepadSeen = false;
@@ -2239,6 +2392,7 @@ private:
     double m_lastWriteMs = 0.0;
     std::vector<std::pair<DWORD, HANDLE>> m_gpuProcs;
     size_t m_lastNapped = 0;
+    size_t m_lastCoalesced = 0;
     autopower::Inputs m_inputs;
     autopower::Decision m_decision;
     uint32_t m_today = 0;
@@ -2364,8 +2518,19 @@ void AutoPowerEngine::Signal(bool forceSample, bool commit) noexcept {
 ULONG CALLBACK AutoPowerEngine::PlanChanged(PVOID context, ULONG type, PVOID setting) {
     auto* self = static_cast<AutoPowerEngine*>(context);
     const auto* change = static_cast<const POWERBROADCAST_SETTING*>(setting);
-    if (self == nullptr || type != PBT_POWERSETTINGCHANGE || change == nullptr ||
-        change->DataLength < sizeof(GUID) || IsEqualGUID(change->PowerSetting, kActiveSchemeSetting) == FALSE) {
+    if (self == nullptr || type != PBT_POWERSETTINGCHANGE || change == nullptr) {
+        return ERROR_SUCCESS;
+    }
+    if (IsEqualGUID(change->PowerSetting, kDisplayStateSetting) != FALSE && change->DataLength >= sizeof(DWORD)) {
+        DWORD state = 1;
+        std::memcpy(&state, change->Data, sizeof(state));
+        // Dimmed still shows the screen.
+        if (self->m_displayOff.exchange(state == 0) != (state == 0)) {
+            self->Wake();
+        }
+        return ERROR_SUCCESS;
+    }
+    if (change->DataLength < sizeof(GUID) || IsEqualGUID(change->PowerSetting, kActiveSchemeSetting) == FALSE) {
         return ERROR_SUCCESS;
     }
     GUID scheme{};
@@ -2399,6 +2564,14 @@ void AutoPowerEngine::ThreadMain() {
         int unknown = 0;
         static_cast<void>(m_planState.compare_exchange_strong(unknown, ActivePlanIs(kAutoPlan) ? 1 : 2));
     }
+    // Display on/off (the current state is delivered on registration).
+    // Without it the display simply counts as on.
+    m_displayOff.store(false);
+    HPOWERNOTIFY displayNotify = nullptr;
+    if (PowerSettingRegisterNotification(&kDisplayStateSetting, kDeviceNotifyCallback, &subscribe, &displayNotify) !=
+        ERROR_SUCCESS) {
+        displayNotify = nullptr;
+    }
     {
         Engine engine;
         bool forceSample = true;
@@ -2408,7 +2581,7 @@ void AutoPowerEngine::ThreadMain() {
             const bool planActive = planState == 0 ? ActivePlanIs(kAutoPlan) : planState == 1;
             const TickResult result = engine.Tick(forceSample, planActive,
                 m_hookInputTick.load(std::memory_order_relaxed), commitWake,
-                m_keyboardInput.load(std::memory_order_relaxed));
+                m_keyboardInput.load(std::memory_order_relaxed), m_displayOff.load(std::memory_order_relaxed));
             const AutoPowerStatus& status = result.status;
             m_wantInput.store(status.engaged && result.wantInput, std::memory_order_relaxed);
             m_wantCommit.store(status.engaged && result.wantCommit, std::memory_order_relaxed);
@@ -2448,6 +2621,9 @@ void AutoPowerEngine::ThreadMain() {
         m_wantCommit.store(false);
         if (notify != nullptr) {
             PowerSettingUnregisterNotification(notify);
+        }
+        if (displayNotify != nullptr) {
+            PowerSettingUnregisterNotification(displayNotify);
         }
         // Engine destructor restores the calm plan and process throttling.
     }

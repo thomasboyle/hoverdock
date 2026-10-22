@@ -30,14 +30,26 @@
 //   - Heavy     any focused app with sustained heavy CPU load, including a
 //               single saturated thread (compiles, scripts, recalcs).
 // Each demand is held for a reason-specific time after it stops so power
-// does not flap between samples. Games, creative tools, AI runtimes, and apps
+// does not flap between samples.
+//
+// Below full power sits the interactive tier, the counterpart of macOS's
+// user-interactive QoS and its frame-deadline work intervals: the focused app
+// doing real work right after input (scrolling, typing, clicking through a
+// page), or keeping steady load while it covers its monitor. Interactive work
+// keeps rest clocks and parking but gets Windows' input boost, which unparks
+// cores and raises performance the moment input arrives, so frames and input
+// never wait on a core waking up. Pointer motion with nothing behind it, and
+// media playing with nobody touching the input, still get nothing. Games, creative tools, AI runtimes, and apps
 // playing audio or using the camera or microphone are also exempt from
 // Windows background throttling (EcoQoS) while that is true.
 //
-// Like App Nap on macOS, apps the user cannot see (every window minimized or
-// on another desktop) that are not playing audio, on a call, demanding power,
-// or recently used are napped: run as EcoQoS with their timer resolution
-// requests ignored, until a window is shown again.
+// Like App Nap on macOS, apps the user cannot see (every window minimized, on
+// another desktop or covered by a maximized or fullscreen window, or the
+// display off) that are not playing audio, on a call, demanding power, or
+// recently used are napped: run as EcoQoS with their timer resolution
+// requests ignored, until a window is shown again. Like macOS's timer QoS
+// tiers, windowed apps the user can see but is not using get their timers
+// coalesced (timer resolution requests ignored) at full speed.
 namespace autopower {
 
 enum class AppKind : uint8_t {
@@ -89,7 +101,8 @@ struct AppSample {
     double gpu3dPercent = 0.0;
     double gpuComputePercent = 0.0;
     // Has a window the user could switch to (taskbar-eligible), and whether
-    // any such window is showing (not minimized, not on another desktop).
+    // any such window is showing (not minimized, not on another desktop, not
+    // covered by a maximized or fullscreen window).
     bool windowed = false;
     bool windowVisible = false;
     // Live audio stream (playback or capture) and camera / microphone use.
@@ -113,6 +126,9 @@ struct Inputs {
     // apps holds the same keys in the same order (only loads and flags
     // changed), so keys need not be compared. 0 = no promise.
     uint64_t layout = 0;
+    // The display is off (asleep or powered down): nobody can see any window,
+    // so every app counts as hidden and the machine as away.
+    bool displayOff = false;
 };
 
 struct Decision {
@@ -121,12 +137,22 @@ struct Decision {
     // App the boost is credited to (foreground first, then priority).
     std::wstring appKey;
     std::wstring appName;
-    // App keys whose processes must never be power throttled right now, and
-    // app keys to nap (EcoQoS, timer resolution ignored); both sorted. The
-    // version changes whenever either list may have: compare versions to
-    // detect a change without comparing the strings.
+    // Interactive tier (see above), independent of fullPower; the app it is
+    // credited to (foreground first, then the most recent).
+    bool interactive = false;
+    std::wstring interactiveKey;
+    std::wstring interactiveName;
+    // Nobody is watching (display off) and nothing demands power: the
+    // engine may favour efficiency over latency.
+    bool away = false;
+    // App keys whose processes must never be power throttled right now, app
+    // keys to nap (EcoQoS, timer resolution ignored), and app keys whose
+    // timers to coalesce (timer resolution ignored only); all sorted. The
+    // version changes whenever any list may have: compare versions to detect
+    // a change without comparing the strings.
     std::vector<std::wstring> unthrottle;
     std::vector<std::wstring> nap;
+    std::vector<std::wstring> coalesce;
     uint64_t throttleVersion = 0;
     // Apps whose sustained work (Heavy, Render, Ai, Call) was newly confirmed
     // by this update: worth remembering as demanding (see History).
@@ -173,12 +199,28 @@ struct Tuning {
     uint64_t callHoldMs = 10000;
     uint64_t aiHoldMs = 20000;
     uint64_t heavyHoldMs = 10000;
+    // Interactive tier. Driven: the focused app shows real load within
+    // interactiveIdleMs of input (one sample is enough, like a creative tool
+    // being driven). Frame-paced: the focused app keeps steady load while it
+    // covers its monitor (fullscreen animation, slideshows, players),
+    // sustained like other runs so a single spike does not count.
+    uint64_t interactiveIdleMs = 3000;
+    double interactiveCores = 0.15;
+    double interactiveGpu3dPercent = 5.0;
+    double frameCores = 0.1;
+    double frameGpu3dPercent = 3.0;
+    uint64_t interactiveHoldMs = 5000;
     // App Nap: hidden this long since it was last focused (or first seen).
     uint64_t napAfterMs = 30000;
     // Work the user started stays unnapped: an app busy above napBusyCores
     // that was focused within napBusyGraceMs keeps running at full speed.
     uint64_t napBusyGraceMs = 10 * 60 * 1000;
     double napBusyCores = 0.5;
+    // Timer coalescing (macOS timer QoS tiers): a windowed app the user is
+    // not using, focused no sooner than this, has its timer resolution
+    // requests ignored, unless it shows real 3D load (a visible animation).
+    uint64_t coalesceAfterMs = 10000;
+    double coalesce3dPercent = 10.0;
 };
 
 // Classify an executable by lowercase file name and lowercase full path
@@ -227,14 +269,19 @@ private:
         Run heavy;
         Run call;
         Run ai;
+        Run frames;
+        // Interactive tier hold, and when it was last demanded.
+        uint64_t interactiveUntilMs = 0;
+        uint64_t lastInteractiveMs = 0;
         // Update generation that last saw this app (exited apps are dropped).
         uint64_t seenGeneration = 0;
         bool exemptNow = false;
         // When it was first seen and last focused (0 = never).
         uint64_t firstSeenMs = 0;
         uint64_t lastForegroundMs = 0;
-        // Power throttling wanted: OS-managed, never throttled, or napped.
-        enum class Qos : uint8_t { Os, Never, Nap };
+        // Power throttling wanted: OS-managed, never throttled, timers
+        // coalesced, or napped.
+        enum class Qos : uint8_t { Os, Never, Coalesce, Nap };
         Qos qos = Qos::Os;
     };
 
@@ -249,6 +296,8 @@ private:
     // newRun: the returned demand is a sustained run demanding for the first time.
     [[nodiscard]] BoostReason Demand(
         const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track, bool& newRun) const;
+    // Advances the frame-paced run: true while the app is interactive.
+    [[nodiscard]] bool Interactive(const AppSample& app, uint64_t nowMs, uint64_t idleMs, Track& track) const;
     [[nodiscard]] bool Sustained(const Run& run, uint64_t stamp, bool known) const noexcept;
     static bool FirstDemand(Run& run) noexcept;
     [[nodiscard]] uint64_t HoldMs(BoostReason reason) const noexcept;
@@ -261,7 +310,11 @@ private:
     std::vector<Slot> m_seen;
     std::vector<std::wstring> m_unthrottle;
     std::vector<std::wstring> m_nap;
+    std::vector<std::wstring> m_coalesce;
     uint64_t m_throttleVersion = 0;
+    // When the display went off (0 = on): time away does not use up the
+    // grace that keeps work the user started running.
+    uint64_t m_displayOffSinceMs = 0;
 };
 
 // Per-app memory of confirmed demanding work, persisted between sessions so
