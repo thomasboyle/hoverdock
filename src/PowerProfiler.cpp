@@ -49,6 +49,8 @@ const GUID kScratchPlan = {0x7f3c1e2a, 0x5b6d, 0x4c8e, {0x9a, 0x0b, 0x1c, 0x2d, 
 constexpr wchar_t kScratchPlanName[] = L"Hoverdock Profiler (temporary)";
 // Named event that switches on the engine's per-tick diagnostics (AutoPower.cpp).
 constexpr wchar_t kProfilerEventName[] = L"Local\\HoverdockPowerProfiler";
+// Set by Dock Settings to stop a running profile early.
+constexpr wchar_t kStopEventName[] = L"Local\\HoverdockPowerProfilerStop";
 constexpr char kEngineTracePrefix[] = "[Hoverdock AutoPower]";
 
 struct SettingInfo {
@@ -115,7 +117,7 @@ std::string ValueText(bool ok, DWORD value) {
 
 HANDLE g_out = nullptr;
 HANDLE g_cleanupDone = nullptr;
-// The console window is closing (not just Ctrl+C): exit without waiting for Enter.
+// The console window is closing, or Dock Settings stopped the run: exit without waiting for Enter.
 std::atomic<bool> g_closing{false};
 std::mutex g_sayMutex;
 std::wstring g_progressLog;
@@ -2251,6 +2253,12 @@ int Profile(const ProfileOptions& options) {
         notes.push_back("The run was stopped early: tables cover what was measured.");
     }
     WriteFileText(context.dir + L"\\summary.md", Summary(context, systemText, settingsTable, sweepBaseline, notes));
+    // Tells Dock Settings where the results are.
+    const std::wstring marker = PowerProfileResultMarker();
+    if (!marker.empty()) {
+        CreateDirectoryW(marker.substr(0, marker.find_last_of(L'\\')).c_str(), nullptr);
+        WriteFileText(marker, Utf8(context.dir));
+    }
     Say(L"");
     Say(L"Finished. Results: " + context.dir);
     Say(L"Zip that whole folder and share it.");
@@ -2287,6 +2295,26 @@ int RunPowerProfiler(int argc, LPWSTR* argv) {
     SetConsoleTitleW(L"Hoverdock power profiler");
     g_cleanupDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     SetConsoleCtrlHandler(&OnConsoleControl, TRUE);
+    // Dock Settings' Stop button (the event exists already when the dock started us).
+    HANDLE stopEvent = nullptr;
+    {
+        OpenSecurity security;
+        stopEvent = CreateEventW(security.Get(), TRUE, FALSE, kStopEventName);
+        if (stopEvent == nullptr) {
+            stopEvent = OpenEventW(SYNCHRONIZE, FALSE, kStopEventName);
+        }
+    }
+    std::thread watcher;
+    if (stopEvent != nullptr && g_cleanupDone != nullptr) {
+        watcher = std::thread([stopEvent] {
+            const HANDLE waits[2] = {stopEvent, g_cleanupDone};
+            if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) {
+                g_closing.store(true);
+                g_abort.store(true);
+                Say(L"Stop requested from Dock Settings: restoring your power plan and saving what was measured\u2026");
+            }
+        });
+    }
     int code = 1;
     try {
         code = Profile(ParseOptions(argc, argv));
@@ -2295,6 +2323,12 @@ int RunPowerProfiler(int argc, LPWSTR* argv) {
     }
     if (g_cleanupDone != nullptr) {
         SetEvent(g_cleanupDone);
+    }
+    if (watcher.joinable()) {
+        watcher.join();
+    }
+    if (stopEvent != nullptr) {
+        CloseHandle(stopEvent);
     }
     if (!g_closing.load()) {
         Say(L"Press Enter to close this window.");
@@ -2308,4 +2342,98 @@ int RunPowerProfiler(int argc, LPWSTR* argv) {
         }
     }
     return code;
+}
+
+std::wstring PowerProfileResultMarker() {
+    wchar_t local[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return {};
+    }
+    return std::wstring(local) + L"\\Hoverdock\\last-power-profile.txt";
+}
+
+PowerProfilerLauncher::~PowerProfilerLauncher() {
+    // A running profile carries on (and restores the plan) without the dock.
+    Close();
+}
+
+bool PowerProfilerLauncher::Start(bool& elevated) {
+    elevated = false;
+    if (IsRunning()) {
+        return false;
+    }
+    Close();
+    m_stopping = false;
+    const std::wstring marker = PowerProfileResultMarker();
+    if (!marker.empty()) {
+        DeleteFileW(marker.c_str());
+    }
+    m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, kStopEventName);
+    if (m_stopEvent != nullptr) {
+        ResetEvent(m_stopEvent);
+    }
+    const std::wstring exe = ModulePath();
+    if (exe.empty()) {
+        return false;
+    }
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    info.lpVerb = L"runas";
+    info.lpFile = exe.c_str();
+    info.lpParameters = L"--power-profile";
+    info.nShow = SW_SHOWNORMAL;
+    if (ShellExecuteExW(&info) != FALSE) {
+        elevated = true;
+    } else {
+        // Elevation declined: run anyway, with less data (no RAPL counters or energy report).
+        info.lpVerb = nullptr;
+        if (ShellExecuteExW(&info) == FALSE) {
+            return false;
+        }
+    }
+    m_process = info.hProcess;
+    return m_process != nullptr;
+}
+
+void PowerProfilerLauncher::RequestStop() noexcept {
+    if (m_stopEvent != nullptr && m_process != nullptr) {
+        SetEvent(m_stopEvent);
+        m_stopping = true;
+    }
+}
+
+bool PowerProfilerLauncher::IsRunning() const noexcept {
+    return m_process != nullptr && WaitForSingleObject(m_process, 0) == WAIT_TIMEOUT;
+}
+
+std::wstring PowerProfilerLauncher::LastResult() const {
+    const std::wstring marker = PowerProfileResultMarker();
+    FILE* file = nullptr;
+    if (marker.empty() || _wfopen_s(&file, marker.c_str(), L"rb") != 0 || file == nullptr) {
+        return {};
+    }
+    std::string text;
+    char buffer[512];
+    size_t read = 0;
+    while ((read = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        text.append(buffer, read);
+    }
+    std::fclose(file);
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+        text.pop_back();
+    }
+    return Wide(text);
+}
+
+void PowerProfilerLauncher::Close() noexcept {
+    if (m_process != nullptr) {
+        CloseHandle(m_process);
+        m_process = nullptr;
+    }
+    if (m_stopEvent != nullptr) {
+        CloseHandle(m_stopEvent);
+        m_stopEvent = nullptr;
+    }
 }

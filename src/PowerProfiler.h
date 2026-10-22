@@ -2,6 +2,8 @@
 
 #include <Windows.h>
 
+#include <string>
+
 // Dock.exe --power-profile [--quick] [--live <minutes>] [--skip-plans] [--skip-sweep] [--no-energy-report]
 //
 // Collects everything needed to tune the Automatic energy engine on this
@@ -34,3 +36,35 @@
 // is cancelled (Ctrl+C). --live records only the timeline, processes and engine
 // trace while the machine is used normally.
 int RunPowerProfiler(int argc, LPWSTR* argv);
+
+// Dock Settings "Run power profiler": starts Dock.exe --power-profile in its own
+// console, elevated when the user allows it (the energy counters and
+// powercfg /energy need it), and stops it through a named event so the
+// profiler still puts the power plan back.
+class PowerProfilerLauncher {
+public:
+    PowerProfilerLauncher() = default;
+    ~PowerProfilerLauncher();
+
+    PowerProfilerLauncher(const PowerProfilerLauncher&) = delete;
+    PowerProfilerLauncher& operator=(const PowerProfilerLauncher&) = delete;
+
+    // elevated reports whether the user allowed elevation; false when it could not start at all.
+    [[nodiscard]] bool Start(bool& elevated);
+    // Asks the profiler to stop early; it restores the plan and writes what it measured.
+    void RequestStop() noexcept;
+    [[nodiscard]] bool IsRunning() const noexcept;
+    [[nodiscard]] bool IsStopping() const noexcept { return m_stopping; }
+    // Results folder of the run that just finished, or empty.
+    [[nodiscard]] std::wstring LastResult() const;
+
+private:
+    void Close() noexcept;
+
+    HANDLE m_process = nullptr;
+    HANDLE m_stopEvent = nullptr;
+    bool m_stopping = false;
+};
+
+// Where a finished profile records its results folder for the dock to find.
+std::wstring PowerProfileResultMarker();

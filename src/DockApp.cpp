@@ -2458,7 +2458,6 @@ DockApp::~DockApp() {
     RevokeTrashDropTarget();
     UnregisterTrashNotify();
     StopSearchServices();
-    m_perfProfiler.Stop();
     m_energyBench.Stop();
     m_autoPower.Stop();
     DestroyDockSettings();
@@ -3941,6 +3940,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             }
         } else if (wParam == kEnergyBenchTimerId) {
             TickEnergyBench();
+        } else if (wParam == kPowerProfileTimerId) {
+            TickPowerProfile();
         } else if (wParam == kResumeZOrderTimerId) {
             ReassertOverlayZOrder();
             if (--m_resumeZOrderPasses <= 0) {
@@ -4031,7 +4032,6 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         UnregisterSystemResumeNotifications();
         StopShellFlyoutWatch();
         StopSearchServices();
-        m_perfProfiler.Stop();
         // Before the engine stops: the benchmark puts the user's power plan back.
         m_energyBench.Stop();
         SyncAutoPowerKeyboard(false);
@@ -7361,7 +7361,7 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
             if (GetCursorPos(&cursor) && ScreenToClient(window, &cursor)) {
                 const int hit = app->SettingsHitIndex(cursor);
                 if (hit >= 0 &&
-                    (app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::PerfLog ||
+                    (app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::PowerProfileLog ||
                         app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::EnergyBenchLog)) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
@@ -7464,6 +7464,21 @@ bool DockApp::SettingsGlassValid(POINT origin) const noexcept {
         std::abs(m_settingsGlassFrost - m_config.FrostAmount()) < 0.001F;
 }
 
+// The profiler runs in its own process: when it exits, show where it saved.
+void DockApp::TickPowerProfile() {
+    if (m_powerProfiler.IsRunning()) {
+        return;
+    }
+    KillTimer(m_window, kPowerProfileTimerId);
+    m_powerProfileFolder = m_powerProfiler.LastResult();
+    m_powerProfileStatus = m_powerProfileFolder.empty() ? L"The power profiler closed without saving results."
+                                                        : L"Saved " + m_powerProfileFolder;
+    Log(L"Power profiler finished: " + m_powerProfileStatus);
+    if (IsDockSettingsOpen()) {
+        QueueSettingsPaint();
+    }
+}
+
 void DockApp::TickEnergyBench() {
     if (!m_energyBench.IsRunning()) {
         KillTimer(m_window, kEnergyBenchTimerId);
@@ -7515,7 +7530,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         break;
     }
     case SettingsHitKind::CheckNow:
-    case SettingsHitKind::PerfProfile:
+    case SettingsHitKind::PowerProfile:
     case SettingsHitKind::EnergyBench: {
         // Capsule modules: dark wash in the exact pill (round caps), inset
         // 1px. A squircle of the same radius bulged past the rounded ends.
@@ -7527,7 +7542,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         break;
     }
     case SettingsHitKind::QsColorReset:
-    case SettingsHitKind::PerfLog:
+    case SettingsHitKind::PowerProfileLog:
     case SettingsHitKind::EnergyBenchLog: {
         SetFlyoutChromeInk(33, 34, 36);
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
@@ -8273,26 +8288,27 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
             SetUpdateStatus(L"Already checking for updates...");
         }
         break;
-    case SettingsHitKind::PerfProfile: {
-        if (m_perfProfiler.IsRunning()) {
-            m_perfProfiler.Stop();
-            const std::wstring logPath = m_perfProfiler.LogPath();
-            if (!logPath.empty()) {
-                m_perfSavedLog = logPath;
-                m_perfStatus = L"Saved " + logPath;
-                Log(L"Performance profile saved: " + logPath);
-            } else {
-                m_perfSavedLog.clear();
-                m_perfStatus = L"Profiling stopped.";
-            }
+    case SettingsHitKind::PowerProfile: {
+        if (m_powerProfiler.IsRunning()) {
+            m_powerProfiler.RequestStop();
+            m_powerProfileStatus = L"Stopping\u2026 the profiler puts your power plan back and saves what it measured.";
+            Log(L"Power profiler stopping.");
+        } else if (m_energyBench.IsRunning()) {
+            m_powerProfileStatus = L"Stop the energy benchmark first: both switch power plans.";
         } else {
-            m_perfSavedLog.clear();
-            if (m_perfProfiler.Start()) {
-                m_perfStatus = L"Profiling... " + m_perfProfiler.LogPath();
-                Log(L"Performance profile started: " + m_perfProfiler.LogPath());
+            m_powerProfileFolder.clear();
+            bool elevated = false;
+            if (m_powerProfiler.Start(elevated)) {
+                m_powerProfileStatus = elevated
+                    ? L"Profiling, about 50 minutes, hands off. Progress shows in the profiler's window."
+                    : L"Profiling without admin rights (less data), about 50 minutes, hands off.";
+                Log(L"Power profiler started.");
+                if (m_window != nullptr) {
+                    SetTimer(m_window, kPowerProfileTimerId, 2000, nullptr);
+                }
             } else {
-                m_perfStatus = L"Could not start performance profile.";
-                Log(L"Performance profile failed to start.");
+                m_powerProfileStatus = L"Could not start the power profiler.";
+                Log(L"Power profiler failed to start.");
             }
         }
         QueueSettingsPaint();
@@ -8302,6 +8318,8 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         if (m_energyBench.IsRunning()) {
             m_energyBench.RequestStop();
             Log(L"Energy benchmark stopping.");
+        } else if (m_powerProfiler.IsRunning()) {
+            m_powerProfileStatus = L"Stop the power profiler first: both switch power plans.";
         } else if (m_energyBench.Start()) {
             Log(L"Energy benchmark started.");
         }
@@ -8325,15 +8343,13 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         }).detach();
         break;
     }
-    case SettingsHitKind::PerfLog: {
-        if (m_perfSavedLog.empty()) {
+    case SettingsHitKind::PowerProfileLog: {
+        if (m_powerProfileFolder.empty()) {
             break;
         }
-        const std::wstring logPath = m_perfSavedLog;
-        std::thread([logPath]() {
-            const std::wstring parameters = L"/select,\"" + logPath + L"\"";
-            ShellExecuteW(nullptr, L"open", L"explorer.exe", parameters.c_str(), nullptr,
-                SW_SHOWNORMAL);
+        const std::wstring folder = m_powerProfileFolder;
+        std::thread([folder]() {
+            ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }).detach();
         break;
     }
@@ -8921,7 +8937,7 @@ void DockApp::PaintSettingsPopup() {
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, checking ? 150 : 255);
     pushHit(SettingsHitKind::CheckNow, checkRect);
 
-    const bool profiling = m_perfProfiler.IsRunning();
+    const bool profiling = m_powerProfiler.IsRunning();
     if (profiling) {
         // Active capsule: accent fill inset 2pt so the glass rim stays visible.
         const float capRadius = static_cast<float>(buttonHeight) * 0.5F - static_cast<float>(P(2.0F));
@@ -8933,10 +8949,12 @@ void DockApp::PaintSettingsPopup() {
         SetFlyoutChromeInk(onAccentR, onAccentG, onAccentB);
     }
     DrawFlyoutText(pixels, width, height, perfRect, labelFont,
-        profiling ? L"Stop profiling" : L"Start performance profile",
+        !profiling                       ? L"Run power profiler"
+            : m_powerProfiler.IsStopping() ? L"Stopping\u2026"
+                                           : L"Stop power profiler",
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, 255);
     SetFlyoutChromeInk(inkR, inkG, inkB);
-    pushHit(SettingsHitKind::PerfProfile, perfRect);
+    pushHit(SettingsHitKind::PowerProfile, perfRect);
 
     std::string current = Updater::CurrentVersion();
     std::wstring wideVersion(current.begin(), current.end());
@@ -8947,14 +8965,14 @@ void DockApp::PaintSettingsPopup() {
         versionBounds.bottom + 2 + subHeight + 4};
     DrawFlyoutText(pixels, width, height, statusBounds, statusFont, m_updateStatus,
         DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 210);
-    if (!m_perfStatus.empty() || profiling) {
-        std::wstring perfLine = m_perfStatus;
+    if (!m_powerProfileStatus.empty() || profiling) {
+        std::wstring perfLine = m_powerProfileStatus;
         if (profiling && perfLine.empty()) {
-            perfLine = L"Profiling... " + m_perfProfiler.LogPath();
+            perfLine = L"Profiling\u2026";
         }
         RECT perfStatusBounds{padding, statusBounds.bottom, panelWidth - padding,
             statusTop + statusHeight + subHeight};
-        const bool savedLink = !profiling && !m_perfSavedLog.empty();
+        const bool savedLink = !profiling && !m_powerProfileFolder.empty();
         const std::wstring savedPrefix = L"Saved ";
         const int underlineFrom = savedLink && perfLine.starts_with(savedPrefix)
             ? static_cast<int>(savedPrefix.size())
@@ -8962,7 +8980,7 @@ void DockApp::PaintSettingsPopup() {
         DrawFlyoutText(pixels, width, height, perfStatusBounds, statusFont, perfLine,
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 210, underlineFrom);
         if (savedLink) {
-            pushHit(SettingsHitKind::PerfLog, perfStatusBounds);
+            pushHit(SettingsHitKind::PowerProfileLog, perfStatusBounds);
         }
     }
 

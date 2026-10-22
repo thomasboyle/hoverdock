@@ -18,7 +18,7 @@
 #include "Weather.h"
 #include "SpeedTest.h"
 #include "EnergyBench.h"
-#include "PerfProfiler.h"
+#include "PowerProfiler.h"
 #include "PerfBoost.h"
 
 #include <Windows.h>
@@ -212,6 +212,7 @@ private:
     static constexpr UINT_PTR kResumeZOrderTimerId = 23;
     // Dock Settings energy benchmark: 1 s countdown while it runs.
     static constexpr UINT_PTR kEnergyBenchTimerId = 24;
+    static constexpr UINT_PTR kPowerProfileTimerId = 25;
     static constexpr UINT kResumeZOrderIntervalMs = 1000;
     static constexpr int kResumeZOrderPasses = 4;
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
@@ -347,8 +348,8 @@ private:
         HandsFree,
         LightPanels,
         CheckNow,
-        PerfProfile,
-        PerfLog,
+        PowerProfile,
+        PowerProfileLog,
         EnergyBench,
         EnergyBenchLog,
         Close,
@@ -503,6 +504,7 @@ private:
     void QueueSettingsPaint(bool hoverOnly = false);
     // Energy benchmark countdown tick: repaints Dock Settings, notes the finish.
     void TickEnergyBench();
+    void TickPowerProfile();
     // allowCc=false keeps the plain dock material even while Dock Settings has CC shapes.
     [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false,
         bool allowCc = true) const noexcept;
@@ -1254,13 +1256,13 @@ private:
     std::wstring m_updateStatus = L"Checking for updates...";
     std::atomic<bool> m_updateInFlight{false};
     std::atomic<bool> m_updateInstalling{false};
-    PerfProfiler m_perfProfiler;
+    PowerProfilerLauncher m_powerProfiler;
     EnergyBenchmark m_energyBench;
     AutoPowerEngine m_autoPower;
     bool m_autoPowerKeyboard = false;
-    std::wstring m_perfStatus;
-    // Set only after a profile finishes writing. Clicking the path opens it.
-    std::wstring m_perfSavedLog;
+    std::wstring m_powerProfileStatus;
+    // Set only after a power profile finishes writing. Clicking the path opens it.
+    std::wstring m_powerProfileFolder;
     double m_lastUpdateCheck = 0.0;
     std::wstring m_overflowGlyphKey;
     std::vector<uint8_t> m_overflowGlyphGear;

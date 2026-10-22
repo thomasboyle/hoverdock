@@ -46,7 +46,6 @@ add_executable(Dock WIN32
     src/WindowCatalog.cpp
     src/Bluetooth.cpp
     src/PerfBoost.cpp
-    src/PerfProfiler.cpp
     src/EnergyBench.cpp
     src/PowerProfiler.cpp
     src/AutoPower.cpp
