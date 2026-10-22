@@ -2459,6 +2459,7 @@ DockApp::~DockApp() {
     UnregisterTrashNotify();
     StopSearchServices();
     m_perfProfiler.Stop();
+    m_energyBench.Stop();
     m_autoPower.Stop();
     DestroyDockSettings();
     DestroyOverflowPopup();
@@ -3936,6 +3937,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             if (!IsDockSettingsOpen()) {
                 OpenDockSettings();
             }
+        } else if (wParam == kEnergyBenchTimerId) {
+            TickEnergyBench();
         } else if (wParam == kResumeZOrderTimerId) {
             ReassertOverlayZOrder();
             if (--m_resumeZOrderPasses <= 0) {
@@ -4027,6 +4030,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         StopShellFlyoutWatch();
         StopSearchServices();
         m_perfProfiler.Stop();
+        // Before the engine stops: the benchmark puts the user's power plan back.
+        m_energyBench.Stop();
         SyncAutoPowerKeyboard(false);
         m_autoPower.Stop();
         DestroyDockSettings();
@@ -7354,7 +7359,8 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
             if (GetCursorPos(&cursor) && ScreenToClient(window, &cursor)) {
                 const int hit = app->SettingsHitIndex(cursor);
                 if (hit >= 0 &&
-                    app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::PerfLog) {
+                    (app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::PerfLog ||
+                        app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::EnergyBenchLog)) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
                 }
@@ -7456,6 +7462,17 @@ bool DockApp::SettingsGlassValid(POINT origin) const noexcept {
         std::abs(m_settingsGlassFrost - m_config.FrostAmount()) < 0.001F;
 }
 
+void DockApp::TickEnergyBench() {
+    if (!m_energyBench.IsRunning()) {
+        KillTimer(m_window, kEnergyBenchTimerId);
+        Log(L"Energy benchmark finished: " + m_energyBench.Status().result);
+    }
+    // The countdown only needs painting while the panel is showing.
+    if (IsDockSettingsOpen()) {
+        QueueSettingsPaint();
+    }
+}
+
 void DockApp::QueueSettingsPaint(bool hoverOnly) {
     // Coalesce rapid hover transitions into a single repaint, mirroring the
     // Quick Settings popup path. Hover moves only need the cheap base-copy +
@@ -7496,7 +7513,8 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         break;
     }
     case SettingsHitKind::CheckNow:
-    case SettingsHitKind::PerfProfile: {
+    case SettingsHitKind::PerfProfile:
+    case SettingsHitKind::EnergyBench: {
         // Capsule modules: dark wash in the exact pill (round caps), inset
         // 1px. A squircle of the same radius bulged past the rounded ends.
         const float h = static_cast<float>(hit.bounds.bottom - hit.bounds.top);
@@ -7507,7 +7525,8 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         break;
     }
     case SettingsHitKind::QsColorReset:
-    case SettingsHitKind::PerfLog: {
+    case SettingsHitKind::PerfLog:
+    case SettingsHitKind::EnergyBenchLog: {
         SetFlyoutChromeInk(33, 34, 36);
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
@@ -8277,6 +8296,33 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         QueueSettingsPaint();
         break;
     }
+    case SettingsHitKind::EnergyBench:
+        if (m_energyBench.IsRunning()) {
+            m_energyBench.RequestStop();
+            Log(L"Energy benchmark stopping.");
+        } else if (m_energyBench.Start()) {
+            Log(L"Energy benchmark started.");
+        }
+        if (m_window != nullptr) {
+            SetTimer(m_window, kEnergyBenchTimerId, 1000, nullptr);
+        }
+        QueueSettingsPaint();
+        break;
+    case SettingsHitKind::EnergyBenchLog: {
+        const std::wstring summary = m_energyBench.Status().summaryPath;
+        if (summary.empty()) {
+            break;
+        }
+        std::thread([summary]() {
+            // No app for .md: show the file in Explorer instead.
+            if (reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", summary.c_str(), nullptr, nullptr,
+                    SW_SHOWNORMAL)) <= 32) {
+                const std::wstring parameters = L"/select,\"" + summary + L"\"";
+                ShellExecuteW(nullptr, L"open", L"explorer.exe", parameters.c_str(), nullptr, SW_SHOWNORMAL);
+            }
+        }).detach();
+        break;
+    }
     case SettingsHitKind::PerfLog: {
         if (m_perfSavedLog.empty()) {
             break;
@@ -8468,8 +8514,12 @@ void DockApp::PaintSettingsPopup() {
     const RECT checkRect{padding, contentY, padding + moduleWidth, contentY + buttonHeight};
     contentY = checkRect.bottom + gutter;
     const RECT perfRect{padding, contentY, padding + moduleWidth, contentY + buttonHeight};
-    const LONG statusTop = perfRect.bottom + gutter;
-    contentY = statusTop + statusHeight + subHeight + padding;  // version, update status, perf path
+    contentY = perfRect.bottom + gutter;
+    const RECT benchRect{padding, contentY, padding + moduleWidth, contentY + buttonHeight};
+    const LONG statusTop = benchRect.bottom + gutter;
+    // Energy benchmark step / outcome: up to two lines under the perf path.
+    const LONG benchLineHeight = subHeight * 2L + P(6.0F);
+    contentY = statusTop + statusHeight + subHeight + benchLineHeight + padding;  // version, update, perf, bench
     m_settingsSize.cx = panelWidth;
     m_settingsSize.cy = contentY;
 
@@ -8495,6 +8545,7 @@ void DockApp::PaintSettingsPopup() {
         addShape(colorRect, static_cast<float>(moduleRadius));
         addShape(checkRect, static_cast<float>(buttonHeight) * 0.5F);
         addShape(perfRect, static_cast<float>(buttonHeight) * 0.5F);
+        addShape(benchRect, static_cast<float>(buttonHeight) * 0.5F);
     }
 
     // WM_CLOSE / external destroy can kill the HWND while leaving a dangling
@@ -8910,6 +8961,60 @@ void DockApp::PaintSettingsPopup() {
             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, 210, underlineFrom);
         if (savedLink) {
             pushHit(SettingsHitKind::PerfLog, perfStatusBounds);
+        }
+    }
+
+    // ---- Energy benchmark: Start / Stop with a live countdown -----------------
+    {
+        const EnergyBenchStatus bench = m_energyBench.Status();
+        if (bench.running) {
+            const float capRadius = static_cast<float>(buttonHeight) * 0.5F - static_cast<float>(P(2.0F));
+            FillPillColorPremul(pixels, width, height,
+                static_cast<float>(benchRect.left) + static_cast<float>(buttonHeight) * 0.5F,
+                static_cast<float>(benchRect.right) - static_cast<float>(buttonHeight) * 0.5F,
+                0.5F * static_cast<float>(benchRect.top + benchRect.bottom), capRadius, 0.98F,
+                accentB, accentG, accentR);
+            SetFlyoutChromeInk(onAccentR, onAccentG, onAccentB);
+        }
+        std::wstring benchLabel = L"Start energy benchmark";
+        if (bench.stopping) {
+            benchLabel = L"Stopping\u2026";
+        } else if (bench.running) {
+            const auto left = static_cast<long long>(std::ceil(bench.secondsLeft));
+            wchar_t clock[32]{};
+            if (left >= 3600) {
+                swprintf_s(clock, L"%lld:%02lld:%02lld", left / 3600, left % 3600 / 60, left % 60);
+            } else {
+                swprintf_s(clock, L"%lld:%02lld", left / 60, left % 60);
+            }
+            benchLabel = L"Stop benchmark \u00B7 " + std::wstring(clock) + L" left";
+        }
+        DrawFlyoutText(pixels, width, height, benchRect, labelFont, benchLabel,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+        SetFlyoutChromeInk(inkR, inkG, inkB);
+        pushHit(SettingsHitKind::EnergyBench, benchRect);
+
+        const LONG benchStatusTop = statusTop + statusHeight + subHeight;
+        const RECT benchStatusBounds{padding, benchStatusTop, panelWidth - padding, benchStatusTop + benchLineHeight};
+        std::wstring benchLine;
+        int benchUnderline = -1;
+        const bool summaryLink = !bench.running && !bench.summaryPath.empty();
+        if (bench.running) {
+            benchLine = bench.step;
+        } else if (!bench.result.empty()) {
+            benchLine = bench.result;
+            if (summaryLink) {
+                benchLine += L" ";
+                benchUnderline = static_cast<int>(benchLine.size());
+                benchLine += L"Open summary";
+            }
+        } else {
+            benchLine = L"Compares Automatic with Balanced on scripted workloads (about 30 min, hands off).";
+        }
+        DrawFlyoutText(pixels, width, height, benchStatusBounds, statusFont, benchLine,
+            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, bench.failed ? 235 : 210, benchUnderline);
+        if (summaryLink) {
+            pushHit(SettingsHitKind::EnergyBenchLog, benchStatusBounds);
         }
     }
 

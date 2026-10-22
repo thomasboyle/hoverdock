@@ -113,6 +113,21 @@ It works the way a Mac does. Performance follows the work instead of a mode: the
 
 The Automatic row shows **High Power** while it's boosting an app and **Low Power** the rest of the time. It reacts in milliseconds: switching to a game or working in a creative tool boosts straight away, and work you start (an export, a render, a build) is confirmed within about a third of a second. CPU load for every process comes from a single system call, and GPU load comes from the kernel's graphics statistics. That keeps the GPU cheap enough to check all the time. The time each switch takes, and how many hidden apps are napping, are written to the debug output (visible in DebugView). Each boost is held a few seconds after the work stops, so power doesn't flicker on and off. Picking Low or High Power hands control back to Windows and undoes everything Automatic changed. If you were on Balanced (which Hoverdock already showed as Automatic), it moves you to the Automatic plan once. Uninstalling Hoverdock switches you back to Balanced and removes the plan.
 
+**Does it actually save energy on your machine?** Open Dock Settings and click **Start energy benchmark**. It runs the same scripted workloads under Windows **Balanced** (Automatic's engine switched off) and under **Automatic**, swapping which goes first each round, three times over. That takes about 30 minutes, and the button counts down the time left. Click it again to stop at any time. Your original power plan comes back when it finishes or stops.
+
+- **Before you start:** choose Automatic once (that creates its plan). While it runs, don't touch the keyboard or mouse, because input wakes the engine. Also keep the brightness and the charger as they are.
+- **Workloads:**
+  - an idle desktop
+  - the pointer moving
+  - a minimized app polling a fast timer, which App Nap should catch
+  - short UI-like bursts of work
+  - a 60 fps frame loop
+  - a fixed all-core job, measured as the energy to finish it
+
+  The work is identical under both plans. Burst time, missed frames and job time are reported next to energy, so a saving that comes from doing less shows up.
+- **Meters:** unplug the charger to measure the whole machine from the battery. Plugged in, it reads the processor's own energy counters.
+- **Results:** the outcome appears under the button, for example "Automatic used less energy in 4, more in 0, no clear difference in 2 of 6 tests". A difference only counts when it's bigger than the run-to-run noise (95% confidence). **Open summary** shows the full table. Every reading is saved in `runs.csv` in a `Hoverdock-energy-<date>` folder next to `Dock.exe`.
+
 ## Build it yourself
 
 You need Windows 10 (19041+), Visual Studio 2022, and CMake 3.25+. No vcpkg, no NuGet, no extra SDKs. Just the Windows SDK.

@@ -17,6 +17,7 @@
 #include "QuickSettingsPanel.h"
 #include "Weather.h"
 #include "SpeedTest.h"
+#include "EnergyBench.h"
 #include "PerfProfiler.h"
 #include "PerfBoost.h"
 
@@ -209,6 +210,8 @@ private:
     // Post-wake topmost re-assertion: Explorer/DWM reshuffle z-order for a
     // few seconds after resume/unlock, which can sink the dock under windows.
     static constexpr UINT_PTR kResumeZOrderTimerId = 23;
+    // Dock Settings energy benchmark: 1 s countdown while it runs.
+    static constexpr UINT_PTR kEnergyBenchTimerId = 24;
     static constexpr UINT kResumeZOrderIntervalMs = 1000;
     static constexpr int kResumeZOrderPasses = 4;
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
@@ -346,6 +349,8 @@ private:
         CheckNow,
         PerfProfile,
         PerfLog,
+        EnergyBench,
+        EnergyBenchLog,
         Close,
         QsColorSwatch,
         QsColorHue,
@@ -496,6 +501,8 @@ private:
         const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
         const RECT* dirty = nullptr, bool preservePopupShadow = false) noexcept;
     void QueueSettingsPaint(bool hoverOnly = false);
+    // Energy benchmark countdown tick: repaints Dock Settings, notes the finish.
+    void TickEnergyBench();
     // allowCc=false keeps the plain dock material even while Dock Settings has CC shapes.
     [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false,
         bool allowCc = true) const noexcept;
@@ -1248,6 +1255,7 @@ private:
     std::atomic<bool> m_updateInFlight{false};
     std::atomic<bool> m_updateInstalling{false};
     PerfProfiler m_perfProfiler;
+    EnergyBenchmark m_energyBench;
     AutoPowerEngine m_autoPower;
     bool m_autoPowerKeyboard = false;
     std::wstring m_perfStatus;

@@ -47,6 +47,7 @@ add_executable(Dock WIN32
     src/Bluetooth.cpp
     src/PerfBoost.cpp
     src/PerfProfiler.cpp
+    src/EnergyBench.cpp
     src/AutoPower.cpp
     src/AutoPowerPolicy.cpp
     src/RecycleBin.cpp
@@ -145,6 +146,8 @@ target_link_libraries(Dock PRIVATE
     UIAutomationCore
     wbemuuid
     pdh
+    setupapi
+    winmm
     dbghelp
     crypt32
 )
@@ -211,6 +214,7 @@ set_property(TARGET Dock PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_D
 #   AiPipelineBench        AI answer streaming/request benchmark (portable)
 #   AutoPowerPolicyTests   Automatic energy mode decisions (portable)
 #   AutoPowerPolicyBench   Automatic energy mode per-tick decision cost (portable)
+#   EnergyBenchStatsTests  Dock Settings energy benchmark statistics (portable)
 option(DOCK_BUILD_TESTS "Build the Search engine tests" OFF)
 if(DOCK_BUILD_TESTS)
     enable_testing()
@@ -243,6 +247,9 @@ if(DOCK_BUILD_TESTS)
     add_test(NAME AutoPowerPolicyTests COMMAND AutoPowerPolicyTests)
     # Automatic energy mode per-tick decision benchmark; not a CTest.
     add_dock_test(AutoPowerPolicyBench tests/AutoPowerPolicyBench.cpp src/AutoPowerPolicy.cpp)
+    # Dock Settings energy benchmark statistics (portable; the benchmark itself runs in Dock.exe).
+    add_dock_test(EnergyBenchStatsTests tests/EnergyBenchStatsTests.cpp)
+    add_test(NAME EnergyBenchStatsTests COMMAND EnergyBenchStatsTests)
 endif()
 
 # Signed PawnIO IntelMSR blob header (third_party/pawnio/IntelMsrBin.h).
