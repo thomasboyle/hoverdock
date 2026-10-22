@@ -2454,6 +2454,8 @@ DockApp::DockApp(HINSTANCE instance)
 }
 
 DockApp::~DockApp() {
+    // Refresh jobs use this object: finish them first.
+    m_catalogWorker.Stop();
     m_bluetooth.Stop();
     RevokeTrashDropTarget();
     UnregisterTrashNotify();
@@ -13085,34 +13087,23 @@ void DockApp::BeginBackgroundRefresh(bool force) {
     }
 
     const UINT generation = m_refreshGeneration.load();
-    const std::vector<PinnedApp> pins = m_config.Pins();
-    const std::vector<DisplayApp> currentApps = m_displayApps;
+    std::vector<PinnedApp> pins = m_config.Pins();
+    std::vector<DisplayApp> currentApps = m_displayApps;
     const UINT iconPixelExtent = m_loadedIconExtent != 0 ? m_loadedIconExtent : IconPixelExtent();
-    std::vector<std::wstring> cachedIconTargets;
-    cachedIconTargets.reserve(m_renderer.IconTargetKeys().size());
-    for (const std::wstring& target : m_renderer.IconTargetKeys()) {
-        if (m_renderer.HasCachedIconPixels(target)) {
-            cachedIconTargets.push_back(target);
-        }
-    }
+    std::vector<std::wstring> cachedIconTargets = m_renderer.IconTargetKeys();
+    std::erase_if(cachedIconTargets, [this](const std::wstring& target) {
+        return !m_renderer.HasCachedIconPixels(target);
+    });
 
-    std::thread([this, force, retryIcons, generation, pins, currentApps, iconPixelExtent, cachedIconTargets]() {
+    m_catalogWorker.Post([this, force, retryIcons, generation, pins = std::move(pins),
+                             currentApps = std::move(currentApps), iconPixelExtent,
+                             cachedIconTargets = std::move(cachedIconTargets)]() {
         struct RefreshScope {
             DockApp* app;
             ~RefreshScope() {
                 app->m_refreshInFlight = false;
             }
         } refreshScope{this};
-
-        const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        struct ComScope {
-            HRESULT result = E_FAIL;
-            ~ComScope() {
-                if (SUCCEEDED(result)) {
-                    CoUninitialize();
-                }
-            }
-        } comScope{.result = comResult};
 
         WindowCatalog windows;
         // Profiles before refresh: enrichment needs the flag set first, and a
@@ -13178,7 +13169,7 @@ void DockApp::BeginBackgroundRefresh(bool force) {
             m_refreshSnapshot = std::move(snapshot);
         }
         PostMessageW(m_window, kRefreshApplyMessage, static_cast<WPARAM>(generation), 0);
-    }).detach();
+    });
 }
 
 void DockApp::ApplyBackgroundRefresh(UINT generation) {

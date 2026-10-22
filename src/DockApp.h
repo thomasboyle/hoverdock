@@ -17,6 +17,7 @@
 #include "Weather.h"
 #include "SpeedTest.h"
 #include "PerfBoost.h"
+#include "StaWorker.h"
 
 #include <Windows.h>
 
@@ -976,6 +977,8 @@ private:
     HWINEVENTHOOK m_catalogHook = nullptr;
     bool m_inBeginShow = false;
     std::atomic<bool> m_hiddenCatalogDirty{false};
+    // Runs every catalog refresh (BeginBackgroundRefresh) on one COM thread.
+    StaWorker m_catalogWorker;
     std::atomic<UINT> m_hiddenCatalogEpoch{0};
     UINT m_hostRefreshHz = 60;
     UINT m_backdropFastPeriodMs = 0;

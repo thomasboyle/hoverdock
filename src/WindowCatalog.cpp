@@ -2098,14 +2098,15 @@ std::wstring WindowCatalog::NormalizedPath(const std::wstring& path) {
     }
 
     const std::wstring stripped = StripExtendedPathPrefix(path);
-    wchar_t fullPath[32768]{};
+    // Only the [0, length) range the API writes is read: no zero fill (64 KB).
+    wchar_t fullPath[32768];
     const DWORD length = GetFullPathNameW(stripped.c_str(), static_cast<DWORD>(std::size(fullPath)),
         fullPath, nullptr);
     std::wstring normalized = length == 0 || length >= std::size(fullPath)
         ? stripped
         : std::wstring(fullPath, length);
 
-    wchar_t longPath[32768]{};
+    wchar_t longPath[32768];
     const DWORD longLength = GetLongPathNameW(normalized.c_str(), longPath,
         static_cast<DWORD>(std::size(longPath)));
     if (longLength > 0 && longLength < std::size(longPath)) {
