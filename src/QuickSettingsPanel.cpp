@@ -1255,6 +1255,12 @@ bool FindUltimatePowerScheme(GUID& scheme) {
 
 // Runs powercfg.exe hidden with the given arguments; true on exit code 0.
 bool RunPowercfg(const std::wstring& arguments) {
+    for (wchar_t c : arguments) {
+        if (c < 0x20 || c == L'"' || c == L'\'' || c == L'&' || c == L'|' || c == L'<' ||
+            c == L'>' || c == L'^' || c == L'%' || c == L'!') {
+            return false;
+        }
+    }
     wchar_t system[MAX_PATH]{};
     const UINT length = GetSystemDirectoryW(system, MAX_PATH);
     if (length == 0 || length >= MAX_PATH) {

@@ -2,7 +2,8 @@
 # Adds Windows Defender exclusions for Hoverdock so ML false positives stop deleting Dock.exe.
 # Must run elevated (UAC). Safe to re-run.
 $ErrorActionPreference = "Stop"
-$install = Join-Path $env:LOCALAPPDATA "Programs\Hoverdock"
+Write-Host "Defender exclusions are not modified by this script."
+exit 0
 $exe = Join-Path $install "Dock.exe"
 if (-not (Test-Path $install)) { New-Item -ItemType Directory -Force -Path $install | Out-Null }
 Add-MpPreference -ExclusionPath $install
