@@ -479,10 +479,9 @@ bool HttpGetEx(const std::wstring& host, INTERNET_PORT port, bool secure,
                     return false;
                 }
                 const bool redirectHostAllowed = nextSecure &&
-                    (nextHost == L"github.com" || nextHost == L"api.github.com" ||
-                        nextHost == L"objects.githubusercontent.com" ||
-                        nextHost.ends_with(L".github.com") ||
-                        nextHost.ends_with(L".githubusercontent.com"));
+                                    (nextHost == L"github.com" || nextHost == L"api.github.com" ||
+                                        nextHost == L"objects.githubusercontent.com" ||
+                                        nextHost.ends_with(L".githubusercontent.com"));
                 if (!redirectHostAllowed) {
                     error = L"Update redirect host was not allowed.";
                     return false;
@@ -618,6 +617,12 @@ void BuildFallbackRelease(
 
 bool ParseApiReleaseBody(const std::string& body, Updater::ReleaseInfo& out) {
     out = Updater::ReleaseInfo{};
+    // Only accept release assets hosted under the configured repository (or its
+    // CDN). A compromised/malicious release payload must not be able to point
+    // the updater at an asset in another repository on github.com.
+    const std::string expectedGithubPrefix =
+        std::string("https://github.com/") + ToLowerAscii(DockVersion::kRepoOwner) + "/" +
+        ToLowerAscii(DockVersion::kRepoName) + "/releases/download/";
     size_t cursor = 0;
     std::string tag;
     if (FindJsonStringField(body, cursor, "tag_name", tag)) {
@@ -638,8 +643,8 @@ bool ParseApiReleaseBody(const std::string& body, Updater::ReleaseInfo& out) {
     }
     for (const std::string& candidate : urls) {
         const std::string lowerCandidate = ToLowerAscii(candidate);
-        const bool allowedHost = lowerCandidate.rfind("https://github.com/", 0) == 0 ||
-            lowerCandidate.rfind("https://objects.githubusercontent.com/", 0) == 0;
+        const bool allowedHost = lowerCandidate.rfind(expectedGithubPrefix, 0) == 0 ||
+                    lowerCandidate.rfind("https://objects.githubusercontent.com/", 0) == 0;
         if (!allowedHost) {
             continue;
         }
@@ -651,8 +656,8 @@ bool ParseApiReleaseBody(const std::string& body, Updater::ReleaseInfo& out) {
     }
     for (const std::string& candidate : urls) {
         const std::string lower = ToLowerAscii(candidate);
-        const bool allowedHost = lower.rfind("https://github.com/", 0) == 0 ||
-            lower.rfind("https://objects.githubusercontent.com/", 0) == 0;
+        const bool allowedHost = lower.rfind(expectedGithubPrefix, 0) == 0 ||
+                    lower.rfind("https://objects.githubusercontent.com/", 0) == 0;
         if (!allowedHost) {
             continue;
         }
@@ -673,8 +678,8 @@ bool ParseApiReleaseBody(const std::string& body, Updater::ReleaseInfo& out) {
         // Last resort: any .exe asset so a renamed uploader still updates.
         for (const std::string& candidate : urls) {
             const std::string lower = ToLowerAscii(candidate);
-            const bool allowedHost = lower.rfind("https://github.com/", 0) == 0 ||
-                lower.rfind("https://objects.githubusercontent.com/", 0) == 0;
+            const bool allowedHost = lower.rfind(expectedGithubPrefix, 0) == 0 ||
+                        lower.rfind("https://objects.githubusercontent.com/", 0) == 0;
             if (!allowedHost) {
                 continue;
             }
@@ -898,10 +903,9 @@ bool Updater::DownloadFile(const std::string& url, const std::wstring& destPath,
         return false;
     }
     const bool downloadHostAllowed = secure &&
-        (host == L"github.com" || host == L"api.github.com" ||
-            host == L"objects.githubusercontent.com" ||
-            host.ends_with(L".github.com") ||
-            host.ends_with(L".githubusercontent.com"));
+            (host == L"github.com" || host == L"api.github.com" ||
+                host == L"objects.githubusercontent.com" ||
+                host.ends_with(L".githubusercontent.com"));
     if (!downloadHostAllowed) {
         error = L"Update download host was not allowed.";
         return false;
@@ -1040,7 +1044,7 @@ bool Updater::VerifyAuthenticode(const std::wstring& path) {
     WINTRUST_DATA data{};
     data.cbStruct = sizeof(data);
     data.dwUIChoice = WTD_UI_NONE;
-    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
     data.dwUnionChoice = WTD_CHOICE_FILE;
     data.pFile = &fileInfo;
     data.dwStateAction = WTD_STATEACTION_VERIFY;
