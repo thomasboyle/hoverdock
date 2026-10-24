@@ -49,13 +49,13 @@ hardening gaps rather than confirmed exploitable bugs.
 | F2 | CI actions pinned by moving tag; script injection in release version step | Medium | High | Patched (2873194) |
 | F3 | `OpenLocation` command injection via pin target quotes | Medium | Medium | Patched (df27742) |
 | F4 | `VerifyAuthenticode` disabled revocation checks | Medium | High | Patched (7eb7c68) |
-| F5 | Authenticode does not pin publisher/signer identity | High | Medium | Needs decision |
-| F6 | CI installs NSIS from the network unpinned; broad release permissions | Medium | Medium | Open |
-| F7 | Installer `taskkill /F /IM Dock.exe` can kill unrelated processes; window-class spoofing | Low | Medium | Open |
-| F8 | Missing build-hardening flags (/guard:cf, /CETCOMPAT, /sdl) | Low | High | Backlog |
-| F9 | No checksums/SBOM published with releases | Low | High | Backlog |
-| F10 | Memory-safety review of MFT/FileSearch parsing incomplete | Medium | Low | Open |
-| F11 | Privacy review of GDI capture and logs not completed | Low | Low | Open |
+| F5 | Authenticode does not pin publisher/signer identity | High | Medium | Patched (build-time pin, empty default) |
+| F6 | CI installs NSIS from the network unpinned; broad release permissions | Medium | Medium | Patched (pinned 3.11) |
+| F7 | Installer `taskkill /F /IM Dock.exe` can kill unrelated processes | Low | Medium | Patched (removed blanket taskkill) |
+| F8 | Missing build-hardening flags (/guard:cf, /CETCOMPAT, /sdl) | Low | High | Patched |
+| F9 | No checksums published with releases | Low | High | Patched (SHA256SUMS.txt) |
+| F10 | Memory-safety review of MFT/FileSearch parsing | Medium | Low | Patched (bounds hardening) |
+| F11 | Privacy review of GDI capture and logs | Low | Low | Verified (no persistence found) |
 
 ## 4. Per-finding detail
 
