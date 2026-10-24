@@ -150,7 +150,8 @@ D3D12_BLEND_DESC PremultipliedBlendDescription() {
 }
 
 UINT IconAtlasExtent(UINT displayExtent) {
-    return std::min(256U, std::max(1U, displayExtent * 2U));
+    const UINT doubled = displayExtent > 128U ? 256U : displayExtent * 2U;
+    return std::min(256U, std::max(1U, doubled));
 }
 
 UINT IconSourceExtent(UINT displayExtent) {
@@ -239,6 +240,9 @@ bool CopyBitmapPixels(HBITMAP bitmap, std::vector<uint8_t>& out, UINT& width, UI
 
     if (info.bmBitsPixel == 32 && info.bmBits != nullptr) {
         const size_t stride = static_cast<size_t>(info.bmWidthBytes);
+        if (stride < static_cast<size_t>(width) * 4U) {
+            return false;
+        }
         const auto* src = static_cast<const uint8_t*>(info.bmBits);
         const bool bottomUp = info.bmHeight > 0;
         for (UINT y = 0; y < height; ++y) {

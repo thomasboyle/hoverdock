@@ -476,6 +476,15 @@ bool HttpGetEx(const std::wstring& host, INTERNET_PORT port, bool secure,
                     error = L"Update redirect URL was invalid.";
                     return false;
                 }
+                const bool redirectHostAllowed = nextSecure &&
+                    (nextHost == L"github.com" || nextHost == L"api.github.com" ||
+                        nextHost == L"objects.githubusercontent.com" ||
+                        nextHost.ends_with(L".github.com") ||
+                        nextHost.ends_with(L".githubusercontent.com"));
+                if (!redirectHostAllowed) {
+                    error = L"Update redirect host was not allowed.";
+                    return false;
+                }
                 curHost = nextHost;
                 curPath = nextPath;
                 curPort = nextPort;
@@ -626,6 +635,12 @@ bool ParseApiReleaseBody(const std::string& body, Updater::ReleaseInfo& out) {
         urls.push_back(url);
     }
     for (const std::string& candidate : urls) {
+        const std::string lowerCandidate = ToLowerAscii(candidate);
+        const bool allowedHost = lowerCandidate.rfind("https://github.com/", 0) == 0 ||
+            lowerCandidate.rfind("https://objects.githubusercontent.com/", 0) == 0;
+        if (!allowedHost) {
+            continue;
+        }
         if (ToLowerContains(candidate, ".exe") && ToLowerContains(candidate, "setup")) {
             if (out.setupUrl.empty()) {
                 out.setupUrl = candidate;
@@ -634,6 +649,11 @@ bool ParseApiReleaseBody(const std::string& body, Updater::ReleaseInfo& out) {
     }
     for (const std::string& candidate : urls) {
         const std::string lower = ToLowerAscii(candidate);
+        const bool allowedHost = lower.rfind("https://github.com/", 0) == 0 ||
+            lower.rfind("https://objects.githubusercontent.com/", 0) == 0;
+        if (!allowedHost) {
+            continue;
+        }
         const bool isExe = lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".exe") == 0;
         if (!isExe) {
             continue;
@@ -650,6 +670,12 @@ bool ParseApiReleaseBody(const std::string& body, Updater::ReleaseInfo& out) {
     if (out.setupUrl.empty() && out.exeUrl.empty()) {
         // Last resort: any .exe asset so a renamed uploader still updates.
         for (const std::string& candidate : urls) {
+            const std::string lower = ToLowerAscii(candidate);
+            const bool allowedHost = lower.rfind("https://github.com/", 0) == 0 ||
+                lower.rfind("https://objects.githubusercontent.com/", 0) == 0;
+            if (!allowedHost) {
+                continue;
+            }
             if (ToLowerContains(candidate, ".exe")) {
                 out.exeUrl = candidate;
                 break;
@@ -862,6 +888,15 @@ bool Updater::DownloadFile(const std::string& url, const std::wstring& destPath,
         error = L"Update URL was invalid.";
         return false;
     }
+    const bool downloadHostAllowed = secure &&
+        (host == L"github.com" || host == L"api.github.com" ||
+            host == L"objects.githubusercontent.com" ||
+            host.ends_with(L".github.com") ||
+            host.ends_with(L".githubusercontent.com"));
+    if (!downloadHostAllowed) {
+        error = L"Update download host was not allowed.";
+        return false;
+    }
     std::string body;
     if (!HttpGet(host, port, secure, path, L"Accept: */*", body, kMaxDownloadBytes, error)) {
         return false;
@@ -1005,6 +1040,16 @@ bool Updater::LaunchInstallerAndExit(const std::wstring& installerPath) {
     if (!isAscii(installerPath)) {
         return false;
     }
+    auto isBatchSafe = [](const std::wstring& value) {
+        for (const wchar_t c : value) {
+            if (c == L'"' || c == L'&' || c == L'|' || c == L'<' || c == L'>' ||
+                c == L'^' || c == L'%' || c == L'!' || c == L'\n' || c == L'\r' ||
+                c == L'\t') {
+                return false;
+            }
+        }
+        return true;
+    };
     const DWORD pid = GetCurrentProcessId();
     const std::wstring batch = TempDirectory() + L"\\hoverdock-setup-update.bat";
     std::wstring script =
@@ -1059,6 +1104,19 @@ bool Updater::StagePortableUpdateAndRestart(const std::wstring& downloadedExe) {
         return true;
     };
     if (!isAscii(downloadedExe) || !isAscii(currentPath)) {
+        return false;
+    }
+    auto isBatchSafe = [](const std::wstring& value) {
+        for (const wchar_t c : value) {
+            if (c == L'"' || c == L'&' || c == L'|' || c == L'<' || c == L'>' ||
+                c == L'^' || c == L'%' || c == L'!' || c == L'\n' || c == L'\r' ||
+                c == L'\t') {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!isBatchSafe(downloadedExe) || !isBatchSafe(currentPath)) {
         return false;
     }
     const std::wstring batch = TempDirectory() + L"\\hoverdock-update.bat";

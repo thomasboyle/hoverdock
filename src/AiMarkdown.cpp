@@ -1167,12 +1167,25 @@ bool IsSafeUrl(std::wstring_view url) {
             return false;
         }
     }
-    if (StartsWithNoCase(url, L"mailto:")) {
-        return url.size() > 7;
-    }
+    // Reject userinfo and other authority tricks (user:pass@host).
     const bool https = StartsWithNoCase(url, L"https://");
     const bool http = StartsWithNoCase(url, L"http://");
-    return (https && url.size() > 8) || (http && url.size() > 7);
+    const bool mailto = StartsWithNoCase(url, L"mailto:");
+    if (mailto) {
+        return url.size() > 7 && url.find(L'@') != std::wstring_view::npos;
+    }
+    if (!https && !http) {
+        return false;
+    }
+    const size_t schemeLen = https ? 8 : 7;
+    const std::wstring_view authority = url.substr(schemeLen);
+    const size_t slash = authority.find(L'/');
+    const std::wstring_view hostPart = slash == std::wstring_view::npos ? authority : authority.substr(0, slash);
+    if (hostPart.empty() || hostPart.find(L'@') != std::wstring_view::npos ||
+        hostPart.find(L'\\') != std::wstring_view::npos) {
+        return false;
+    }
+    return url.size() > schemeLen;
 }
 
 std::vector<Token> HighlightCode(std::wstring_view code, std::wstring_view language) {

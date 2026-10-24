@@ -6931,6 +6931,16 @@ std::optional<int> DockApp::HandOffToNewerInstalledCopy() {
     if (GetFileAttributesW(installed.exePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         return std::nullopt;
     }
+    std::wstring lowerPath = installed.exePath;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), [](wchar_t c) {
+        return static_cast<wchar_t>(std::towlower(c));
+    });
+    const bool trustedPath = lowerPath.find(L"\\programs\\hoverdock\\") != std::wstring::npos ||
+        lowerPath.find(L"\\program files\\") != std::wstring::npos ||
+        lowerPath.find(L"\\program files (x86)\\") != std::wstring::npos;
+    if (!trustedPath) {
+        return std::nullopt;
+    }
     const std::wstring wideCurrent(current.begin(), current.end());
     const std::wstring wideInstalled(installed.version.begin(), installed.version.end());
     Log(L"Installed v" + wideInstalled + L" is newer than running v" + wideCurrent +
