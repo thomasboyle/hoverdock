@@ -1037,7 +1037,7 @@ bool DockConfig::Load() {
         }
         const auto typeSafeApiKey = dockSection->second.find(L"typesafeapikey");
         if (typeSafeApiKey != dockSection->second.end()) {
-            m_typeSafeApiKey = typeSafeApiKey->second;
+            m_typeSafeApiKey = Trim(UnprotectSecret(typeSafeApiKey->second));
         }
         const auto groqApiKey = dockSection->second.find(L"groqapikey");
         if (groqApiKey != dockSection->second.end()) {
@@ -1215,7 +1215,10 @@ bool DockConfig::Save() const {
         contents << L"LastInstalledAttempts=" << m_lastInstalledAttempts << L"\n";
     }
     if (!m_typeSafeApiKey.empty()) {
-        contents << L"TypeSafeApiKey=" << m_typeSafeApiKey << L"\n";
+        const std::wstring protectedKey = ProtectSecret(m_typeSafeApiKey);
+        if (!protectedKey.empty()) {
+            contents << L"TypeSafeApiKey=" << protectedKey << L"\\n";
+        }
     }
     if (!m_groqApiKey.empty()) {
         const std::wstring protectedKey = ProtectSecret(m_groqApiKey);
