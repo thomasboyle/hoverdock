@@ -647,6 +647,20 @@ bool DownloadImage(const std::wstring& url, std::string& bytes) {
         (parts.nScheme != INTERNET_SCHEME_HTTPS)) {
         return false;
     }
+    // Allowlist image hosts to known providers.
+    std::wstring hostLower(host);
+    std::transform(hostLower.begin(), hostLower.end(), hostLower.begin(), ::towlower);
+    const bool allowedHost =
+        hostLower == L"www.google.com" || hostLower.ends_with(L".google.com") ||
+        hostLower == L"www.bing.com" || hostLower.ends_with(L".bing.com") ||
+        hostLower.ends_with(L".microsoft.com") ||
+        hostLower == L"duckduckgo.com" || hostLower.ends_with(L".duckduckgo.com") ||
+        hostLower.ends_with(L".yahoo.com") ||
+        hostLower.ends_with(L".wikipedia.org") || hostLower.ends_with(L".wikimedia.org") ||
+        hostLower.ends_with(L".github.com") || hostLower.ends_with(L".githubusercontent.com");
+    if (!allowedHost) {
+        return false;
+    }
     WinHttpHandle session = OpenSession();
     if (!session) {
         return false;
@@ -666,6 +680,16 @@ bool DownloadImage(const std::wstring& url, std::string& bytes) {
     if (WinHttpSendRequest(request.Get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ==
             FALSE ||
         WinHttpReceiveResponse(request.Get(), nullptr) == FALSE) {
+        return false;
+    }
+    DWORD status = 0; DWORD statusSize = sizeof(status);
+    if (WinHttpQueryHeaders(request.Get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX) == FALSE ||
+        status != 200) {
+        return false;
+    }
+    wchar_t contentType[256]{}; DWORD ctSize = sizeof(contentType);
+    if (!WinHttpQueryHeaders(request.Get(), WINHTTP_QUERY_CONTENT_TYPE, WINHTTP_HEADER_NAME_BY_INDEX, contentType, &ctSize, WINHTTP_NO_HEADER_INDEX) ||
+        (wcsstr(contentType, L"image/") == nullptr)) {
         return false;
     }
     HttpResult result;

@@ -146,6 +146,7 @@ target_link_libraries(Dock PRIVATE
     winmm
     dbghelp
     crypt32
+    wintrust
 )
 
 set(DOCK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.hlsl")
@@ -222,7 +223,7 @@ if(DOCK_BUILD_TESTS)
     add_dock_test(FileSearchIndexBench tests/FileSearchIndexBench.cpp src/FileSearchIndex.cpp)
     add_dock_test(FileSearchServiceTests tests/FileSearchServiceTests.cpp src/FileSearch.cpp
         src/FileSearchIndex.cpp)
-    target_link_libraries(FileSearchServiceTests PRIVATE taskschd ole32 oleaut32 shell32 advapi32)
+    target_link_libraries(FileSearchServiceTests PRIVATE taskschd ole32 oleaut32 shell32 advapi32 wintrust)
     # System tray detection against the live shell (a child adds a real icon).
     add_dock_test(TrayIconsTests tests/TrayIconsTests.cpp src/SystemTray.cpp)
     target_link_libraries(TrayIconsTests PRIVATE ole32 oleaut32 shell32 user32 gdi32 advapi32 dwmapi

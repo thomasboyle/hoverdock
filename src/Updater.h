@@ -49,6 +49,7 @@ public:
     [[nodiscard]] static std::wstring CurrentExecutablePath();
     // Case-insensitive path equality tolerating '/' vs '\\' separators.
     [[nodiscard]] static bool IsSamePath(const std::wstring& left, const std::wstring& right);
+    [[nodiscard]] static bool VerifyAuthenticode(const std::wstring& path);
     // Installed = running from a per-user or per-machine install directory
     // (LocalAppData\Programs\Hoverdock or Program Files). Portable builds
     // self-replace instead of expecting an installer.

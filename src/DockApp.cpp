@@ -2685,6 +2685,14 @@ LRESULT CALLBACK DockApp::WindowProcedure(HWND window, UINT message, WPARAM wPar
     } else {
         app = reinterpret_cast<DockApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     }
+    if (app != nullptr && InSendMessageEx(nullptr) != ISMEX_NOSEND) {
+        if (message == DockApp::kSearchResultMessage || message == DockApp::kSearchAppsMessage ||
+            message == DockApp::kSearchIconMessage || message == DockApp::kAiImageMessage ||
+            message == DockApp::kAiAttachmentMessage || message == DockApp::kTrayIconsMessage ||
+            message == DockApp::kBoostResultMessage || message == DockApp::kUpdateResultMessage) {
+            return 0;
+        }
+    }
     return app == nullptr ? DefWindowProcW(window, message, wParam, lParam)
                           : app->HandleRendererMessage(window, message, wParam, lParam);
 }
@@ -3282,9 +3290,14 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         // Drives the same BluetoothService jobs a click enqueues, without cursor input.
         static const UINT kBtTestLive = RegisterWindowMessageW(L"Hoverdock.BtTestLive");
         static const bool kBtTestLiveOn = []() {
+#ifdef HOVERDOCK_ENABLE_TEST_HOOKS
             wchar_t v[8]{};
             return GetEnvironmentVariableW(L"HOVERDOCK_BT_TESTHOOK", v, 8) != 0 && v[0] != L'0';
+#else
+            return false;
+#endif
         }();
+#pragma warning(suppress:4127)
         if (kBtTestLiveOn && kBtTestLive != 0 && message == kBtTestLive) {
             LARGE_INTEGER qpc{};
             QueryPerformanceCounter(&qpc);
@@ -6931,6 +6944,9 @@ std::optional<int> DockApp::HandOffToNewerInstalledCopy() {
     if (GetFileAttributesW(installed.exePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         return std::nullopt;
     }
+    if (!Updater::VerifyAuthenticode(installed.exePath)) {
+        return std::nullopt;
+    }
     std::wstring lowerPath = installed.exePath;
     std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), [](wchar_t c) {
         return static_cast<wchar_t>(std::towlower(c));
@@ -8908,9 +8924,14 @@ void DockApp::ApplyBluetoothSnapshot() {
     {
         // TEST-ONLY phase-2 timing harness: log the state the tile would show.
         static const bool kBtSnapLog = []() {
+#ifdef HOVERDOCK_ENABLE_TEST_HOOKS
             wchar_t v[8]{};
             return GetEnvironmentVariableW(L"HOVERDOCK_BT_TESTHOOK", v, 8) != 0 && v[0] != L'0';
+#else
+            return false;
+#endif
         }();
+#pragma warning(suppress:4127)
         if (kBtSnapLog) {
             LARGE_INTEGER qpc{};
             QueryPerformanceCounter(&qpc);

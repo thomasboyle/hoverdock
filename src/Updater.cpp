@@ -4,6 +4,8 @@
 
 #include <Windows.h>
 #include <winhttp.h>
+#include <wintrust.h>
+#include <softpub.h>
 
 #include <algorithm>
 #include <cctype>
@@ -682,6 +684,13 @@ bool ParseApiReleaseBody(const std::string& body, Updater::ReleaseInfo& out) {
             }
         }
     }
+    // Validate version charset to avoid injection/confusion.
+    for (char c : out.version) {
+        if (!(std::isdigit(static_cast<unsigned char>(c)) != 0 || c == '.' || c == '-' || c == '_')) {
+            out.version.clear();
+            break;
+        }
+    }
     return !out.version.empty() && (!out.setupUrl.empty() || !out.exeUrl.empty());
 }
 
@@ -1023,9 +1032,30 @@ bool Updater::IsInstalledCopy() {
     return !installed.exePath.empty() && EqualInsensitivePath(path, installed.exePath);
 }
 
+bool Updater::VerifyAuthenticode(const std::wstring& path) {
+    WINTRUST_FILE_INFO fileInfo{};
+    fileInfo.cbStruct = sizeof(fileInfo);
+    fileInfo.pcwszFilePath = path.c_str();
+    GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA data{};
+    data.cbStruct = sizeof(data);
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &fileInfo;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    const LONG status = WinVerifyTrust(nullptr, &policy, &data);
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &policy, &data);
+    return status == ERROR_SUCCESS;
+}
+
 bool Updater::LaunchInstallerAndExit(const std::wstring& installerPath) {
     if (installerPath.empty() || GetFileAttributesW(installerPath.c_str()) ==
             INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    if (!VerifyAuthenticode(installerPath)) {
         return false;
     }
     // Wait for this process to exit, then run Setup /S (same PID gate as portable updates).
@@ -1051,7 +1081,7 @@ bool Updater::LaunchInstallerAndExit(const std::wstring& installerPath) {
         return true;
     };
     const DWORD pid = GetCurrentProcessId();
-    const std::wstring batch = TempDirectory() + L"\\hoverdock-setup-update.bat";
+    const std::wstring batch = TempDirectory() + L"\\hoverdock-setup-update-" + std::to_wstring(GetTickCount64()) + L".bat";
     std::wstring script =
         L"@echo off\r\n"
         L"for /L %%i in (1,1,30) do (\r\n"
@@ -1091,6 +1121,9 @@ bool Updater::StagePortableUpdateAndRestart(const std::wstring& downloadedExe) {
     if (GetFileAttributesW(downloadedExe.c_str()) == INVALID_FILE_ATTRIBUTES) {
         return false;
     }
+    if (!VerifyAuthenticode(downloadedExe)) {
+        return false;
+    }
     // The helper below is a batch file, which cmd.exe reads in the ANSI code
     // page: non-ASCII bytes in either path would be mojibake and the move
     // would silently target the wrong file (relaunching the old build =
@@ -1119,7 +1152,7 @@ bool Updater::StagePortableUpdateAndRestart(const std::wstring& downloadedExe) {
     if (!isBatchSafe(downloadedExe) || !isBatchSafe(currentPath)) {
         return false;
     }
-    const std::wstring batch = TempDirectory() + L"\\hoverdock-update.bat";
+    const std::wstring batch = TempDirectory() + L"\\hoverdock-update-" + std::to_wstring(GetTickCount64()) + L".bat";
     // Wait for the dock PID to exit, then replace and relaunch.
     const DWORD pid = GetCurrentProcessId();
     std::wstring script =

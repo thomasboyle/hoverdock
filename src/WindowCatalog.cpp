@@ -1500,6 +1500,18 @@ bool WindowCatalog::TryActivate(const PinnedApp& app, HWND preferredWindow) cons
 }
 
 bool WindowCatalog::LaunchApp(const PinnedApp& app) {
+    // Reject targets containing control characters or shell metacharacters.
+    auto unsafe = [](const std::wstring& value) {
+        for (wchar_t c : value) {
+            if (c < 0x20 || c == L'"' || c == L'\r' || c == L'\n') {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (app.target.empty() || unsafe(app.target) || unsafe(app.arguments) || unsafe(app.workingDirectory)) {
+        return false;
+    }
 
     // A stale working directory (e.g. a Squirrel app-* folder removed by an
     // update) makes ShellExecute fail outright, so a tray-hidden app could never

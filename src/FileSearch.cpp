@@ -4,6 +4,8 @@
 #include <ShlObj.h>
 #include <Shellapi.h>
 #include <sddl.h>
+#include <wintrust.h>
+#include <softpub.h>
 #include <taskschd.h>
 #include <winioctl.h>
 
@@ -654,10 +656,20 @@ bool BuildFromMftInProcess(BuildContext& ctx, std::vector<JournalStart>& journal
 bool BuildFromHelper(BuildContext& ctx, std::vector<JournalStart>& journals, const std::wstring& sid, bool& denied) {
     denied = false;
     const std::wstring pipeName = std::wstring(kPipePrefix) + sid;
+    SECURITY_ATTRIBUTES securityAttributes{};
+    securityAttributes.nLength = sizeof(securityAttributes);
+    PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GA;;;OW)(A;;GA;;;SY)", SDDL_REVISION_1, &securityDescriptor, nullptr) != FALSE) {
+        securityAttributes.lpSecurityDescriptor = securityDescriptor;
+    }
     Handle pipe(CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE |
             FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 0, 1U << 20, 0,
-        nullptr));
+        &securityAttributes));
+    if (securityDescriptor != nullptr) {
+        LocalFree(securityDescriptor);
+    }
     if (!pipe.Valid()) {
         return false;
     }
@@ -1276,6 +1288,7 @@ void FileSearchService::SearchThread() {
                 reply->apps.push_back(std::move(item));
             }
             if (m_index != nullptr) {
+                const std::wstring currentProfile = KnownFolder(FOLDERID_Profile);
                 for (const filesearch::Hit& hit : m_index->Search(query, request.fileLimit, &state, threads)) {
                     FileSearchItem item;
                     item.kind = (m_index->Flags(hit.entry) & filesearch::kFlagDirectory) != 0
@@ -1283,6 +1296,11 @@ void FileSearchService::SearchThread() {
                         : FileSearchItem::Kind::File;
                     item.name = FromUtf8(m_index->Name(hit.entry));
                     item.path = FromUtf8(m_index->Path(hit.entry));
+                    // Avoid exposing other users' profile trees.
+                    if (!currentProfile.empty() && item.path.find(L"\\Users\\") != std::wstring::npos &&
+                        item.path.rfind(currentProfile, 0) != 0) {
+                        continue;
+                    }
                     reply->files.push_back(std::move(item));
                 }
                 reply->indexedEntries = m_index->LiveEntryCount();
@@ -1328,10 +1346,31 @@ void FileSearchService::SearchThread() {
     }
 }
 
+static bool VerifyAuthenticode(const std::wstring& path) {
+    WINTRUST_FILE_INFO fileInfo{};
+    fileInfo.cbStruct = sizeof(fileInfo);
+    fileInfo.pcwszFilePath = path.c_str();
+    GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA data{};
+    data.cbStruct = sizeof(data);
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_NONE;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &fileInfo;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    const LONG status = WinVerifyTrust(nullptr, &policy, &data);
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &policy, &data);
+    return status == ERROR_SUCCESS;
+}
+
 bool FileSearchService::RequestMftAccess() {
     const std::wstring sid = CurrentUserSid();
     const std::wstring exe = ModulePath();
     if (sid.empty() || exe.empty()) {
+        return false;
+    }
+    if (!VerifyAuthenticode(exe)) {
         return false;
     }
     const std::wstring parameters = L"--register-mft-task " + sid;
