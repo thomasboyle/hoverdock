@@ -12,6 +12,7 @@
 #include <powrprof.h>
 #include <propvarutil.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <tlhelp32.h>
 #include <wlanapi.h>
 #include <audioclient.h>
@@ -1254,6 +1255,12 @@ bool FindUltimatePowerScheme(GUID& scheme) {
 
 // Runs powercfg.exe hidden with the given arguments; true on exit code 0.
 bool RunPowercfg(const std::wstring& arguments) {
+    for (wchar_t c : arguments) {
+        if (c < 0x20 || c == L'"' || c == L'\'' || c == L'&' || c == L'|' || c == L'<' ||
+            c == L'>' || c == L'^' || c == L'%' || c == L'!') {
+            return false;
+        }
+    }
     wchar_t system[MAX_PATH]{};
     const UINT length = GetSystemDirectoryW(system, MAX_PATH);
     if (length == 0 || length >= MAX_PATH) {
@@ -3900,6 +3907,9 @@ void DockApp::ProjectBrightness(int percent) {
 
 void DockApp::OpenSettingsPage(const wchar_t* uri) {
     CloseOverflowPopup();
+    if (uri == nullptr || (wcsncmp(uri, L"ms-settings:", 12) != 0 && wcsncmp(uri, L"ms-availablenetworks:", 21) != 0)) {
+        return;
+    }
     if (m_window != nullptr) {
         SetForegroundWindow(m_window);
     }
@@ -4338,11 +4348,12 @@ void RemoveLegacyAutomaticPowerPlan() {
     }
     static_cast<void>(PowerDeleteScheme(nullptr, &kLegacyAutomaticPowerScheme));
     // The removed engine's learned app history.
-    wchar_t appData[MAX_PATH]{};
-    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", appData, MAX_PATH);
-    if (length != 0 && length < MAX_PATH) {
-        const std::wstring history = std::wstring(appData) + L"\\LiquidGlassDock\\autopower-history.txt";
+    PWSTR localAppData = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &localAppData)) &&
+        localAppData != nullptr) {
+        const std::wstring history = std::wstring(localAppData) + L"\\LiquidGlassDock\\autopower-history.txt";
         static_cast<void>(DeleteFileW(history.c_str()));
+        CoTaskMemFree(localAppData);
     }
 }
 

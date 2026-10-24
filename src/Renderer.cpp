@@ -150,7 +150,8 @@ D3D12_BLEND_DESC PremultipliedBlendDescription() {
 }
 
 UINT IconAtlasExtent(UINT displayExtent) {
-    return std::min(256U, std::max(1U, displayExtent * 2U));
+    const UINT doubled = displayExtent > 128U ? 256U : displayExtent * 2U;
+    return std::min(256U, std::max(1U, doubled));
 }
 
 UINT IconSourceExtent(UINT displayExtent) {
@@ -239,6 +240,9 @@ bool CopyBitmapPixels(HBITMAP bitmap, std::vector<uint8_t>& out, UINT& width, UI
 
     if (info.bmBitsPixel == 32 && info.bmBits != nullptr) {
         const size_t stride = static_cast<size_t>(info.bmWidthBytes);
+        if (stride < static_cast<size_t>(width) * 4U) {
+            return false;
+        }
         const auto* src = static_cast<const uint8_t*>(info.bmBits);
         const bool bottomUp = info.bmHeight > 0;
         for (UINT y = 0; y < height; ++y) {
@@ -257,12 +261,16 @@ bool CopyBitmapPixels(HBITMAP bitmap, std::vector<uint8_t>& out, UINT& width, UI
     const int lines = GetDIBits(dc, bitmap, 0, height, out.data(), reinterpret_cast<BITMAPINFO*>(&header),
         DIB_RGB_COLORS);
     DeleteDC(dc);
-    return lines > 0;
+    return lines == static_cast<int>(height);
 }
 
 std::vector<uint8_t> ScalePremultipliedPixels(const std::vector<uint8_t>& source, UINT sourceWidth,
     UINT sourceHeight, UINT extent) {
     if (source.empty() || sourceWidth == 0 || sourceHeight == 0 || extent == 0) {
+        return {};
+    }
+    if (sourceWidth > 16384 || sourceHeight > 16384 || extent > 4096 ||
+        source.size() < static_cast<size_t>(sourceWidth) * sourceHeight * 4U) {
         return {};
     }
 
@@ -379,6 +387,13 @@ std::vector<uint8_t> RasterizeIconGdi(HICON icon, UINT extent) {
                 if (CopyBitmapPixels(info.hbmMask, maskPixels, maskWidth, maskHeight) && maskWidth > 0 &&
                     maskHeight > 0) {
                     const UINT maskRows = info.hbmColor == nullptr ? maskHeight / 2U : maskHeight;
+                    if (maskRows == 0) {
+                        DeleteObject(info.hbmMask);
+                        if (info.hbmColor != nullptr) {
+                            DeleteObject(info.hbmColor);
+                        }
+                        return pixels;
+                    }
                     for (UINT y = 0; y < extent; ++y) {
                         const UINT maskY = std::min(maskRows - 1U, y * maskRows / extent);
                         for (UINT x = 0; x < extent; ++x) {
@@ -1371,8 +1386,16 @@ BOOL CALLBACK OnMagnifierFrame(HWND, void* srcdata, MAGIMAGEHEADER srcheader, vo
         srcheader.height != g_magFrame.height || srcheader.stride < srcheader.width * 4U) {
         return FALSE;
     }
+    if (srcheader.offset > (1ULL << 30) || srcheader.stride > (1ULL << 30)) {
+        return FALSE;
+    }
     const auto* src = static_cast<const uint8_t*>(srcdata) + srcheader.offset;
     const size_t rowBytes = static_cast<size_t>(srcheader.width) * 4U;
+    const size_t totalBytes = static_cast<size_t>(srcheader.offset) +
+        (static_cast<size_t>(srcheader.height) - 1U) * static_cast<size_t>(srcheader.stride) + rowBytes;
+    if (totalBytes < rowBytes || totalBytes > (1ULL << 30)) {
+        return FALSE;
+    }
     for (UINT row = 0; row < srcheader.height; ++row) {
         std::memcpy(g_magFrame.pixels + static_cast<size_t>(row) * rowBytes,
             src + static_cast<size_t>(row) * srcheader.stride, rowBytes);
@@ -3230,6 +3253,12 @@ void Renderer::CreateFallbackIcon(UINT textureIndex, ID3D12GraphicsCommandList* 
 
 void Renderer::UploadIconTexture(UINT textureIndex, const uint8_t* pixels, UINT width, UINT height,
     ID3D12GraphicsCommandList* commandList) {
+    if (pixels == nullptr || width == 0 || height == 0 || textureIndex >= m_iconCount) {
+        return;
+    }
+    if (width > 4096 || height > 4096) {
+        return;
+    }
     const D3D12_RESOURCE_DESC texture = TextureDescription(width, height, TextureArraySize(m_iconCount));
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -3364,6 +3393,10 @@ void Renderer::StampDockBackdropInto(const RECT& panel, uint8_t* panelPixels) co
         const int dockRow = static_cast<int>(y - dock.top);
         const int panelCol = static_cast<int>(overlap.left - panel.left);
         const int dockCol = static_cast<int>(overlap.left - dock.left);
+        if (panelRow < 0 || dockRow < 0 || panelCol < 0 || dockCol < 0 ||
+            dockRow >= static_cast<int>(m_height) || dockCol + (byteCount / 4) > static_cast<int>(m_width)) {
+            continue;
+        }
         std::memcpy(
             panelPixels + (static_cast<size_t>(panelRow) * static_cast<size_t>(panelWidth) + panelCol) * 4U,
             m_backdropDibPixels + (static_cast<size_t>(dockRow) * m_width + static_cast<size_t>(dockCol)) * 4U,

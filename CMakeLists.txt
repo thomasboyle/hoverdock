@@ -146,6 +146,7 @@ target_link_libraries(Dock PRIVATE
     winmm
     dbghelp
     crypt32
+    wintrust
 )
 
 set(DOCK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.hlsl")
