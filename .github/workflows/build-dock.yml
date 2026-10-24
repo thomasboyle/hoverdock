@@ -38,7 +38,7 @@ jobs:
 
       - name: Install NSIS
         shell: powershell
-        run: choco install nsis -y --no-progress
+        run: choco install nsis --version=3.11 -y --no-progress
 
       - name: Build NSIS installer
         shell: cmd

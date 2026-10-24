@@ -93,7 +93,7 @@ jobs:
 
       - name: Install NSIS
         shell: powershell
-        run: choco install nsis -y --no-progress
+        run: choco install nsis --version=3.11 -y --no-progress
 
       - name: Build NSIS installer
         shell: cmd
@@ -135,6 +135,16 @@ jobs:
           Copy-Item "out\bin\Release\Dock.exe" "release-assets\Dock.exe"
           Copy-Item "out\Hoverdock-Setup-*.exe" "release-assets\"
           Get-ChildItem release-assets
+
+      - name: Generate checksums
+        shell: powershell
+        run: |
+          $lines = Get-ChildItem release-assets -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          }
+          $lines | Set-Content -Path release-assets/SHA256SUMS.txt -Encoding ascii
+          Get-Content release-assets/SHA256SUMS.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
