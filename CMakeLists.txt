@@ -90,6 +90,7 @@ target_compile_definitions(Dock PRIVATE
     DOCK_VERSION_STRING="${DOCK_EFFECTIVE_VERSION}"
     DOCK_REPO_OWNER="${DOCK_REPO_OWNER}"
     DOCK_REPO_NAME="${DOCK_REPO_NAME}"
+    DOCK_EXPECTED_SIGNER_SUBJECT="${DOCK_EXPECTED_SIGNER_SUBJECT}"
 )
 
 target_compile_options(Dock PRIVATE
@@ -99,11 +100,15 @@ target_compile_options(Dock PRIVATE
     /EHsc
     /Zc:__cplusplus
     /utf-8
+    /sdl
+    /guard:cf
     $<$<CONFIG:Release>:/O2 /Oi /Gy /Zi>
 )
 
 # Release PDBs: no codegen change, but crash dumps become analyzable.
 target_link_options(Dock PRIVATE
+    /guard:cf
+    /CETCOMPAT
     $<$<CONFIG:Release>:/DEBUG>
 )
 
@@ -149,6 +154,7 @@ target_link_libraries(Dock PRIVATE
     wintrust
 )
 
+set(DOCK_EXPECTED_SIGNER_SUBJECT "" CACHE STRING "Expected Authenticode signer subject for auto-updates (optional)")
 set(DOCK_SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/Shaders.hlsl")
 set(DOCK_SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
