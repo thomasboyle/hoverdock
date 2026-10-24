@@ -71,18 +71,16 @@ SetCompressor /SOLID lzma
       ${If} $0 == 0
         Goto after_window
       ${EndIf}
-      ${If} $1 >= 25 ; ~5 s grace, then force
-        ExecWait '"$SYSDIR\taskkill.exe" /F /IM ${APPEXE}' $0
-        Sleep 500
+      ${If} $1 >= 25 ; ~5 s grace, then give up (do not taskkill by image name)
         Goto after_window
       ${EndIf}
       Goto loop_window
   ${EndIf}
   after_window:
   ; Ensure Dock.exe has exited so File can replace it before Version is written.
+  ; (Do not use a blanket taskkill /IM Dock.exe: it can terminate unrelated
+  ; processes that happen to share the image name.)
   Sleep 800
-  ExecWait '"$SYSDIR\taskkill.exe" /F /IM ${APPEXE}' $0
-  Sleep 400
   Pop $1
   Pop $0
 !macroend

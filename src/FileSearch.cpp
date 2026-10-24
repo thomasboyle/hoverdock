@@ -276,7 +276,8 @@ void ForEachUsnRecord(const BYTE* data, size_t size, F&& f) {
         }
         if (header->MajorVersion == 2 && length >= sizeof(USN_RECORD_V2)) {
             const auto* record = reinterpret_cast<const USN_RECORD_V2*>(data + offset);
-            if (static_cast<size_t>(record->FileNameOffset) + record->FileNameLength <= length) {
+            if (record->FileNameLength > 0 && (record->FileNameLength % 2 == 0) &&
+                static_cast<size_t>(record->FileNameOffset) + record->FileNameLength <= length) {
                 f(record->FileReferenceNumber, record->ParentFileReferenceNumber, record->FileAttributes,
                     record->Reason,
                     reinterpret_cast<const char16_t*>(reinterpret_cast<const BYTE*>(record) + record->FileNameOffset),
@@ -284,7 +285,8 @@ void ForEachUsnRecord(const BYTE* data, size_t size, F&& f) {
             }
         } else if (header->MajorVersion == 3 && length >= sizeof(USN_RECORD_V3)) {
             const auto* record = reinterpret_cast<const USN_RECORD_V3*>(data + offset);
-            if (static_cast<size_t>(record->FileNameOffset) + record->FileNameLength <= length) {
+            if (record->FileNameLength > 0 && (record->FileNameLength % 2 == 0) &&
+                static_cast<size_t>(record->FileNameOffset) + record->FileNameLength <= length) {
                 uint64_t id = 0;
                 uint64_t parent = 0;
                 std::memcpy(&id, record->FileReferenceNumber.Identifier, sizeof(id));

@@ -1586,7 +1586,13 @@ bool WindowCatalog::OpenLocation(const PinnedApp& app) const {
     if (IsShellTarget(app.target)) {
         return false;
     }
-
+    // Guard against command injection through a crafted pin target: the
+    // target is embedded into explorer's /select argument list.
+    for (wchar_t c : app.target) {
+        if (c < 0x20 || c == L'"' || c == 13 || c == 10) {
+            return false;
+        }
+    }
     const std::wstring parameters = L"/select,\"" + app.target + L"\"";
     return reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", L"explorer.exe",
         parameters.c_str(), nullptr, SW_SHOWNORMAL)) > 32;
