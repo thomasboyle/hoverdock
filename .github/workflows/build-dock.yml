@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Configure and build Release
         shell: cmd
@@ -48,14 +48,14 @@ jobs:
           dir out\Hoverdock-Setup-*.exe
 
       - name: Upload Dock.exe
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: Dock.exe
           path: out\bin\Release\Dock.exe
           if-no-files-found: error
 
       - name: Upload installer
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: Hoverdock-Setup
           path: out\Hoverdock-Setup-*.exe
