@@ -1,5 +1,8 @@
-#include "Updater.h"
+#ifndef DOCK_EXPECTED_SIGNER_SUBJECT
+#define DOCK_EXPECTED_SIGNER_SUBJECT ""
+#endif
 
+#include "Updater.h"
 #include "Version.h"
 
 #include <Windows.h>
@@ -1051,7 +1054,54 @@ bool Updater::VerifyAuthenticode(const std::wstring& path) {
     const LONG status = WinVerifyTrust(nullptr, &policy, &data);
     data.dwStateAction = WTD_STATEACTION_CLOSE;
     WinVerifyTrust(nullptr, &policy, &data);
-    return status == ERROR_SUCCESS;
+    if (status != ERROR_SUCCESS) {
+        return false;
+    }
+    if (std::string(DOCK_EXPECTED_SIGNER_SUBJECT).empty()) {
+        return true;
+    }
+    HCERTSTORE store = nullptr;
+    HCRYPTMSG msg = nullptr;
+    if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, path.c_str(),
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED, CERT_QUERY_FORMAT_FLAG_BINARY, 0,
+            nullptr, nullptr, nullptr, &store, &msg, nullptr)) {
+        if (store) CertCloseStore(store, 0);
+        if (msg) CryptMsgClose(msg);
+        return true;
+    }
+    DWORD signerSize = 0;
+    CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, nullptr, &signerSize);
+    bool ok = true;
+    if (signerSize > 0) {
+        std::vector<BYTE> signerBuf(signerSize);
+        if (CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, signerBuf.data(),
+                &signerSize)) {
+            auto* signerInfo = reinterpret_cast<PCMSG_SIGNER_INFO>(signerBuf.data());
+            CERT_INFO certInfo{};
+            certInfo.Issuer = signerInfo->Issuer;
+            certInfo.SerialNumber = signerInfo->SerialNumber;
+            PCCERT_CONTEXT cert = CertFindCertificateInStore(store, X509_ASN_ENCODING |
+                    PKCS_7_ASN_ENCODING, 0, CERT_FIND_SUBJECT_CERT, &certInfo, nullptr);
+            if (cert == nullptr) {
+                ok = false;
+            } else {
+                wchar_t subject[512]{};
+                DWORD len = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
+                    subject, 512);
+                std::wstring actual(subject, len > 0 ? len - 1 : 0);
+                std::wstring expected = Utf8ToWideSimple(DOCK_EXPECTED_SIGNER_SUBJECT);
+                ok = (_wcsicmp(actual.c_str(), expected.c_str()) == 0);
+                CertFreeCertificateContext(cert);
+            }
+        } else {
+            ok = false;
+        }
+    } else {
+        ok = false;
+    }
+    if (store) CertCloseStore(store, 0);
+    if (msg) CryptMsgClose(msg);
+    return ok;
 }
 
 bool Updater::LaunchInstallerAndExit(const std::wstring& installerPath) {
