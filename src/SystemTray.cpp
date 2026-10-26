@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cwctype>
@@ -1953,11 +1954,14 @@ std::wstring ResolveKnownFolderPath(std::wstring path) {
 }
 
 // Receives Explorer's notification-item list. Explorer calls Notify once per
-// known item, synchronously inside RegisterCallback (the same mechanism the
-// Settings "Other system tray icons" page and Chromium use).
+// known item (the same mechanism the Settings "Other system tray icons" page
+// and Chromium use). Older builds deliver them inside RegisterCallback; on
+// Windows 11 they arrive asynchronously afterwards, so the caller must pump.
 class TrayItemCollector final : public INotificationCB {
 public:
     std::vector<TrayNotifyIcon> items;
+    // Atomic: on an MTA caller, Notify runs on RPC threads while we wait.
+    std::atomic<size_t> notifications{0};
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
         if (object == nullptr) {
@@ -1976,6 +1980,7 @@ public:
     ULONG STDMETHODCALLTYPE Release() override { return 1; }
 
     HRESULT STDMETHODCALLTYPE Notify(ULONG /*event*/, NOTIFYITEM* item) override {
+        ++notifications;
         if (item == nullptr) {
             return S_OK;
         }
@@ -2026,6 +2031,39 @@ public:
     }
 };
 
+// Dispatches incoming COM calls (Explorer's Notify callbacks) on this STA
+// until the item stream settles. Returns as soon as no further callback has
+// arrived for kSettleMs, so the synchronous delivery case costs little.
+void PumpTrayNotifications(const TrayItemCollector& collector) {
+    constexpr ULONGLONG kFirstItemWaitMs = 1000;
+    constexpr ULONGLONG kSettleMs = 150;
+    constexpr ULONGLONG kMaxWaitMs = 3000;
+    const ULONGLONG start = GetTickCount64();
+    ULONGLONG lastArrival = start;
+    size_t seen = collector.notifications.load();
+    for (;;) {
+        const ULONGLONG now = GetTickCount64();
+        if (const size_t count = collector.notifications.load(); count != seen) {
+            seen = count;
+            lastArrival = now;
+        }
+        const ULONGLONG idleLimit = seen == 0 ? kFirstItemWaitMs : kSettleMs;
+        const ULONGLONG idle = now - lastArrival;
+        const ULONGLONG elapsed = now - start;
+        if (idle >= idleLimit || elapsed >= kMaxWaitMs) {
+            break;
+        }
+        const ULONGLONG wait = std::min(idleLimit - idle, kMaxWaitMs - elapsed);
+        MsgWaitForMultipleObjectsEx(0, nullptr, static_cast<DWORD>(wait), QS_ALLINPUT,
+            MWMO_INPUTAVAILABLE);
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != FALSE) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
 // Every notification icon Explorer knows about, visible or in the hidden
 // overflow. The UI Automation view below only sees buttons the taskbar has
 // realized; with the taskbar hidden, the overflow island usually never is.
@@ -2041,16 +2079,21 @@ std::vector<TrayNotifyIcon> EnumerateTrayNotifyItems() {
     if (SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&trayWin8))) && trayWin8 != nullptr) {
         ULONG cookie = 0;
         if (SUCCEEDED(trayWin8->RegisterCallback(&collector, &cookie))) {
+            PumpTrayNotifications(collector);
             trayWin8->UnregisterCallback(&cookie);
         }
         trayWin8->Release();
     } else if (SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&tray))) && tray != nullptr) {
         if (SUCCEEDED(tray->RegisterCallback(&collector))) {
+            PumpTrayNotifications(collector);
             tray->RegisterCallback(nullptr);
         }
         tray->Release();
     }
     unknown->Release();
+    // The collector lives on this stack frame: sever any proxy Explorer still
+    // holds so a straggling Notify can never reach it after we return.
+    CoDisconnectObject(static_cast<INotificationCB*>(&collector), 0);
     return std::move(collector.items);
 }
 

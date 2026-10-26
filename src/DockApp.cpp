@@ -3422,14 +3422,26 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         UpdatePrimaryMonitor();
         RebuildLayout(true);
         HideTaskbar();
+        BeginWakeLayoutRepair();
         return 0;
 
     case WM_POWERBROADCAST:
         return HandlePowerBroadcast(wParam, lParam);
 
     case WM_WTSSESSION_CHANGE:
-        if (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT) {
+        if (wParam == WTS_SESSION_LOCK || wParam == WTS_CONSOLE_DISCONNECT ||
+            wParam == WTS_REMOTE_DISCONNECT) {
+            CaptureWakeLayout();
+            if (wParam == WTS_SESSION_LOCK) {
+                m_sessionLocked = true;
+            }
+        } else if (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT) {
+            if (wParam == WTS_SESSION_UNLOCK) {
+                m_sessionLocked = false;
+            }
+            m_workAreaExpanded = false;
             HideTaskbar();
+            BeginWakeLayoutRepair();
             ScheduleResumeZOrderReassert();
         }
         return 0;
@@ -3921,6 +3933,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             if (!IsDockSettingsOpen()) {
                 OpenDockSettings();
             }
+        } else if (wParam == kWakeLayoutTimerId) {
+            RepairWakeLayoutPass();
         } else if (wParam == kResumeZOrderTimerId) {
             ReassertOverlayZOrder();
             if (--m_resumeZOrderPasses <= 0) {
@@ -4007,6 +4021,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         m_badges.Stop();
         m_bluetooth.Stop();
         StopTaskbarMonitor();
+        ClearWakeLayout();
         StopUpdateTimer();
         UnregisterSystemResumeNotifications();
         StopShellFlyoutWatch();
@@ -4657,6 +4672,153 @@ void DockApp::ScheduleResumeZOrderReassert() {
     ReassertOverlayZOrder();
     m_resumeZOrderPasses = kResumeZOrderPasses;
     SetTimer(m_window, kResumeZOrderTimerId, kResumeZOrderIntervalMs, nullptr);
+}
+
+namespace {
+
+constexpr size_t kMaxWakeLayoutWindows = 512;
+
+BOOL CALLBACK CollectWakeLayoutWindow(HWND window, LPARAM parameter) {
+    auto* windows = reinterpret_cast<std::vector<std::pair<HWND, bool>>*>(parameter);
+    if (windows->size() >= kMaxWakeLayoutWindows) {
+        return FALSE;
+    }
+    if (!IsVisibleUncloakedWindow(window) || IsIconic(window) != FALSE) {
+        return TRUE;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid == GetCurrentProcessId()) {
+        return TRUE;
+    }
+    const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+    const LONG_PTR extended = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    if ((extended & WS_EX_TOOLWINDOW) != 0 || (style & (WS_CAPTION | WS_THICKFRAME)) == 0) {
+        return TRUE;
+    }
+    wchar_t className[64]{};
+    GetClassNameW(window, className, static_cast<int>(std::size(className)));
+    const std::wstring_view name(className);
+    if (name == L"Shell_TrayWnd" || name == L"Shell_SecondaryTrayWnd" || name == L"Progman" ||
+        name == L"WorkerW") {
+        return TRUE;
+    }
+    windows->emplace_back(window, IsZoomed(window) != FALSE);
+    return TRUE;
+}
+
+bool PrimaryWorkAreaIs(const RECT& expected) noexcept {
+    RECT work{};
+    return SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0) != FALSE && RectsEqual(work, expected);
+}
+
+} // namespace
+
+void DockApp::CaptureWakeLayout() {
+    // Keep the first clean snapshot (lock usually precedes sleep), and only
+    // record while the work area is full-screen: a layout already squeezed by
+    // the old taskbar would be pointless to restore.
+    if (!m_taskbarHidden || m_wakeLayoutPending || !PrimaryWorkAreaIs(m_primaryBounds)) {
+        return;
+    }
+    std::vector<std::pair<HWND, bool>> windows;
+    EnumWindows(&CollectWakeLayoutWindow, reinterpret_cast<LPARAM>(&windows));
+    m_wakeLayout.clear();
+    m_wakeLayout.reserve(windows.size());
+    for (const auto& [window, zoomed] : windows) {
+        RECT rect{};
+        if (GetWindowRect(window, &rect) != FALSE && rect.right > rect.left && rect.bottom > rect.top) {
+            m_wakeLayout.push_back({window, rect, zoomed});
+        }
+    }
+    m_wakeLayoutPrimary = m_primaryBounds;
+    m_wakeLayoutMonitors = GetSystemMetrics(SM_CMONITORS);
+    m_wakeLayoutPending = !m_wakeLayout.empty();
+}
+
+void DockApp::BeginWakeLayoutRepair() {
+    if (m_window == nullptr || !m_wakeLayoutPending) {
+        return;
+    }
+    m_wakeLayoutPasses = kWakeLayoutPasses;
+    RepairWakeLayoutPass();
+    if (m_wakeLayoutPending) {
+        SetTimer(m_window, kWakeLayoutTimerId, kWakeLayoutIntervalMs, nullptr);
+    }
+}
+
+void DockApp::ClearWakeLayout() noexcept {
+    if (m_window != nullptr) {
+        KillTimer(m_window, kWakeLayoutTimerId);
+    }
+    m_wakeLayout.clear();
+    m_wakeLayoutPasses = 0;
+    m_wakeLayoutPending = false;
+}
+
+void DockApp::RepairWakeLayoutPass() {
+    if (!m_wakeLayoutPending || !m_taskbarHidden) {
+        ClearWakeLayout();
+        return;
+    }
+    const bool lastPass = --m_wakeLayoutPasses <= 0;
+    if (lastPass) {
+        KillTimer(m_window, kWakeLayoutTimerId);
+    }
+    // Monitors can take a few seconds to come back after wake; wait for the
+    // same topology rather than replaying rects onto a different desktop.
+    const bool sameTopology = GetSystemMetrics(SM_CMONITORS) == m_wakeLayoutMonitors &&
+        RectsEqual(m_primaryBounds, m_wakeLayoutPrimary);
+    // A held button means the user is dragging/resizing: never fight that.
+    const bool userDragging = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    if (sameTopology && !userDragging) {
+        if (!PrimaryWorkAreaIs(m_primaryBounds)) {
+            // Explorer re-reserved the taskbar strip. Re-expand with a broadcast
+            // so maximized windows re-fit the full monitor.
+            m_workAreaExpanded = false;
+            static_cast<void>(ExpandPrimaryWorkArea(true));
+        }
+        if (PrimaryWorkAreaIs(m_primaryBounds)) {
+            LONG strip = m_workAreaSaved ? m_primaryBounds.bottom - m_savedWorkArea.bottom : 0;
+            if (strip <= 0) {
+                const UINT dpi = HostDpi();
+                strip = std::max(40L, static_cast<LONG>(std::lround(
+                    48.0F * static_cast<float>(dpi == 0 ? 96U : dpi) / 96.0F)));
+            }
+            for (const WakeWindowLayout& saved : m_wakeLayout) {
+                if (IsWindow(saved.window) == FALSE || IsIconic(saved.window) != FALSE ||
+                    (IsZoomed(saved.window) != FALSE) != saved.zoomed) {
+                    continue;
+                }
+                RECT current{};
+                if (GetWindowRect(saved.window, &current) == FALSE || RectsEqual(current, saved.rect)) {
+                    continue;
+                }
+                RECT monitor{};
+                if (!MonitorRect(MonitorFromRect(&saved.rect, MONITOR_DEFAULTTONEAREST), monitor)) {
+                    continue;
+                }
+                // Only undo the taskbar's effect: the window used to reach into
+                // the strip the old taskbar reserves and was pulled up out of it.
+                // Anything else is a deliberate move and is left alone.
+                if (saved.rect.bottom <= monitor.bottom - strip || current.bottom >= saved.rect.bottom) {
+                    continue;
+                }
+                SetWindowPos(saved.window, nullptr, saved.rect.left, saved.rect.top,
+                    saved.rect.right - saved.rect.left, saved.rect.bottom - saved.rect.top,
+                    SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            }
+        }
+    }
+    if (lastPass) {
+        // Still locked: Explorer re-reserves again at unlock, so keep the
+        // snapshot for the unlock-triggered repair.
+        if (m_sessionLocked) {
+            m_wakeLayoutPasses = 0;
+        } else {
+            ClearWakeLayout();
+        }
+    }
 }
 
 struct HoverBubbleLayout {
@@ -13403,6 +13565,7 @@ void DockApp::RestoreTaskbar() {
     m_shellFlyoutHoldUntil = 0.0;
     m_shellFlyoutSeen = false;
     StopTaskbarMonitor();
+    ClearWakeLayout();
     DestroyFullscreenClaimWindows();
     if (m_taskbarStateSaved) {
         SetTaskbarAppBarState(m_savedTaskbarState);
@@ -14120,19 +14283,33 @@ void DockApp::UnregisterSystemResumeNotifications() noexcept {
 }
 
 LRESULT DockApp::HandlePowerBroadcast(WPARAM wParam, LPARAM lParam) {
+    if (wParam == PBT_APMSUSPEND) {
+        CaptureWakeLayout();
+        return TRUE;
+    }
     if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND ||
         wParam == PBT_APMRESUMECRITICAL) {
+        // Force the work-area re-expansion to broadcast: Explorer re-reserved
+        // the taskbar strip during wake and windows only re-fit on a change
+        // notification.
+        m_workAreaExpanded = false;
         HideTaskbar();
+        BeginWakeLayoutRepair();
         ScheduleResumeZOrderReassert();
         return TRUE;
     }
     if (wParam == PBT_POWERSETTINGCHANGE) {
         const auto* setting = reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
         if (setting != nullptr && setting->DataLength >= sizeof(DWORD) &&
-            IsEqualGUID(setting->PowerSetting, kMonitorPowerOnGuid) &&
-            *reinterpret_cast<const DWORD*>(setting->Data) != 0) {
-            HideTaskbar();
-            ScheduleResumeZOrderReassert();
+            IsEqualGUID(setting->PowerSetting, kMonitorPowerOnGuid)) {
+            if (*reinterpret_cast<const DWORD*>(setting->Data) != 0) {
+                m_workAreaExpanded = false;
+                HideTaskbar();
+                BeginWakeLayoutRepair();
+                ScheduleResumeZOrderReassert();
+            } else {
+                CaptureWakeLayout();
+            }
         }
         return TRUE;
     }

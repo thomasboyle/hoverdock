@@ -4915,7 +4915,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         capsule(moduleRect(QsModule::Power), L'\uE83F', L"Power", EnergyModeLabel(m_qsCache.powerMode),
             TrayFlyoutHitKind::Power, false, 0, 3, TrayFlyoutHitKind::None);
         // Row 2: System Tray capsule (item count, live overlay) + Microphone.
-        capsule(moduleRect(QsModule::SystemTray), L'\uE70E', L"System Tray", std::wstring{},
+        capsule(moduleRect(QsModule::SystemTray), L'\uE70E', L"Tray", std::wstring{},
             TrayFlyoutHitKind::SystemTrayPage, false, 3, 6, TrayFlyoutHitKind::None);
         {
             const RECT b = moduleRect(QsModule::Microphone);
@@ -5503,7 +5503,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         // item with its icon and status. Clicking a row is the item's normal
         // (left) click; the arrow that appears on hover opens its own menu,
         // which on the taskbar needs a right-click.
-        beginHeader(L"System Tray", false, -1, false);
+        beginHeader(L"Tray", false, -1, false);
         {
             const std::wstring summary = TrayItemCountText();
             text({padding + menuInset, y, panelWidth - padding - menuInset, y + sectionH}, statusFont, summary,

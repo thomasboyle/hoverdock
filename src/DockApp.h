@@ -208,6 +208,12 @@ private:
     static constexpr UINT_PTR kResumeZOrderTimerId = 23;
     static constexpr UINT kResumeZOrderIntervalMs = 1000;
     static constexpr int kResumeZOrderPasses = 4;
+    // Post-wake window layout repair: Explorer briefly re-reserves the old
+    // taskbar strip on resume/unlock, which shrinks maximized windows and
+    // pushes others up. Put them back for a few seconds after wake.
+    static constexpr UINT_PTR kWakeLayoutTimerId = 24;
+    static constexpr UINT kWakeLayoutIntervalMs = 250;
+    static constexpr int kWakeLayoutPasses = 40;
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
     static constexpr float kQsChevronFadeMs = 140.0F;
     // Home tiles with a hover arrow: Wi-Fi, Bluetooth, Boost, Power, Sound,
@@ -399,6 +405,10 @@ private:
     void PositionOverlayWindows();
     void ReassertOverlayZOrder();
     void ScheduleResumeZOrderReassert();
+    void CaptureWakeLayout();
+    void BeginWakeLayoutRepair();
+    void RepairWakeLayoutPass();
+    void ClearWakeLayout() noexcept;
     void UpdateHoverLabel(bool forceGlassRefresh = false);
     void HideHoverLabel() noexcept;
     // Liquid-glass hover label: BakeGlassPanel plate + flyout ink glyphs.
@@ -1028,6 +1038,19 @@ private:
     // SetWindowPos round-trips so steady calls cost microseconds.
     bool m_overlayPosValid = false;
     int m_resumeZOrderPasses = 0;
+    // Window rects captured before sleep/lock/monitor-off while the work area
+    // was still full-screen; replayed by RepairWakeLayoutPass after wake.
+    struct WakeWindowLayout {
+        HWND window = nullptr;
+        RECT rect{};
+        bool zoomed = false;
+    };
+    std::vector<WakeWindowLayout> m_wakeLayout;
+    RECT m_wakeLayoutPrimary{};
+    int m_wakeLayoutMonitors = 0;
+    int m_wakeLayoutPasses = 0;
+    bool m_wakeLayoutPending = false;
+    bool m_sessionLocked = false;
     LONG m_overlayX = 0;
     LONG m_overlayY = 0;
     LONG m_overlayW = 0;
