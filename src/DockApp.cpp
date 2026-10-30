@@ -2491,7 +2491,15 @@ DockApp::~DockApp() {
 }
 
 int DockApp::Run() {
-    m_singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\LiquidGlassDock.SingleInstance");
+    {
+        wchar_t mutexName[128] = L"Local\\LiquidGlassDock.SingleInstance";
+        const DWORD mutexEnv = GetEnvironmentVariableW(L"HOVERDOCK_INSTANCE_MUTEX", mutexName,
+            static_cast<DWORD>(std::size(mutexName)));
+        if (mutexEnv == 0 || mutexEnv >= std::size(mutexName)) {
+            wcsncpy_s(mutexName, L"Local\\LiquidGlassDock.SingleInstance", _TRUNCATE);
+        }
+        m_singleInstanceMutex = CreateMutexW(nullptr, TRUE, mutexName);
+    }
     if (m_singleInstanceMutex == nullptr) {
         MessageBoxW(nullptr, L"Liquid Glass Dock could not create its single-instance lock.",
             L"Liquid Glass Dock", MB_ICONERROR | MB_OK);
@@ -5425,6 +5433,11 @@ void DockApp::RefreshTray(bool forceLayout) {
     // the 1 Hz tick skips WLAN/COM-audio/power-scheme IPC unless Quick Settings
     // is open (its tiles need volume/network/brightness). Interval unchanged.
     const bool popupOpen = IsOverflowOpen();
+    // Live tray list while the Tray page is open (registry + process scan
+    // on a worker). inFlight guard collapses overlapping requests.
+    if (popupOpen && m_qsPage == QuickSettingsPage::SystemTray) {
+        RequestTrayIconsAsync();
+    }
     const bool changed =
         (popupOpen || forceLayout ? m_tray.Refresh() : m_tray.RefreshForDock()) || forceLayout;
     // Trash polls on the same 1 Hz tick (SHQueryRecycleBin is one cheap syscall).
@@ -6952,7 +6965,7 @@ void DockApp::BeginOverflowShow() {
     }
     InstallOverflowDismissHook();
     qsOpenMark(L"InstallOverflowDismissHook");
-    // Fresh tray icons for the System Tray tile count / page (UIA on a worker).
+    // Fresh tray icons for the Tray tile/page (worker; no flyout needed).
     RequestTrayIconsAsync();
     // Soft refresh for radio/ready; periodic CollectPaired only while on BT page.
     m_bluetooth.RequestRefresh(false);
@@ -7135,7 +7148,15 @@ std::optional<int> DockApp::HandOffToNewerInstalledCopy() {
         return 0;
     }
     Log(L"Hand-off to the installed copy failed; continuing with this copy.");
-    m_singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\LiquidGlassDock.SingleInstance");
+    {
+        wchar_t mutexName[128] = L"Local\\LiquidGlassDock.SingleInstance";
+        const DWORD mutexEnv = GetEnvironmentVariableW(L"HOVERDOCK_INSTANCE_MUTEX", mutexName,
+            static_cast<DWORD>(std::size(mutexName)));
+        if (mutexEnv == 0 || mutexEnv >= std::size(mutexName)) {
+            wcsncpy_s(mutexName, L"Local\\LiquidGlassDock.SingleInstance", _TRUNCATE);
+        }
+        m_singleInstanceMutex = CreateMutexW(nullptr, TRUE, mutexName);
+    }
     if (m_singleInstanceMutex == nullptr) {
         MessageBoxW(nullptr, L"Liquid Glass Dock could not create its single-instance lock.",
             L"Liquid Glass Dock", MB_ICONERROR | MB_OK);

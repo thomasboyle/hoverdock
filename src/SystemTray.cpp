@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cwctype>
 #include <ranges>
@@ -1387,11 +1388,11 @@ std::wstring PrettyTrayName(const std::wstring& exePath) {
 bool IsTrayHostWindowClass(const std::wstring& className) {
     const std::wstring lowered = LowerCopy(className);
     if (lowered == L"electron_notifyiconhostwindow" || lowered == L"chrome_statustraywindow" ||
-        lowered == L"sunawttrayicon") {
+        lowered == L"sunawttrayicon" || lowered == L"vanguardtraywindowclass") {
         return true;
     }
-    // Catches Qt (QTrayIcon...), Vanguard and similar per-toolkit hosts while
-    // excluding their menu/context hosts.
+    // Catches Qt (QTrayIcon / Qt683TrayIconMessageWindowClass) and similar
+    // per-toolkit hosts while excluding their menu/context hosts.
     return lowered.find(L"trayicon") != std::wstring::npos &&
         lowered.find(L"menu") == std::wstring::npos &&
         lowered.find(L"context") == std::wstring::npos;
@@ -2123,12 +2124,166 @@ std::vector<TrayNotifyIcon> EnumerateHostIcons() {
     return icons;
 }
 
-std::vector<TrayNotifyIcon> SystemTray::EnumerateNotifyIcons() const {
-    // Complete list from Explorer (includes hidden overflow icons), linked to
-    // the taskbar's XAML buttons where those exist so clicks go through the
-    // real icon. Buttons the list did not report are kept as well.
-    std::vector<TrayNotifyIcon> icons = EnumerateTrayNotifyItems();
-    std::vector<TrayNotifyIcon> buttons = EnumerateShellButtons(false);
+struct RunningProcessIndex {
+    std::vector<std::wstring> paths;
+    std::vector<std::wstring> stems;
+
+    [[nodiscard]] bool Matches(const std::wstring& resolvedPath) const {
+        const std::wstring lower = LowerCopy(resolvedPath);
+        if (std::ranges::find(paths, lower) != paths.end()) {
+            return true;
+        }
+        // Exact image path exists but is not running: do not keep a stale
+        // NotifyIconSettings row alive just because some other process shares
+        // the file stem (e.g. many powershell.exe hosts).
+        if (GetFileAttributesW(resolvedPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return false;
+        }
+        // Versioned / moved install dirs leave a dead path in the registry;
+        // accept a same-stem process only in that case.
+        const std::wstring stem = LowerCopy(FileStem(resolvedPath));
+        return !stem.empty() && std::ranges::find(stems, stem) != stems.end();
+    }
+};
+
+RunningProcessIndex CollectRunningProcesses() {
+    RunningProcessIndex index;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return index;
+    }
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry) != FALSE) {
+        do {
+            if (entry.th32ProcessID == 0 || entry.th32ProcessID == GetCurrentProcessId()) {
+                continue;
+            }
+            index.stems.push_back(LowerCopy(FileStem(entry.szExeFile)));
+            const std::wstring path = ProcessImagePath(entry.th32ProcessID);
+            if (!path.empty()) {
+                index.paths.push_back(LowerCopy(path));
+            }
+        } while (Process32NextW(snapshot, &entry) != FALSE);
+    }
+    CloseHandle(snapshot);
+    return index;
+}
+
+std::wstring ReadRegString(HKEY key, const wchar_t* name) {
+    DWORD type = 0;
+    DWORD bytes = 0;
+    if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &bytes) != ERROR_SUCCESS ||
+        (type != REG_SZ && type != REG_EXPAND_SZ) || bytes < sizeof(wchar_t)) {
+        return {};
+    }
+    std::wstring value(bytes / sizeof(wchar_t), L'\0');
+    if (RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(value.data()), &bytes) !=
+        ERROR_SUCCESS) {
+        return {};
+    }
+    while (!value.empty() && value.back() == L'\0') {
+        value.pop_back();
+    }
+    return value;
+}
+
+// Win11 stores every notification icon under NotifyIconSettings. Entries linger
+// after quit, so keep only those whose executable is running. This list is
+// populated without the overflow flyout ever existing — unlike UIA on the
+// XAML tray island, which stays empty until that flyout has been shown once.
+std::vector<TrayNotifyIcon> EnumerateNotifyIconSettings(const RunningProcessIndex& running) {
+    std::vector<TrayNotifyIcon> icons;
+    HKEY root = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\NotifyIconSettings", 0, KEY_READ, &root) !=
+        ERROR_SUCCESS) {
+        return icons;
+    }
+    std::vector<std::wstring> seen;
+    for (DWORD index = 0;; ++index) {
+        wchar_t keyName[64]{};
+        DWORD keyLen = static_cast<DWORD>(std::size(keyName));
+        if (RegEnumKeyExW(root, index, keyName, &keyLen, nullptr, nullptr, nullptr, nullptr) !=
+            ERROR_SUCCESS) {
+            break;
+        }
+        HKEY sub = nullptr;
+        if (RegOpenKeyExW(root, keyName, 0, KEY_READ, &sub) != ERROR_SUCCESS) {
+            continue;
+        }
+        const std::wstring rawExe = ReadRegString(sub, L"ExecutablePath");
+        DWORD uid = 0;
+        DWORD uidBytes = sizeof(uid);
+        RegQueryValueExW(sub, L"UID", nullptr, nullptr, reinterpret_cast<BYTE*>(&uid), &uidBytes);
+        std::wstring tip = ReadRegString(sub, L"IconTopTip");
+        if (tip.empty()) {
+            tip = ReadRegString(sub, L"InitialTooltip");
+        }
+        RegCloseKey(sub);
+        if (rawExe.empty()) {
+            continue;
+        }
+        std::wstring path = ResolveKnownFolderPath(rawExe);
+        if (path.empty() || path[0] == L'{') {
+            continue;
+        }
+        const std::wstring stem = LowerCopy(FileStem(path));
+        if (stem == L"explorer") {
+            continue;
+        }
+        if (!running.Matches(path)) {
+            continue;
+        }
+        if (std::ranges::find(seen, stem) != seen.end()) {
+            continue;
+        }
+        seen.push_back(stem);
+
+        TrayNotifyIcon icon;
+        icon.executablePath = std::move(path);
+        icon.exeName = FileStem(icon.executablePath);
+        icon.id = uid;
+        tip = TrimEdges(tip);
+        const size_t line = tip.find_first_of(L"\r\n");
+        icon.tip = TrimEdges(line == std::wstring::npos ? tip : tip.substr(0, line));
+        if (icon.tip.empty()) {
+            icon.tip = PrettyTrayName(icon.executablePath);
+        }
+        icon.icon = ExtractExeIcon(icon.executablePath, 64);
+        icons.push_back(std::move(icon));
+    }
+    RegCloseKey(root);
+    return icons;
+}
+
+void LinkHostWindows(std::vector<TrayNotifyIcon>& icons, std::vector<TrayNotifyIcon>& hosts) {
+    for (TrayNotifyIcon& icon : icons) {
+        if (icon.window != nullptr || icon.executablePath.empty()) {
+            continue;
+        }
+        const std::wstring lower = LowerCopy(icon.executablePath);
+        const std::wstring stem = LowerCopy(icon.exeName);
+        for (TrayNotifyIcon& host : hosts) {
+            if (host.window == nullptr) {
+                continue;
+            }
+            const std::wstring hostPath = LowerCopy(host.executablePath);
+            const bool same = (!hostPath.empty() && hostPath == lower) ||
+                (!stem.empty() && LowerCopy(host.exeName) == stem);
+            if (!same) {
+                continue;
+            }
+            icon.window = host.window;
+            if (icon.id == 0) {
+                icon.id = host.id;
+            }
+            host.window = nullptr;
+            break;
+        }
+    }
+}
+
+void LinkShellButtons(std::vector<TrayNotifyIcon>& icons, std::vector<TrayNotifyIcon>& buttons) {
     std::vector<TrayNotifyIcon> unmatched;
     for (TrayNotifyIcon& button : buttons) {
         TrayNotifyIcon* best = nullptr;
@@ -2137,9 +2292,13 @@ std::vector<TrayNotifyIcon> SystemTray::EnumerateNotifyIcons() const {
             if (icon.shellButton) {
                 continue;
             }
-            const int score = ShellButtonMatchScore(button.shellName, icon.tip);
+            const int tipScore = ShellButtonMatchScore(button.shellName, icon.tip);
+            const int exeScore = ShellButtonMatchScore(button.shellName, icon.exeName);
+            const int score = std::max(tipScore, exeScore);
             const int needed = static_cast<int>(std::min<size_t>(12, icon.tip.size()));
-            if (score > bestScore && (score >= 100000 || (needed > 0 && score >= needed))) {
+            if (score > bestScore &&
+                (score >= 100000 || (needed > 0 && score >= needed) ||
+                    score >= static_cast<int>(icon.exeName.size()))) {
                 best = &icon;
                 bestScore = score;
             }
@@ -2157,10 +2316,58 @@ std::vector<TrayNotifyIcon> SystemTray::EnumerateNotifyIcons() const {
             icons.push_back(std::move(button));
         }
     }
-    if (!icons.empty()) {
-        return icons;
+}
+
+void DumpTrayIconsIfRequested(const std::vector<TrayNotifyIcon>& icons) {
+    wchar_t dumpPath[MAX_PATH]{};
+    const DWORD got =
+        GetEnvironmentVariableW(L"HOVERDOCK_TRAY_DUMP", dumpPath, static_cast<DWORD>(std::size(dumpPath)));
+    if (got == 0 || got >= std::size(dumpPath)) {
+        return;
     }
-    return EnumerateHostIcons();
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, dumpPath, L"w, ccs=UTF-8") != 0 || file == nullptr) {
+        return;
+    }
+    fwprintf(file, L"tray_count=%zu\n", icons.size());
+    for (const TrayNotifyIcon& icon : icons) {
+        fwprintf(file, L"tip=%s\texe=%s\tid=%u\twindow=%p\tshell=%d\tshellName=%s\n",
+            icon.tip.c_str(), icon.executablePath.c_str(), icon.id, static_cast<void*>(icon.window),
+            icon.shellButton ? 1 : 0, icon.shellName.c_str());
+    }
+    fclose(file);
+}
+
+std::vector<TrayNotifyIcon> SystemTray::EnumerateNotifyIcons() const {
+    // Win11 (taskbar hidden / overflow never shown): UIA only sees promoted
+    // taskbar buttons, and ITrayNotify::RegisterCallback returns S_OK but
+    // delivers zero Notify callbacks (observed on 26H2 build 26300). The
+    // complete list without opening the flyout comes from NotifyIconSettings
+    // filtered to running processes, linked to host HWNDs and any realized
+    // shell buttons.
+    const RunningProcessIndex running = CollectRunningProcesses();
+    std::vector<TrayNotifyIcon> icons = EnumerateNotifyIconSettings(running);
+
+    std::vector<TrayNotifyIcon> hosts = EnumerateHostIcons();
+    LinkHostWindows(icons, hosts);
+    for (TrayNotifyIcon& host : hosts) {
+        if (host.window == nullptr) {
+            continue;
+        }
+        const std::wstring stem = LowerCopy(host.exeName);
+        const bool known = std::ranges::any_of(icons, [&stem](const TrayNotifyIcon& icon) {
+            return LowerCopy(icon.exeName) == stem;
+        });
+        if (!known) {
+            icons.push_back(std::move(host));
+        }
+    }
+
+    std::vector<TrayNotifyIcon> buttons = EnumerateShellButtons(false);
+    LinkShellButtons(icons, buttons);
+
+    DumpTrayIconsIfRequested(icons);
+    return icons;
 }
 
 bool SystemTray::ToggleMute() {

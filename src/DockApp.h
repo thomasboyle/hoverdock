@@ -580,7 +580,7 @@ private:
         bool includeMediaTime = true) const;
     // "N items" for the Home System Tray tile ("..." until the first scan).
     [[nodiscard]] std::wstring TrayItemCountText() const;
-    // Scan tray icons (UI Automation) on a worker; kTrayIconsMessage applies.
+    // Scan tray icons on a worker; kTrayIconsMessage applies.
     void RequestTrayIconsAsync();
     void ApplyTrayIcons(std::vector<TrayNotifyIcon>&& icons);
     // Hover/dirty extent of a hit: tray option arrows light their whole row.
