@@ -2,7 +2,6 @@
 #include "DockTheme.hlsli"
 #include "PerfBoost.h"
 #include "Profile.h"
-#include <cstdio>
 #include <share.h>
 #include <string>
 #include "RecycleBin.h"
@@ -26,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -9212,11 +9212,25 @@ void DockApp::RequestTrayIconsAsync() {
         return;
     }
     const HWND reply = m_window;
-    std::thread([this, reply] {
+    const DWORD uiTid = GetCurrentThreadId();
+    std::thread([this, reply, uiTid] {
         auto* icons = new std::vector<TrayNotifyIcon>();
         try {
             const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            const ULONGLONG started = GetTickCount64();
             *icons = m_tray.EnumerateNotifyIcons();
+            const double enumMs = static_cast<double>(GetTickCount64() - started);
+            // Append UI/worker tid evidence for hitch checks (inert unless dump set).
+            wchar_t dumpPath[MAX_PATH]{};
+            if (GetEnvironmentVariableW(L"HOVERDOCK_TRAY_DUMP", dumpPath,
+                    static_cast<DWORD>(std::size(dumpPath))) != 0) {
+                FILE* file = nullptr;
+                if (_wfopen_s(&file, dumpPath, L"a, ccs=UTF-8") == 0 && file != nullptr) {
+                    fwprintf(file, L"request_ui_tid=%lu\nrequest_worker_tid=%lu\nrequest_enum_ms=%.2f\n",
+                        uiTid, GetCurrentThreadId(), enumMs);
+                    fclose(file);
+                }
+            }
             if (SUCCEEDED(hr)) {
                 CoUninitialize();
             }

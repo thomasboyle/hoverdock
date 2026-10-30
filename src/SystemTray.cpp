@@ -18,7 +18,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -53,43 +52,6 @@ struct DisplayBrightness {
     UCHAR ac = 0;
     UCHAR dc = 0;
 };
-
-enum NOTIFYITEM_PREFERENCE {
-    PREFERENCE_SHOW_WHEN_ACTIVE = 0,
-    PREFERENCE_SHOW_NEVER = 1,
-    PREFERENCE_SHOW_ALWAYS = 2,
-};
-
-struct NOTIFYITEM {
-    PWSTR pszExeName;
-    PWSTR pszTip;
-    HICON hIcon;
-    HWND hWnd;
-    NOTIFYITEM_PREFERENCE dwPreference;
-    UINT uID;
-    GUID guidItem;
-};
-
-struct __declspec(uuid("D782CCBA-AFB0-43F1-94DB-FDA3779EACCB")) INotificationCB : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE Notify(ULONG event, NOTIFYITEM* item) = 0;
-};
-
-struct __declspec(uuid("FB852B2C-6BAD-4605-9551-F15F87830935")) ITrayNotify : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE RegisterCallback(INotificationCB* callback) = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetPreference(const NOTIFYITEM* item) = 0;
-    virtual HRESULT STDMETHODCALLTYPE EnableAutoTray(BOOL enabled) = 0;
-};
-
-struct __declspec(uuid("D133CE13-3537-48BA-93A7-AFCD5D2053B4")) ITrayNotifyWin8 : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE RegisterCallback(INotificationCB* callback, ULONG* cookie) = 0;
-    virtual HRESULT STDMETHODCALLTYPE UnregisterCallback(ULONG* cookie) = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetPreference(const NOTIFYITEM* item) = 0;
-    virtual HRESULT STDMETHODCALLTYPE EnableAutoTray(BOOL enabled) = 0;
-    virtual HRESULT STDMETHODCALLTYPE DoAction(BOOL enabled) = 0;
-};
-
-constexpr CLSID kClsidTrayNotify = {
-    0x25DEAD04, 0x1EAC, 0x4911, {0x9E, 0x3A, 0xAD, 0x0A, 0x4A, 0xB5, 0x60, 0xFD}};
 
 INPUT KeyboardInput(WORD key, DWORD flags) {
     INPUT input{};
@@ -1954,150 +1916,6 @@ std::wstring ResolveKnownFolderPath(std::wstring path) {
     return path;
 }
 
-// Receives Explorer's notification-item list. Explorer calls Notify once per
-// known item (the same mechanism the Settings "Other system tray icons" page
-// and Chromium use). Older builds deliver them inside RegisterCallback; on
-// Windows 11 they arrive asynchronously afterwards, so the caller must pump.
-class TrayItemCollector final : public INotificationCB {
-public:
-    std::vector<TrayNotifyIcon> items;
-    // Atomic: on an MTA caller, Notify runs on RPC threads while we wait.
-    std::atomic<size_t> notifications{0};
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
-        if (object == nullptr) {
-            return E_POINTER;
-        }
-        if (riid == IID_IUnknown || riid == __uuidof(INotificationCB)) {
-            *object = static_cast<INotificationCB*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *object = nullptr;
-        return E_NOINTERFACE;
-    }
-    // Stack-owned for the duration of one enumeration.
-    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
-    ULONG STDMETHODCALLTYPE Release() override { return 1; }
-
-    HRESULT STDMETHODCALLTYPE Notify(ULONG /*event*/, NOTIFYITEM* item) override {
-        ++notifications;
-        if (item == nullptr) {
-            return S_OK;
-        }
-        try {
-            // Explorer also reports remembered icons of apps that are not
-            // running (no live owner window): those are not in the tray.
-            if (item->hWnd == nullptr || IsWindow(item->hWnd) == FALSE) {
-                return S_OK;
-            }
-            DWORD pid = 0;
-            GetWindowThreadProcessId(item->hWnd, &pid);
-            if (pid == GetCurrentProcessId()) {
-                return S_OK;
-            }
-            const auto same = [item](const TrayNotifyIcon& known) {
-                return known.window == item->hWnd && known.id == item->uID;
-            };
-            const auto existing = std::ranges::find_if(items, same);
-            TrayNotifyIcon icon;
-            icon.window = item->hWnd;
-            icon.id = item->uID;
-            icon.guid = item->guidItem;
-            icon.preference = static_cast<int>(item->dwPreference);
-            icon.executablePath = ResolveKnownFolderPath(item->pszExeName != nullptr ? item->pszExeName : L"");
-            if (icon.executablePath.empty() || icon.executablePath[0] == L'{') {
-                icon.executablePath = ProcessImagePath(pid);
-            }
-            icon.exeName = FileStem(icon.executablePath);
-            std::wstring tip = TrimEdges(item->pszTip != nullptr ? item->pszTip : L"");
-            const size_t line = tip.find_first_of(L"\r\n");
-            icon.tip = TrimEdges(line == std::wstring::npos ? tip : tip.substr(0, line));
-            if (icon.tip.empty()) {
-                icon.tip = PrettyTrayName(icon.executablePath);
-            }
-            // The live tray glyph (shows state such as unread or sync).
-            icon.icon = item->hIcon != nullptr ? CopyIcon(item->hIcon) : nullptr;
-            if (icon.icon == nullptr) {
-                icon.icon = ExtractExeIcon(icon.executablePath, 64);
-            }
-            if (existing != items.end()) {
-                *existing = std::move(icon);
-            } else {
-                items.push_back(std::move(icon));
-            }
-        } catch (...) {
-        }
-        return S_OK;
-    }
-};
-
-// Dispatches incoming COM calls (Explorer's Notify callbacks) on this STA
-// until the item stream settles. Returns as soon as no further callback has
-// arrived for kSettleMs, so the synchronous delivery case costs little.
-void PumpTrayNotifications(const TrayItemCollector& collector) {
-    constexpr ULONGLONG kFirstItemWaitMs = 1000;
-    constexpr ULONGLONG kSettleMs = 150;
-    constexpr ULONGLONG kMaxWaitMs = 3000;
-    const ULONGLONG start = GetTickCount64();
-    ULONGLONG lastArrival = start;
-    size_t seen = collector.notifications.load();
-    for (;;) {
-        const ULONGLONG now = GetTickCount64();
-        if (const size_t count = collector.notifications.load(); count != seen) {
-            seen = count;
-            lastArrival = now;
-        }
-        const ULONGLONG idleLimit = seen == 0 ? kFirstItemWaitMs : kSettleMs;
-        const ULONGLONG idle = now - lastArrival;
-        const ULONGLONG elapsed = now - start;
-        if (idle >= idleLimit || elapsed >= kMaxWaitMs) {
-            break;
-        }
-        const ULONGLONG wait = std::min(idleLimit - idle, kMaxWaitMs - elapsed);
-        MsgWaitForMultipleObjectsEx(0, nullptr, static_cast<DWORD>(wait), QS_ALLINPUT,
-            MWMO_INPUTAVAILABLE);
-        MSG message{};
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != FALSE) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-    }
-}
-
-// Every notification icon Explorer knows about, visible or in the hidden
-// overflow. The UI Automation view below only sees buttons the taskbar has
-// realized; with the taskbar hidden, the overflow island usually never is.
-std::vector<TrayNotifyIcon> EnumerateTrayNotifyItems() {
-    TrayItemCollector collector;
-    IUnknown* unknown = nullptr;
-    if (FAILED(CoCreateInstance(kClsidTrayNotify, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&unknown))) ||
-        unknown == nullptr) {
-        return {};
-    }
-    ITrayNotifyWin8* trayWin8 = nullptr;
-    ITrayNotify* tray = nullptr;
-    if (SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&trayWin8))) && trayWin8 != nullptr) {
-        ULONG cookie = 0;
-        if (SUCCEEDED(trayWin8->RegisterCallback(&collector, &cookie))) {
-            PumpTrayNotifications(collector);
-            trayWin8->UnregisterCallback(&cookie);
-        }
-        trayWin8->Release();
-    } else if (SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&tray))) && tray != nullptr) {
-        if (SUCCEEDED(tray->RegisterCallback(&collector))) {
-            PumpTrayNotifications(collector);
-            tray->RegisterCallback(nullptr);
-        }
-        tray->Release();
-    }
-    unknown->Release();
-    // The collector lives on this stack frame: sever any proxy Explorer still
-    // holds so a straggling Notify can never reach it after we return.
-    CoDisconnectObject(static_cast<INotificationCB*>(&collector), 0);
-    return std::move(collector.items);
-}
-
 std::vector<TrayNotifyIcon> EnumerateHostIcons() {
     std::vector<TrayNotifyIcon> icons;
     HostIconSearch search;
@@ -2318,18 +2136,27 @@ void LinkShellButtons(std::vector<TrayNotifyIcon>& icons, std::vector<TrayNotify
     }
 }
 
-void DumpTrayIconsIfRequested(const std::vector<TrayNotifyIcon>& icons) {
+void DumpTrayIconsIfRequested(const std::vector<TrayNotifyIcon>& icons, double enumMs) {
     wchar_t dumpPath[MAX_PATH]{};
     const DWORD got =
         GetEnvironmentVariableW(L"HOVERDOCK_TRAY_DUMP", dumpPath, static_cast<DWORD>(std::size(dumpPath)));
     if (got == 0 || got >= std::size(dumpPath)) {
+        // Optional profile line (inert unless HOVERDOCK_PROFILE is set).
+        wchar_t profile[8]{};
+        if (GetEnvironmentVariableW(L"HOVERDOCK_PROFILE", profile, static_cast<DWORD>(std::size(profile))) != 0) {
+            wchar_t line[128]{};
+            swprintf_s(line, L"tray_enum tid=%lu ms=%.2f count=%zu\n",
+                GetCurrentThreadId(), enumMs, icons.size());
+            OutputDebugStringW(line);
+        }
         return;
     }
     FILE* file = nullptr;
     if (_wfopen_s(&file, dumpPath, L"w, ccs=UTF-8") != 0 || file == nullptr) {
         return;
     }
-    fwprintf(file, L"tray_count=%zu\n", icons.size());
+    fwprintf(file, L"tray_count=%zu\nenum_ms=%.2f\nworker_tid=%lu\n", icons.size(), enumMs,
+        GetCurrentThreadId());
     for (const TrayNotifyIcon& icon : icons) {
         fwprintf(file, L"tip=%s\texe=%s\tid=%u\twindow=%p\tshell=%d\tshellName=%s\n",
             icon.tip.c_str(), icon.executablePath.c_str(), icon.id, static_cast<void*>(icon.window),
@@ -2339,12 +2166,11 @@ void DumpTrayIconsIfRequested(const std::vector<TrayNotifyIcon>& icons) {
 }
 
 std::vector<TrayNotifyIcon> SystemTray::EnumerateNotifyIcons() const {
-    // Win11 (taskbar hidden / overflow never shown): UIA only sees promoted
-    // taskbar buttons, and ITrayNotify::RegisterCallback returns S_OK but
-    // delivers zero Notify callbacks (observed on 26H2 build 26300). The
-    // complete list without opening the flyout comes from NotifyIconSettings
-    // filtered to running processes, linked to host HWNDs and any realized
-    // shell buttons.
+    // Win11 with the taskbar hidden: UIA only sees promoted buttons until the
+    // overflow island has been created once, so the complete list without
+    // opening the flyout comes from NotifyIconSettings filtered to running
+    // processes, linked to host HWNDs and any realized shell buttons.
+    const ULONGLONG started = GetTickCount64();
     const RunningProcessIndex running = CollectRunningProcesses();
     std::vector<TrayNotifyIcon> icons = EnumerateNotifyIconSettings(running);
 
@@ -2366,7 +2192,8 @@ std::vector<TrayNotifyIcon> SystemTray::EnumerateNotifyIcons() const {
     std::vector<TrayNotifyIcon> buttons = EnumerateShellButtons(false);
     LinkShellButtons(icons, buttons);
 
-    DumpTrayIconsIfRequested(icons);
+    const double enumMs = static_cast<double>(GetTickCount64() - started);
+    DumpTrayIconsIfRequested(icons, enumMs);
     return icons;
 }
 
