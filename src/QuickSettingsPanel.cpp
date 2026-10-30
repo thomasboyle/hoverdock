@@ -3850,7 +3850,7 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     m_qsCache.stampNetwork = 0;
     m_qsCache.stampNight = 0;
     if (page == QuickSettingsPage::SystemTray) {
-        // UIA scrape on a worker; the page shows the last scan meanwhile.
+        // Tray enum on a worker; the page shows the last scan meanwhile.
         RequestTrayIconsAsync();
     }
     if (page == QuickSettingsPage::Bluetooth) {

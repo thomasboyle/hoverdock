@@ -128,22 +128,30 @@ int wmain(int argc, wchar_t** argv) {
     if (found != nullptr) {
         CHECK(found->id == kProbeId);
         CHECK(found->icon != nullptr);
-        CHECK(found->window != nullptr && IsWindow(found->window) != FALSE);
         CHECK(_wcsicmp(found->executablePath.c_str(), self) == 0);
-        PostMessageW(found->window, WM_CLOSE, 0, 0);
+        if (found->window != nullptr && IsWindow(found->window) != FALSE) {
+            PostMessageW(found->window, WM_CLOSE, 0, 0);
+        }
     }
     if (probe != nullptr) {
-        if (WaitForSingleObject(probe, 10000) != WAIT_OBJECT_0) {
+        if (found == nullptr || found->window == nullptr) {
+            TerminateProcess(probe, 0);
+        } else if (WaitForSingleObject(probe, 10000) != WAIT_OBJECT_0) {
             TerminateProcess(probe, 0);
         }
         CloseHandle(probe);
+        probe = nullptr;
     }
-    // Gone once its owner removed it.
-    bool stillListed = false;
+    // Settings-backed enum keys off the running executable. This test process
+    // shares the probe's image path, so the tip can remain while we still run.
+    // Require that no icon still points at a live probe window.
+    bool liveProbeWindow = false;
     for (const TrayNotifyIcon& icon : tray.EnumerateNotifyIcons()) {
-        stillListed = stillListed || icon.tip == kProbeTip;
+        if (icon.tip == kProbeTip && icon.window != nullptr && IsWindow(icon.window) != FALSE) {
+            liveProbeWindow = true;
+        }
     }
-    CHECK(!stillListed);
+    CHECK(!liveProbeWindow);
     if (SUCCEEDED(com)) {
         CoUninitialize();
     }
