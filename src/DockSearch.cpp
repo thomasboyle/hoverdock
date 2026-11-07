@@ -2428,6 +2428,7 @@ void DockApp::StartSearchServices() {
     if (m_config.SearchHotkey() && !m_searchHotkey.Start(m_window, kSearchHotkeyMessage)) {
         Log(L"Search: Ctrl+Space is taken by another app; use the dock Search tile.");
     }
+    SyncSearchHotkeyForFullscreen();
     RefreshSearchApps();
 }
 

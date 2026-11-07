@@ -3799,7 +3799,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
     case kSearchHotkeyMessage:
         // A press racing a switch into fullscreen still never opens Search
         // over a fullscreen app.
-        if (!IsSearchOpen() && IsForegroundBorderlessFullscreen()) {
+        if (!IsSearchOpen() && IsForegroundAppFullscreen()) {
             SyncSearchHotkeyForFullscreen();
             return 0;
         }
@@ -14507,23 +14507,23 @@ void DockApp::Log(const std::wstring& message) const {
     OutputDebugStringW((message + L"\n").c_str());
 }
 
-bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept {
+HWND DockApp::ForegroundAppWindow() const noexcept {
     const HWND foreground = GetForegroundWindow();
     if (foreground == nullptr || IsWindowVisible(foreground) == FALSE ||
         IsIconic(foreground) != FALSE) {
-        return false;
+        return nullptr;
     }
     if (foreground == m_window || foreground == m_inputWindow ||
         foreground == m_hoverLabelWindow || foreground == m_dragGhostWindow ||
         foreground == m_searchWindow || foreground == m_overflowWindow ||
         foreground == m_settingsWindow || foreground == m_contextWindow) {
-        return false;
+        return nullptr;
     }
     wchar_t className[64]{};
     if (GetClassNameW(foreground, className, static_cast<int>(std::size(className))) > 0) {
         // All dock-owned windows use the LiquidGlassDock* class prefix.
         if (_wcsnicmp(className, L"LiquidGlassDock", 15) == 0) {
-            return false;
+            return nullptr;
         }
         // Explorer desktop hosts (Progman / WorkerW / DefView) are popup-sized to
         // the virtual desktop with no caption. Treating them as borderless
@@ -14532,23 +14532,18 @@ bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept
         if (_wcsicmp(className, L"Progman") == 0 ||
             _wcsicmp(className, L"WorkerW") == 0 ||
             _wcsicmp(className, L"SHELLDLL_DefView") == 0) {
-            return false;
+            return nullptr;
         }
     }
+    return foreground;
+}
 
-    const LONG_PTR style = GetWindowLongPtrW(foreground, GWL_STYLE);
-    // Borderless / exclusive fullscreen: no caption chrome and no thick resize
-    // frame (typically WS_POPUP). Maximized windowed apps keep WS_CAPTION /
-    // WS_THICKFRAME and must still be allowed to edge-show the dock.
-    if ((style & WS_CAPTION) != 0 || (style & WS_THICKFRAME) != 0) {
-        return false;
-    }
-
+bool DockApp::WindowCoversMonitor(HWND window, HMONITOR* monitor) noexcept {
     RECT windowRect{};
-    if (GetWindowRect(foreground, &windowRect) == FALSE) {
+    if (GetWindowRect(window, &windowRect) == FALSE) {
         return false;
     }
-    const HMONITOR windowMonitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+    const HMONITOR windowMonitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
     if (windowMonitor == nullptr) {
         return false;
     }
@@ -14568,6 +14563,75 @@ bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept
     return covers;
 }
 
+bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept {
+    const HWND foreground = ForegroundAppWindow();
+    if (foreground == nullptr) {
+        return false;
+    }
+    const LONG_PTR style = GetWindowLongPtrW(foreground, GWL_STYLE);
+    // Borderless / exclusive fullscreen: no caption chrome and no thick resize
+    // frame (typically WS_POPUP). Maximized windowed apps keep WS_CAPTION /
+    // WS_THICKFRAME and must still be allowed to edge-show the dock.
+    if ((style & WS_CAPTION) != 0 || (style & WS_THICKFRAME) != 0) {
+        return false;
+    }
+    return WindowCoversMonitor(foreground, monitor);
+}
+
+bool DockApp::IsForegroundAppFullscreen() const noexcept {
+    QUERY_USER_NOTIFICATION_STATE notifyState{};
+    const bool queried = SHQueryUserNotificationState(&notifyState) == S_OK;
+    if (queried && notifyState == QUNS_RUNNING_D3D_FULL_SCREEN) {
+        return true;
+    }
+
+    const HWND foreground = ForegroundAppWindow();
+    if (foreground == nullptr) {
+        return false;
+    }
+    if (IsForegroundBorderlessFullscreen()) {
+        return true;
+    }
+
+    // SDL / GLFW / Unity / F11 keep WS_CAPTION, WS_THICKFRAME, or WS_MAXIMIZE
+    // while covering the monitor with no painted non-client chrome. A normal
+    // maximized window still has a caption, so it keeps Ctrl+Space.
+    RECT windowRect{};
+    RECT clientRect{};
+    if (GetWindowRect(foreground, &windowRect) == FALSE ||
+        GetClientRect(foreground, &clientRect) == FALSE) {
+        return false;
+    }
+    constexpr LONG kChromeTol = 8;
+    const bool noChrome =
+        (windowRect.right - windowRect.left) - (clientRect.right - clientRect.left) <= kChromeTol &&
+        (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top) <= kChromeTol;
+    if (!noChrome) {
+        return false;
+    }
+    if (WindowCoversMonitor(foreground, nullptr)) {
+        return true;
+    }
+
+    // Exclusive OpenGL/Vulkan can report QUNS_BUSY while the window size is the
+    // exclusive mode, not the desktop monitor. Require a chromeless focused
+    // window that still fills most of its monitor so a tiny overlay cannot
+    // steal the chord because something else is fullscreen on another display.
+    if (!queried || notifyState != QUNS_BUSY) {
+        return false;
+    }
+    const HMONITOR windowMonitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(info)};
+    if (windowMonitor == nullptr || GetMonitorInfoW(windowMonitor, &info) == FALSE) {
+        return false;
+    }
+    const LONG windowW = windowRect.right - windowRect.left;
+    const LONG windowH = windowRect.bottom - windowRect.top;
+    const LONG monitorW = info.rcMonitor.right - info.rcMonitor.left;
+    const LONG monitorH = info.rcMonitor.bottom - info.rcMonitor.top;
+    return windowW >= monitorW / 2 && windowH >= monitorH / 2;
+}
+
 bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
     HMONITOR monitor = nullptr;
     return IsForegroundBorderlessFullscreen(&monitor) &&
@@ -14576,7 +14640,7 @@ bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
 
 void DockApp::SyncSearchHotkeyForFullscreen() noexcept {
     if (m_searchHotkey.Running()) {
-        m_searchHotkey.SetSuspended(IsForegroundBorderlessFullscreen());
+        m_searchHotkey.SetSuspended(IsForegroundAppFullscreen());
     }
 }
 

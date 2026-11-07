@@ -811,6 +811,14 @@ private:
     // Same rule without the cursor: the foreground app covers its own monitor.
     // monitor (optional) receives that monitor.
     [[nodiscard]] bool IsForegroundBorderlessFullscreen(HMONITOR* monitor = nullptr) const noexcept;
+    // Focused-app fullscreen for Ctrl+Space: exclusive D3D, F11, and
+    // windowed-fullscreen engines that keep caption/frame/maximize styles.
+    [[nodiscard]] bool IsForegroundAppFullscreen() const noexcept;
+    // The foreground window if it belongs to another app (not the dock, not the
+    // desktop); nullptr otherwise.
+    [[nodiscard]] HWND ForegroundAppWindow() const noexcept;
+    // True when `window` spans its monitor's full rect.
+    [[nodiscard]] static bool WindowCoversMonitor(HWND window, HMONITOR* monitor) noexcept;
     // Ctrl+Space stays out of fullscreen apps, like the dock's edge-show: the
     // chord is released to the app while one is focused.
     void SyncSearchHotkeyForFullscreen() noexcept;
