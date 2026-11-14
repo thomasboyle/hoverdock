@@ -2589,7 +2589,7 @@ int DockApp::Run() {
         throw;
     }
     EnsureMissingPinIconsAsync();
-    RefreshWindowCatalog(true);
+    RefreshRunningWindows(true);
 
     m_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, &DockApp::MouseHook, m_instance, 0);
     if (m_mouseHook == nullptr) {
