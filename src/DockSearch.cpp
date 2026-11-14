@@ -33,6 +33,8 @@ void SetFlyoutChromeInk(uint8_t r, uint8_t g, uint8_t b) noexcept;
 IDWriteFactory* FlyoutDWriteFactory();
 bool EnsureWindowCapturable(HWND window);
 void ClearPopupLayeredCorners(HWND window);
+void PunchPopupSquircleWedges(HWND window, uint8_t* pixels, LONG width, LONG height,
+    bool preservePopupShadow, float radiusOverridePx = 0.0F) noexcept;
 LONG DockShadowMarginPx(float scale) noexcept;
 DWORD_PTR SafeShellFileInfo(const wchar_t* target, DWORD fileAttributes, SHFILEINFOW* information,
     UINT flags) noexcept;
@@ -53,6 +55,8 @@ constexpr UINT kAiSpinnerMs = 360;
 // Reverts a code block's "Copied" label.
 constexpr UINT_PTR kAiCopiedTimerId = 3;
 constexpr UINT kAiCopiedMs = 1600;
+// Spotlight reveal/dismiss spring frame timer.
+constexpr UINT_PTR kSearchAnimTimerId = 4;
 constexpr int kMaxVisibleRows = 8;
 constexpr size_t kFileLimit = 40;
 constexpr size_t kAppLimit = 6;
@@ -506,12 +510,18 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
         return DefWindowProcW(window, message, wParam, lParam);
     }
 
+    auto toPanelPoint = [&](POINT windowPoint) noexcept -> POINT {
+        return {windowPoint.x + app->m_searchWindowOrigin.x - app->m_searchOrigin.x,
+            windowPoint.y + app->m_searchWindowOrigin.y - app->m_searchOrigin.y};
+    };
+
     switch (message) {
     case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE) {
             const HWND newlyActive = reinterpret_cast<HWND>(lParam);
             // The image picker is modal on this window: stay open behind it.
-            if (newlyActive != app->m_window && newlyActive != app->m_inputWindow && !app->m_searchPickerOpen) {
+            if (newlyActive != app->m_window && newlyActive != app->m_inputWindow && !app->m_searchPickerOpen &&
+                app->IsSearchOpen()) {
                 app->CloseSearch();
             }
         } else if (app->IsSearchOpen()) {
@@ -522,16 +532,25 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if (!app->IsSearchOpen()) {
+            return 0;
+        }
         if (app->HandleSearchKey(wParam)) {
             return 0;
         }
         break;
 
     case WM_CHAR:
-        app->HandleSearchChar(static_cast<wchar_t>(wParam));
+        if (app->IsSearchOpen()) {
+            app->HandleSearchChar(static_cast<wchar_t>(wParam));
+        }
         return 0;
 
     case WM_TIMER:
+        if (wParam == kSearchAnimTimerId) {
+            app->StepSearchAnimation();
+            return 0;
+        }
         if (wParam == kCaretTimerId) {
             app->m_searchCaretVisible = !app->m_searchCaretVisible;
             app->PaintSearch();
@@ -555,9 +574,10 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
         break;
 
     case WM_SETCURSOR:
-        if (LOWORD(lParam) == HTCLIENT) {
+        if (LOWORD(lParam) == HTCLIENT && app->IsSearchOpen()) {
             POINT cursor{};
             if (GetCursorPos(&cursor) != FALSE && ScreenToClient(window, &cursor) != FALSE) {
+                cursor = toPanelPoint(cursor);
                 bool hand = PointIn(app->m_searchAttachButton, cursor);
                 for (const RECT& remove : app->m_aiAttachRemoveRects) {
                     hand = hand || PointIn(remove, cursor);
@@ -572,7 +592,10 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
         break;
 
     case WM_MOUSEMOVE: {
-        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (!app->IsSearchOpen()) {
+            return 0;
+        }
+        const POINT point = toPanelPoint({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
         const bool moved = app->m_searchMouse.x >= 0 &&
             (point.x != app->m_searchMouse.x || point.y != app->m_searchMouse.y);
         const bool wasOverAttach = PointIn(app->m_searchAttachButton, app->m_searchMouse);
@@ -602,6 +625,9 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
     }
 
     case WM_MOUSELEAVE: {
+        if (!app->IsSearchOpen()) {
+            return 0;
+        }
         const bool wasOverAttach = PointIn(app->m_searchAttachButton, app->m_searchMouse);
         app->m_searchMouse = {-1, -1};
         if (app->m_aiHover >= 0 || wasOverAttach) {
@@ -612,7 +638,10 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
     }
 
     case WM_LBUTTONUP: {
-        const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (!app->IsSearchOpen()) {
+            return 0;
+        }
+        const POINT point = toPanelPoint({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
         if (PointIn(app->m_searchAttachButton, point)) {
             app->PickAiAttachments();
             return 0;
@@ -635,6 +664,9 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
     }
 
     case WM_MOUSEWHEEL: {
+        if (!app->IsSearchOpen()) {
+            return 0;
+        }
         if (app->m_searchMode == SearchMode::Ai) {
             const float scale = static_cast<float>(app->HostDpi() == 0 ? 96U : app->HostDpi()) / 96.0F;
             const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
@@ -667,7 +699,7 @@ LRESULT CALLBACK DockApp::SearchWindowProcedure(HWND window, UINT message, WPARA
 }
 
 bool DockApp::IsSearchOpen() const noexcept {
-    return m_searchWindow != nullptr && IsWindowVisible(m_searchWindow) != FALSE;
+    return m_searchWindow != nullptr && m_searchAnim.IsOpen();
 }
 
 void DockApp::ToggleSearch() {
@@ -708,6 +740,11 @@ bool DockApp::OpenSearch() {
         ClearPopupLayeredCorners(m_searchWindow);
     }
 
+    const bool reversingHide = m_searchAnim.phase == searchanim::Phase::Hiding;
+    m_searchHideDockAfterClose = false;
+    SetWindowLongW(m_searchWindow, GWL_EXSTYLE,
+        GetWindowLongW(m_searchWindow, GWL_EXSTYLE) & ~WS_EX_TRANSPARENT);
+
     const bool lightTheme = SystemUsesLightApps();
     if (lightTheme != m_searchLightTheme) {
         m_searchLightTheme = lightTheme;
@@ -722,13 +759,22 @@ bool DockApp::OpenSearch() {
     m_searchSelected = 0;
     m_searchScroll = 0;
     m_aiHover = -1;
-    m_searchGlass.clear();
+    if (!reversingHide) {
+        m_searchGlass.clear();
+    }
     m_searchLayerDib.contentValid = false;
+
+    m_searchAnim.BeginReveal(m_searchMode != SearchMode::Ai && Trimmed(m_searchText).empty());
+    m_searchAnimLastTickAt = QpcSeconds();
+
     PaintSearch();
     const ULONGLONG painted = GetTickCount64();
-    ShowWindow(m_searchWindow, SW_SHOW);
+    if (!IsWindowVisible(m_searchWindow)) {
+        ShowWindow(m_searchWindow, SW_SHOW);
+    }
     const bool focused = ForceForeground(m_searchWindow);
     SetTimer(m_searchWindow, kCaretTimerId, kCaretBlinkMs, nullptr);
+    SetTimer(m_searchWindow, kSearchAnimTimerId, BackdropFrameIntervalMs(), nullptr);
     Log(L"Search opened: first paint " + std::to_wstring(painted - openStarted) + L" ms, total " +
         std::to_wstring(GetTickCount64() - openStarted) + L" ms, focused=" + (focused ? L"1" : L"0"));
     m_fileSearch.SetActive(true);
@@ -752,20 +798,52 @@ void DockApp::CloseSearch(bool hideDockIfAway) {
     m_searchClosing = true;
     KillTimer(m_searchWindow, kCaretTimerId);
     KillTimer(m_searchWindow, kAiSpinnerTimerId);
-    ShowWindow(m_searchWindow, SW_HIDE);
-    m_searchClosing = false;
+    const bool dismissCollapsed = m_searchMode != SearchMode::Ai && m_searchRows.empty();
     if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry) {
         ExitSearchEntry(false);
     }
     m_fileSearch.SetActive(false);
     ++m_searchRequestId;
+    m_searchHideDockAfterClose = hideDockIfAway;
+
+    if (m_searchBits.empty() || m_searchSize.cx <= 0 || m_searchSize.cy <= 0) {
+        m_searchClosing = false;
+        FinishSearchHide();
+        return;
+    }
+
+    // Snapshot the panel as it looked when dismissed, let clicks pass through
+    // the fading window, and drive Spotlight's dismiss spring to alpha 0.
+    m_searchAnim.BeginHide(dismissCollapsed);
+    m_searchAnimLastTickAt = QpcSeconds();
+    SetWindowLongW(m_searchWindow, GWL_EXSTYLE,
+        GetWindowLongW(m_searchWindow, GWL_EXSTYLE) | WS_EX_TRANSPARENT);
+    PresentSearchFrame();
+    SetTimer(m_searchWindow, kSearchAnimTimerId, BackdropFrameIntervalMs(), nullptr);
+    m_searchClosing = false;
+}
+
+void DockApp::FinishSearchHide() noexcept {
+    if (m_searchWindow != nullptr) {
+        KillTimer(m_searchWindow, kSearchAnimTimerId);
+        KillTimer(m_searchWindow, kCaretTimerId);
+        KillTimer(m_searchWindow, kAiSpinnerTimerId);
+        SetWindowLongW(m_searchWindow, GWL_EXSTYLE,
+            GetWindowLongW(m_searchWindow, GWL_EXSTYLE) & ~WS_EX_TRANSPARENT);
+        ShowWindow(m_searchWindow, SW_HIDE);
+    }
+    m_searchAnim.ForceHidden();
+    const bool hideDock = m_searchHideDockAfterClose;
+    m_searchHideDockAfterClose = false;
     m_searchRows.clear();
     m_searchRowRects.clear();
     m_searchGlass.clear();
     std::vector<uint8_t>().swap(m_searchBits);
     std::vector<uint8_t>().swap(m_searchOverlay);
+    std::vector<uint8_t>().swap(m_searchAnimScratch);
+    std::vector<uint8_t>().swap(m_searchAnimPresent);
 
-    if (!hideDockIfAway || m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding) {
+    if (!hideDock || m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding) {
         return;
     }
     POINT cursor{};
@@ -774,6 +852,92 @@ void DockApp::CloseSearch(bool hideDockIfAway) {
         !IsCursorOverDock(cursor)) {
         BeginHide();
     }
+}
+
+void DockApp::StepSearchAnimation() {
+    if (m_searchWindow == nullptr || !m_searchAnim.IsAnimating()) {
+        if (m_searchWindow != nullptr) {
+            KillTimer(m_searchWindow, kSearchAnimTimerId);
+        }
+        return;
+    }
+    const double now = QpcSeconds();
+    const float dt = static_cast<float>(std::max(0.0, now - m_searchAnimLastTickAt));
+    m_searchAnimLastTickAt = now;
+
+    if (!m_searchAnim.Step(dt, m_searchMode != SearchMode::Ai && m_searchRows.empty())) {
+        if (m_searchAnim.phase == searchanim::Phase::Hidden) {
+            FinishSearchHide();
+            return;
+        }
+        KillTimer(m_searchWindow, kSearchAnimTimerId);
+    }
+    PresentSearchFrame();
+}
+
+void DockApp::PresentSearchFrame() {
+    const int srcW = static_cast<int>(m_searchSize.cx);
+    const int srcH = static_cast<int>(m_searchSize.cy);
+    const size_t srcBytes = static_cast<size_t>(srcW) * static_cast<size_t>(srcH) * 4U;
+    if (m_searchWindow == nullptr || srcW <= 0 || srcH <= 0 || m_searchBits.size() != srcBytes) {
+        return;
+    }
+    if (!m_searchAnim.IsAnimating() || m_searchAnim.IsIdentityTransform()) {
+        m_searchWindowOrigin = m_searchOrigin;
+        m_searchLayerDib.contentValid = false;
+        PresentLayeredBits(m_searchWindow, m_searchOrigin, m_searchSize.cx, m_searchSize.cy, m_searchBits.data(),
+            srcBytes, m_searchLayerDib, nullptr, true);
+        return;
+    }
+
+    const float dpiScale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+    const float blurSigmaPx = m_searchAnim.ClampedBlurPt() * dpiScale * 0.45F;
+
+    const uint8_t* source = m_searchBits.data();
+    const auto glassIt = m_searchGlass.find(m_searchSize.cy);
+    if (blurSigmaPx >= 0.45F && m_searchOverlay.size() == srcBytes && glassIt != m_searchGlass.end() &&
+        glassIt->second.size() == srcBytes) {
+        // Spotlight's _setContentBlurRadius blurs interior content without
+        // diffusing the outer glass silhouette: blur the overlay, mask by glass
+        // coverage, and composite onto the cached glass plate.
+        m_searchAnimPresent = m_searchOverlay;
+        m_searchAnimScratch.resize(srcBytes);
+        searchanim::BlurPremulBgra(m_searchAnimPresent.data(), srcW, srcH, blurSigmaPx, m_searchAnimScratch.data());
+        m_searchAnimScratch = glassIt->second;
+        for (size_t i = 0; i < srcBytes; i += 4U) {
+            const uint32_t mask = m_searchAnimScratch[i + 3];
+            if (mask < 255U) {
+                for (size_t c = 0; c < 4U; ++c) {
+                    m_searchAnimPresent[i + c] =
+                        static_cast<uint8_t>((m_searchAnimPresent[i + c] * mask + 127U) / 255U);
+                }
+            }
+        }
+        CompositePremul(m_searchAnimScratch.data(), srcW, srcH, 0, 0, m_searchAnimPresent.data(), srcW, srcH);
+        source = m_searchAnimScratch.data();
+    }
+
+    // Pad symmetrically around the centre so the 1.12x Spotlight scale-in/out
+    // never clips at the HWND edges and the panel centre stays pinned.
+    constexpr float kMaxCanvasScale = 1.16F;
+    const LONG padX = std::max<LONG>(2L,
+        static_cast<LONG>(std::ceil(static_cast<float>(srcW) * (kMaxCanvasScale - 1.0F) * 0.5F)) + 2L);
+    const LONG padY = std::max<LONG>(2L,
+        static_cast<LONG>(std::ceil(static_cast<float>(srcH) * (kMaxCanvasScale - 1.0F) * 0.5F)) + 2L);
+    const LONG dstW = m_searchSize.cx + padX * 2L;
+    const LONG dstH = m_searchSize.cy + padY * 2L;
+    const POINT dstOrigin{m_searchOrigin.x - padX, m_searchOrigin.y - padY};
+
+    m_searchAnimPresent.resize(static_cast<size_t>(dstW) * static_cast<size_t>(dstH) * 4U);
+    searchanim::TransformPremulBgra(source, srcW, srcH, std::max(0.05F, m_searchAnim.scaleX.value),
+        std::max(0.05F, m_searchAnim.scaleY.value), m_searchAnimPresent.data(), static_cast<int>(dstW),
+        static_cast<int>(dstH));
+
+    m_searchWindowOrigin = dstOrigin;
+    m_searchLayerDib.contentValid = false;
+    const auto alphaByte = static_cast<BYTE>(std::lround(m_searchAnim.ClampedAlpha() * 255.0F));
+    PresentLayeredBits(m_searchWindow, dstOrigin, dstW, dstH, m_searchAnimPresent.data(),
+        m_searchAnimPresent.size(), m_searchLayerDib, nullptr, true, alphaByte);
 }
 
 void DockApp::PositionSearch() {
@@ -936,8 +1100,12 @@ void DockApp::ApplySearchLiveGlass(std::vector<uint8_t>& glass) {
     }
     const size_t bytes = static_cast<size_t>(size.cx) * static_cast<size_t>(size.cy) * 4U;
     std::vector<uint8_t>& cached = m_searchGlass[size.cy];
-    if (glass.size() != bytes || m_searchOverlay.size() != bytes ||
-        std::memcmp(glass.data(), cached.data(), bytes) == 0) {
+    if (glass.size() != bytes || m_searchOverlay.size() != bytes) {
+        return;
+    }
+    const float dpiScale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
+    PunchPopupSquircleWedges(m_searchWindow, glass.data(), size.cx, size.cy, false, DockCornerRadiusPx(dpiScale));
+    if (std::memcmp(glass.data(), cached.data(), bytes) == 0) {
         return;
     }
     cached.swap(glass);
@@ -951,9 +1119,7 @@ void DockApp::ApplySearchLiveGlass(std::vector<uint8_t>& glass) {
     m_searchBits = cached;
     CompositePremul(m_searchBits.data(), static_cast<int>(size.cx), static_cast<int>(size.cy), 0, 0,
         m_searchOverlay.data(), static_cast<int>(size.cx), static_cast<int>(size.cy));
-    m_searchLayerDib.contentValid = false;
-    PresentLayeredBits(m_searchWindow, origin, size.cx, size.cy, m_searchBits.data(), m_searchBits.size(),
-        m_searchLayerDib);
+    PresentSearchFrame();
 }
 
 // ---- painting ---------------------------------------------------------------------
@@ -988,6 +1154,7 @@ void DockApp::PaintSearch() {
             FillSquircleColorPremul(glass.data(), width, height, {0, 0, size.cx, size.cy},
                 DockCornerRadiusPx(scale), 0.94F, shade, shade, shade);
         }
+        PunchPopupSquircleWedges(m_searchWindow, glass.data(), size.cx, size.cy, false, DockCornerRadiusPx(scale));
     }
     // Content goes into a transparent overlay composited over the glass below.
     SetFlyoutChromeInkForGlass(glass.data(), width, height);
@@ -1174,8 +1341,7 @@ void DockApp::PaintSearch() {
     CompositePremul(m_searchBits.data(), width, height, 0, 0, pixels, width, height);
     m_searchOrigin = origin;
     m_searchSize = size;
-    PresentLayeredBits(m_searchWindow, origin, size.cx, size.cy, m_searchBits.data(), m_searchBits.size(),
-        m_searchLayerDib);
+    PresentSearchFrame();
 }
 
 // ---- input ----------------------------------------------------------------------------
@@ -2436,7 +2602,9 @@ void DockApp::StopSearchServices() noexcept {
     ExitAiState();
     m_aiView.reset();
     m_searchHotkey.Stop();
+    m_searchAnim.ForceHidden();
     if (m_searchWindow != nullptr) {
+        KillTimer(m_searchWindow, kSearchAnimTimerId);
         KillTimer(m_searchWindow, kCaretTimerId);
         DestroyWindow(m_searchWindow);
         m_searchWindow = nullptr;

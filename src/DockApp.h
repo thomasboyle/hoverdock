@@ -9,6 +9,7 @@
 #include "Renderer.h"
 #include "TypeSafeClient.h"
 #include "FileSearch.h"
+#include "SearchAnimation.h"
 #include "SearchHotkey.h"
 #include "WindowCatalog.h"
 #include "SystemTray.h"
@@ -499,7 +500,8 @@ private:
     void ReleaseLayerPresentDib(LayerPresentDib& slot) noexcept;
     bool PresentLayeredBits(HWND window, const POINT& origin, LONG width, LONG height,
         const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
-        const RECT* dirty = nullptr, bool preservePopupShadow = false) noexcept;
+        const RECT* dirty = nullptr, bool preservePopupShadow = false,
+        BYTE sourceAlpha = 255) noexcept;
     void QueueSettingsPaint(bool hoverOnly = false);
     // allowCc=false keeps the plain dock material even while Dock Settings has CC shapes.
     [[nodiscard]] UINT PackPopupGlassFxFlags(bool dockFace, bool popupShadow = false,
@@ -656,8 +658,11 @@ private:
     // Ctrl+Space, MFT-backed file index + app catalogue.
     bool OpenSearch();
     void CloseSearch(bool hideDockIfAway = true);
+    void FinishSearchHide() noexcept;
     void ToggleSearch();
     [[nodiscard]] bool IsSearchOpen() const noexcept;
+    void PresentSearchFrame();
+    void StepSearchAnimation();
     void PositionSearch();
     void PaintSearch();
     void SearchTextChanged();
@@ -1117,14 +1122,20 @@ private:
     UINT m_searchIconExtent = 0;
     bool m_searchMftPrompting = false;
     bool m_searchClosing = false;
+    bool m_searchHideDockAfterClose = false;
+    searchanim::State m_searchAnim;
+    double m_searchAnimLastTickAt = 0.0;
     // Last client mouse position: rows only follow real pointer movement.
     POINT m_searchMouse{-1, -1};
     // Glass plates per panel height (origin is fixed while open; rows grow down).
     std::unordered_map<LONG, std::vector<uint8_t>> m_searchGlass;
     POINT m_searchGlassOrigin{};
     POINT m_searchOrigin{};
+    POINT m_searchWindowOrigin{};
     SIZE m_searchSize{};
     std::vector<uint8_t> m_searchBits;
+    std::vector<uint8_t> m_searchAnimScratch;
+    std::vector<uint8_t> m_searchAnimPresent;
     // Everything drawn over the glass (text, highlights, icons, answer), kept
     // separately so a live backdrop update is glass + overlay, nothing redrawn.
     std::vector<uint8_t> m_searchOverlay;

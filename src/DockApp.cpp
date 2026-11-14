@@ -299,7 +299,7 @@ float PopupSquircleDistance(float x, float y, float width, float height, float r
 // into a dark rectangle). Force those pixels to exact transparent black so
 // UpdateLayeredWindow and the window region both let the wallpaper through.
 void PunchPopupSquircleWedges(HWND window, uint8_t* pixels, LONG width, LONG height,
-    bool preservePopupShadow) noexcept {
+    bool preservePopupShadow, float radiusOverridePx = 0.0F) noexcept {
     if (preservePopupShadow || pixels == nullptr || width <= 1 || height <= 1) {
         return;
     }
@@ -311,7 +311,7 @@ void PunchPopupSquircleWedges(HWND window, uint8_t* pixels, LONG width, LONG hei
         }
     }
     const float dpiScale = std::max(static_cast<float>(dpi) / 96.0F, 1.0F);
-    const float radius = DOCK_CORNER_RADIUS_PT * dpiScale;
+    const float radius = radiusOverridePx > 0.0F ? radiusOverridePx : DOCK_CORNER_RADIUS_PT * dpiScale;
     const float aa = 1.35F * dpiScale;
     const int reach = std::max(2, static_cast<int>(std::ceil(radius + aa + 1.0F)));
     const int origins[4][2] = {{0, 0}, {std::max(0, static_cast<int>(width) - reach), 0},
@@ -6818,7 +6818,7 @@ void DockApp::ReleaseLayerPresentDib(LayerPresentDib& slot) noexcept
 
 bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, LONG height,
     const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
-    const RECT* dirty, bool preservePopupShadow) noexcept
+    const RECT* dirty, bool preservePopupShadow, BYTE sourceAlpha) noexcept
 {
     if (window == nullptr || pixels == nullptr || width <= 0 || height <= 0) {
         return false;
@@ -6866,7 +6866,7 @@ bool DockApp::PresentLayeredBits(HWND window, const POINT& origin, LONG width, L
     POINT source{0, 0};
     POINT destination{origin.x, origin.y};
     SIZE present{width, height};
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, sourceAlpha, AC_SRC_ALPHA};
     if (partial) {
         UPDATELAYEREDWINDOWINFO info{};
         info.cbSize = sizeof(info);
@@ -8730,7 +8730,7 @@ void DockApp::PaintSettingsPopup() {
     } else {
         std::memset(pixels, 0, pixelCount * 4U);
         const bool gpuGlass = TryBakePopupGlass(origin, m_settingsSize.cx, m_settingsSize.cy, pixels,
-            pixelCount * 4U, true);
+            pixelCount * 4U, true, false, m_searchWindow);
         if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {
@@ -10478,7 +10478,7 @@ void DockApp::PaintOverflowPopup() {
         ProfileScope scopeGlassMiss("OverflowGlass-bake");
         std::memset(pixels, 0, pixelCount * 4U);
         const bool gpuGlass = TryBakePopupGlass(origin, m_overflowSize.cx, m_overflowSize.cy, pixels,
-            pixelCount * 4U, true, true);
+            pixelCount * 4U, true, true, m_searchWindow);
         if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {
@@ -11994,7 +11994,7 @@ void DockApp::PaintContextMenu() {
     } else {
         std::memset(pixels, 0, pixelCount * 4U);
         const bool gpuGlass = TryBakePopupGlass(origin, m_contextSize.cx, m_contextSize.cy, pixels,
-            pixelCount * 4U, false);
+            pixelCount * 4U, false, false, m_searchWindow);
         if (!gpuGlass) {
         screen = GetDC(nullptr);
         if (screen == nullptr) {

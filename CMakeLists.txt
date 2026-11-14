@@ -238,10 +238,12 @@ if(DOCK_BUILD_TESTS)
     # Search AI answers: Markdown parsing and the Groq protocol (portable).
     add_dock_test(AiMarkdownTests tests/AiMarkdownTests.cpp src/AiMarkdown.cpp)
     add_dock_test(GroqProtocolTests tests/GroqProtocolTests.cpp src/GroqProtocol.cpp)
+    add_dock_test(SearchAnimationTests tests/SearchAnimationTests.cpp)
     # AI answer pipeline benchmark (streaming parse/convert, request JSON); not a CTest.
     add_dock_test(AiPipelineBench tests/AiPipelineBench.cpp src/AiMarkdown.cpp src/GroqProtocol.cpp)
     add_test(NAME AiMarkdownTests COMMAND AiMarkdownTests)
     add_test(NAME GroqProtocolTests COMMAND GroqProtocolTests)
+    add_test(NAME SearchAnimationTests COMMAND SearchAnimationTests)
 endif()
 
 # Signed PawnIO IntelMSR blob header (third_party/pawnio/IntelMsrBin.h).
