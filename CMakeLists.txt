@@ -239,11 +239,14 @@ if(DOCK_BUILD_TESTS)
     add_dock_test(AiMarkdownTests tests/AiMarkdownTests.cpp src/AiMarkdown.cpp)
     add_dock_test(GroqProtocolTests tests/GroqProtocolTests.cpp src/GroqProtocol.cpp)
     add_dock_test(SearchAnimationTests tests/SearchAnimationTests.cpp)
+    add_dock_test(DockConfigTests tests/DockConfigTests.cpp src/DockConfig.cpp src/GroqProtocol.cpp)
+    target_link_libraries(DockConfigTests PRIVATE ole32 shell32 advapi32 crypt32)
     # AI answer pipeline benchmark (streaming parse/convert, request JSON); not a CTest.
     add_dock_test(AiPipelineBench tests/AiPipelineBench.cpp src/AiMarkdown.cpp src/GroqProtocol.cpp)
     add_test(NAME AiMarkdownTests COMMAND AiMarkdownTests)
     add_test(NAME GroqProtocolTests COMMAND GroqProtocolTests)
     add_test(NAME SearchAnimationTests COMMAND SearchAnimationTests)
+    add_test(NAME DockConfigTests COMMAND DockConfigTests)
 endif()
 
 # Signed PawnIO IntelMSR blob header (third_party/pawnio/IntelMsrBin.h).

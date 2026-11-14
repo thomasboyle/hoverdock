@@ -1,6 +1,8 @@
 #include "DockConfig.h"
+#include "DockConfigIni.h"
 
 #include <Windows.h>
+#include <ShlObj.h>
 #include <ShObjIdl.h>
 #include <wincrypt.h>
 
@@ -13,6 +15,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -93,25 +96,11 @@ std::wstring Utf8ToWide(const std::string& text) {
     return result;
 }
 
-std::string WideToUtf8(const std::wstring& text) {
-    if (text.empty() || text.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) {
-        return {};
-    }
-
-    const int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
-        static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-    if (count <= 0) {
-        return {};
-    }
-
-    std::string result(static_cast<size_t>(count), '\0');
-    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
-        static_cast<int>(text.size()), result.data(), count, nullptr, nullptr);
-    return result;
-}
-
-std::wstring EnvironmentVariable(const wchar_t* name) {
+std::wstring EnvironmentVariable(const wchar_t* name, bool* definedOut = nullptr) {
     const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (definedOut != nullptr) {
+        *definedOut = required > 0;
+    }
     if (required <= 1) {
         return {};
     }
@@ -125,8 +114,21 @@ std::wstring EnvironmentVariable(const wchar_t* name) {
     return value;
 }
 
+std::wstring KnownLocalAppDataPath() {
+    PWSTR base = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)) || base == nullptr) {
+        return {};
+    }
+    std::wstring path(base);
+    CoTaskMemFree(base);
+    return path;
+}
+
 std::wstring AppDataConfigPath() {
-    const std::wstring appData = EnvironmentVariable(L"LOCALAPPDATA");
+    std::wstring appData = EnvironmentVariable(L"LOCALAPPDATA");
+    if (appData.empty()) {
+        appData = KnownLocalAppDataPath();
+    }
     if (appData.empty()) {
         return {};
     }
@@ -859,6 +861,116 @@ bool SamePins(const std::vector<PinnedApp>& left, const std::vector<PinnedApp>& 
 }
 
 constexpr wchar_t kProtectedPrefix[] = L"dpapi:";
+std::mutex g_configFileMutex;
+
+std::wstring RegistryEnvironmentVariable(HKEY root, const wchar_t* subkey, const wchar_t* name) {
+    wchar_t buffer[4096]{};
+    DWORD size = sizeof(buffer);
+    if (RegGetValueW(root, subkey, name, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, buffer,
+            &size) != ERROR_SUCCESS ||
+        size <= sizeof(wchar_t)) {
+        return {};
+    }
+    return buffer;
+}
+
+std::wstring ApiKeyEnvironmentVariable(const wchar_t* name) {
+    bool definedInProcess = false;
+    std::wstring value = Trim(EnvironmentVariable(name, &definedInProcess));
+    if (definedInProcess) {
+        return value;
+    }
+    value = Trim(RegistryEnvironmentVariable(HKEY_CURRENT_USER, L"Environment", name));
+    if (!value.empty()) {
+        return value;
+    }
+    return Trim(RegistryEnvironmentVariable(
+        HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", name));
+}
+
+bool ReadFileBytesShared(const std::wstring& path, std::string& out) {
+    out.clear();
+    if (path.empty()) {
+        return false;
+    }
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        handle = CreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+            break;
+        }
+        const DWORD err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION) {
+            return false;
+        }
+        Sleep(15);
+    }
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(handle, &size) == FALSE || size.QuadPart < 0 ||
+        size.QuadPart > 16LL * 1024LL * 1024LL) {
+        CloseHandle(handle);
+        return false;
+    }
+    const auto totalBytes = static_cast<DWORD>(size.QuadPart);
+    out.resize(totalBytes);
+    DWORD read = 0;
+    const bool ok = totalBytes == 0 ||
+        (ReadFile(handle, out.data(), totalBytes, &read, nullptr) != FALSE && read == totalBytes);
+    CloseHandle(handle);
+    if (!ok) {
+        out.clear();
+    }
+    return ok;
+}
+
+bool WriteFileBytesAtomic(const std::wstring& path, const std::string& bytes) {
+    if (path.empty() || bytes.size() > (std::numeric_limits<DWORD>::max)()) {
+        return false;
+    }
+    const std::wstring tempPath = path + L".tmp";
+    {
+        HANDLE handle = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            std::ofstream fallback(path, std::ios::binary | std::ios::trunc);
+            fallback.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            return fallback.good();
+        }
+        const auto totalBytes = static_cast<DWORD>(bytes.size());
+        DWORD written = 0;
+        const bool writeOk =
+            WriteFile(handle, bytes.data(), totalBytes, &written, nullptr) != FALSE &&
+            written == totalBytes;
+        if (writeOk) {
+            FlushFileBuffers(handle);
+        }
+        CloseHandle(handle);
+        if (!writeOk) {
+            DeleteFileW(tempPath.c_str());
+            return false;
+        }
+    }
+
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        if (attempt > 0) {
+            Sleep(15);
+        }
+        if (MoveFileExW(tempPath.c_str(), path.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE) {
+            return true;
+        }
+    }
+    DeleteFileW(tempPath.c_str());
+    std::ofstream fallback(path, std::ios::binary | std::ios::trunc);
+    fallback.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return fallback.good();
+}
 
 // Encrypts `secret` for the current Windows user (DPAPI) as "dpapi:<base64>".
 std::wstring ProtectSecret(const std::wstring& secret) {
@@ -881,6 +993,10 @@ std::wstring ProtectSecret(const std::wstring& secret) {
         if (CryptBinaryToStringW(output.pbData, output.cbData, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
                 encoded.data(), &length) != FALSE) {
             encoded.resize(length);
+            while (!encoded.empty() &&
+                (encoded.back() == L'\0' || encoded.back() == L'\r' || encoded.back() == L'\n')) {
+                encoded.pop_back();
+            }
         } else {
             encoded.clear();
         }
@@ -891,10 +1007,13 @@ std::wstring ProtectSecret(const std::wstring& secret) {
 
 // Inverse of ProtectSecret; plain (hand-edited) values pass through.
 std::wstring UnprotectSecret(const std::wstring& stored) {
-    if (!stored.starts_with(kProtectedPrefix)) {
+    if (!StartsWithInsensitive(stored, kProtectedPrefix)) {
         return stored;
     }
-    const std::wstring encoded = stored.substr(std::size(kProtectedPrefix) - 1);
+    const std::wstring encoded = Trim(stored.substr(std::size(kProtectedPrefix) - 1));
+    if (encoded.empty()) {
+        return {};
+    }
     DWORD size = 0;
     if (CryptStringToBinaryW(encoded.c_str(), static_cast<DWORD>(encoded.size()), CRYPT_STRING_BASE64, nullptr, &size,
             nullptr, nullptr) == FALSE ||
@@ -919,9 +1038,49 @@ std::wstring UnprotectSecret(const std::wstring& stored) {
 
 }  // namespace
 
+void DockConfig::ClearSecret(SecretValue& secret) noexcept {
+    SecureZeroMemory(secret.plain.data(), secret.plain.size() * sizeof(wchar_t));
+    secret.plain.clear();
+    secret.protectedRaw.clear();
+    secret.modified = false;
+}
+
+void DockConfig::LoadSecret(SecretValue& secret, const std::wstring& raw) {
+    const std::wstring stored = Trim(raw);
+    if (stored.empty()) {
+        return;
+    }
+    if (StartsWithInsensitive(stored, kProtectedPrefix)) {
+        secret.protectedRaw = stored;
+    }
+    secret.plain = Trim(UnprotectSecret(stored));
+}
+
+std::wstring DockConfig::ResolveSecret(const SecretValue& secret, const wchar_t* envName) {
+    const std::wstring fromEnvironment = ApiKeyEnvironmentVariable(envName);
+    if (!fromEnvironment.empty()) {
+        return fromEnvironment;
+    }
+    if (!secret.plain.empty()) {
+        return secret.plain;
+    }
+    return secret.protectedRaw.empty() ? std::wstring() : Trim(UnprotectSecret(secret.protectedRaw));
+}
+
+std::wstring DockConfig::PersistSecret(const SecretValue& secret) {
+    if (!secret.plain.empty()) {
+        std::wstring protectedKey = ProtectSecret(secret.plain);
+        if (!protectedKey.empty()) {
+            return protectedKey;
+        }
+    }
+    return secret.protectedRaw;
+}
+
 bool DockConfig::LoadOrCreate() {
     m_path = AppDataConfigPath();
-    if (m_path.empty()) {
+    m_hadUnreadableExistingFile = false;
+    auto initDefaultPins = [this]() {
         m_followsTaskbarPins = true;
         m_pins = ImportTaskbarPins();
         m_showDevBounds = false;
@@ -930,19 +1089,26 @@ bool DockConfig::LoadOrCreate() {
         if (m_pins.empty()) {
             SetDefaults();
         }
+    };
+
+    if (m_path.empty()) {
+        initDefaultPins();
         return false;
     }
 
-    if (GetFileAttributesW(m_path.c_str()) == INVALID_FILE_ATTRIBUTES || !Load()) {
-        m_followsTaskbarPins = true;
-        m_pins = ImportTaskbarPins();
-        m_showDevBounds = false;
-        m_launchAtStartup = false;
-        m_checkForUpdates = true;
-        if (m_pins.empty()) {
-            SetDefaults();
-        }
+    const DWORD attributes = GetFileAttributesW(m_path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES &&
+        (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND)) {
+        initDefaultPins();
         return Save();
+    }
+
+    if (!Load()) {
+        // Do not overwrite an existing dock.ini when a transient lock/read
+        // error prevented loading it; doing so would wipe saved API keys.
+        m_hadUnreadableExistingFile = true;
+        initDefaultPins();
+        return false;
     }
 
     if (!m_followsTaskbarPins) {
@@ -960,48 +1126,27 @@ bool DockConfig::LoadOrCreate() {
 }
 
 bool DockConfig::Load() {
-    std::ifstream file(m_path, std::ios::binary);
-    if (!file) {
+    std::string bytes;
+    {
+        std::lock_guard<std::mutex> lock(g_configFileMutex);
+        if (!ReadFileBytesShared(m_path, bytes)) {
+            return false;
+        }
+    }
+
+    std::wstring contents;
+    if (!dockconfig::DecodeIniBytes(bytes, contents)) {
         return false;
     }
 
-    const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    const std::wstring contents = Utf8ToWide(bytes);
-    if (contents.empty() && !bytes.empty()) {
-        return false;
-    }
-
-    std::map<std::wstring, std::map<std::wstring, std::wstring>> sections;
-    std::wstring currentSection;
-    std::wistringstream lines(contents);
-    std::wstring line;
-    while (std::getline(lines, line)) {
-        line = Trim(line);
-        if (line.empty() || line.front() == L';' || line.front() == L'#') {
-            continue;
-        }
-
-        if (line.front() == L'[' && line.back() == L']') {
-            currentSection = ToLower(Trim(line.substr(1, line.size() - 2)));
-            continue;
-        }
-
-        const size_t separator = line.find(L'=');
-        if (separator == std::wstring::npos || currentSection.empty()) {
-            continue;
-        }
-
-        sections[currentSection][ToLower(Trim(line.substr(0, separator)))] =
-            Trim(line.substr(separator + 1));
-    }
+    const dockconfig::IniSections sections = dockconfig::ParseIniSections(contents);
 
     m_pins.clear();
     m_showDevBounds = false;
     m_followsTaskbarPins = true;
     m_dockScale = 1.0F;
-    m_typeSafeApiKey.clear();
-    SecureZeroMemory(m_groqApiKey.data(), m_groqApiKey.size() * sizeof(wchar_t));
-    m_groqApiKey.clear();
+    ClearSecret(m_typeSafeApiKey);
+    ClearSecret(m_groqApiKey);
     m_aiModel.clear();
     m_searchHotkey = true;
     m_launchAtStartup = false;
@@ -1035,13 +1180,11 @@ bool DockConfig::Load() {
         if (dockScale != dockSection->second.end()) {
             m_dockScale = std::clamp(ParseFloat(dockScale->second, 1.0F), 0.75F, 1.5F);
         }
-        const auto typeSafeApiKey = dockSection->second.find(L"typesafeapikey");
-        if (typeSafeApiKey != dockSection->second.end()) {
-            m_typeSafeApiKey = Trim(UnprotectSecret(typeSafeApiKey->second));
+        if (const auto it = dockSection->second.find(L"typesafeapikey"); it != dockSection->second.end()) {
+            LoadSecret(m_typeSafeApiKey, it->second);
         }
-        const auto groqApiKey = dockSection->second.find(L"groqapikey");
-        if (groqApiKey != dockSection->second.end()) {
-            m_groqApiKey = Trim(UnprotectSecret(groqApiKey->second));
+        if (const auto it = dockSection->second.find(L"groqapikey"); it != dockSection->second.end()) {
+            LoadSecret(m_groqApiKey, it->second);
         }
         const auto aiModel = dockSection->second.find(L"aimodel");
         if (aiModel != dockSection->second.end()) {
@@ -1182,6 +1325,34 @@ bool DockConfig::Save() const {
         return false;
     }
 
+    std::wstring persistedTypeSafeKey = PersistSecret(m_typeSafeApiKey);
+    std::wstring persistedGroqKey = PersistSecret(m_groqApiKey);
+
+    std::lock_guard<std::mutex> lock(g_configFileMutex);
+
+    if (m_hadUnreadableExistingFile) {
+        std::string diskBytes;
+        std::wstring diskWide;
+        if (ReadFileBytesShared(m_path, diskBytes) && dockconfig::DecodeIniBytes(diskBytes, diskWide)) {
+            const dockconfig::IniSections existing = dockconfig::ParseIniSections(diskWide);
+            if (const auto existingDock = existing.find(L"dock"); existingDock != existing.end()) {
+                auto rescueSecret = [&](std::wstring& persisted, const SecretValue& secret, const wchar_t* key) {
+                    if (!persisted.empty() || secret.modified) {
+                        return;
+                    }
+                    const auto it = existingDock->second.find(key);
+                    if (it != existingDock->second.end() && !it->second.empty()) {
+                        persisted = StartsWithInsensitive(it->second, kProtectedPrefix)
+                            ? it->second
+                            : ProtectSecret(Trim(it->second));
+                    }
+                };
+                rescueSecret(persistedTypeSafeKey, m_typeSafeApiKey, L"typesafeapikey");
+                rescueSecret(persistedGroqKey, m_groqApiKey, L"groqapikey");
+            }
+        }
+    }
+
     std::wostringstream contents;
     contents << L"; Liquid Glass Dock v1 configuration\n";
     contents << L"; UTF-8 INI. Pins are ordered left to right.\n\n";
@@ -1207,46 +1378,28 @@ bool DockConfig::Save() const {
         contents << L"QuickSettingsIconColor=" << colorText << L"\n";
     }
     if (!m_qsLayout.empty()) {
-        contents << L"QuickSettingsLayout=" << m_qsLayout << L"\n";
+        contents << L"QuickSettingsLayout=" << dockconfig::SanitizeIniValue(m_qsLayout) << L"\n";
     }
     if (!m_lastInstalledVersion.empty()) {
-        contents << L"LastInstalledVersion=" << m_lastInstalledVersion << L"\n";
+        contents << L"LastInstalledVersion=" << dockconfig::SanitizeIniValue(m_lastInstalledVersion) << L"\n";
         contents << L"LastInstalledTime=" << m_lastInstalledTime << L"\n";
         contents << L"LastInstalledAttempts=" << m_lastInstalledAttempts << L"\n";
     }
-    if (!m_typeSafeApiKey.empty()) {
-        const std::wstring protectedKey = ProtectSecret(m_typeSafeApiKey);
-        if (!protectedKey.empty()) {
-            contents << L"TypeSafeApiKey=" << protectedKey << L"\\n";
-        }
-    }
-    if (!m_groqApiKey.empty()) {
-        const std::wstring protectedKey = ProtectSecret(m_groqApiKey);
-        if (!protectedKey.empty()) {
-            contents << L"GroqApiKey=" << protectedKey << L"\n";
-        }
-    }
-    if (!m_aiModel.empty()) {
-        contents << L"AiModel=" << m_aiModel << L"\n";
-    }
-    if (!m_searchHotkey) {
-        contents << L"SearchHotkey=0\n";
-    }
+    dockconfig::AppendSecretAndAiLines(
+        contents, persistedTypeSafeKey, persistedGroqKey, m_aiModel, m_searchHotkey);
     contents << L"\n";
 
     for (size_t index = 0; index < m_pins.size(); ++index) {
         const PinnedApp& app = m_pins[index];
         contents << L"[Pin" << index << L"]\n";
-        contents << L"Name=" << app.name << L"\n";
-        contents << L"Target=" << app.target << L"\n";
-        contents << L"Arguments=" << app.arguments << L"\n";
-        contents << L"WorkingDirectory=" << app.workingDirectory << L"\n\n";
+        contents << L"Name=" << dockconfig::SanitizeIniValue(app.name) << L"\n";
+        contents << L"Target=" << dockconfig::SanitizeIniValue(app.target) << L"\n";
+        contents << L"Arguments=" << dockconfig::SanitizeIniValue(app.arguments) << L"\n";
+        contents << L"WorkingDirectory=" << dockconfig::SanitizeIniValue(app.workingDirectory) << L"\n\n";
     }
 
-    const std::string bytes = WideToUtf8(contents.str());
-    std::ofstream file(m_path, std::ios::binary | std::ios::trunc);
-    file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    return file.good();
+    const std::string bytes = groq::WideToUtf8(contents.str());
+    return !bytes.empty() && WriteFileBytesAtomic(m_path, bytes);
 }
 
 const std::vector<PinnedApp>& DockConfig::Pins() const noexcept {
@@ -1426,11 +1579,7 @@ const std::wstring& DockConfig::Path() const noexcept {
 }
 
 std::wstring DockConfig::TypeSafeApiKey() const {
-    const std::wstring fromEnvironment = Trim(EnvironmentVariable(L"TYPESAFE_API_KEY"));
-    if (!fromEnvironment.empty()) {
-        return fromEnvironment;
-    }
-    return Trim(m_typeSafeApiKey);
+    return ResolveSecret(m_typeSafeApiKey, L"TYPESAFE_API_KEY");
 }
 
 bool DockConfig::SearchHotkey() const noexcept {
@@ -1438,17 +1587,17 @@ bool DockConfig::SearchHotkey() const noexcept {
 }
 
 std::wstring DockConfig::GroqApiKey() const {
-    const std::wstring fromEnvironment = Trim(EnvironmentVariable(L"GROQ_API_KEY"));
-    return fromEnvironment.empty() ? m_groqApiKey : fromEnvironment;
+    return ResolveSecret(m_groqApiKey, L"GROQ_API_KEY");
 }
 
 bool DockConfig::GroqApiKeyFromEnvironment() const {
-    return !Trim(EnvironmentVariable(L"GROQ_API_KEY")).empty();
+    return !ApiKeyEnvironmentVariable(L"GROQ_API_KEY").empty();
 }
 
 void DockConfig::SetGroqApiKey(std::wstring key) {
-    SecureZeroMemory(m_groqApiKey.data(), m_groqApiKey.size() * sizeof(wchar_t));
-    m_groqApiKey = Trim(key);
+    ClearSecret(m_groqApiKey);
+    m_groqApiKey.plain = Trim(key);
+    m_groqApiKey.modified = true;
     SecureZeroMemory(key.data(), key.size() * sizeof(wchar_t));
 }
 

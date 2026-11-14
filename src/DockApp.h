@@ -751,6 +751,8 @@ private:
     void StartTrayTimer() noexcept;
     void StopTrayTimer() noexcept;
     void ScheduleConfigSave() noexcept;
+    void SaveConfigNow() noexcept;
+    void FlushConfigSave() noexcept;
     void ScheduleDeferredRefresh() noexcept;
     void CancelDeferredRefresh() noexcept;
     bool RebuildDisplayApps(bool* structureChanged = nullptr);
@@ -923,6 +925,7 @@ private:
     HPOWERNOTIFY m_suspendNotify = nullptr;
     HPOWERNOTIFY m_monitorNotify = nullptr;
     bool m_sessionNotifyRegistered = false;
+    bool m_configSavePending = false;
     DockConfig m_config;
     WindowCatalog m_windows;
     Renderer m_renderer;

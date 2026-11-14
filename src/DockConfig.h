@@ -90,6 +90,18 @@ public:
     void SetLastInstalledAttempts(int attempts) noexcept;
 
 private:
+    struct SecretValue {
+        std::wstring plain;
+        std::wstring protectedRaw;
+        bool modified = false;
+    };
+
+    static void ClearSecret(SecretValue& secret) noexcept;
+    static void LoadSecret(SecretValue& secret, const std::wstring& stored);
+    [[nodiscard]] static std::wstring ResolveSecret(const SecretValue& secret,
+        const wchar_t* envName);
+    [[nodiscard]] static std::wstring PersistSecret(const SecretValue& secret);
+
     bool Load();
     void SetDefaults();
 
@@ -98,8 +110,9 @@ private:
     bool m_showDevBounds = false;
     bool m_followsTaskbarPins = true;
     float m_dockScale = 1.0F;
-    std::wstring m_typeSafeApiKey;
-    std::wstring m_groqApiKey;
+    SecretValue m_typeSafeApiKey;
+    SecretValue m_groqApiKey;
+    bool m_hadUnreadableExistingFile = false;
     std::wstring m_aiModel;
     bool m_searchHotkey = true;
     bool m_launchAtStartup = false;

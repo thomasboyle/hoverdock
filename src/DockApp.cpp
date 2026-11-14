@@ -49,6 +49,11 @@
 #include <utility>
 #include <vector>
 
+namespace {
+std::mutex g_configSaveMutex;
+std::atomic<uint64_t> g_configSaveGeneration{0};
+}  // namespace
+
 DockApp* DockApp::s_instance = nullptr;
 
 std::vector<uint8_t> BoxDownsamplePremultiplied(const std::vector<uint8_t>& source, UINT sourceExtent,
@@ -3460,6 +3465,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
 
     case WM_ENDSESSION:
         if (wParam != FALSE) {
+            FlushConfigSave();
             StopSearchServices();
             RestoreTaskbar();
         }
@@ -3480,7 +3486,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         }
         if (wParam == VK_F12) {
             m_config.SetShowDevBounds(!m_config.ShowDevBounds());
-            m_config.Save();
+            SaveConfigNow();
             RenderFrame();
             return 0;
         }
@@ -3928,10 +3934,15 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             }
         } else if (wParam == kConfigSaveTimerId) {
             KillTimer(window, kConfigSaveTimerId);
+            m_configSavePending = false;
             // Disk write off the UI/hook thread so pin/unpin never stalls the cursor.
+            const uint64_t generation = ++g_configSaveGeneration;
             const DockConfig snapshot = m_config;
-            std::thread([snapshot]() {
-                static_cast<void>(snapshot.Save());
+            std::thread([snapshot, generation]() {
+                std::lock_guard<std::mutex> lock(g_configSaveMutex);
+                if (generation == g_configSaveGeneration.load(std::memory_order_acquire)) {
+                    static_cast<void>(snapshot.Save());
+                }
             }).detach();
         } else if (wParam == kCursorWatchTimerId) {
             PumpCursorWatch();
@@ -4028,6 +4039,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
 
     case WM_DESTROY:
+        FlushConfigSave();
         KillTimer(window, kWeatherTimerId);
         KillTimer(window, kBluetoothTimerId);
         m_weather.Stop();
@@ -7220,7 +7232,7 @@ void DockApp::ReconcileLastUpdate() {
         // a future mismatch is judged on its own retry budget.
         m_config.SetLastInstalledVersion(L"", 0);
         m_config.SetLastInstalledAttempts(0);
-        static_cast<void>(m_config.Save());
+        SaveConfigNow();
         return;
     }
     // The recorded install is newer than this binary: the replace did not
@@ -7234,7 +7246,7 @@ void DockApp::ReconcileLastUpdate() {
     if (attempts < kMaxUpdateRetries) {
         m_config.SetLastInstalledAttempts(attempts + 1);
         m_config.SetLastInstalledVersion(record, 0);
-        static_cast<void>(m_config.Save());
+        SaveConfigNow();
         m_updateStatus = L"Update v" + record + L" didn't take effect (still v" + wideCurrent +
             L") - retrying...";
         Log(L"Last update to v" + record + L" did not take effect; retry " +
@@ -7403,6 +7415,20 @@ void DockApp::ApplyUpdateResult(const UpdateReply& reply) {
             SetUpdateStatus(L"You are up to date (v" + wide + L").");
             return;
         }
+        const std::wstring prevInstalledVersion = m_config.LastInstalledVersion();
+        const long long prevInstalledTime = m_config.LastInstalledTime();
+        const int prevInstalledAttempts = m_config.LastInstalledAttempts();
+        std::wstring wide(reply.version.begin(), reply.version.end());
+        // Record the install synchronously before spawning the updater so
+        // dock.ini (including any saved API keys) is atomically flushed and
+        // closed before the installer or portable mover runs.
+        if (prevInstalledVersion != wide) {
+            m_config.SetLastInstalledAttempts(0);
+        }
+        m_config.SetLastInstalledVersion(
+            wide, static_cast<long long>(std::time(nullptr)));
+        SaveConfigNow();
+
         bool launched = false;
         if (reply.isSetup) {
             launched = Updater::LaunchInstallerAndExit(reply.path);
@@ -7410,19 +7436,6 @@ void DockApp::ApplyUpdateResult(const UpdateReply& reply) {
             launched = Updater::StagePortableUpdateAndRestart(reply.path);
         }
         if (launched) {
-            std::wstring wide(reply.version.begin(), reply.version.end());
-            // Record the launched install synchronously (not via the deferred
-            // config-save timer, which would not fire before WM_CLOSE exits):
-            // if the new process still reports the old version, the next
-            // check skips this version for a cooldown instead of looping.
-            // A different version restarts the retry budget; re-launching the
-            // same one keeps the attempts spent so far.
-            if (m_config.LastInstalledVersion() != wide) {
-                m_config.SetLastInstalledAttempts(0);
-            }
-            m_config.SetLastInstalledVersion(
-                wide, static_cast<long long>(std::time(nullptr)));
-            static_cast<void>(m_config.Save());
             SetUpdateStatus(L"Restarting into v" + wide + L"...");
             Log(L"Update installer launched; exiting for replace.");
             // Give the status paint a beat, then exit cleanly so the
@@ -7432,6 +7445,9 @@ void DockApp::ApplyUpdateResult(const UpdateReply& reply) {
             }
             return;
         }
+        m_config.SetLastInstalledVersion(prevInstalledVersion, prevInstalledTime);
+        m_config.SetLastInstalledAttempts(prevInstalledAttempts);
+        SaveConfigNow();
         m_updateInstalling.store(false);
         m_updateInFlight.store(false);
         SetUpdateStatus(L"Update install did not start. Try again.");
@@ -13166,8 +13182,31 @@ void DockApp::RemapInteractionAfterLayoutChange(const std::wstring& pressedTarge
 }
 
 void DockApp::ScheduleConfigSave() noexcept {
+    m_configSavePending = true;
+    ++g_configSaveGeneration;
     if (m_window != nullptr) {
         SetTimer(m_window, kConfigSaveTimerId, 400, nullptr);
+    }
+}
+
+void DockApp::SaveConfigNow() noexcept {
+    if (m_window != nullptr) {
+        KillTimer(m_window, kConfigSaveTimerId);
+    }
+    m_configSavePending = false;
+    ++g_configSaveGeneration;
+    try {
+        std::lock_guard<std::mutex> lock(g_configSaveMutex);
+        static_cast<void>(m_config.Save());
+    } catch (...) {
+    }
+}
+
+void DockApp::FlushConfigSave() noexcept {
+    if (m_configSavePending) {
+        SaveConfigNow();
+    } else if (m_window != nullptr) {
+        KillTimer(m_window, kConfigSaveTimerId);
     }
 }
 

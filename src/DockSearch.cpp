@@ -2553,7 +2553,7 @@ void DockApp::CommitSearchEntry() {
     } else {
         return;
     }
-    ScheduleConfigSave();
+    SaveConfigNow();
     ExitSearchEntry(false);
     RefreshSettingsControls();
     if (askNow && !Trimmed(m_searchText).empty()) {
