@@ -141,19 +141,8 @@ Section "Install"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${RUNVALUE}" '"$INSTDIR\${APPEXE}"'
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize" "StartupDelayInMSec" 0
   ${EndIf}
-  ; Always (re)create the logon task when startup is on (fresh install or
-  ; enabled): /F refreshes a stale path after updates. Skipped only when the
-  ; user explicitly turned startup off (no Run value and no task yet — the
-  ; query below exits non-zero). Failures are non-fatal: the Run key above
-  ; remains as fallback.
-  ${If} $0 != ""
-    ExecWait '$SYSDIR\schtasks.exe /Create /TN "${RUNVALUE}" /TR "$\"$INSTDIR\${APPEXE}$\"" /SC ONLOGON /RL LIMITED /F' $1
-  ${Else}
-    ExecWait '"$SYSDIR\schtasks.exe" /Query /TN "${RUNVALUE}"' $1
-    ${If} $1 != 0
-      ExecWait '$SYSDIR\schtasks.exe /Create /TN "${RUNVALUE}" /TR "$\"$INSTDIR\${APPEXE}$\"" /SC ONLOGON /RL LIMITED /F' $1
-    ${EndIf}
-  ${EndIf}
+  ; Startup::SyncWithConfig in Dock.exe creates/repairs the COM logon task
+  ; asynchronously with DisallowStartIfOnBatteries=false and PT0S delay.
 SectionEnd
 
 Section "Uninstall"

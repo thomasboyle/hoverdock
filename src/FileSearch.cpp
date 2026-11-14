@@ -32,8 +32,31 @@ constexpr DWORD kPipeReadTimeoutMs = 60000;
 constexpr DWORD kActivePollMs = 250;
 constexpr DWORD kIdlePollMs = 30000;
 constexpr DWORD kRetryBuildMs = 5U * 60U * 1000U;
+constexpr ULONGLONG kCacheSaveIntervalMs = 5ULL * 60ULL * 1000ULL;
+constexpr uint32_t kCacheFileMagic = 0x31434448U;  // "HDC1"
 constexpr DWORD kJournalReasons = USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_RENAME_NEW_NAME |
     USN_REASON_BASIC_INFO_CHANGE;
+
+struct CachedJournalHeader {
+    uint8_t volume = 0;
+    uint8_t reserved[5]{};
+    uint16_t letter = 0;
+    uint64_t journalId = 0;
+    int64_t nextUsn = 0;
+};
+static_assert(sizeof(CachedJournalHeader) == 24);
+
+std::wstring IndexCachePath() {
+    PWSTR base = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &base)) || base == nullptr) {
+        return {};
+    }
+    std::wstring dir(base);
+    CoTaskMemFree(base);
+    dir += L"\\Hoverdock";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\search-index.bin";
+}
 
 // Wire chunk: header then `length` payload bytes.
 struct DumpChunk {
@@ -1119,6 +1142,172 @@ bool FileSearchService::BuildIndex(std::unique_ptr<FileIndex>& index, std::vecto
     return true;
 }
 
+bool FileSearchService::LoadCachedIndex(std::unique_ptr<FileIndex>& index, std::vector<Journal>& journals,
+    FileSearchMode& mode) {
+    const std::wstring path = IndexCachePath();
+    if (path.empty()) {
+        return false;
+    }
+    Handle file(CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (!file.Valid()) {
+        return false;
+    }
+    LARGE_INTEGER fileSize{};
+    if (GetFileSizeEx(file.Get(), &fileSize) == FALSE || fileSize.QuadPart <= 16 ||
+        fileSize.QuadPart > (1LL << 29)) {
+        return false;
+    }
+    std::vector<uint8_t> bytes(static_cast<size_t>(fileSize.QuadPart));
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        DWORD got = 0;
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(bytes.size() - offset, 1U << 20));
+        if (ReadFile(file.Get(), bytes.data() + offset, chunk, &got, nullptr) == FALSE || got == 0) {
+            return false;
+        }
+        offset += got;
+    }
+    uint32_t magic = 0;
+    uint8_t rawMode = 0;
+    uint8_t journalCount = 0;
+    std::memcpy(&magic, bytes.data(), sizeof(magic));
+    rawMode = bytes[4];
+    journalCount = bytes[5];
+    if (magic != kCacheFileMagic ||
+        (rawMode != static_cast<uint8_t>(FileSearchMode::Mft) &&
+            rawMode != static_cast<uint8_t>(FileSearchMode::Folders)) ||
+        journalCount == 0 || journalCount > 26) {
+        return false;
+    }
+    const auto savedMode = static_cast<FileSearchMode>(rawMode);
+    const std::wstring sid = CurrentUserSid();
+    const bool elevated = IsElevated();
+    // If the user enabled MFT access since a Folders cache was written, discard
+    // the partial cache so the full disk is indexed.
+    if (savedMode == FileSearchMode::Folders && (elevated || (!sid.empty() && MftTaskExists(sid)))) {
+        return false;
+    }
+    // In MFT mode every current fixed NTFS volume must be represented in the cache.
+    if (savedMode == FileSearchMode::Mft) {
+        const std::vector<wchar_t> currentVolumes = FixedNtfsVolumes();
+        if (currentVolumes.size() != journalCount) {
+            return false;
+        }
+    }
+    const size_t headerBytes = 8 + static_cast<size_t>(journalCount) * sizeof(CachedJournalHeader);
+    if (bytes.size() <= headerBytes) {
+        return false;
+    }
+    std::vector<Journal> openedJournals;
+    openedJournals.reserve(journalCount);
+    const auto closeOpened = [&openedJournals]() noexcept {
+        for (Journal& j : openedJournals) {
+            if (j.handle != INVALID_HANDLE_VALUE) {
+                CloseHandle(j.handle);
+                j.handle = INVALID_HANDLE_VALUE;
+            }
+        }
+        openedJournals.clear();
+    };
+    for (uint8_t i = 0; i < journalCount; ++i) {
+        CachedJournalHeader cj{};
+        std::memcpy(&cj, bytes.data() + 8 + static_cast<size_t>(i) * sizeof(CachedJournalHeader), sizeof(cj));
+        const auto letter = static_cast<wchar_t>(cj.letter);
+        if (letter < L'A' || letter > L'Z' || cj.journalId == 0) {
+            closeOpened();
+            return false;
+        }
+        const wchar_t device[] = {L'\\', L'\\', L'.', L'\\', letter, L':', L'\0'};
+        constexpr DWORD kShare = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        bool privileged = true;
+        HANDLE handle = CreateFileW(device, GENERIC_READ, kShare, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            privileged = false;
+            handle = CreateFileW(device, FILE_TRAVERSE, kShare, nullptr, OPEN_EXISTING, 0, nullptr);
+        }
+        if (handle == INVALID_HANDLE_VALUE) {
+            closeOpened();
+            return false;
+        }
+        USN_JOURNAL_DATA_V0 live{};
+        DWORD returned = 0;
+        if (DeviceIoControl(handle, FSCTL_QUERY_USN_JOURNAL, nullptr, 0, &live, sizeof(live), &returned,
+                nullptr) == FALSE ||
+            live.UsnJournalID != cj.journalId || cj.nextUsn < live.FirstUsn || cj.nextUsn > live.NextUsn) {
+            CloseHandle(handle);
+            closeOpened();
+            return false;
+        }
+        Journal journal;
+        journal.volume = cj.volume;
+        journal.letter = letter;
+        journal.handle = handle;
+        journal.journalId = cj.journalId;
+        journal.nextUsn = cj.nextUsn;
+        journal.privileged = privileged;
+        openedJournals.push_back(journal);
+    }
+
+    auto loaded = std::make_unique<FileIndex>();
+    if (!loaded->Deserialize(bytes.data() + headerBytes, bytes.size() - headerBytes) ||
+        loaded->LiveEntryCount() == 0) {
+        closeOpened();
+        return false;
+    }
+
+    index = std::move(loaded);
+    journals = std::move(openedJournals);
+    mode = savedMode;
+    std::lock_guard lock(m_statusLock);
+    m_status.canEnableMft = mode == FileSearchMode::Folders && !elevated;
+    return true;
+}
+
+void FileSearchService::SaveCachedIndex(const FileIndex& index, const std::vector<Journal>& journals,
+    FileSearchMode mode) noexcept {
+    try {
+        if (journals.empty() || journals.size() > 26 || index.LiveEntryCount() == 0) {
+            return;
+        }
+        const std::wstring path = IndexCachePath();
+        if (path.empty()) {
+            return;
+        }
+        std::vector<uint8_t> bytes;
+        bytes.reserve(index.MemoryBytes() + 256);
+        const uint32_t magic = kCacheFileMagic;
+        const auto* magicBytes = reinterpret_cast<const uint8_t*>(&magic);
+        bytes.insert(bytes.end(), magicBytes, magicBytes + sizeof(magic));
+        bytes.push_back(static_cast<uint8_t>(mode));
+        bytes.push_back(static_cast<uint8_t>(journals.size()));
+        bytes.push_back(0);
+        bytes.push_back(0);
+        for (const Journal& j : journals) {
+            CachedJournalHeader cj{};
+            cj.volume = j.volume;
+            cj.letter = static_cast<uint16_t>(j.letter);
+            cj.journalId = j.journalId;
+            cj.nextUsn = j.nextUsn;
+            const auto* cjBytes = reinterpret_cast<const uint8_t*>(&cj);
+            bytes.insert(bytes.end(), cjBytes, cjBytes + sizeof(cj));
+        }
+        index.Serialize(bytes);
+
+        const std::wstring tmpPath = path + L".tmp";
+        {
+            Handle file(CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (!file.Valid() || !WriteAll(file.Get(), bytes.data(), bytes.size())) {
+                return;
+            }
+        }
+        MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    } catch (...) {
+    }
+}
+
 void FileSearchService::CloseJournals() noexcept {
     for (Journal& journal : m_journals) {
         if (journal.handle != INVALID_HANDLE_VALUE) {
@@ -1129,7 +1318,10 @@ void FileSearchService::CloseJournals() noexcept {
     m_journals.clear();
 }
 
-bool FileSearchService::PollJournals() {
+bool FileSearchService::PollJournals(bool* changed) {
+    if (changed != nullptr) {
+        *changed = false;
+    }
     struct Update {
         uint8_t volume;
         bool remove;
@@ -1188,6 +1380,9 @@ bool FileSearchService::PollJournals() {
         }
     }
     if (!updates.empty()) {
+        if (changed != nullptr) {
+            *changed = true;
+        }
         std::unique_lock lock(m_indexLock);
         if (m_index != nullptr) {
             for (const Update& update : updates) {
@@ -1206,6 +1401,7 @@ bool FileSearchService::PollJournals() {
 }
 
 void FileSearchService::IndexThread() {
+    bool forceRebuild = false;
     while (!m_stop.load()) {
         {
             std::lock_guard lock(m_statusLock);
@@ -1218,11 +1414,19 @@ void FileSearchService::IndexThread() {
         std::unique_ptr<FileIndex> index;
         std::vector<Journal> journals;
         FileSearchMode mode = FileSearchMode::Starting;
-        // Low I/O + CPU priority: indexing must never compete with the user.
-        const bool background = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) != FALSE;
-        const bool built = BuildIndex(index, journals, mode);
-        if (background) {
-            SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+        bool fromCache = false;
+        if (!forceRebuild) {
+            fromCache = LoadCachedIndex(index, journals, mode);
+        }
+        forceRebuild = false;
+        bool built = fromCache;
+        if (!built) {
+            // BELOW_NORMAL keeps the UI responsive without entering Windows
+            // THREAD_MODE_BACKGROUND_BEGIN, whose Very-Low I/O priority gets
+            // starved for tens of seconds during boot disk activity.
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            built = BuildIndex(index, journals, mode);
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
         }
         if (m_stop.load()) {
             for (Journal& journal : journals) {
@@ -1249,14 +1453,59 @@ void FileSearchService::IndexThread() {
             WaitForSingleObject(m_wake, kRetryBuildMs);
             continue;
         }
-        // Catch up on changes made while building, then follow the journal.
+        // Catch up on changes made while building (or while powered off), then
+        // persist a fresh snapshot and follow the journal.
+        bool initialChanged = false;
+        if (!PollJournals(&initialChanged)) {
+            forceRebuild = true;
+            m_rebuild.store(true);
+            continue;
+        }
+        if (!fromCache || initialChanged) {
+            std::shared_lock lock(m_indexLock);
+            if (m_index != nullptr) {
+                SaveCachedIndex(*m_index, m_journals, mode);
+            }
+        }
+        m_cacheDirty = false;
+        m_lastCacheSaveTick = GetTickCount64();
+
         while (!m_stop.load() && !m_rebuild.load()) {
-            if (!PollJournals()) {
+            bool changed = false;
+            if (!PollJournals(&changed)) {
+                forceRebuild = true;
                 m_rebuild.store(true);
                 break;
             }
+            if (changed) {
+                m_cacheDirty = true;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (m_cacheDirty && now - m_lastCacheSaveTick >= kCacheSaveIntervalMs) {
+                std::shared_lock lock(m_indexLock);
+                if (m_index != nullptr) {
+                    SaveCachedIndex(*m_index, m_journals, mode);
+                }
+                m_cacheDirty = false;
+                m_lastCacheSaveTick = now;
+            }
             WaitForSingleObject(m_wake, m_active.load() ? kActivePollMs : kIdlePollMs);
         }
+        if (m_rebuild.load()) {
+            forceRebuild = true;
+        }
+    }
+    if (m_cacheDirty) {
+        std::shared_lock lock(m_indexLock);
+        if (m_index != nullptr) {
+            FileSearchMode mode = FileSearchMode::Starting;
+            {
+                std::lock_guard statusLock(m_statusLock);
+                mode = m_status.mode;
+            }
+            SaveCachedIndex(*m_index, m_journals, mode);
+        }
+        m_cacheDirty = false;
     }
     CloseJournals();
 }

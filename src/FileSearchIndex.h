@@ -115,6 +115,13 @@ public:
     void SetZoneMarker(uint8_t volume, uint64_t id, Zone zone);
     void RecomputeZones();
 
+    // ---- binary persistence ----------------------------------------------------
+    // Serialises / restores the complete ranked index (volumes, entries, slots,
+    // names, record maps, and zone markers) to a flat byte buffer so the index
+    // survives shutdown/reboot and only needs USN journal catch-up on startup.
+    void Serialize(std::vector<uint8_t>& out) const;
+    [[nodiscard]] bool Deserialize(const uint8_t* data, size_t size);
+
     // ---- queries ------------------------------------------------------------------
     // Case-insensitive AND of whitespace separated terms against file names.
     // Returns the best `limit` hits, best first. `state` (optional) enables

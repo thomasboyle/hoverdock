@@ -2525,11 +2525,12 @@ int DockApp::Run() {
         return *handOff;
     }
     m_renderer.BeginDeviceCreation();
-    // Startup entries are authoritative for logon launch, but the toggle owns
-    // them: repair a stale path (portable copy moved) or clear leftover
-    // entries so the persisted setting and the system never disagree after
-    // restart.
-    Startup::SyncWithConfig(m_config.LaunchAtStartup());
+    // Sync startup entries (Run key + Task Scheduler RPC) off the UI thread so
+    // a contended Schedule service at logon never stalls dock initialization.
+    {
+        const bool launchAtStartup = m_config.LaunchAtStartup();
+        std::thread([launchAtStartup] { Startup::SyncWithConfig(launchAtStartup); }).detach();
+    }
     {
         std::string current = Updater::CurrentVersion();
         std::wstring wide(current.begin(), current.end());
@@ -2555,11 +2556,9 @@ int DockApp::Run() {
     m_bluetoothTestMessage = RegisterWindowMessageW(L"Hoverdock.BluetoothTest");
     RegisterSystemResumeNotifications();
     HideTaskbar();
-    // Profiles first: enrichment (AppUserModelId coverage) depends on knowing
-    // which pins need it before windows are enriched.
-    m_windows.RebuildPinProfiles(m_config.Pins());
-    static_cast<void>(m_windows.Refresh());
-    static_cast<void>(m_tray.Refresh());
+    // The dock face only renders clock + battery; skip synchronous WLAN/audio/
+    // network COM RPC at boot (Quick Settings refreshes those when opened).
+    static_cast<void>(m_tray.RefreshForDock());
     m_weather.Start(m_window, kWeatherMessage);
     m_badges.Start(m_window, kBadgeMessage);
     m_bluetooth.Start(m_window, kBluetoothMessage);
@@ -2568,22 +2567,29 @@ int DockApp::Run() {
     RebuildDisplayApps();
     RebuildLayout(false);
 
-    // Shell icon extraction and D3D12 device creation are each a few hundred
-    // ms and independent, so extract on a worker while the device comes up.
+    // Seed procedural glyphs (Start, Search) in memory immediately so the dock
+    // comes up without blocking on cold-disk shell icon extraction (which can
+    // take several seconds on first boot while Defender scans executables).
+    // EnsureMissingPinIconsAsync + RefreshWindowCatalog populate the app icons
+    // and running windows in the background right after the message loop starts.
     const IconLoadRequest iconLoad = PrepareIconLoad();
-    std::future<std::vector<std::vector<uint8_t>>> iconPixels =
-        std::async(std::launch::async, [&iconLoad] {
-            return Renderer::ExtractIconPixelBuffers(iconLoad.candidates, iconLoad.extent);
-        });
+    std::vector<std::vector<uint8_t>> initialIcons(iconLoad.candidates.size());
+    for (size_t i = 0; i < iconLoad.candidates.size(); ++i) {
+        if (!iconLoad.candidates[i].empty() && IsSpecialDockTarget(iconLoad.candidates[i][0])) {
+            initialIcons[i] = Renderer::ExtractIconPixels(iconLoad.candidates[i], iconLoad.extent);
+        }
+    }
     try {
         m_renderer.Initialize(m_window, m_dockWidth, m_dockHeight);
         m_rendererInitialized = true;
-        ApplyIconLoad(iconLoad, iconPixels.get());
+        ApplyIconLoad(iconLoad, initialIcons);
         AssignIconTextureIndices();
     } catch (...) {
         DestroyWindow(m_window);
         throw;
     }
+    EnsureMissingPinIconsAsync();
+    RefreshWindowCatalog(true);
 
     m_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, &DockApp::MouseHook, m_instance, 0);
     if (m_mouseHook == nullptr) {
@@ -2606,6 +2612,7 @@ int DockApp::Run() {
     }
     Log(L"Dock initialized.");
     // MFT file index (background, low priority) + Ctrl+Space.
+    // RefreshSearchApps already loads m_installedApps on its worker thread.
     StartSearchServices();
     // Startup transient allocations (icon extraction temps, shell queries) stay
     // committed in the CRT heap; hand fully-free pages back to the OS once.
@@ -2613,9 +2620,6 @@ int DockApp::Run() {
     // Prime the DDC brightness level off-thread (monitor round-trips stall far
     // too long for the UI thread); the tile updates on arrival when it moved.
     RefreshBrightnessAsync();
-    std::thread([this] {
-        m_installedApps.EnsureLoaded();
-    }).detach();
     // Delayed first update check (lets the dock settle), then every 6 h while
     // running. The worker skips itself when auto-checks are disabled.
     StartUpdateTimer(kUpdateInitialDelayMs);
@@ -3456,6 +3460,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
 
     case WM_ENDSESSION:
         if (wParam != FALSE) {
+            StopSearchServices();
             RestoreTaskbar();
         }
         return 0;
@@ -3672,12 +3677,14 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
                 SHChangeNotification_Unlock(lock);
             }
         }
-        PostMessageW(m_window, kTrashRefreshMessage, 0, 0);
+        RefreshTrash(false);
         return 0;
     }
 
     case kTrashRefreshMessage:
-        RefreshTrash(false);
+        ApplyTrashRefresh(m_trashPendingCount.load(std::memory_order_relaxed),
+            m_trashPendingBytes.load(std::memory_order_relaxed),
+            m_trashRefreshForce.exchange(false, std::memory_order_relaxed));
         return 0;
 
     case kTrashDropMessage: {
@@ -5864,17 +5871,35 @@ void DockApp::UpdateTrashIconState(bool full) {
 }
 
 void DockApp::RefreshTrash(bool forceLayout) {
-    RecycleBinState shell{};
-    if (!RecycleBin::QueryState(shell)) {
+    if (forceLayout) {
+        m_trashRefreshForce.store(true, std::memory_order_relaxed);
+    }
+    if (m_window == nullptr || m_trashRefreshInFlight.exchange(true, std::memory_order_relaxed)) {
         return;
     }
-    const bool full = !shell.isEmpty;
+    const HWND reply = m_window;
+    std::thread([this, reply]() {
+        RecycleBinState shell{};
+        const bool ok = RecycleBin::QueryState(shell);
+        if (ok) {
+            m_trashPendingCount.store(shell.itemCount, std::memory_order_relaxed);
+            m_trashPendingBytes.store(shell.byteSize, std::memory_order_relaxed);
+        }
+        m_trashRefreshInFlight.store(false, std::memory_order_relaxed);
+        if (ok) {
+            PostMessageW(reply, kTrashRefreshMessage, 0, 0);
+        }
+    }).detach();
+}
+
+void DockApp::ApplyTrashRefresh(ULONGLONG itemCount, ULONGLONG byteSize, bool forceLayout) {
+    const bool full = (itemCount > 0);
     const bool changed = (full != m_trashFull) ||
-        (shell.itemCount != m_trashState.itemCount) ||
-        (shell.byteSize != m_trashState.byteSize) || forceLayout;
-    m_trashState.itemCount = shell.itemCount;
-    m_trashState.byteSize = shell.byteSize;
-    m_trashState.isEmpty = shell.isEmpty;
+        (itemCount != m_trashState.itemCount) ||
+        (byteSize != m_trashState.byteSize) || forceLayout;
+    m_trashState.itemCount = itemCount;
+    m_trashState.byteSize = byteSize;
+    m_trashState.isEmpty = !full;
     if (!changed) {
         // Still ensure icons exist after a full texture reload (extent change).
         if (!m_renderer.HasIconForTarget(RecycleBin::kEmptyTarget) ||

@@ -449,6 +449,51 @@ void TestTopNIsPrefixOfFullRanking() {
     }
 }
 
+void TestSerialization() {
+    FileIndex original = BuildSample();
+    original.Upsert(0, 300, 102, 0, "Saved Before Reboot.xlsx");
+    original.Remove(0, 201);
+
+    std::vector<uint8_t> bytes;
+    original.Serialize(bytes);
+    CHECK(!bytes.empty());
+
+    FileIndex restored;
+    CHECK(restored.Deserialize(bytes.data(), bytes.size()));
+    CHECK(restored.LiveEntryCount() == original.LiveEntryCount());
+    CHECK(restored.EntryCount() == original.EntryCount());
+    CHECK(restored.Path(restored.Find(0, 200)) == "C:\\Users\\tom\\Documents\\Report Final.docx");
+    CHECK(restored.Path(restored.Find(0, 300)) == "C:\\Users\\tom\\Documents\\Saved Before Reboot.xlsx");
+    CHECK(restored.Find(0, 201) == FileIndex::kNone);
+
+    for (const char* q : {"report", "mail", "saved", "final"}) {
+        const auto a = original.Search(q, 10);
+        const auto b = restored.Search(q, 10);
+        bool same = a.size() == b.size();
+        for (size_t i = 0; same && i < a.size(); ++i) {
+            same = a[i].entry == b[i].entry && a[i].score == b[i].score &&
+                original.Path(a[i].entry) == restored.Path(b[i].entry);
+        }
+        CHECK(same);
+    }
+
+    // Incremental journal updates work seamlessly after deserialization.
+    restored.Upsert(0, 301, 105, 0, "Created After Boot.txt");
+    restored.Remove(0, 300);
+    CHECK(restored.Search("saved", 10).empty());
+    const auto hits = restored.Search("created after", 10);
+    CHECK(hits.size() == 1);
+    CHECK(restored.Path(hits[0].entry) == "C:\\Users\\tom\\Desktop\\Created After Boot.txt");
+    CHECK(restored.ZoneOf(hits[0].entry) == Zone::UserFolder);
+
+    // Reject truncated or corrupt buffers.
+    FileIndex bad;
+    CHECK(!bad.Deserialize(bytes.data(), 4));
+    CHECK(!bad.Deserialize(bytes.data(), bytes.size() - 1));
+    bytes[0] ^= 0xFFU;
+    CHECK(!bad.Deserialize(bytes.data(), bytes.size()));
+}
+
 }  // namespace
 
 int main() {
@@ -461,6 +506,7 @@ int main() {
     TestUnicodeMatching();
     TestCompaction();
     TestTopNIsPrefixOfFullRanking();
+    TestSerialization();
     if (g_failures == 0) {
         std::printf("FileSearchIndex tests: all passed\n");
         return 0;

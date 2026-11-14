@@ -209,6 +209,41 @@ bool TaskExists() {
     return false;
 }
 
+bool TaskIsHealthy() {
+    TaskService task;
+    if (!task.Connect()) {
+        return false;
+    }
+    BSTR name = SysAllocString(kTaskName);
+    if (name == nullptr) {
+        return false;
+    }
+    IRegisteredTask* registered = nullptr;
+    const HRESULT got = task.Folder()->GetTask(name, &registered);
+    SysFreeString(name);
+    if (FAILED(got) || registered == nullptr) {
+        return false;
+    }
+    bool healthy = false;
+    ITaskDefinition* definition = nullptr;
+    if (SUCCEEDED(registered->get_Definition(&definition)) && definition != nullptr) {
+        ITaskSettings* settings = nullptr;
+        if (SUCCEEDED(definition->get_Settings(&settings)) && settings != nullptr) {
+            VARIANT_BOOL disallowOnBatteries = VARIANT_TRUE;
+            VARIANT_BOOL stopOnBatteries = VARIANT_TRUE;
+            if (SUCCEEDED(settings->get_DisallowStartIfOnBatteries(&disallowOnBatteries)) &&
+                SUCCEEDED(settings->get_StopIfGoingOnBatteries(&stopOnBatteries)) &&
+                disallowOnBatteries == VARIANT_FALSE && stopOnBatteries == VARIANT_FALSE) {
+                healthy = true;
+            }
+            settings->Release();
+        }
+        definition->Release();
+    }
+    registered->Release();
+    return healthy;
+}
+
 bool DeleteLogonTask() {
     TaskService task;
     if (!task.Connect()) {
@@ -482,9 +517,9 @@ void Startup::SyncWithConfig(bool configEnabled) {
     if (!runOk) {
         static_cast<void>(WriteRunCommand(command));
     }
-    // Fast path: Run already correct and the logon task exists (the common
-    // steady state) — nothing to repair.
-    if (runOk && TaskExists()) {
+    // Fast path: Run already correct and the logon task exists with battery
+    // launch enabled (the common steady state) — nothing to repair.
+    if (runOk && TaskIsHealthy()) {
         DisableStartupDelay();
         return;
     }

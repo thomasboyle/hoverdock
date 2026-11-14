@@ -118,8 +118,12 @@ private:
     void SearchThread();
     bool BuildIndex(std::unique_ptr<filesearch::FileIndex>& index, std::vector<Journal>& journals,
         FileSearchMode& mode);
+    bool LoadCachedIndex(std::unique_ptr<filesearch::FileIndex>& index, std::vector<Journal>& journals,
+        FileSearchMode& mode);
+    void SaveCachedIndex(const filesearch::FileIndex& index, const std::vector<Journal>& journals,
+        FileSearchMode mode) noexcept;
     // Returns false when a journal wrapped / was reset (rebuild needed).
-    bool PollJournals();
+    bool PollJournals(bool* changed = nullptr);
     void CloseJournals() noexcept;
     void NotifyStatus() const noexcept;
     [[nodiscard]] bool StopRequested() const noexcept { return m_stop.load(); }
@@ -132,6 +136,8 @@ private:
     filesearch::FileIndex m_apps;
     std::vector<Journal> m_journals;      // index thread only
     std::vector<BYTE> m_journalBuffer;    // index thread only
+    bool m_cacheDirty = false;            // index thread only
+    ULONGLONG m_lastCacheSaveTick = 0;    // index thread only
 
     std::thread m_indexThread;
     std::thread m_searchThread;
