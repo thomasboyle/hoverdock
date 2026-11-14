@@ -938,225 +938,206 @@ namespace {
 
 constexpr uint32_t kIndexCacheMagic = 0x31495346U;  // "FSI1"
 
-template <typename T>
-void PutPod(std::vector<uint8_t>& out, const T& value) {
-    const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
-    out.insert(out.end(), bytes, bytes + sizeof(T));
-}
-
-template <typename T>
-void PutVec(std::vector<uint8_t>& out, const std::vector<T>& vec) {
-    PutPod(out, static_cast<uint64_t>(vec.size()));
-    if (!vec.empty()) {
-        const auto* bytes = reinterpret_cast<const uint8_t*>(vec.data());
-        out.insert(out.end(), bytes, bytes + vec.size() * sizeof(T));
-    }
-}
-
-void PutStr(std::vector<uint8_t>& out, std::string_view s) {
-    PutPod(out, static_cast<uint64_t>(s.size()));
-    if (!s.empty()) {
-        const auto* bytes = reinterpret_cast<const uint8_t*>(s.data());
-        out.insert(out.end(), bytes, bytes + s.size());
-    }
-}
-
-struct ByteReader {
+struct BinaryArchive {
+    std::vector<uint8_t>* out = nullptr;
     const uint8_t* p = nullptr;
     size_t left = 0;
+    bool ok = true;
 
     template <typename T>
-    bool GetPod(T& value) noexcept {
-        if (left < sizeof(T)) {
-            return false;
+    void Pod(T& v) {
+        if (out != nullptr) {
+            const auto* b = reinterpret_cast<const uint8_t*>(&v);
+            out->insert(out->end(), b, b + sizeof(T));
+        } else if (left >= sizeof(T)) {
+            std::memcpy(&v, p, sizeof(T));
+            p += sizeof(T);
+            left -= sizeof(T);
+        } else {
+            ok = false;
         }
-        std::memcpy(&value, p, sizeof(T));
-        p += sizeof(T);
-        left -= sizeof(T);
-        return true;
     }
 
     template <typename T>
-    bool GetVec(std::vector<T>& vec, size_t maxElements = (1ULL << 27)) {
-        uint64_t count = 0;
-        if (!GetPod(count) || count > maxElements || count > left / sizeof(T)) {
-            return false;
+    void Vec(std::vector<T>& vec, size_t maxElements = (1ULL << 27)) {
+        auto count = static_cast<uint64_t>(vec.size());
+        Pod(count);
+        if (!ok) {
+            return;
         }
-        const auto n = static_cast<size_t>(count);
-        vec.resize(n);
-        if (n > 0) {
-            std::memcpy(vec.data(), p, n * sizeof(T));
-            p += n * sizeof(T);
-            left -= n * sizeof(T);
+        if (out != nullptr) {
+            const auto* b = reinterpret_cast<const uint8_t*>(vec.data());
+            out->insert(out->end(), b, b + vec.size() * sizeof(T));
+        } else if (count <= maxElements && count <= left / sizeof(T)) {
+            vec.resize(static_cast<size_t>(count));
+            if (count > 0) {
+                std::memcpy(vec.data(), p, static_cast<size_t>(count) * sizeof(T));
+                p += static_cast<size_t>(count) * sizeof(T);
+                left -= static_cast<size_t>(count) * sizeof(T);
+            }
+        } else {
+            ok = false;
         }
-        return true;
     }
 
-    bool GetStr(std::string& s, size_t maxBytes = (1ULL << 29)) {
-        uint64_t count = 0;
-        if (!GetPod(count) || count > maxBytes || count > left) {
-            return false;
+    void Str(std::string& s, size_t maxBytes = (1ULL << 29)) {
+        auto count = static_cast<uint64_t>(s.size());
+        Pod(count);
+        if (!ok) {
+            return;
         }
-        const auto n = static_cast<size_t>(count);
-        s.resize(n);
-        if (n > 0) {
-            std::memcpy(s.data(), p, n);
-            p += n;
-            left -= n;
+        if (out != nullptr) {
+            const auto* b = reinterpret_cast<const uint8_t*>(s.data());
+            out->insert(out->end(), b, b + s.size());
+        } else if (count <= maxBytes && count <= left) {
+            s.resize(static_cast<size_t>(count));
+            if (count > 0) {
+                std::memcpy(s.data(), p, static_cast<size_t>(count));
+                p += static_cast<size_t>(count);
+                left -= static_cast<size_t>(count);
+            }
+        } else {
+            ok = false;
         }
-        return true;
     }
 };
 
 }  // namespace
 
 void FileIndex::Serialize(std::vector<uint8_t>& out) const {
-    PutPod(out, kIndexCacheMagic);
-    PutPod(out, static_cast<uint64_t>(m_liveEntries));
-    PutPod(out, static_cast<uint64_t>(m_deadNameBytes));
-    PutPod(out, m_sortedEnd);
-
-    PutVec(out, m_parent);
-    PutVec(out, m_slot);
-    PutVec(out, m_flags);
-    PutVec(out, m_zone);
-    PutVec(out, m_slotStart);
-    PutVec(out, m_slotEntry);
-    PutVec(out, m_slotBase);
-    PutVec(out, m_slotKey);
-    PutStr(out, m_names);
-
-    PutPod(out, static_cast<uint64_t>(m_volumes.size()));
-    for (const Volume& v : m_volumes) {
-        PutStr(out, v.rootName);
-        PutPod(out, v.rootEntry);
-        PutPod(out, v.rootRecord);
-        PutPod(out, v.firstPending);
-        PutVec(out, v.byRecord);
+    auto& self = const_cast<FileIndex&>(*this);
+    BinaryArchive ar{&out, nullptr, 0, true};
+    uint32_t magic = kIndexCacheMagic;
+    auto live = static_cast<uint64_t>(m_liveEntries);
+    auto dead = static_cast<uint64_t>(m_deadNameBytes);
+    ar.Pod(magic);
+    ar.Pod(live);
+    ar.Pod(dead);
+    ar.Pod(self.m_sortedEnd);
+    ar.Vec(self.m_parent);
+    ar.Vec(self.m_slot);
+    ar.Vec(self.m_flags);
+    ar.Vec(self.m_zone);
+    ar.Vec(self.m_slotStart);
+    ar.Vec(self.m_slotEntry);
+    ar.Vec(self.m_slotBase);
+    ar.Vec(self.m_slotKey);
+    ar.Str(self.m_names);
+    auto volumeCount = static_cast<uint64_t>(m_volumes.size());
+    ar.Pod(volumeCount);
+    for (Volume& v : self.m_volumes) {
+        ar.Str(v.rootName);
+        ar.Pod(v.rootEntry);
+        ar.Pod(v.rootRecord);
+        ar.Pod(v.firstPending);
+        ar.Vec(v.byRecord);
     }
-
-    PutPod(out, static_cast<uint64_t>(m_zoneMarkers.size()));
-    for (const auto& [key, zone] : m_zoneMarkers) {
-        PutPod(out, key);
-        PutPod(out, zone);
+    auto markerCount = static_cast<uint64_t>(m_zoneMarkers.size());
+    ar.Pod(markerCount);
+    for (const auto& [k, z] : m_zoneMarkers) {
+        uint64_t key = k;
+        uint8_t zone = z;
+        ar.Pod(key);
+        ar.Pod(zone);
     }
 }
 
 bool FileIndex::Deserialize(const uint8_t* data, size_t size) {
-    ByteReader r{data, size};
+    FileIndex tmp;
+    BinaryArchive ar{nullptr, data, size, true};
     uint32_t magic = 0;
-    uint64_t liveEntries = 0;
-    uint64_t deadNameBytes = 0;
-    uint32_t sortedEnd = 0;
-    if (!r.GetPod(magic) || magic != kIndexCacheMagic || !r.GetPod(liveEntries) ||
-        !r.GetPod(deadNameBytes) || !r.GetPod(sortedEnd)) {
+    uint64_t live = 0;
+    uint64_t dead = 0;
+    ar.Pod(magic);
+    ar.Pod(live);
+    ar.Pod(dead);
+    ar.Pod(tmp.m_sortedEnd);
+    if (!ar.ok || magic != kIndexCacheMagic) {
         return false;
     }
-
-    std::vector<uint32_t> parent;
-    std::vector<uint32_t> slot;
-    std::vector<uint8_t> flags;
-    std::vector<uint8_t> zone;
-    std::vector<uint32_t> slotStart;
-    std::vector<uint32_t> slotEntry;
-    std::vector<int16_t> slotBase;
-    std::vector<uint16_t> slotKey;
-    std::string names;
-
-    if (!r.GetVec(parent) || !r.GetVec(slot) || !r.GetVec(flags) || !r.GetVec(zone) ||
-        !r.GetVec(slotStart) || !r.GetVec(slotEntry) || !r.GetVec(slotBase) ||
-        !r.GetVec(slotKey) || !r.GetStr(names)) {
-        return false;
-    }
-
-    const size_t entryCount = parent.size();
-    const size_t slotCount = slotEntry.size();
-    if (slot.size() != entryCount || flags.size() != entryCount || zone.size() != entryCount ||
-        slotBase.size() != slotCount || slotKey.size() != slotCount ||
-        slotStart.size() != slotCount + 1 || sortedEnd > slotCount ||
-        names.size() < kPad || liveEntries > entryCount) {
-        return false;
-    }
-
-    const size_t logicalNames = names.size() - kPad;
-    if (slotStart.front() != 0 || slotStart.back() != logicalNames) {
-        return false;
-    }
-    for (size_t i = 0; i < kPad; ++i) {
-        if (names[logicalNames + i] != '\0') {
-            return false;
-        }
-    }
-    for (size_t i = 0; i < entryCount; ++i) {
-        if (parent[i] >= entryCount || (slot[i] != kNone && slot[i] >= slotCount)) {
-            return false;
-        }
-    }
-    for (size_t s = 0; s < slotCount; ++s) {
-        const uint32_t s0 = slotStart[s];
-        const uint32_t s1 = slotStart[s + 1];
-        if (s1 <= s0 || s1 > logicalNames || names[s1 - 1] != '\0') {
-            return false;
-        }
-        if (slotEntry[s] != kNone && slotEntry[s] >= entryCount) {
-            return false;
-        }
-    }
+    ar.Vec(tmp.m_parent);
+    ar.Vec(tmp.m_slot);
+    ar.Vec(tmp.m_flags);
+    ar.Vec(tmp.m_zone);
+    ar.Vec(tmp.m_slotStart);
+    ar.Vec(tmp.m_slotEntry);
+    ar.Vec(tmp.m_slotBase);
+    ar.Vec(tmp.m_slotKey);
+    ar.Str(tmp.m_names);
 
     uint64_t volumeCount = 0;
-    if (!r.GetPod(volumeCount) || volumeCount > 64) {
+    ar.Pod(volumeCount);
+    if (!ar.ok || volumeCount > 64) {
         return false;
     }
-    std::vector<Volume> volumes(static_cast<size_t>(volumeCount));
-    for (Volume& v : volumes) {
-        if (!r.GetStr(v.rootName, 64) || !r.GetPod(v.rootEntry) || !r.GetPod(v.rootRecord) ||
-            !r.GetPod(v.firstPending) || !r.GetVec(v.byRecord)) {
+    tmp.m_volumes.resize(static_cast<size_t>(volumeCount));
+    for (Volume& v : tmp.m_volumes) {
+        ar.Str(v.rootName, 64);
+        ar.Pod(v.rootEntry);
+        ar.Pod(v.rootRecord);
+        ar.Pod(v.firstPending);
+        ar.Vec(v.byRecord);
+    }
+
+    uint64_t markerCount = 0;
+    ar.Pod(markerCount);
+    if (!ar.ok || markerCount > (1ULL << 16)) {
+        return false;
+    }
+    tmp.m_zoneMarkers.reserve(static_cast<size_t>(markerCount));
+    for (uint64_t i = 0; i < markerCount && ar.ok; ++i) {
+        uint64_t key = 0;
+        uint8_t zone = 0;
+        ar.Pod(key);
+        ar.Pod(zone);
+        tmp.m_zoneMarkers[key] = zone;
+    }
+
+    const size_t entries = tmp.m_parent.size();
+    const size_t slots = tmp.m_slotEntry.size();
+    if (!ar.ok || ar.left != 0 || tmp.m_slot.size() != entries || tmp.m_flags.size() != entries ||
+        tmp.m_zone.size() != entries || tmp.m_slotBase.size() != slots || tmp.m_slotKey.size() != slots ||
+        tmp.m_slotStart.size() != slots + 1 || tmp.m_sortedEnd > slots || tmp.m_names.size() < kPad ||
+        live > entries) {
+        return false;
+    }
+    const size_t logical = tmp.m_names.size() - kPad;
+    if (tmp.m_slotStart.front() != 0 || tmp.m_slotStart.back() != logical) {
+        return false;
+    }
+    for (size_t i = logical; i < tmp.m_names.size(); ++i) {
+        if (tmp.m_names[i] != '\0') {
             return false;
         }
-        if (v.rootEntry >= entryCount || v.firstPending > entryCount) {
+    }
+    for (size_t i = 0; i < entries; ++i) {
+        if (tmp.m_parent[i] >= entries || (tmp.m_slot[i] != kNone && tmp.m_slot[i] >= slots)) {
+            return false;
+        }
+    }
+    for (size_t s = 0; s < slots; ++s) {
+        const uint32_t s0 = tmp.m_slotStart[s];
+        const uint32_t s1 = tmp.m_slotStart[s + 1];
+        if (s1 <= s0 || s1 > logical || tmp.m_names[s1 - 1] != '\0' ||
+            (tmp.m_slotEntry[s] != kNone && tmp.m_slotEntry[s] >= entries)) {
+            return false;
+        }
+    }
+    for (const Volume& v : tmp.m_volumes) {
+        if (v.rootEntry >= entries || v.firstPending > entries) {
             return false;
         }
         for (const uint32_t e : v.byRecord) {
-            if (e != kNone && e >= entryCount) {
+            if (e != kNone && e >= entries) {
                 return false;
             }
         }
     }
 
-    uint64_t markerCount = 0;
-    if (!r.GetPod(markerCount) || markerCount > (1ULL << 16)) {
-        return false;
-    }
-    std::unordered_map<uint64_t, uint8_t> markers;
-    markers.reserve(static_cast<size_t>(markerCount));
-    for (uint64_t i = 0; i < markerCount; ++i) {
-        uint64_t key = 0;
-        uint8_t z = 0;
-        if (!r.GetPod(key) || !r.GetPod(z)) {
-            return false;
-        }
-        markers[key] = z;
-    }
-    if (r.left != 0) {
-        return false;
-    }
-
-    m_parent = std::move(parent);
-    m_slot = std::move(slot);
-    m_flags = std::move(flags);
-    m_zone = std::move(zone);
-    m_pendingParent.clear();
-    m_slotStart = std::move(slotStart);
-    m_slotEntry = std::move(slotEntry);
-    m_slotBase = std::move(slotBase);
-    m_slotKey = std::move(slotKey);
-    m_sortedEnd = sortedEnd;
-    m_names = std::move(names);
-    m_deadNameBytes = static_cast<size_t>(deadNameBytes);
-    m_volumes = std::move(volumes);
-    m_zoneMarkers = std::move(markers);
-    m_liveEntries = static_cast<size_t>(liveEntries);
-    ++m_generation;
+    tmp.m_liveEntries = static_cast<size_t>(live);
+    tmp.m_deadNameBytes = static_cast<size_t>(dead);
+    tmp.m_generation = m_generation + 1;
+    *this = std::move(tmp);
     return true;
 }
 

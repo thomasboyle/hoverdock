@@ -842,7 +842,6 @@ private:
     [[nodiscard]] int TrashRenderIndex() const noexcept;
     [[nodiscard]] bool IsPointOverTrash(POINT screen) const noexcept;
     void RefreshTrash(bool forceLayout);
-    void ApplyTrashRefresh(ULONGLONG itemCount, ULONGLONG byteSize, bool forceLayout);
     void EnsureTrashIcons();
     void UpdateTrashIconState(bool full);
     void OpenTrash();
@@ -1501,10 +1500,6 @@ private:
     UINT m_loadedTrashExtent = 0;
     bool m_trashDragOver = false;
     bool m_trashDropInFlight = false;
-    std::atomic<bool> m_trashRefreshInFlight{false};
-    std::atomic<bool> m_trashRefreshForce{false};
-    std::atomic<ULONGLONG> m_trashPendingCount{0};
-    std::atomic<ULONGLONG> m_trashPendingBytes{0};
     ULONG m_trashNotifyCookie = 0;
     TrashPidl m_trashNotifyPidl = nullptr;
     IDropTarget* m_trashDropTarget = nullptr;

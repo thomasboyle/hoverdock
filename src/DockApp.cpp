@@ -3682,9 +3682,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
     }
 
     case kTrashRefreshMessage:
-        ApplyTrashRefresh(m_trashPendingCount.load(std::memory_order_relaxed),
-            m_trashPendingBytes.load(std::memory_order_relaxed),
-            m_trashRefreshForce.exchange(false, std::memory_order_relaxed));
+        RefreshTrash(false);
         return 0;
 
     case kTrashDropMessage: {
@@ -5871,28 +5869,35 @@ void DockApp::UpdateTrashIconState(bool full) {
 }
 
 void DockApp::RefreshTrash(bool forceLayout) {
+    static std::atomic<bool> s_inFlight{false};
+    static std::atomic<bool> s_haveResult{false};
+    static std::atomic<bool> s_force{false};
+    static std::atomic<ULONGLONG> s_itemCount{0};
+    static std::atomic<ULONGLONG> s_byteSize{0};
+
     if (forceLayout) {
-        m_trashRefreshForce.store(true, std::memory_order_relaxed);
+        s_force.store(true, std::memory_order_relaxed);
     }
-    if (m_window == nullptr || m_trashRefreshInFlight.exchange(true, std::memory_order_relaxed)) {
+    if (!s_haveResult.exchange(false, std::memory_order_acquire)) {
+        if (m_window != nullptr && !s_inFlight.exchange(true, std::memory_order_relaxed)) {
+            const HWND reply = m_window;
+            std::thread([reply]() {
+                RecycleBinState shell{};
+                if (RecycleBin::QueryState(shell)) {
+                    s_itemCount.store(shell.itemCount, std::memory_order_relaxed);
+                    s_byteSize.store(shell.byteSize, std::memory_order_relaxed);
+                    s_haveResult.store(true, std::memory_order_release);
+                    PostMessageW(reply, kTrashRefreshMessage, 0, 0);
+                }
+                s_inFlight.store(false, std::memory_order_relaxed);
+            }).detach();
+        }
         return;
     }
-    const HWND reply = m_window;
-    std::thread([this, reply]() {
-        RecycleBinState shell{};
-        const bool ok = RecycleBin::QueryState(shell);
-        if (ok) {
-            m_trashPendingCount.store(shell.itemCount, std::memory_order_relaxed);
-            m_trashPendingBytes.store(shell.byteSize, std::memory_order_relaxed);
-        }
-        m_trashRefreshInFlight.store(false, std::memory_order_relaxed);
-        if (ok) {
-            PostMessageW(reply, kTrashRefreshMessage, 0, 0);
-        }
-    }).detach();
-}
 
-void DockApp::ApplyTrashRefresh(ULONGLONG itemCount, ULONGLONG byteSize, bool forceLayout) {
+    forceLayout = forceLayout || s_force.exchange(false, std::memory_order_relaxed);
+    const ULONGLONG itemCount = s_itemCount.load(std::memory_order_relaxed);
+    const ULONGLONG byteSize = s_byteSize.load(std::memory_order_relaxed);
     const bool full = (itemCount > 0);
     const bool changed = (full != m_trashFull) ||
         (itemCount != m_trashState.itemCount) ||

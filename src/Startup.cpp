@@ -190,26 +190,7 @@ private:
     bool m_ownedCom = false;
 };
 
-bool TaskExists() {
-    TaskService task;
-    if (!task.Connect()) {
-        return false;
-    }
-    BSTR name = SysAllocString(kTaskName);
-    if (name == nullptr) {
-        return false;
-    }
-    IRegisteredTask* registered = nullptr;
-    const HRESULT got = task.Folder()->GetTask(name, &registered);
-    SysFreeString(name);
-    if (SUCCEEDED(got) && registered != nullptr) {
-        registered->Release();
-        return true;
-    }
-    return false;
-}
-
-bool TaskIsHealthy() {
+bool TaskExists(bool requireBatteryAllowed = false) {
     TaskService task;
     if (!task.Connect()) {
         return false;
@@ -224,24 +205,24 @@ bool TaskIsHealthy() {
     if (FAILED(got) || registered == nullptr) {
         return false;
     }
-    bool healthy = false;
-    ITaskDefinition* definition = nullptr;
-    if (SUCCEEDED(registered->get_Definition(&definition)) && definition != nullptr) {
-        ITaskSettings* settings = nullptr;
-        if (SUCCEEDED(definition->get_Settings(&settings)) && settings != nullptr) {
-            VARIANT_BOOL disallowOnBatteries = VARIANT_TRUE;
-            VARIANT_BOOL stopOnBatteries = VARIANT_TRUE;
-            if (SUCCEEDED(settings->get_DisallowStartIfOnBatteries(&disallowOnBatteries)) &&
-                SUCCEEDED(settings->get_StopIfGoingOnBatteries(&stopOnBatteries)) &&
-                disallowOnBatteries == VARIANT_FALSE && stopOnBatteries == VARIANT_FALSE) {
-                healthy = true;
+    bool ok = !requireBatteryAllowed;
+    if (requireBatteryAllowed) {
+        ITaskDefinition* definition = nullptr;
+        if (SUCCEEDED(registered->get_Definition(&definition)) && definition != nullptr) {
+            ITaskSettings* settings = nullptr;
+            if (SUCCEEDED(definition->get_Settings(&settings)) && settings != nullptr) {
+                VARIANT_BOOL disallow = VARIANT_TRUE;
+                VARIANT_BOOL stop = VARIANT_TRUE;
+                ok = SUCCEEDED(settings->get_DisallowStartIfOnBatteries(&disallow)) &&
+                    SUCCEEDED(settings->get_StopIfGoingOnBatteries(&stop)) &&
+                    disallow == VARIANT_FALSE && stop == VARIANT_FALSE;
+                settings->Release();
             }
-            settings->Release();
+            definition->Release();
         }
-        definition->Release();
     }
     registered->Release();
-    return healthy;
+    return ok;
 }
 
 bool DeleteLogonTask() {
@@ -519,7 +500,7 @@ void Startup::SyncWithConfig(bool configEnabled) {
     }
     // Fast path: Run already correct and the logon task exists with battery
     // launch enabled (the common steady state) — nothing to repair.
-    if (runOk && TaskIsHealthy()) {
+    if (runOk && TaskExists(true)) {
         DisableStartupDelay();
         return;
     }
