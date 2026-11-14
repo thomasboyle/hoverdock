@@ -20,27 +20,10 @@ std::wstring Quoted(const std::wstring& path) {
     return L"\"" + path + L"\"";
 }
 
-bool RunValuePresent() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
-        return false;
+bool ReadRunCommand(std::wstring* command = nullptr) {
+    if (command != nullptr) {
+        command->clear();
     }
-    wchar_t value[32768]{};
-    DWORD byteCount = sizeof(value);
-    DWORD type = 0;
-    const LONG queried =
-        RegQueryValueExW(key, kRunValueName, nullptr, &type, reinterpret_cast<BYTE*>(value),
-            &byteCount);
-    RegCloseKey(key);
-    if (queried != ERROR_SUCCESS || type != REG_SZ) {
-        return false;
-    }
-    // Any value counts as enabled; SyncWithConfig repairs stale paths below.
-    return value[0] != L'\0';
-}
-
-bool ReadRunCommand(std::wstring& command) {
-    command.clear();
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
         return false;
@@ -55,8 +38,15 @@ bool ReadRunCommand(std::wstring& command) {
     if (queried != ERROR_SUCCESS || type != REG_SZ || value[0] == L'\0') {
         return false;
     }
-    command.assign(value);
+    if (command != nullptr) {
+        command->assign(value);
+    }
     return true;
+}
+
+bool RunValuePresent() {
+    // Any value counts as enabled; SyncWithConfig repairs stale paths below.
+    return ReadRunCommand();
 }
 
 bool WriteRunCommand(const std::wstring& command) {
@@ -480,7 +470,7 @@ void Startup::SyncWithConfig(bool configEnabled) {
     }
 
     std::wstring current;
-    const bool hasRun = ReadRunCommand(current);
+    const bool hasRun = ReadRunCommand(&current);
     const bool runOk = hasRun && current == command;
 
     if (!configEnabled) {

@@ -5299,29 +5299,44 @@ void DockApp::ApplyIconLoad(const IconLoadRequest& request,
     RefreshTrash(true);
 }
 
-std::wstring DockApp::TrayIconsKey() const {
+namespace {
+
+struct ClockIconExtent {
+    UINT width = 128U;
+    UINT height = 48U;
+};
+
+ClockIconExtent ResolveClockIconExtent(const std::vector<DockIconRenderData>& icons) noexcept {
     RECT clockBounds{};
-    for (const DockIconRenderData& icon : m_iconRenderData) {
+    for (const DockIconRenderData& icon : icons) {
         if (icon.kind == DockIconKind::Clock) {
             clockBounds = icon.bounds;
             break;
         }
     }
+    return {
+        clockBounds.right > clockBounds.left
+            ? static_cast<UINT>(clockBounds.right - clockBounds.left)
+            : 128U,
+        clockBounds.bottom > clockBounds.top
+            ? static_cast<UINT>(clockBounds.bottom - clockBounds.top)
+            : 48U,
+    };
+}
+
+}  // namespace
+
+std::wstring DockApp::TrayIconsKey() const {
+    const ClockIconExtent clock = ResolveClockIconExtent(m_iconRenderData);
     const UINT atlas = m_renderer.IconAtlasPixelExtent();
-    const UINT clockWidth = clockBounds.right > clockBounds.left
-        ? static_cast<UINT>(clockBounds.right - clockBounds.left)
-        : 128U;
-    const UINT clockHeight = clockBounds.bottom > clockBounds.top
-        ? static_cast<UINT>(clockBounds.bottom - clockBounds.top)
-        : 48U;
     const TrayStatus& status = m_tray.Status();
     const WeatherService::Snapshot weather = m_weather.GetSnapshot();
     std::wstring weatherKey = weather.valid
         ? (std::wstring(weather.slug.begin(), weather.slug.end()) + L"|" +
             std::to_wstring(static_cast<int>(std::lround(weather.temperatureC))))
         : L"none";
-    return std::to_wstring(atlas) + L"|" + std::to_wstring(clockWidth) + L"x" +
-        std::to_wstring(clockHeight) + L"|" + status.timeText + L"|" + status.dateText + L"|" +
+    return std::to_wstring(atlas) + L"|" + std::to_wstring(clock.width) + L"x" +
+        std::to_wstring(clock.height) + L"|" + status.timeText + L"|" + status.dateText + L"|" +
         (status.hasBattery ? L"1" : L"0") + L"|" + (status.batteryCharging ? L"1" : L"0") + L"|" +
         std::to_wstring(status.batteryPercent) + L"|" + weatherKey;
 }
@@ -5384,19 +5399,7 @@ void DockApp::EnsureTrayIcons() {
 
     const TrayStatus& status = m_tray.Status();
     const UINT atlas = m_renderer.IconAtlasPixelExtent();
-    RECT clockBounds{};
-    for (const DockIconRenderData& icon : m_iconRenderData) {
-        if (icon.kind == DockIconKind::Clock) {
-            clockBounds = icon.bounds;
-            break;
-        }
-    }
-    const UINT clockWidth = clockBounds.right > clockBounds.left
-        ? static_cast<UINT>(clockBounds.right - clockBounds.left)
-        : 128U;
-    const UINT clockHeight = clockBounds.bottom > clockBounds.top
-        ? static_cast<UINT>(clockBounds.bottom - clockBounds.top)
-        : 48U;
+    const ClockIconExtent clock = ResolveClockIconExtent(m_iconRenderData);
 
     std::vector<std::wstring> targets;
     std::vector<std::vector<uint8_t>> pixels;
@@ -5410,7 +5413,7 @@ void DockApp::EnsureTrayIcons() {
         if (slot == TraySlot::Clock) {
             const UINT dpi = m_window == nullptr ? 96U : std::max(GetDpiForWindow(m_window), 96U);
             const float layoutScale = static_cast<float>(dpi) / 96.0F * m_dockScale;
-            pixels.push_back(m_tray.RasterizeClock(atlas, clockWidth, clockHeight, layoutScale));
+            pixels.push_back(m_tray.RasterizeClock(atlas, clock.width, clock.height, layoutScale));
         } else {
             pixels.push_back(m_tray.RasterizeGlyph(slot, atlas));
         }

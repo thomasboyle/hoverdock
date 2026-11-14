@@ -1164,14 +1164,7 @@ void WindowCatalog::RebuildPinProfiles(const std::vector<PinnedApp>& pins) {
                 profile.normalizedPaths.push_back(normalized);
             }
 
-            const std::wstring executableName = FileNameWithoutExtension(normalized);
-            const bool nameKnown = std::ranges::any_of(profile.executableNames,
-                [&executableName](const std::wstring& existing) {
-                    return EqualInsensitive(existing, executableName);
-                });
-            if (!nameKnown) {
-                profile.executableNames.push_back(executableName);
-            }
+            addExecutableName(FileNameWithoutExtension(normalized));
         };
 
         addCandidate(pin.target);
@@ -1191,15 +1184,6 @@ void WindowCatalog::RebuildPinProfiles(const std::vector<PinnedApp>& pins) {
             !steamAppId.empty()) {
             for (const std::wstring& gameExe : SteamGameExecutables(steamAppId)) {
                 addCandidate(gameExe);
-            }
-        }
-        if (IsAppsFolderTarget(pin.target)) {
-            profile.appsFolderAumid = AppsFolderAumid(pin.target);
-            m_pinMatchingNeedsAumid = true;
-            const size_t bang = profile.appsFolderAumid.find(L'!');
-            if (bang != std::wstring::npos) {
-                profile.packageFamily = profile.appsFolderAumid.substr(0, bang);
-                addExecutableName(profile.appsFolderAumid.substr(bang + 1));
             }
         }
 

@@ -1075,7 +1075,7 @@ void AppendJsonDouble(std::string& out, double value) {
     out += text;
 }
 
-void AppendBoostProcess(std::string& out, const BoostCandidate& candidate) {
+void AppendCandidateIdentity(std::string& out, const BoostCandidate& candidate) {
     out += '{';
     AppendEscaped(out, "id");
     out += ':';
@@ -1084,6 +1084,10 @@ void AppendBoostProcess(std::string& out, const BoostCandidate& candidate) {
     AppendUtf8Field(out, "name", candidate.name);
     out += ',';
     AppendUtf8Field(out, "exe", candidate.exePath);
+}
+
+void AppendBoostProcess(std::string& out, const BoostCandidate& candidate) {
+    AppendCandidateIdentity(out, candidate);
     out += ",\"memory_mb\":";
     AppendJsonDouble(out, candidate.memoryMb);
     out += ",\"cpu_pct\":";
@@ -1097,24 +1101,58 @@ void AppendBoostProcess(std::string& out, const BoostCandidate& candidate) {
     out += '}';
 }
 
-std::string BuildBoostRequestBody(const std::vector<BoostCandidate>& candidates) {
+void AppendStartupBoostApp(std::string& out, const BoostCandidate& candidate) {
+    AppendCandidateIdentity(out, candidate);
+    out += ",\"running\":";
+    out += candidate.ageSeconds > 0 || candidate.memoryMb > 0.0 || candidate.hasWindow
+        ? "true"
+        : "false";
+    out += ",\"has_window\":";
+    out += candidate.hasWindow ? "true" : "false";
+    out += ",\"memory_mb\":";
+    AppendJsonDouble(out, candidate.memoryMb);
+    out += ",\"cpu_pct\":";
+    AppendJsonDouble(out, candidate.cpuPercent);
+    out += '}';
+}
+
+std::string BeginBoostRequestBody(std::string_view surface, std::string_view focus,
+    std::string_view policy, std::string_view listKey) {
     std::string body = "{\"model\":\"jev-latest\",\"state\":{\"surface\":";
-    AppendEscaped(body,
+    AppendEscaped(body, surface);
+    body += ",\"focus\":";
+    AppendEscaped(body, focus);
+    body += ",\"policy\":";
+    AppendEscaped(body, policy);
+    body += ',';
+    AppendEscaped(body, listKey);
+    body += ":[";
+    return body;
+}
+
+void AppendNoulQuestion(std::string& body, std::string_view id, std::string_view instructions,
+    std::string_view criteriaTrue, std::string_view criteriaFalse) {
+    AppendEscaped(body, id);
+    body += ":{\"type\":\"noul\",\"instructions\":";
+    AppendEscaped(body, instructions);
+    body += ",\"criteria\":{\"true\":";
+    AppendEscaped(body, criteriaTrue);
+    body += ",\"false\":";
+    AppendEscaped(body, criteriaFalse);
+    body += "}}";
+}
+
+std::string BuildBoostRequestBody(const std::vector<BoostCandidate>& candidates) {
+    std::string body = BeginBoostRequestBody(
         "Windows Quick Settings Boost performance in a desktop dock. Code enumerated "
         "candidate processes with memory, CPU, window, and age. Code enforces its own "
-        "denylist and owns all closing; Jev only supplies safe/idle probabilities.");
-    body += ",\"focus\":";
-    AppendEscaped(body,
+        "denylist and owns all closing; Jev only supplies safe/idle probabilities.",
         "Keep the foreground app and important user work fast by reclaiming memory "
-        "from idle background work that is safe to close.");
-    body += ',';
-    AppendEscaped(body, "policy");
-    body += ':';
-    AppendEscaped(body,
+        "from idle background work that is safe to close.",
         "Never approve closing operating-system components, drivers, security "
         "software, shell hosts, console hosts, or anything holding important unsaved "
-        "work. When the evidence is ambiguous, answer no.");
-    body += ",\"processes\":[";
+        "work. When the evidence is ambiguous, answer no.",
+        "processes");
     for (size_t index = 0; index < candidates.size(); ++index) {
         if (index > 0) {
             body += ',';
@@ -1127,36 +1165,23 @@ std::string BuildBoostRequestBody(const std::vector<BoostCandidate>& candidates)
             body += ',';
         }
         const std::string ref = "`processes[" + std::to_string(index) + "]`";
-        AppendEscaped(body, "safe_" + candidates[index].id);
-        body += ":{\"type\":\"noul\",\"instructions\":";
-        AppendEscaped(body,
+        AppendNoulQuestion(body, "safe_" + candidates[index].id,
             "Is " + ref + " safe to close right now? `policy` forbids harming Windows "
             "stability, drivers, security software, shell hosts, or important unsaved "
             "user work. Answer yes only when the process is ordinary user software "
-            "whose close is harmless or recoverable by reopening the app.");
-        body += ",\"criteria\":{\"true\":";
-        AppendEscaped(body,
-            "Ordinary user app or background agent; closing is harmless or recoverable.");
-        body += ",\"false\":";
-        AppendEscaped(body,
+            "whose close is harmless or recoverable by reopening the app.",
+            "Ordinary user app or background agent; closing is harmless or recoverable.",
             "OS, driver, security, shell, or actively important work; closing risks "
             "stability or data loss.");
-        body += "}},";
-        AppendEscaped(body, "idle_" + candidates[index].id);
-        body += ":{\"type\":\"noul\",\"instructions\":";
-        AppendEscaped(body,
+        body += ',';
+        AppendNoulQuestion(body, "idle_" + candidates[index].id,
             "Is " + ref + " idle background work rather than actively used? An empty "
             "`window_title` means it shows no window. Near-zero `cpu_pct` with a large "
             "`age_min` suggests idle. A `window_title` naming media, meetings, calls, "
             "downloads, gaming, recording, or an edited document means in use even at "
-            "low CPU.");
-        body += ",\"criteria\":{\"true\":";
-        AppendEscaped(body,
-            "No window and near-zero CPU, or a background agent with no sign of use.");
-        body += ",\"false\":";
-        AppendEscaped(body,
+            "low CPU.",
+            "No window and near-zero CPU, or a background agent with no sign of use.",
             "Has a window suggesting current use, notable CPU, or just started.");
-        body += "}}";
     }
     body += "}}";
     return body;
@@ -1164,52 +1189,26 @@ std::string BuildBoostRequestBody(const std::vector<BoostCandidate>& candidates)
 
 
 std::string BuildStartupBoostRequestBody(const std::vector<BoostCandidate>& candidates) {
-    std::string body = "{\"model\":\"jev-latest\",\"state\":{\"surface\":";
-    AppendEscaped(body,
+    std::string body = BeginBoostRequestBody(
         "Windows Quick Settings Boost performance in a desktop dock. Code enumerated "
         "currently enabled Windows startup apps (Run keys and Startup folder). Code "
         "hard-protects only the dock itself and Windows SecurityHealthSystray; Jev "
         "decides which other startup entries are safe to disable via StartupApproved "
-        "and end if running. Code owns every registry write and process end.");
-    body += ",\"focus\":";
-    AppendEscaped(body,
+        "and end if running. Code owns every registry write and process end.",
         "Speed up logon and free RAM by disabling non-essential startup apps that are "
         "safe to turn off for a gaming/performance boost, without harming security or "
-        "the shell.");
-    body += ',';
-    AppendEscaped(body, "policy");
-    body += ':';
-    AppendEscaped(body,
+        "the shell.",
         "Never approve disabling operating-system security, shell hosts, accessibility "
         "helpers the user relies on, disk encryption agents, or anything whose absence "
         "would break Windows stability. When evidence is ambiguous, answer no. Chat "
         "apps, browsers auto-launch, game launchers, and vendor updaters are typical "
-        "yes candidates when nothing indicates they are critical.");
-    body += ",\"startup_apps\":[";
+        "yes candidates when nothing indicates they are critical.",
+        "startup_apps");
     for (size_t index = 0; index < candidates.size(); ++index) {
         if (index > 0) {
             body += ',';
         }
-        const BoostCandidate& candidate = candidates[index];
-        body += '{';
-        AppendEscaped(body, "id");
-        body += ':';
-        AppendEscaped(body, candidate.id);
-        body += ',';
-        AppendUtf8Field(body, "name", candidate.name);
-        body += ',';
-        AppendUtf8Field(body, "exe", candidate.exePath);
-        body += ",\"running\":";
-        body += candidate.ageSeconds > 0 || candidate.memoryMb > 0.0 || candidate.hasWindow
-            ? "true"
-            : "false";
-        body += ",\"has_window\":";
-        body += candidate.hasWindow ? "true" : "false";
-        body += ",\"memory_mb\":";
-        AppendJsonDouble(body, candidate.memoryMb);
-        body += ",\"cpu_pct\":";
-        AppendJsonDouble(body, candidate.cpuPercent);
-        body += '}';
+        AppendStartupBoostApp(body, candidates[index]);
     }
     body += "]},\"questions\":{";
     for (size_t index = 0; index < candidates.size(); ++index) {
@@ -1217,33 +1216,20 @@ std::string BuildStartupBoostRequestBody(const std::vector<BoostCandidate>& cand
             body += ',';
         }
         const std::string ref = "`startup_apps[" + std::to_string(index) + "]`";
-        AppendEscaped(body, "safe_" + candidates[index].id);
-        body += ":{\"type\":\"noul\",\"instructions\":";
-        AppendEscaped(body,
+        AppendNoulQuestion(body, "safe_" + candidates[index].id,
             "Is " + ref + " safe to disable from Windows startup right now for a "
             "performance boost? `policy` forbids harming Windows security, shell "
             "stability, or critical system agents. Answer yes only for ordinary user "
-            "software that can be re-enabled later without risk.");
-        body += ",\"criteria\":{\"true\":";
-        AppendEscaped(body,
-            "Ordinary chat, browser, game launcher, updater, or similar; safe to disable.");
-        body += ",\"false\":";
-        AppendEscaped(body,
+            "software that can be re-enabled later without risk.",
+            "Ordinary chat, browser, game launcher, updater, or similar; safe to disable.",
             "OS security, shell, accessibility, encryption, or other critical agent.");
-        body += "}},";
-        AppendEscaped(body, "idle_" + candidates[index].id);
-        body += ":{\"type\":\"noul\",\"instructions\":";
-        AppendEscaped(body,
+        body += ',';
+        AppendNoulQuestion(body, "idle_" + candidates[index].id,
             "Is " + ref + " non-essential for day-to-day system health — i.e. optional "
             "background/chat/browser/game-launcher startup rather than something the "
-            "user likely needs at every logon for security or core workflow?");
-        body += ",\"criteria\":{\"true\":";
-        AppendEscaped(body,
-            "Optional launcher, chat, browser auto-start, or vendor updater.");
-        body += ",\"false\":";
-        AppendEscaped(body,
+            "user likely needs at every logon for security or core workflow?",
+            "Optional launcher, chat, browser auto-start, or vendor updater.",
             "Likely important tray/security/workflow agent the user would miss.");
-        body += "}}";
     }
     body += "}}";
     return body;

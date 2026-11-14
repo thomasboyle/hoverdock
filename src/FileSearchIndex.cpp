@@ -294,7 +294,6 @@ int ZoneBonus(Zone zone) noexcept {
 
 struct Query {
     std::string folded;            // tokens joined by one space
-    std::vector<std::string_view> parts;
     std::vector<Token> tokens;
     size_t anchor = 0;             // index of the longest token (scanned)
 };
@@ -302,6 +301,8 @@ struct Query {
 bool ParseQuery(std::string_view text, Query& query) {
     const std::string folded = FoldUtf8(text);
     query.folded.clear();
+    query.tokens.clear();
+    query.anchor = 0;
     size_t i = 0;
     while (i < folded.size()) {
         while (i < folded.size() && (folded[i] == ' ' || folded[i] == '\t')) {
@@ -325,14 +326,12 @@ bool ParseQuery(std::string_view text, Query& query) {
         if (end == std::string::npos) {
             end = query.folded.size();
         }
-        query.parts.emplace_back(query.folded.data() + pos, end - pos);
-        pos = end + 1;
-    }
-    for (const std::string_view part : query.parts) {
+        const std::string_view part(query.folded.data() + pos, end - pos);
         query.tokens.push_back(MakeToken(part));
-        if (part.size() > query.parts[query.anchor].size()) {
+        if (part.size() > query.tokens[query.anchor].length) {
             query.anchor = query.tokens.size() - 1;
         }
+        pos = end + 1;
     }
     return !query.tokens.empty();
 }
