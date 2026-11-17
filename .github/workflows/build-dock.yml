@@ -36,6 +36,7 @@ jobs:
           out\bin\Release\AiMarkdownTests.exe || exit /b 1
           out\bin\Release\GroqProtocolTests.exe || exit /b 1
           out\bin\Release\SearchAnimationTests.exe || exit /b 1
+          out\bin\Release\AudioPolicyTests.exe || exit /b 1
           out\bin\Release\DockConfigTests.exe || exit /b 1
 
       - name: Install NSIS

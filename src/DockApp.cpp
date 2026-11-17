@@ -6698,7 +6698,7 @@ void DockApp::FinishOverflowHide() noexcept {
         ShowWindow(m_overflowWindow, SW_HIDE);
     }
     m_overflowVisibility = VisibilityState::Hidden;
-    StopQuickSettingsCapture();
+    SyncQuickSettingsCapturePolicy(false, QuickSettingsPage::Home, m_config.HandsFree());
     if (m_overflowWindow != nullptr) {
         KillTimer(m_overflowWindow, kQsReorderTimerId);
     }
@@ -7025,6 +7025,8 @@ void DockApp::ArmOverflowLiveWorkers() noexcept {
     if (m_overflowWindow == nullptr) {
         return;
     }
+    SyncQuickSettingsCapturePolicy(
+        IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, m_config.HandsFree());
     const ULONGLONG now = GetTickCount64();
     if (m_qsCache.stampNetwork == 0 || now - m_qsCache.stampNetwork >= 2500ULL ||
         m_qsCache.stampNight == 0 || now - m_qsCache.stampNight >= 8000ULL) {
@@ -7089,7 +7091,7 @@ void DockApp::PrewarmOverflowPopup() noexcept {
         KillTimer(m_overflowWindow, kQsTempsTimerId);
         ShowWindow(m_overflowWindow, SW_HIDE);
     }
-    StopQuickSettingsCapture();
+    SyncQuickSettingsCapturePolicy(false, QuickSettingsPage::Home, m_config.HandsFree());
 }
 
 void DockApp::DestroyOverflowPopup() noexcept {
@@ -8419,6 +8421,11 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         ScheduleConfigSave();
         // Non-blocking: only queues a worker job for the 111E change.
         m_bluetooth.SetHandsFree(enabled, true);
+        SyncQuickSettingsCapturePolicy(
+            IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, enabled);
+        if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Microphone && enabled) {
+            EnsureQuickSettingsCaptureAsync();
+        }
         QueueSettingsPaint();
         break;
     }
@@ -9482,13 +9489,18 @@ void DockApp::HandleOverflowClick(const TrayFlyoutHit& hit, UINT message) {
             break;
         }
         {
-            const BluetoothDeviceInfo& device =
+            BluetoothDeviceInfo& device =
                 m_bluetoothSnapshot.paired[static_cast<size_t>(hit.index)];
             if (!device.busy && !device.id.empty()) {
-                if (device.connected) {
-                    m_bluetooth.Disconnect(device.id);
+                const std::wstring id = device.id;
+                const bool wasConnected = device.connected;
+                device.busy = true;
+                device.status = wasConnected ? L"Disconnecting..." : L"Connecting...";
+                QueueOverflowPaint();
+                if (wasConnected) {
+                    m_bluetooth.Disconnect(id);
                 } else {
-                    m_bluetooth.Connect(device.id);
+                    m_bluetooth.Connect(id);
                 }
             }
         }

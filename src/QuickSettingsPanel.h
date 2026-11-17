@@ -193,6 +193,10 @@ struct QuickSettingsCache {
 // Release the Quick Settings capture client so the microphone-in-use indicator
 // drops when the panel closes. Also stops the background peak pump.
 void StopQuickSettingsCapture() noexcept;
+// Update whether Quick Settings may open WASAPI capture on the active page.
+// Stops capture immediately on non-meter pages and prevents Home from pulling
+// Bluetooth headsets out of A2DP stereo into HFP SCO call mode.
+void SyncQuickSettingsCapturePolicy(bool popupVisible, QuickSettingsPage page, bool handsFree) noexcept;
 // Live-meter / media poll result. MetersOnly = peak or scrub moved (partial
 // present). Labels = title/artist/note/playing changed (full rebuild).
 enum class QsLiveChange : uint8_t {

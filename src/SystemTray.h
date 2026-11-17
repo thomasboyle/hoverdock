@@ -90,6 +90,8 @@ public:
     bool ToggleMute();
     bool AdjustVolume(float delta);
     bool SetVolumeLevel(float level);
+    void ProjectVolumeStatus(float level) noexcept;
+    static bool WriteSystemVolumeLevel(float level);
     bool AdjustBrightness(int deltaPercent);
     // Absolute set without re-reading first (worker threads only). The caller
     // owns freshness; used for debounced writes of an already-projected value.
@@ -113,6 +115,9 @@ private:
     // prefers this over power-scheme values (which don't track external
     // monitors) so it never clobbers freshly adjusted state with stale data.
     int m_ddcPercent = -1;
+    // Brief hold window (GetTickCount64 ms) while the async volume slider worker
+    // applies a projected level so the 1 Hz poll does not snap the thumb back.
+    ULONGLONG m_volumeProjectedUntil = 0;
     // MeasureClock cache: GDI font creation + text measurement costs ~1ms per
     // call, and RebuildLayout invokes it every time. The result only depends on
     // the clock texts and the scale, so cache it (mutable: MeasureClock is

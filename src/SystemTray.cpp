@@ -1,4 +1,5 @@
 #include "SystemTray.h"
+#include "AudioPolicy.h"
 #include "DockTheme.hlsli"
 
 #include <Unknwn.h>
@@ -22,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwctype>
+#include <mutex>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -600,7 +602,25 @@ std::vector<uint8_t> ScalePremultiplied(const std::vector<uint8_t>& source, UINT
     return dest;
 }
 
-IAudioEndpointVolume* OpenEndpointVolume() {
+struct SavedEndpointBalance {
+    std::mutex mutex;
+    std::wstring deviceId;
+    audio_policy::SavedChannelBalance balance;
+};
+
+SavedEndpointBalance& EndpointBalanceState() {
+    static SavedEndpointBalance state;
+    return state;
+}
+
+IAudioEndpointVolume* OpenEndpointVolume(bool* outIsBluetooth = nullptr,
+    std::wstring* outDeviceId = nullptr) {
+    if (outIsBluetooth != nullptr) {
+        *outIsBluetooth = false;
+    }
+    if (outDeviceId != nullptr) {
+        outDeviceId->clear();
+    }
     IMMDeviceEnumerator* enumerator = nullptr;
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
             IID_PPV_ARGS(&enumerator))) ||
@@ -611,6 +631,12 @@ IAudioEndpointVolume* OpenEndpointVolume() {
     IAudioEndpointVolume* volume = nullptr;
     if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device)) &&
         device != nullptr) {
+        if (outIsBluetooth != nullptr) {
+            *outIsBluetooth = audio_policy::IsBluetoothEndpoint(device);
+        }
+        if (outDeviceId != nullptr) {
+            *outDeviceId = audio_policy::EndpointDeviceId(device);
+        }
         static_cast<void>(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
             reinterpret_cast<void**>(&volume)));
         device->Release();
@@ -619,8 +645,56 @@ IAudioEndpointVolume* OpenEndpointVolume() {
     return volume;
 }
 
+bool WriteMasterVolumePreservingOrRepairingBalance(IAudioEndpointVolume* volume, float level,
+    bool isBluetooth, const std::wstring& deviceId) {
+    if (volume == nullptr) {
+        return false;
+    }
+    level = std::clamp(level, 0.0F, 1.0F);
+    UINT channelCount = 0;
+    std::array<float, audio_policy::kMaxAudioChannels> before{};
+    size_t tracked = 0;
+    if (SUCCEEDED(volume->GetChannelCount(&channelCount)) && channelCount >= 2) {
+        tracked = (std::min)(static_cast<size_t>(channelCount), audio_policy::kMaxAudioChannels);
+        for (size_t i = 0; i < tracked; ++i) {
+            if (FAILED(volume->GetChannelVolumeLevelScalar(static_cast<UINT>(i), &before[i]))) {
+                tracked = 0;
+                break;
+            }
+        }
+    }
+
+    std::array<float, audio_policy::kMaxAudioChannels> targets{};
+    if (tracked >= 2) {
+        SavedEndpointBalance& state = EndpointBalanceState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.deviceId != deviceId) {
+            state.deviceId = deviceId;
+            state.balance = {};
+        }
+        audio_policy::ComputeChannelVolumeTargets(
+            level, isBluetooth, before.data(), tracked, state.balance, targets.data());
+    }
+
+    if (FAILED(volume->SetMasterVolumeLevelScalar(level, &audio_policy::kVolumeEventContext))) {
+        return false;
+    }
+    volume->SetMute(FALSE, &audio_policy::kVolumeEventContext);
+
+    for (size_t i = 0; i < tracked; ++i) {
+        float after = targets[i];
+        if (SUCCEEDED(volume->GetChannelVolumeLevelScalar(static_cast<UINT>(i), &after)) &&
+            std::fabs(after - targets[i]) > audio_policy::kBluetoothBalanceTolerance) {
+            static_cast<void>(volume->SetChannelVolumeLevelScalar(
+                static_cast<UINT>(i), targets[i], &audio_policy::kVolumeEventContext));
+        }
+    }
+    return true;
+}
+
 void QueryVolume(TrayStatus& status) {
-    IAudioEndpointVolume* volume = OpenEndpointVolume();
+    bool isBluetooth = false;
+    IAudioEndpointVolume* volume = OpenEndpointVolume(&isBluetooth, nullptr);
     if (volume == nullptr) {
         return;
     }
@@ -631,6 +705,9 @@ void QueryVolume(TrayStatus& status) {
     }
     if (SUCCEEDED(volume->GetMasterVolumeLevelScalar(&level))) {
         status.volumeLevel = std::clamp(level, 0.0F, 1.0F);
+    }
+    if (isBluetooth) {
+        audio_policy::RepairBluetoothBalance(volume, &status.volumeLevel);
     }
     volume->Release();
 }
@@ -970,7 +1047,12 @@ bool SystemTray::Refresh() {
     TrayStatus next;
     QueryClock(next);
     QueryBattery(next);
-    QueryVolume(next);
+    if (GetTickCount64() < m_volumeProjectedUntil) {
+        next.volumeLevel = m_status.volumeLevel;
+        next.volumeMuted = m_status.volumeMuted;
+    } else {
+        QueryVolume(next);
+    }
     QueryNetwork(next);
     QueryBrightness(next, m_ddcPercent);
     const bool changed = next.network != m_status.network || next.wifiBars != m_status.wifiBars ||
@@ -2203,51 +2285,65 @@ bool SystemTray::ToggleMute() {
         return OpenSoundMixer();
     }
     const BOOL muted = m_status.volumeMuted ? FALSE : TRUE;
-    const HRESULT result = volume->SetMute(muted, nullptr);
+    const HRESULT result = volume->SetMute(muted, &audio_policy::kVolumeEventContext);
     volume->Release();
     if (FAILED(result)) {
         return false;
     }
+    m_volumeProjectedUntil = 0;
     m_status.volumeMuted = muted != FALSE;
     return true;
 }
 
 bool SystemTray::AdjustVolume(float delta) {
-    IAudioEndpointVolume* volume = OpenEndpointVolume();
+    bool isBluetooth = false;
+    std::wstring deviceId;
+    IAudioEndpointVolume* volume = OpenEndpointVolume(&isBluetooth, &deviceId);
     if (volume == nullptr) {
         return false;
     }
     float level = m_status.volumeLevel;
-    if (FAILED(volume->GetMasterVolumeLevelScalar(&level))) {
+    if (GetTickCount64() >= m_volumeProjectedUntil &&
+        FAILED(volume->GetMasterVolumeLevelScalar(&level))) {
         volume->Release();
         return false;
     }
     level = std::clamp(level + delta, 0.0F, 1.0F);
-    const HRESULT result = volume->SetMasterVolumeLevelScalar(level, nullptr);
-    if (SUCCEEDED(result)) {
-        // Scrolled volume implies intent to hear it.
-        volume->SetMute(FALSE, nullptr);
+    const bool ok = WriteMasterVolumePreservingOrRepairingBalance(volume, level, isBluetooth, deviceId);
+    if (ok) {
         m_status.volumeLevel = level;
         m_status.volumeMuted = false;
+        m_volumeProjectedUntil = GetTickCount64() + 350ULL;
     }
     volume->Release();
-    return SUCCEEDED(result);
+    return ok;
 }
 
 bool SystemTray::SetVolumeLevel(float level) {
-    IAudioEndpointVolume* volume = OpenEndpointVolume();
+    level = std::clamp(level, 0.0F, 1.0F);
+    if (!WriteSystemVolumeLevel(level)) {
+        return false;
+    }
+    ProjectVolumeStatus(level);
+    return true;
+}
+
+void SystemTray::ProjectVolumeStatus(float level) noexcept {
+    m_status.volumeLevel = std::clamp(level, 0.0F, 1.0F);
+    m_status.volumeMuted = false;
+    m_volumeProjectedUntil = GetTickCount64() + 350ULL;
+}
+
+bool SystemTray::WriteSystemVolumeLevel(float level) {
+    bool isBluetooth = false;
+    std::wstring deviceId;
+    IAudioEndpointVolume* volume = OpenEndpointVolume(&isBluetooth, &deviceId);
     if (volume == nullptr) {
         return false;
     }
-    level = std::clamp(level, 0.0F, 1.0F);
-    const HRESULT result = volume->SetMasterVolumeLevelScalar(level, nullptr);
-    if (SUCCEEDED(result)) {
-        volume->SetMute(FALSE, nullptr);
-        m_status.volumeLevel = level;
-        m_status.volumeMuted = false;
-    }
+    const bool ok = WriteMasterVolumePreservingOrRepairingBalance(volume, level, isBluetooth, deviceId);
     volume->Release();
-    return SUCCEEDED(result);
+    return ok;
 }
 
 bool SystemTray::AdjustBrightness(int deltaPercent) {

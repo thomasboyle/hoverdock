@@ -1,5 +1,6 @@
 #include "DockApp.h"
 
+#include "AudioPolicy.h"
 #include "QuickSettingsPanel.h"
 #include "SystemTemps.h"
 
@@ -119,29 +120,8 @@ const GUID kUltimatePowerSchemeSource = {
 const GUID kLegacyAutomaticPowerScheme = {
     0xa5cc14c9, 0x7d82, 0x4ffc, {0xa6, 0x98, 0x22, 0x5b, 0xee, 0xd1, 0xe7, 0x3f}};
 
-struct DeviceShareMode;
-
-MIDL_INTERFACE("f8679f50-850a-41cf-9c72-430f290290c8")
-IPolicyConfig : public IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE GetMixFormat(PCWSTR, WAVEFORMATEX**) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetDeviceFormat(PCWSTR, INT, WAVEFORMATEX**) = 0;
-    virtual HRESULT STDMETHODCALLTYPE ResetDeviceFormat(PCWSTR) = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetDeviceFormat(PCWSTR, WAVEFORMATEX*, WAVEFORMATEX*) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetProcessingPeriod(PCWSTR, INT, PINT64, PINT64) = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetProcessingPeriod(PCWSTR, PINT64) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetShareMode(PCWSTR, DeviceShareMode*) = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetShareMode(PCWSTR, DeviceShareMode*) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PCWSTR, const PROPERTYKEY&, PROPVARIANT*) = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetPropertyValue(PCWSTR, const PROPERTYKEY&, PROPVARIANT*) = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetDefaultEndpoint(PCWSTR deviceId, ERole role) = 0;
-    virtual HRESULT STDMETHODCALLTYPE SetEndpointVisibility(PCWSTR, INT) = 0;
-};
-
 const PROPERTYKEY kDeviceFriendlyName = {
     {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
-
-const CLSID kPolicyConfigClient = {
-    0x870af99c, 0x171d, 0x4f9e, {0xaf, 0x0d, 0xe6, 0x3d, 0xf4, 0x0c, 0x2b, 0xc9}};
 
 std::wstring Lower(std::wstring text) {
     for (wchar_t& ch : text) {
@@ -513,8 +493,9 @@ bool SetDefaultAudioDevice(const std::wstring& id) {
     if (id.empty()) {
         return false;
     }
-    IPolicyConfig* policy = nullptr;
-    if (FAILED(CoCreateInstance(kPolicyConfigClient, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&policy))) ||
+    audio_policy::IPolicyConfig* policy = nullptr;
+    if (FAILED(CoCreateInstance(
+            audio_policy::kPolicyConfigClient, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&policy))) ||
         policy == nullptr) {
         return false;
     }
@@ -565,16 +546,7 @@ std::wstring DeviceName(IMMDevice* device) {
 }
 
 std::wstring DeviceId(IMMDevice* device) {
-    if (device == nullptr) {
-        return {};
-    }
-    LPWSTR id = nullptr;
-    if (FAILED(device->GetId(&id)) || id == nullptr) {
-        return {};
-    }
-    std::wstring text = id;
-    CoTaskMemFree(id);
-    return text;
+    return audio_policy::EndpointDeviceId(device);
 }
 
 void CollectEndpoints(EDataFlow flow, std::vector<QsNamedId>& devices, std::wstring& defaultId,
@@ -1902,6 +1874,11 @@ struct CaptureMeter {
         }
     }
 
+    std::atomic<bool> policyPopupVisible{false};
+    std::atomic<uint8_t> policyPage{static_cast<uint8_t>(QuickSettingsPage::Home)};
+    std::atomic<bool> policyHandsFree{true};
+    bool policySuppressed = false;
+
     void Sample(QuickSettingsCache& cache, IMMDevice* device) {
         const ULONGLONG now = GetTickCount64();
         const std::wstring id = device != nullptr ? DeviceId(device) : std::wstring();
@@ -1909,6 +1886,7 @@ struct CaptureMeter {
             Close();
             {
                 std::lock_guard<std::mutex> lock(mutex);
+                policySuppressed = false;
                 note = L"No microphone";
                 publishedNote = note;
             }
@@ -1917,9 +1895,32 @@ struct CaptureMeter {
             cache.inputNote = L"No microphone";
             return;
         }
+        const bool popupVisible = policyPopupVisible.load(std::memory_order_acquire);
+        const auto page = static_cast<QuickSettingsPage>(policyPage.load(std::memory_order_acquire));
+        const bool handsFree = policyHandsFree.load(std::memory_order_acquire);
+        const bool isBluetooth = audio_policy::IsBluetoothEndpoint(device);
+        if (!audio_policy::ShouldOpenCaptureStream(popupVisible, page == QuickSettingsPage::Home,
+                page == QuickSettingsPage::Microphone, isBluetooth, handsFree)) {
+            Close();
+            const std::wstring policyNote =
+                (page == QuickSettingsPage::Microphone && isBluetooth && !handsFree)
+                ? std::wstring(L"Hands-free mic is off in Dock Settings")
+                : std::wstring();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                policySuppressed = true;
+                retryAt = now + 2500ULL;
+                note.clear();
+                publishedNote = policyNote;
+            }
+            cache.inputPeak = 0.0F;
+            cache.inputNote = policyNote;
+            return;
+        }
         bool needOpen = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
+            policySuppressed = false;
             needOpen = client == nullptr || deviceId != id;
             if (needOpen && now < retryAt && deviceId.empty() && !note.empty()) {
                 cache.inputPeak = 0.0F;
@@ -3497,16 +3498,82 @@ void SeekQuickSettingsMedia(float level) noexcept {
 
 void StopQuickSettingsCapture() noexcept {
     g_captureMeter.Close();
+    std::lock_guard<std::mutex> lock(g_captureMeter.mutex);
+    g_captureMeter.policySuppressed = false;
     g_captureMeter.retryAt = 0;
 }
 
+void SyncQuickSettingsCapturePolicy(bool popupVisible, QuickSettingsPage page, bool handsFree) noexcept {
+    const uint8_t prevPage =
+        g_captureMeter.policyPage.exchange(static_cast<uint8_t>(page), std::memory_order_acq_rel);
+    const bool prevHandsFree =
+        g_captureMeter.policyHandsFree.exchange(handsFree, std::memory_order_acq_rel);
+    g_captureMeter.policyPopupVisible.store(popupVisible, std::memory_order_release);
+    if (!popupVisible || (page != QuickSettingsPage::Home && page != QuickSettingsPage::Microphone)) {
+        StopQuickSettingsCapture();
+        return;
+    }
+    if (prevPage != static_cast<uint8_t>(page) || prevHandsFree != handsFree) {
+        std::lock_guard<std::mutex> lock(g_captureMeter.mutex);
+        g_captureMeter.policySuppressed = false;
+        g_captureMeter.retryAt = 0;
+    }
+}
+
+namespace {
+
+void SetVolumeLevelAsync(float level) {
+    static std::atomic<int> desiredPermille{-1};
+    static std::atomic<bool> busy{false};
+    const int target = std::clamp(static_cast<int>(std::lround(level * 1000.0F)), 0, 1000);
+    desiredPermille.store(target, std::memory_order_release);
+    if (busy.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    std::thread([] {
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        int lastWritten = -1;
+        for (;;) {
+            const int want = desiredPermille.exchange(-1, std::memory_order_acq_rel);
+            if (want < 0) {
+                busy.store(false, std::memory_order_release);
+                if (desiredPermille.load(std::memory_order_acquire) >= 0 &&
+                    !busy.exchange(true, std::memory_order_acq_rel)) {
+                    continue;
+                }
+                break;
+            }
+            if (want != lastWritten) {
+                static_cast<void>(SystemTray::WriteSystemVolumeLevel(
+                    static_cast<float>(want) / 1000.0F));
+                lastWritten = want;
+            }
+            if (desiredPermille.load(std::memory_order_acquire) >= 0) {
+                Sleep(32);
+            }
+        }
+        if (SUCCEEDED(com)) {
+            CoUninitialize();
+        }
+    }).detach();
+}
+
+}  // namespace
+
 void EnsureQuickSettingsCaptureAsync() noexcept {
+    const bool popupVisible = g_captureMeter.policyPopupVisible.load(std::memory_order_acquire);
+    const auto page = static_cast<QuickSettingsPage>(
+        g_captureMeter.policyPage.load(std::memory_order_acquire));
+    if (!popupVisible || (page != QuickSettingsPage::Home && page != QuickSettingsPage::Microphone)) {
+        return;
+    }
     bool needOpen = false;
     {
         std::lock_guard<std::mutex> lock(g_captureMeter.mutex);
         needOpen = g_captureMeter.client == nullptr || g_captureMeter.capture == nullptr;
-        if (needOpen && GetTickCount64() < g_captureMeter.retryAt && !g_captureMeter.note.empty() &&
-            g_captureMeter.deviceId.empty()) {
+        if (needOpen && GetTickCount64() < g_captureMeter.retryAt &&
+            (g_captureMeter.policySuppressed ||
+                (!g_captureMeter.note.empty() && g_captureMeter.deviceId.empty()))) {
             return;
         }
     }
@@ -3786,6 +3853,8 @@ QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
 }
 
 void DockApp::RefreshQuickSettingsCache() {
+    SyncQuickSettingsCapturePolicy(
+        IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, m_config.HandsFree());
     const ULONGLONG now = GetTickCount64();
     // WLAN / adapters / endpoints / WASAPI / power / HDR / Night Light: worker.
     // First paint keeps whatever is already cached (possibly stale).
@@ -3837,6 +3906,8 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
     ResetQsChevronFade();
+    SyncQuickSettingsCapturePolicy(
+        IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, m_config.HandsFree());
     if (page == QuickSettingsPage::RefreshRate) {
         m_qsRefreshNote.clear();
     }
@@ -3882,6 +3953,8 @@ void DockApp::CloseQuickSettingsPage() {
     ResetQsChevronFade();
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
+    SyncQuickSettingsCapturePolicy(
+        IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, m_config.HandsFree());
     if (leaving == QuickSettingsPage::Bluetooth && back != QuickSettingsPage::Bluetooth &&
         m_window != nullptr && !m_bluetoothSnapshot.discovering && !m_bluetooth.IsPairing()) {
         KillTimer(m_window, kBluetoothTimerId);
@@ -3919,11 +3992,9 @@ void DockApp::OpenSettingsPage(const wchar_t* uri) {
 void DockApp::ApplyQuickSettingsSlider(TrayFlyoutHitKind kind, const RECT& track, LONG x) {
     const float level = TrackLevel(track, x);
     if (kind == TrayFlyoutHitKind::VolumeSlider) {
-        if (m_tray.SetVolumeLevel(level)) {
-            EnsureTrayIcons();
-            QueueOverflowPaint();
-            QueueRenderFrame();
-        }
+        m_tray.ProjectVolumeStatus(level);
+        SetVolumeLevelAsync(level);
+        QueueOverflowPaint();
         return;
     }
     if (kind == TrayFlyoutHitKind::BrightnessSlider) {
