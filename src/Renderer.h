@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <wrl/client.h>
@@ -91,7 +92,12 @@ public:
     [[nodiscard]] UINT TextureIndexForTarget(const std::wstring& target) const noexcept;
     [[nodiscard]] bool HasIconForTarget(const std::wstring& target) const noexcept;
     [[nodiscard]] bool HasCachedIconPixels(const std::wstring& target) const noexcept;
-    [[nodiscard]] const std::vector<uint8_t>* CachedIconPixels(const std::wstring& target) const noexcept;
+    [[nodiscard]] std::vector<std::vector<uint8_t>> ReadIconPixelsBatch(
+        std::span<const std::wstring> targets);
+    [[nodiscard]] std::vector<uint8_t> ReadIconPixels(const std::wstring& target) {
+        auto batch = ReadIconPixelsBatch(std::span<const std::wstring>{&target, 1});
+        return batch.empty() ? std::vector<uint8_t>{} : std::move(batch[0]);
+    }
     [[nodiscard]] std::vector<std::wstring> IconTargetKeys() const;
     void AppendMissingIcons(const std::vector<std::wstring>& targets,
         const std::vector<std::vector<uint8_t>>& pixelBuffers);
@@ -101,17 +107,22 @@ public:
     [[nodiscard]] static std::vector<uint8_t> ExtractIconPixels(
         const std::vector<std::wstring>& candidates, UINT iconPixelExtent);
     [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle, bool* changed = nullptr);
+    void NotePopupSelfPresent(int popupIndex) noexcept;
+    void TrimIdlePanelResources() noexcept;
+    void ReleaseHiddenResources() noexcept;
     // One DXGI duplication acquire for this tick. Dock strip and open menu plates
     // share it so a 120 Hz backdrop tick does not consume the frame twice.
-    void PollDesktopChanges() noexcept;
+    void PollDesktopChanges(HMONITOR hostMonitor = nullptr) noexcept;
     void FinishDesktopChangePoll() noexcept;
-    [[nodiscard]] bool DesktopRegionChanged(const RECT& region) const noexcept;
+    [[nodiscard]] bool DesktopRegionChanged(const RECT& region, int popupIndex = -1) const noexcept;
+    [[nodiscard]] bool HadDesktopActivity() const noexcept;
     // One-shot: the next CaptureBackdrop BitBlts even if the strip looks idle.
     // Used for focus changes. Does not allocate.
     void RequestBackdropRefresh() noexcept;
     [[nodiscard]] bool NeedsBackdropBitBlt(const RECT& screenRectangle) const noexcept;
     [[nodiscard]] bool BackdropValid() const noexcept;
     void InvalidateBackdrop() noexcept;
+    void ResetAfterWake() noexcept;
     [[nodiscard]] bool Render(const DockRenderState& state);
     // Slide the swap chain inside the HWND. Moving the window itself drops it
     // from desktop capture for the whole reveal/hide.
@@ -172,21 +183,23 @@ public:
     [[nodiscard]] D3D_SHADER_MODEL ShaderModel() const noexcept;
 
 private:
-    static constexpr UINT kBufferCount = 3;
+    static constexpr UINT kBufferCount = 2;
     static constexpr UINT kMaximumIcons = 512;
-    // Sparse scanline probe before a full dock-strip BitBlt. Hover/Present
-    // advances DWM cFrame without changing wallpaper; probing a few rows is
-    // ~height/kProbeRows cheaper and avoids the 2-10 ms kernel BitBlt.
-    static constexpr UINT kBackdropProbeRows = 6;
-    // Allow a few flapping pixels (DWM subpixel / cursor-adjacent) before a
-    // probe miss or a committed-sample "changed" decision. Stops hash flap
-    // from bumping BackdropChangeSerial and storming live menu rebakes.
-    static constexpr UINT kBackdropProbeNoisePixels = 24;
     static constexpr UINT kBackdropChangeMinSamples = 96;
     static constexpr UINT kIconTextureDescriptor = 0;
     static constexpr UINT kBackdropTextureDescriptor = 1;
     static constexpr UINT kTempBlurDescriptor = 2;
     static constexpr UINT kTempBlurDescriptor2 = 3;
+    static constexpr UINT kSrvDescriptorsPerTable = 4;
+    static constexpr UINT kSrvTableCount = 2;
+
+    struct BlurCacheKey {
+        uint64_t backdropSerial = 0;
+        UINT width = 0;
+        UINT height = 0;
+        UINT fxMask = ~0u;
+        bool operator==(const BlurCacheKey&) const noexcept = default;
+    };
 
     struct alignas(256) FrameConstants {
         float scene0[4]{};
@@ -203,8 +216,7 @@ private:
 
     struct FrameResource {
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
-        Microsoft::WRL::ComPtr<ID3D12Resource> constants;
-        Microsoft::WRL::ComPtr<ID3D12Resource> iconInstances;
+        Microsoft::WRL::ComPtr<ID3D12Resource> uploadBuffer;
         FrameConstants* mappedConstants = nullptr;
         IconInstanceConstants* mappedIcons = nullptr;
         UINT64 fenceValue = 0;
@@ -216,19 +228,21 @@ private:
     void CreateRootSignatureAndPipelines();
     void CreateRenderTargets();
     void CreateBackdropResources();
+    void EnsureDockBlurTemp2();
+    bool EnsurePanelPipelineResources();
+    void ReleasePanelPipelineResources() noexcept;
     void ReleaseBackdropResources() noexcept;
     [[nodiscard]] bool UploadBackdropPixels();
-    [[nodiscard]] uint64_t HashBackdropPixels() const noexcept;
-    [[nodiscard]] bool EnsureBackdropProbe(UINT width);
-    void ReleaseBackdropProbe() noexcept;
-    [[nodiscard]] bool ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept;
-    void CommitBackdropProbeFromDib() noexcept;
     [[nodiscard]] size_t CountBackdropSampleDiffs() const noexcept;
     void CommitBackdropSamplesFromDib() noexcept;
     [[nodiscard]] bool WaitForBackdropCopy(DWORD timeoutMs = INFINITE);
     [[nodiscard]] bool WaitForFrame(FrameResource& frame, DWORD timeoutMs = INFINITE);
     void WaitForAllFrames();
-    void RebuildIconAtlasFromCache();
+    void RebuildIconAtlasFromStaged();
+    void ApplyIncrementalIconUploads(
+        const std::vector<std::pair<UINT, const std::vector<uint8_t>*>>& uploads,
+        UINT newIconCount);
+    void UpdateIconAtlasSrvs() noexcept;
     void RequestIconAtlasRebuild();
     // Next atlas slice that does not collide with a key already assigned.
     // m_iconCount stays 0 until the deferred batch rebuild, so callers must
@@ -283,15 +297,18 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_blurTemp2;
     bool m_blurTemp2IsShaderResource = false;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_backdropUpload;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_backdropCopyAllocator;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_backdropCopyCommandList;
+    bool m_backdropUploadDirty = false;
+    uint64_t m_backdropGpuSerial = 0;
+    BlurCacheKey m_blurCache{};
     UINT m_iconCount = 0;
+    UINT m_iconAtlasCapacity = 0;
     UINT m_iconPixelExtent = 56;
     bool m_iconBatchActive = false;
     bool m_iconAtlasRebuildPending = false;
     float m_dpiScale = 1.0F;
     std::unordered_map<std::wstring, UINT> m_iconTextureByTarget;
-    std::unordered_map<std::wstring, std::vector<uint8_t>> m_iconPixelCache;
+    std::unordered_set<std::wstring> m_validIconTargets;
+    std::unordered_map<std::wstring, std::vector<uint8_t>> m_stagedBatchIcons;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_pendingUploads;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_backdropFootprint{};
     UINT m_backdropRowCount = 0;
@@ -307,7 +324,6 @@ private:
     bool m_backdropOriginValid = false;
     bool m_backdropInitialized = false;
     bool m_backdropValid = false;
-    uint64_t m_backdropHash = 0;
     uint64_t m_backdropChangeSerial = 0;
     // Last DWM composed-frame count sampled into the backdrop. Fallback gate
     // when the shared duplication poll cannot vouch for the strip.
@@ -317,14 +333,9 @@ private:
     // Duplication reported dirt over the strip that no successful sample has
     // consumed yet (a failed read or upload must retry on the next tick).
     bool m_backdropDirtPending = false;
-    // Sparse probe DIB (width x kBackdropProbeRows) + reference from last commit.
-    HDC m_backdropProbeDc = nullptr;
-    HBITMAP m_backdropProbeBitmap = nullptr;
-    HGDIOBJ m_backdropProbePrevious = nullptr;
-    uint8_t* m_backdropProbePixels = nullptr;
-    UINT m_backdropProbeWidth = 0;
-    bool m_backdropProbeValid = false;
-    std::vector<uint8_t> m_backdropProbeReference;
+    uint64_t m_lastDockSelfPresentMs = 0;
+    uint64_t m_deferredSelfCheckDueMs = 0;
+    uint64_t m_lastPopupSelfPresentMs[4] = {};
     // Stride-8 samples of the last uploaded/accepted backdrop (noise-tolerant
     // change detection after a full BitBlt).
     std::vector<uint32_t> m_backdropCommittedSamples;
@@ -350,10 +361,7 @@ private:
     [[nodiscard]] bool ParkInFlightPanelBake() noexcept;
     [[nodiscard]] bool CreatePanelGlassResourcesExact(UINT width, UINT height);
 
-    // Exact-size D3D panel glass pool. Live menus round-robin different sizes;
-    // stash up to 3 exact WxH sets so CreateCommittedResource is not paid every
-    // tick. Active set lives in m_panel* below; pool holds the rest.
-    static constexpr size_t kPanelGlassPoolSize = 3;
+    static constexpr size_t kPanelGlassPoolSize = 1;
     struct PanelGlassPoolEntry {
         UINT width = 0;
         UINT height = 0;
@@ -399,7 +407,7 @@ private:
     // round-robin different WxH; without this, EnsurePanelCaptureDib destroyed
     // and CreateDIBSection+ICM'd every tick. Active slot is mirrored in the
     // m_panelCapture* aliases below for BitBlt/upload call sites.
-    static constexpr size_t kPanelCapturePoolSize = 3;
+    static constexpr size_t kPanelCapturePoolSize = 2;
     struct PanelCapturePoolEntry {
         HDC dc = nullptr;
         HBITMAP bitmap = nullptr;

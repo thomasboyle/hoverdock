@@ -19,6 +19,8 @@
 #include "SpeedTest.h"
 #include "PerfBoost.h"
 #include "StaWorker.h"
+#include "WakePolicy.h"
+#include "ActiveDockPolicy.h"
 
 #include <Windows.h>
 
@@ -211,10 +213,8 @@ private:
     static constexpr int kResumeZOrderPasses = 4;
     // Post-wake window layout repair: Explorer briefly re-reserves the old
     // taskbar strip on resume/unlock, which shrinks maximized windows and
-    // pushes others up. Put them back for a few seconds after wake.
+    // pushes others up. Debounce bursts and restore cleanly after wake.
     static constexpr UINT_PTR kWakeLayoutTimerId = 24;
-    static constexpr UINT kWakeLayoutIntervalMs = 250;
-    static constexpr int kWakeLayoutPasses = 40;
     static constexpr UINT kQsChevronFadeIntervalMs = 16;
     static constexpr float kQsChevronFadeMs = 140.0F;
     // Home tiles with a hover arrow: Wi-Fi, Bluetooth, Boost, Power, Sound,
@@ -233,7 +233,7 @@ private:
     // visible the backdrop timer tracks that monitor (BackdropFrameIntervalMs).
     static constexpr UINT kBackdropIntervalMs = 8;
     static constexpr UINT kBackdropIdleIntervalMs = 250;
-    static constexpr UINT kBackdropRestingIntervalMs = 100;
+    static constexpr UINT kBackdropRestingIntervalMs = 33;
     static constexpr UINT kBackdropIdleHysteresisTicks = 15;
     static constexpr UINT kBackdropRestingHysteresisTicks = 15;
     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
@@ -406,8 +406,10 @@ private:
     void PositionOverlayWindows();
     void ReassertOverlayZOrder();
     void ScheduleResumeZOrderReassert();
+    void OnSystemWake(bool sessionJustUnlocked = false);
+    void SyncWorkAreaWindows(bool notifyAll);
     void CaptureWakeLayout();
-    void BeginWakeLayoutRepair();
+    void ScheduleWakeLayoutSettle();
     void RepairWakeLayoutPass();
     void ClearWakeLayout() noexcept;
     void UpdateHoverLabel(bool forceGlassRefresh = false);
@@ -416,8 +418,8 @@ private:
     // screenOrigin is the layered-window top-left (label sits above the dock).
     // Height is uniform for every label; width follows text up to a max with
     // ellipsis. Not cached — glass samples the live backdrop at that origin.
-    [[nodiscard]] bool RasterizeHoverLabel(const std::wstring& text, float scale,
-        POINT screenOrigin, SIZE& labelSize, std::vector<uint8_t>& bits);
+    [[nodiscard]] bool RasterizeHoverLabel(const std::wstring& text, LONG measuredTextWidth,
+        float scale, SIZE& labelSize, uint8_t* bits);
     void DestroyHoverLabelFont() noexcept;
     [[nodiscard]] HFONT HoverLabelFont();
     struct IconLoadRequest {
@@ -602,13 +604,16 @@ private:
     [[nodiscard]] bool IsTrayRenderIndex(int index) const noexcept;
     [[nodiscard]] int AppSlotCount() const noexcept;
     void UpdatePrimaryMonitor();
+    void RefreshDisplayTopologyCache() noexcept;
+    void UpdatePillScreenBounds() noexcept;
+    void TrimIdlePopupMemory() noexcept;
     [[nodiscard]] bool AdoptMonitorForCursor(POINT cursor);
     [[nodiscard]] UINT HostDpi() const noexcept;
     void NoteHostRefreshHz() noexcept;
     [[nodiscard]] UINT BackdropFrameIntervalMs() const noexcept;
     void BeginShow();
     void CatchUpHiddenCatalog();
-    void PumpCatalogMessages();
+    void PumpCatalogMessages(bool waitIfIdle = false);
     void FlushPendingLayout();
     [[nodiscard]] bool CaptureLiveBackdrop();
     // Returns true when a live bake was submitted or a completed bake was applied.
@@ -743,7 +748,7 @@ private:
     void RefreshRunningWindows(bool force = false);
     void BeginBackgroundRefresh(bool force);
     void ApplyBackgroundRefresh(UINT generation);
-    void EnsureMissingPinIconsAsync();
+    void EnsureMissingPinIconsAsync(bool forceAll = false);
     void ApplyPinIcons(UINT generation);
     void StartRefreshTimer() noexcept;
     void StopRefreshTimer() noexcept;
@@ -774,7 +779,7 @@ private:
     [[nodiscard]] bool MaintainNativeTaskbarSuppression();
     [[nodiscard]] bool ExpandPrimaryWorkArea(bool notify);
     void CollectTaskbarWindows(std::vector<HWND>& taskbars);
-    [[nodiscard]] bool ExpandSecondaryMonitorWorkAreas();
+    [[nodiscard]] bool ExpandSecondaryMonitorWorkAreas(bool force = false);
     void RestoreDesktopWorkArea();
     void DisableMultiMonitorTaskbars();
     void RestoreMultiMonitorTaskbars();
@@ -782,12 +787,13 @@ private:
     void EnsureFullscreenClaimWindows();
     void DestroyFullscreenClaimWindows() noexcept;
     void EnsureTaskbarList();
-    [[nodiscard]] bool CollapseNativeTaskbarAppBar();
+    [[nodiscard]] bool CollapseNativeTaskbarAppBar(bool force = false);
     void StartTaskbarMonitor() noexcept;
     void StopTaskbarMonitor() noexcept;
     void StartCursorWatch() noexcept;
     void StopCursorWatch() noexcept;
     void EnsureMouseHook() noexcept;
+    void ReinstallMouseHook() noexcept;
     void InstallOverflowDismissHook() noexcept;
     void RemoveOverflowDismissHook() noexcept;
     void DismissQuickSettings();
@@ -876,6 +882,7 @@ private:
     HFONT m_hoverLabelFont = nullptr;
     UINT m_hoverLabelFontDpi = 0;
     int m_hoverLabelFontPx = 0;
+    LayerPresentDib m_hoverLabelDib{};
     HBITMAP m_dragGhostBitmap = nullptr;
     HDC m_dragGhostMemoryDc = nullptr;
     HGDIOBJ m_dragGhostPreviousBitmap = nullptr;
@@ -884,6 +891,9 @@ private:
     RECT m_primaryBounds{};
     HMONITOR m_hostMonitor = nullptr;
     RECT m_hostBounds{};
+    UINT m_cachedHostDpi = 96;
+    RECT m_pillScreenBounds{};
+    std::vector<std::pair<HMONITOR, RECT>> m_cachedMonitors;
     POINT m_lastCursor{};
     std::vector<HWND> m_hiddenTaskbars;
     std::vector<std::pair<HWND, RECT>> m_hiddenTaskbarRects;
@@ -928,6 +938,9 @@ private:
     bool m_configSavePending = false;
     DockConfig m_config;
     WindowCatalog m_windows;
+    // Owned exclusively by m_catalogWorker so pin profiles & previous snapshots
+    // persist across background refreshes without per-tick COM/FS rebuilds.
+    WindowCatalog m_workerWindows;
     Renderer m_renderer;
     std::vector<DisplayApp> m_displayApps;
     std::vector<DockIconRenderData> m_iconRenderData;
@@ -987,6 +1000,7 @@ private:
     bool m_chromeInkKnown = false;
     bool m_chromeInkTimerRunning = false;
     double m_chromeInkLastTickAt = 0.0;
+    uint64_t m_chromeInkBackdropSerial = ~0ULL;
     bool m_suppressDragUntilRelease = false;
     bool m_launchClickInProgress = false;
     std::wstring m_pressedTarget;
@@ -999,6 +1013,10 @@ private:
     bool m_cursorWatchCalm = false;
     UINT m_cursorWatchAppliedMs = 0;
     UINT m_cursorWatchStationaryPumps = 0;
+    double m_postWakeUntil = 0.0;
+    std::atomic<uint64_t> m_mouseHookEventCount{0};
+    std::atomic<uint32_t> m_mouseHookEpoch{1};
+    uint64_t m_lastHookEventCount = 0;
     HWINEVENTHOOK m_foregroundHook = nullptr;
     HWINEVENTHOOK m_catalogHook = nullptr;
     bool m_inBeginShow = false;
@@ -1021,6 +1039,11 @@ private:
     mutable bool m_elevatedForegroundValid = false;
     mutable bool m_elevatedForegroundCached = false;
     mutable double m_elevatedForegroundCheckedAt = 0.0;
+    mutable bool m_fgBorderlessValid = false;
+    mutable bool m_fgBorderlessCached = false;
+    mutable HMONITOR m_fgBorderlessMonitor = nullptr;
+    mutable HWND m_fgBorderlessHwnd = nullptr;
+    mutable double m_fgBorderlessCheckedAt = 0.0;
     bool m_multiMonTaskbarSaved = false;
     bool m_multiMonTaskbarHadValue = false;
     DWORD m_savedMultiMonTaskbar = 1;
@@ -1058,15 +1081,16 @@ private:
     // was still full-screen; replayed by RepairWakeLayoutPass after wake.
     struct WakeWindowLayout {
         HWND window = nullptr;
-        RECT rect{};
-        bool zoomed = false;
+        wake_policy::SavedWindowState state{};
+        bool synthesized = false;
     };
     std::vector<WakeWindowLayout> m_wakeLayout;
     RECT m_wakeLayoutPrimary{};
     int m_wakeLayoutMonitors = 0;
-    int m_wakeLayoutPasses = 0;
-    bool m_wakeLayoutPending = false;
+    int m_wakeLayoutFollowUps = 0;
+    bool m_wakeLayoutCaptured = false;
     bool m_sessionLocked = false;
+    wake_policy::WorkAreaStormState m_workAreaStorm{};
     LONG m_overlayX = 0;
     LONG m_overlayY = 0;
     LONG m_overlayW = 0;

@@ -119,8 +119,9 @@ private:
     bool BuildIndex(std::unique_ptr<filesearch::FileIndex>& index, std::vector<Journal>& journals,
         FileSearchMode& mode);
     bool LoadCachedIndex(std::unique_ptr<filesearch::FileIndex>& index, std::vector<Journal>& journals,
-        FileSearchMode& mode);
+        FileSearchMode& mode, bool metadataOnly = false, size_t* outLiveEntries = nullptr);
     void SaveCachedIndex() const noexcept;
+    [[nodiscard]] bool NeedResident() const noexcept;
     // Returns false when a journal wrapped / was reset (rebuild needed).
     bool PollJournals();
     void CloseJournals() noexcept;
@@ -135,6 +136,7 @@ private:
     filesearch::FileIndex m_apps;
     std::vector<Journal> m_journals;      // index thread only
     std::vector<BYTE> m_journalBuffer;    // index thread only
+    bool m_dirtySinceSave = false;        // index thread only
 
     std::thread m_indexThread;
     std::thread m_searchThread;
@@ -142,14 +144,17 @@ private:
     std::atomic<bool> m_started{false};
     std::atomic<bool> m_rebuild{false};
     std::atomic<bool> m_active{false};
+    std::atomic<ULONGLONG> m_lastDemandTick{0};
     HANDLE m_wake = nullptr;  // auto-reset: poll journals / rebuild now
 
     mutable std::mutex m_statusLock;
+    std::condition_variable m_residentCv;
     Status m_status;
     std::atomic<size_t> m_progress{0};
 
     std::mutex m_requestLock;
     std::condition_variable m_requestReady;
+    bool m_searchThreadStarted = false;
     bool m_hasRequest = false;
     Request m_request;
 };

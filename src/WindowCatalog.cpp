@@ -167,6 +167,23 @@ bool IsExistingFile(const std::wstring& path) {
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
+uint64_t PathMetadataStamp(const std::wstring& path) noexcept {
+    if (path.empty()) {
+        return 0;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data) == FALSE) {
+        return 1ULL;
+    }
+    const uint64_t writeTime =
+        (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32U) |
+        data.ftLastWriteTime.dwLowDateTime;
+    const uint64_t size =
+        (static_cast<uint64_t>(data.nFileSizeHigh) << 32U) | data.nFileSizeLow;
+    return (writeTime * 1099511628211ULL) ^ (size + 0x9e3779b97f4a7c15ULL) ^
+        static_cast<uint64_t>(data.dwFileAttributes);
+}
+
 std::wstring StripExtendedPathPrefix(std::wstring path) {
     constexpr std::wstring_view kLongPathPrefix = L"\\\\?\\";
     if (path.size() >= kLongPathPrefix.size() &&
@@ -710,15 +727,14 @@ bool IsApplicationFrameHostWindow(HWND window) {
     if (process == nullptr) {
         return false;
     }
-    std::wstring path(32768, L'\0');
-    DWORD length = static_cast<DWORD>(path.size());
-    const BOOL success = QueryFullProcessImageNameW(process, 0, path.data(), &length);
+    wchar_t pathBuf[kMaximumPathLength];
+    DWORD length = static_cast<DWORD>(std::size(pathBuf));
+    const BOOL success = QueryFullProcessImageNameW(process, 0, pathBuf, &length);
     CloseHandle(process);
-    if (success == FALSE) {
+    if (success == FALSE || length == 0 || length >= std::size(pathBuf)) {
         return false;
     }
-    path.resize(length);
-    return IsApplicationFrameHostPath(path);
+    return IsApplicationFrameHostPath(std::wstring(pathBuf, length));
 }
 
 std::wstring HostedAppUserModelId(HWND frame) {
@@ -843,31 +859,35 @@ std::wstring ResolveShortcutTarget(const std::wstring& shortcut) {
     }
 
     link->Resolve(nullptr, SLR_NO_UI | SLR_NOSEARCH | SLR_NOTRACK);
-    std::array<wchar_t, kMaximumPathLength> target{};
+    wchar_t target[kMaximumPathLength];
+    target[0] = L'\0';
+    target[kMaximumPathLength - 1] = L'\0';
     WIN32_FIND_DATAW findData{};
-    const bool hasTarget = SUCCEEDED(link->GetPath(target.data(), static_cast<int>(target.size()),
+    const bool hasTarget = SUCCEEDED(link->GetPath(target, static_cast<int>(std::size(target)),
         &findData, SLGP_RAWPATH));
-    std::array<wchar_t, kMaximumPathLength> arguments{};
-    const bool hasArguments = SUCCEEDED(link->GetArguments(arguments.data(),
-        static_cast<int>(arguments.size())));
+    wchar_t arguments[kMaximumPathLength];
+    arguments[0] = L'\0';
+    arguments[kMaximumPathLength - 1] = L'\0';
+    const bool hasArguments = SUCCEEDED(link->GetArguments(arguments,
+        static_cast<int>(std::size(arguments))));
     link->Release();
     if (!hasTarget && !hasArguments) {
         return {};
     }
 
-    if (hasTarget && target.front() != L'\0') {
-        const std::wstring appsFolder = ExtractAppsFolderFromText(target.data());
+    if (hasTarget && target[0] != L'\0') {
+        const std::wstring appsFolder = ExtractAppsFolderFromText(target);
         if (!appsFolder.empty()) {
             return appsFolder;
         }
-        if (IsAppsFolderTarget(target.data())) {
-            return target.data();
+        if (IsAppsFolderTarget(target)) {
+            return target;
         }
-        return target.data();
+        return target;
     }
 
-    if (hasArguments && arguments.front() != L'\0') {
-        return ExtractAppsFolderFromText(arguments.data());
+    if (hasArguments && arguments[0] != L'\0') {
+        return ExtractAppsFolderFromText(arguments);
     }
 
     return {};
@@ -1100,16 +1120,36 @@ bool WindowCatalog::Refresh() {
 }
 
 void WindowCatalog::RebuildPinProfiles(const std::vector<PinnedApp>& pins) {
-    if (pins.size() == m_cachedPinProfileSources.size() &&
+    const bool samePins = pins.size() == m_cachedPinProfileSources.size() &&
         std::equal(pins.begin(), pins.end(), m_cachedPinProfileSources.begin(),
             [](const PinnedApp& left, const PinnedApp& right) {
                 return left.name == right.name && left.target == right.target &&
                     left.arguments == right.arguments && left.workingDirectory == right.workingDirectory;
-            })) {
-        return;
+            });
+    if (samePins) {
+        const bool stampsMatch = std::ranges::all_of(m_cachedPinFileStamps,
+            [](const std::pair<std::wstring, uint64_t>& entry) {
+                return PathMetadataStamp(entry.first) == entry.second;
+            });
+        if (stampsMatch) {
+            return;
+        }
     }
     m_cachedPinProfileSources = pins;
+    m_cachedPinFileStamps.clear();
     m_pinMatchingNeedsAumid = false;
+
+    const auto recordStamp = [this](const std::wstring& path) {
+        if (path.empty()) {
+            return;
+        }
+        for (const auto& existing : m_cachedPinFileStamps) {
+            if (EqualInsensitive(existing.first, path)) {
+                return;
+            }
+        }
+        m_cachedPinFileStamps.emplace_back(path, PathMetadataStamp(path));
+    };
 
     ComApartment apartment;
     static_cast<void>(apartment);
@@ -1119,6 +1159,24 @@ void WindowCatalog::RebuildPinProfiles(const std::vector<PinnedApp>& pins) {
     for (const PinnedApp& pin : pins) {
         if (IsShellTarget(pin.target) && !IsAppsFolderTarget(pin.target)) {
             continue;
+        }
+
+        if (EndsWithInsensitive(pin.target, L".lnk") || EndsWithInsensitive(pin.target, L".url")) {
+            recordStamp(pin.target);
+        }
+        if (!ExtractProcessStartArgument(pin.arguments).empty()) {
+            if (!pin.workingDirectory.empty()) {
+                const std::filesystem::path parent = std::filesystem::path(pin.workingDirectory).parent_path();
+                if (!parent.empty()) {
+                    recordStamp(parent.wstring());
+                }
+            }
+            if (!pin.target.empty() && !IsShellTarget(pin.target)) {
+                const std::filesystem::path targetDir = std::filesystem::path(pin.target).parent_path();
+                if (!targetDir.empty()) {
+                    recordStamp(targetDir.wstring());
+                }
+            }
         }
 
         PinMatchProfile profile;
@@ -2063,14 +2121,14 @@ std::wstring WindowCatalog::CachedExecutablePath(DWORD processId) {
         }
     }
 
-    std::wstring path(32768, L'\0');
-    DWORD length = static_cast<DWORD>(path.size());
-    const BOOL success = QueryFullProcessImageNameW(process, 0, path.data(), &length);
+    wchar_t pathBuf[kMaximumPathLength];
+    DWORD length = static_cast<DWORD>(std::size(pathBuf));
+    const BOOL success = QueryFullProcessImageNameW(process, 0, pathBuf, &length);
     CloseHandle(process);
-    if (success == FALSE) {
+    if (success == FALSE || length == 0 || length >= std::size(pathBuf)) {
         return {};
     }
-    path.resize(length);
+    std::wstring path(pathBuf, length);
     {
         const std::lock_guard lock(s_processPathMutex);
         // Bounded: process tables turn over; drop the cache rather than grow it.

@@ -156,8 +156,7 @@ float BevelSlopeN(float oneMinusX, float oneMinusX4)
 {
     float numer = oneMinusX * oneMinusX * oneMinusX;
     float denomBase = max(1.0 - oneMinusX4, 1e-4);
-    // pow(x, 0.75) = sqrt(sqrt(x^3)); use pow for clarity, safe on [1e-4,1].
-    float denom = pow(denomBase, 0.75);
+    float denom = denomBase * rsqrt(sqrt(denomBase));
     return min(numer / max(denom, 1e-3), 3.5);
 }
 
@@ -399,13 +398,16 @@ LensGeo GetLensGeo(bool physical, float bevelWidth, float dpi)
 // gapPx = 0 (dock, contact model) is exactly the first term. n sin(thetaS-thetaR)
 // >= 1 is total internal reflection at the underside (thetaS > ~82 deg for BK7);
 // the profile slope is clamped below that, the min() only guards the tan.
-float SlabPull(float thicknessPx, float thetaS, float sinS, float n, float gapPx)
+float SlabPullSlope(float thicknessPx, float cosS, float sinS, float n, float gapPx)
 {
-    const float a = max(thetaS - asin(clamp(sinS / n, 0.0, 0.999)), 0.0);
-    float pull = thicknessPx * tan(a);
+    const float sinR = clamp(sinS / n, 0.0, 0.999);
+    const float cosR = sqrt(1.0 - sinR * sinR);
+    const float sinA = max(sinS * cosR - cosS * sinR, 0.0);
+    const float cosA = cosS * cosR + sinS * sinR;
+    float pull = thicknessPx * (sinA / max(cosA, 1e-4));
     if (gapPx > 0.0)
     {
-        const float sinPhi = min(n * sin(a), 0.999);
+        const float sinPhi = min(n * sinA, 0.999);
         pull += gapPx * sinPhi * rsqrt(1.0 - sinPhi * sinPhi);
     }
     return pull;
@@ -447,31 +449,108 @@ static const float kGaussW[17] = {
     0.011223, 0.008948, 0.007023
 };
 
+// Exact texel-aligned bilinear pair constants for unit-step (step == 1) 33-tap
+// Gaussian: pairs j = (2*i - 16, 2*i - 15) for i = 0..16, parameterized by
+// subtexel fraction f in [0, 1). Evaluates all 33 taps in 17 bilinear fetches
+// with zero approximation error (including at Nyquist / 1 px dither).
+static const float4 kGaussExactPairs[17] = {
+    float4(0.015971, 0.007023, 0.008948, 0.007023),
+    float4(0.025081, 0.020171, 0.013858, 0.011223),
+    float4(0.037011, 0.030705, 0.020164, 0.016847),
+    float4(0.051318, 0.043922, 0.027560, 0.023758),
+    float4(0.066863, 0.059035, 0.035388, 0.031475),
+    float4(0.081857, 0.074559, 0.042686, 0.039171),
+    float4(0.094166, 0.088482, 0.048370, 0.045796),
+    float4(0.101786, 0.098667, 0.051489, 0.050297),
+    float4(0.103382, 0.103382, 0.051489, 0.051893),
+    float4(0.098667, 0.101786, 0.048370, 0.050297),
+    float4(0.088482, 0.094166, 0.042686, 0.045796),
+    float4(0.074559, 0.081857, 0.035388, 0.039171),
+    float4(0.059035, 0.066863, 0.027560, 0.031475),
+    float4(0.043922, 0.051318, 0.020164, 0.023758),
+    float4(0.030705, 0.037011, 0.013858, 0.016847),
+    float4(0.020171, 0.025081, 0.008948, 0.011223),
+    float4(0.007023, 0.015971, 0.000000, 0.007023),
+};
+
+// Paired tap weights & offsets (W_p, K_p) for dense sub-half-texel steps.
+static const float2 kGaussSubstepPairs[8] = {
+    float2(0.101786, 1.4941446),
+    float2(0.094166, 3.4863326),
+    float2(0.081857, 5.4785296),
+    float2(0.066863, 7.4707387),
+    float2(0.051318, 9.4629565),
+    float2(0.037011, 11.4551890),
+    float2(0.025081, 13.4474702),
+    float2(0.015971, 15.4397345),
+};
+
+float3 SampleBlurRgb(Texture2D tex, float2 uv, float2 texel, float2 lo, float2 hi,
+    float step, float2 axis, bool allowFast17)
+{
+    const float2 cUv = clamp(uv, lo, hi);
+    if (allowFast17 && abs(step - 1.0) < 0.0001)
+    {
+        const bool horiz = axis.x > 0.5;
+        const float sizeA = horiz ? scene0.x : scene0.y;
+        const float texelA = horiz ? texel.x : texel.y;
+        const float loA = horiz ? lo.x : lo.y;
+        const float hiA = horiz ? hi.x : hi.y;
+        const float p = (horiz ? cUv.x : cUv.y) * sizeA - 0.5;
+        const float baseIdx = floor(p);
+        const float f = p - baseIdx;
+        float3 sum = float3(0.0, 0.0, 0.0);
+        [unroll]
+        for (int i = 0; i < 17; ++i)
+        {
+            const float4 gp = kGaussExactPairs[i];
+            const float w = lerp(gp.x, gp.y, f);
+            const float t = lerp(gp.z, gp.w, f) / w;
+            const float coord = clamp((baseIdx + float(2 * i - 16) + 0.5 + t) * texelA, loA, hiA);
+            const float2 sUv = horiz ? float2(coord, cUv.y) : float2(cUv.x, coord);
+            sum += tex.Sample(linearClamp, sUv).rgb * w;
+        }
+        return sum;
+    }
+    if (allowFast17 && step <= 0.55)
+    {
+        float3 accSub = tex.Sample(linearClamp, cUv).rgb * kGaussW[0];
+        [unroll]
+        for (int p = 0; p < 8; ++p)
+        {
+            const float2 pair = kGaussSubstepPairs[p];
+            const float2 off = axis * (pair.y * step) * texel;
+            accSub += (tex.Sample(linearClamp, clamp(uv + off, lo, hi)).rgb +
+                tex.Sample(linearClamp, clamp(uv - off, lo, hi)).rgb) * pair.x;
+        }
+        return accSub;
+    }
+    float3 acc = tex.Sample(linearClamp, cUv).rgb * kGaussW[0];
+    [unroll]
+    for (int k = 1; k <= 16; ++k)
+    {
+        const float2 off = axis * (float(k) * step) * texel;
+        acc += (tex.Sample(linearClamp, clamp(uv + off, lo, hi)).rgb +
+            tex.Sample(linearClamp, clamp(uv - off, lo, hi)).rgb) * kGaussW[k];
+    }
+    return acc;
+}
+
 float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
     float2 texel, float blurPx, float2 axis)
 {
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
-    // Unit-pixel steps (never sparse). blurPx scales how far the lobe
-    // reaches; with blurPx == 16, step == 1 and all 33 taps are used.
-    // Spotlight spreads the taps past 1 px so one pass reaches sigma = blurPx / 2.
-    const float step = SpotlightPanel() ? blurPx / 16.0 : min(blurPx / 16.0, 1.0);
-    float3 acc = float3(tex.Sample(linearClamp, clamp(uvR, lo, hi)).r,
-        tex.Sample(linearClamp, clamp(uvG, lo, hi)).g,
-        tex.Sample(linearClamp, clamp(uvB, lo, hi)).b) * kGaussW[0];
-    [unroll]
-    for (int k = 1; k <= 16; ++k)
+    const bool spotlight = SpotlightPanel();
+    const float step = spotlight ? blurPx * 0.0625 : min(blurPx * 0.0625, 1.0);
+    if (all(uvR == uvG) && all(uvB == uvG))
     {
-        const float2 off = axis * (float(k) * step) * texel;
-        const float w = kGaussW[k];
-        acc.r += (tex.Sample(linearClamp, clamp(uvR + off, lo, hi)).r +
-            tex.Sample(linearClamp, clamp(uvR - off, lo, hi)).r) * w;
-        acc.g += (tex.Sample(linearClamp, clamp(uvG + off, lo, hi)).g +
-            tex.Sample(linearClamp, clamp(uvG - off, lo, hi)).g) * w;
-        acc.b += (tex.Sample(linearClamp, clamp(uvB + off, lo, hi)).b +
-            tex.Sample(linearClamp, clamp(uvB - off, lo, hi)).b) * w;
+        return SampleBlurRgb(tex, uvG, texel, lo, hi, step, axis, !spotlight);
     }
-    return acc;
+    return float3(
+        SampleBlurRgb(tex, uvR, texel, lo, hi, step, axis, !spotlight).r,
+        SampleBlurRgb(tex, uvG, texel, lo, hi, step, axis, !spotlight).g,
+        SampleBlurRgb(tex, uvB, texel, lo, hi, step, axis, !spotlight).b);
 }
 
 // ---------------------------------------------------------------------------
@@ -491,16 +570,7 @@ float3 CcSampleAxis(Texture2D tex, float2 uv, float2 texel, float blurPx, float2
 {
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
-    const float step = max(blurPx * 0.0625, 0.25);
-    float3 acc = tex.Sample(linearClamp, clamp(uv, lo, hi)).rgb * kGaussW[0];
-    [unroll]
-    for (int k = 1; k <= 16; ++k)
-    {
-        const float2 off = axis * (float(k) * step) * texel;
-        acc += (tex.Sample(linearClamp, clamp(uv + off, lo, hi)).rgb +
-            tex.Sample(linearClamp, clamp(uv - off, lo, hi)).rgb) * kGaussW[k];
-    }
-    return acc;
+    return SampleBlurRgb(tex, uv, texel, lo, hi, max(blurPx * 0.0625, 0.25), axis, true);
 }
 float SdRoundRectCc(float2 p, float2 halfSize, float r)
 {
@@ -517,21 +587,25 @@ uint CcShapeCount()
 float CcBlurPxAt(float2 pixel)
 {
     const uint n = CcShapeCount();
-    float blurPx = 0.0;
-    for (uint i = 0u; i < 48u; ++i)
+    if (n == 0u)
     {
-        if (i >= n)
+        return 1.0;
+    }
+    for (uint k = 1u; k < 48u; ++k)
+    {
+        if (k >= n)
         {
             break;
         }
+        const uint i = n - k;
         const IconInstance a = iconInstances[2u * i];
         const float s = SdRoundRectCc(pixel - a.iconRect.xy, a.iconRect.zw, a.iconMeta.x);
-        if (i == 0u || s < 0.0)
+        if (s < 0.0)
         {
-            blurPx = a.iconMeta.w;
+            return max(a.iconMeta.w, 1.0);
         }
     }
-    return max(blurPx, 1.0);
+    return max(iconInstances[0u].iconMeta.w, 1.0);
 }
 
 float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
@@ -594,7 +668,7 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
             // visible while uniform backdrops give an identical face.
             const float gain = b.iconMeta.x;
             float3 face = b.iconRect.y + (b.iconRect.x - b.iconRect.y) * c;
-            if (gain > 0.0)
+            if (gain > 0.0 && disp > 0.0)
             {
                 const float2 uv0 = clamp(pixel * texel, lo, hi);
                 const float3 c0 = CcSampleAxis(blurTemp, uv0, texel, a.iconMeta.w, float2(0.0, 1.0));
@@ -618,6 +692,62 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
     alpha = alpha + (1.0 - alpha) * ring;
     return float4(accum, alpha);
 }
+// Shared bevel + Snell refraction helper used by GlassPS and ComputeFrostUVs.
+void ComputeBevelRefraction(float2 uv, float2 texel, float2 outward, float insideDistance,
+    float bevelWidth, float dpi, bool isPanel, bool dockStyle, bool lensEnabled, bool dispEnabled,
+    out float height01, out float slopeMag, out float2 uvR, out float2 uvG, out float2 uvB)
+{
+    const float2 lo = texel * 0.5;
+    const float2 hi = 1.0 - texel * 0.5;
+    const float2 clampedUv = clamp(uv, lo, hi);
+    uvR = clampedUv;
+    uvG = clampedUv;
+    uvB = clampedUv;
+    if (insideDistance <= 0.0)
+    {
+        height01 = 0.0;
+        slopeMag = 0.0;
+        return;
+    }
+    if (insideDistance >= bevelWidth)
+    {
+        height01 = 1.0;
+        slopeMag = 0.0;
+        return;
+    }
+    const float x = saturate(insideDistance / max(bevelWidth, 1e-3));
+    const float oneMinusX = 1.0 - x;
+    const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
+    height01 = BevelHeight(oneMinusX4);
+    const LensGeo lens = GetLensGeo(PhysicalGlassPanel(isPanel, dockStyle), bevelWidth, dpi);
+    slopeMag = lens.slopeScale * BevelSlopeN(oneMinusX, oneMinusX4);
+    if (!lensEnabled)
+    {
+        return;
+    }
+    const float thicknessPx = (0.35 + 0.65 * height01) * lens.thickScale;
+    const float cosS = rsqrt(1.0 + slopeMag * slopeMag);
+    const float sinS = slopeMag * cosS;
+    const float lensRimFade = smoothstep(0.0, lens.rimFadePx, insideDistance);
+    const float rawG = SlabPullSlope(thicknessPx, cosS, sinS, 1.5168, lens.gapPx) * lens.gain;
+    const float dG = SoftLensCap(rawG, lens.capPx) * lensRimFade;
+    uvG = clamp(uv - outward * dG * texel, lo, hi);
+    if (dispEnabled)
+    {
+        float dR = SlabPullSlope(thicknessPx, cosS, sinS, 1.5143, lens.gapPx) * lens.gain;
+        float dB = SlabPullSlope(thicknessPx, cosS, sinS, 1.5224, lens.gapPx) * lens.gain;
+        dR = SoftLensCap(rawG + (dR - rawG) * kFringeBoost, lens.capPx) * lensRimFade;
+        dB = SoftLensCap(rawG + (dB - rawG) * kFringeBoost, lens.capPx) * lensRimFade;
+        uvR = clamp(uv - outward * dR * texel, lo, hi);
+        uvB = clamp(uv - outward * dB * texel, lo, hi);
+    }
+    else
+    {
+        uvR = uvG;
+        uvB = uvG;
+    }
+}
+
 float4 GlassPS(VertexOutput input) : SV_Target
 {
     if (scene1.z > 50.0)
@@ -650,7 +780,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
     {
         cornerRadius = max(min(scene3.y, halfSize.y), 1.0);
     }
-    float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
+    float distance;
     float dockS = 1.0;
     float2 dockNrm = float2(0.0, 1.0);
     if (!isPanel)
@@ -660,6 +790,10 @@ float4 GlassPS(VertexOutput input) : SV_Target
     else if (dockStyle)
     {
         DockPanelShape(pixel, outputSize, dpi, halfSize, cornerRadius, dockS, distance, dockNrm);
+    }
+    else
+    {
+        distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
     }
     const float aa = 1.35 * dpi;
     // Dock: crisp 1 px coverage (the spec edge is a 0.5-coverage crossing).
@@ -679,7 +813,6 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // Continuous mica strength from bits 16-23 (0..255). Toggle off/on used
     // to be the endpoints; the settings slider lands anywhere between.
     const float frostAmount = saturate(((uint)fxBits >> 16) / 255.0);
-    const float tintOn = FxEnabled(fxBits, 16.0);
     const float specOn = FxEnabled(fxBits, 32.0);
     const float shadowOn = FxEnabled(fxBits, 64.0);
     const float thickOn = FxEnabled(fxBits, 128.0);
@@ -762,26 +895,17 @@ float4 GlassPS(VertexOutput input) : SV_Target
     // size. x = saturate(depth/bevel) reaches 1 inside the band because the
     // SDF returns true interior depth.
     float bevelWidth = GlassBevelWidth(halfSize, cornerRadius, dpi, isPanel);
-    const float x = saturate(insideDistance / max(bevelWidth, 1e-3)); // 0 rim -> 1 flat
-    const float oneMinusX = 1.0 - x;
-    const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
-    const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
-    const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
-    // True surface slope dH/dDist = (B/bevel) * f'(x), B = 0.65*bevel.
-    const LensGeo lens = GetLensGeo(PhysicalGlassPanel(isPanel, dockStyle), bevelWidth, dpi);
-    float slopeMag = lens.slopeScale * slopeN;
-    // Lens/rim depend only on edge distance (no icon-proximity modulation).
+    float height01;
+    float slopeMag;
+    float2 uvR;
+    float2 uvG;
+    float2 uvB;
+    ComputeBevelRefraction(uv, texel, outward, insideDistance, bevelWidth, dpi, isPanel,
+        dockStyle, lensOn > 0.5, dispOn > 0.5, height01, slopeMag, uvR, uvG, uvB);
     const float rimLightDamp = 1.0;
-    // Slab thickness T(x) = T0 + B*f(x), T0 = 0.35*bevel, B = 0.65*bevel.
-    const float thicknessPx = (0.35 + 0.65 * height01) * lens.thickScale;
-    const float bevelFactor = 1.0 - x; // 1 at rim, 0 in flat field
 
-    // Frost radii: clear veil through mid, full mica on the right half.
     float frostRim;
     float frostCore;
-    // Panels keep a minimum mica dissolve so busy wallpaper detail cannot
-    // fight glyphs even when the user parks Frost near clear.
-    // Dock-face panels follow the dock's Frost slider exactly (no floor).
     const float panelFrost = max(frostAmount,
         max(charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR,
             (dockStyle ? 0.0 : textPanel * DOCK_TEXT_PANEL_FROST_FLOOR)));
@@ -794,85 +918,28 @@ float4 GlassPS(VertexOutput input) : SV_Target
     }
     else
     {
-        // ---- 2. Snell refraction through the convex slab ------------------
-        // theta_s = atan(slope) = incidence (view is normal to the plate).
-        // theta_r = asin(sin(theta_s)/n) per wavelength, BK7 crown glass.
-        // d(x) = T(x) * tan(theta_s - theta_r), peak at the rim.
-        // uv' = uv - outward * d (inward pull => magnified look).
-        const float thetaS = atan(slopeMag);
-        const float sinS = sin(thetaS);
-        // 3. Chromatic dispersion: real BK7 Fraunhofer indices (d/F/C lines).
-        // Red 656nm 1.5143, Green 588nm 1.5168, Blue 486nm 1.5224.
-        const float nR = 1.5143;
-        const float nG = 1.5168;
-        const float nB = 1.5224;
-        const float sinRR = clamp(sinS / nR, 0.0, 0.999);
-        const float sinRG = clamp(sinS / nG, 0.0, 0.999);
-        const float sinRB = clamp(sinS / nB, 0.0, 0.999);
-        const float thetaRR = asin(sinRR);
-        const float thetaRG = asin(sinRG);
-        const float thetaRB = asin(sinRB);
-        // Gain lives in kLensGain above (shared with the horizontal pass):
-        // calm center, one continuous slab; pull soft-capped to kLensMaxPx with
-        // a rim fade so a high-contrast edge above the dock cannot paint the
-        // opposite (dark) rim.
-        float dR = SlabPull(thicknessPx, thetaS, sinS, nR, lens.gapPx) * lens.gain * lensOn;
-        float dG = SlabPull(thicknessPx, thetaS, sinS, nG, lens.gapPx) * lens.gain * lensOn;
-        float dB = SlabPull(thicknessPx, thetaS, sinS, nB, lens.gapPx) * lens.gain * lensOn;
-        // Chromatic split (ratios physical, blue bends most); shared boost.
-        dR = dG + (dR - dG) * kFringeBoost;
-        dB = dG + (dB - dG) * kFringeBoost;
-        // Dispersion off collapses all channels onto green (no split).
-        dR = lerp(dG, dR, dispOn);
-        dB = lerp(dG, dB, dispOn);
-        // Soft-cap the drag (see SoftLensCap / kLensMaxPx): keep white-fringe
-        // protection without a hard plateau kink toward the dock center.
-        const float lensMax = lens.capPx;
-        dR = SoftLensCap(dR, lensMax);
-        dG = SoftLensCap(dG, lensMax);
-        dB = SoftLensCap(dB, lensMax);
-        const float lensRimFade = smoothstep(0.0, lens.rimFadePx, insideDistance);
-        dR *= lensRimFade;
-        dG *= lensRimFade;
-        dB *= lensRimFade;
-
-        const float2 lo = texel * 0.5;
-        const float2 hi = 1.0 - texel * 0.5;
-        const float2 uvR = clamp(uv - outward * dR * texel, lo, hi);
-        const float2 uvG = clamp(uv - outward * dG * texel, lo, hi);
-        const float2 uvB = clamp(uv - outward * dB * texel, lo, hi);
-
 #if LIQUID_DEBUG_REFRACTION_ONLY
-        // Refraction-only diagnostic: raw backdrop at the refracted UV, no
-        // tint/blur/dispersion/Fresnel/lights. If straight edges behind the
-        // dock don't kink at the rim here, displacement is zero and material
-        // tuning is pointless. Production builds set this to 0.
         {
-            float3 dbg = backdropTexture.Sample(linearClamp, clamp(uvG, lo, hi)).rgb;
+            float3 dbg = backdropTexture.Sample(linearClamp, uvG).rgb;
             return float4(dbg * mask, mask);
         }
 #endif
-
-        // ---- 5. Scattering blur modulated by slab height ------------------
-        // Heavy mica: soft rim (refraction still reads), near-opaque frost
-        // in the thick center. Iterated separable passes compound radii.
-        // Icon legibility comes from blur + the #e1e1e1 plate, not sharpness.
         const float blurPx = SpotlightPanel() ? DOCK_SPOTLIGHT_BLUR_PX * dpi : lerp(frostRim, frostCore, height01) * dpi;
-        // Frost off samples each channel once at its (possibly refracted)
-        // UV instead of the 17-tap ring: same result as a zero-radius blur
-        // with a seventeenth of the fetches.
-        // Frost off samples each channel once (no frost); on runs the ring.
         if (frostOn < 0.5)
         {
-            frostedBackground = float3(backdropTexture.Sample(linearClamp, clamp(uvR, lo, hi)).r,
-                backdropTexture.Sample(linearClamp, clamp(uvG, lo, hi)).g,
-                backdropTexture.Sample(linearClamp, clamp(uvB, lo, hi)).b);
+            if (all(uvR == uvG) && all(uvB == uvG))
+            {
+                frostedBackground = backdropTexture.Sample(linearClamp, uvG).rgb;
+            }
+            else
+            {
+                frostedBackground = float3(backdropTexture.Sample(linearClamp, uvR).r,
+                    backdropTexture.Sample(linearClamp, uvG).g,
+                    backdropTexture.Sample(linearClamp, uvB).b);
+            }
         }
         else
         {
-            // Frost on: vertical separable axis from the temp target (pass 1
-            // blurred horizontal). True Gaussian finish, zero stochastic
-            // elements anywhere in the frost.
             frostedBackground = SampleGlassAxis(blurTemp, uvR, uvG, uvB, texel, blurPx, float2(0.0, 1.0));
         }
     }
@@ -1046,7 +1113,7 @@ float4 GlassPS(VertexOutput input) : SV_Target
 // ---------------------------------------------------------------------------
 // Shared lens-UV computation for every frost pass. Must stay identical to
 // the UV block in GlassPS above.
-void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
+void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi, bool allowDispersion,
     out float2 uvR, out float2 uvG, out float2 uvB, out float blurPx)
 {
     if (scene1.z > 50.0)
@@ -1058,7 +1125,6 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
         blurPx = CcBlurPxAt(pixel);
         return;
     }
-    // DOCK_FX_PANEL (menus): fill the surface; dock keeps the shadow margin ring.
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);
     const float popupShadowOn = FxEnabled(scene1.x, (float)DOCK_FX_POPUP_SHADOW);
     const bool isPanel = panelOn > 0.5;
@@ -1066,12 +1132,11 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     const float marginDev = max(1.0 - panelOn, popupShadowOn) * DOCK_SHADOW_MARGIN_PT * dpi;
     float2 halfSize = max(outputSize * 0.5 - marginDev, float2(1.0, 1.0));
     float cornerRadius = max(min(DOCK_CORNER_RADIUS_PT * dpi, halfSize.y), 1.0);
-    // Panels may override the radius (device px, scene3.y), e.g. Search uses the dock's own corner.
     if (isPanel && scene3.y > 0.0)
     {
         cornerRadius = max(min(scene3.y, halfSize.y), 1.0);
     }
-    float distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
+    float distance;
     float dockS = 1.0;
     float2 dockNrm = float2(0.0, 1.0);
     const float textPanelF = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE) * (1.0 - labelFace);
@@ -1084,60 +1149,28 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi,
     {
         DockPanelShape(pixel, outputSize, dpi, halfSize, cornerRadius, dockS, distance, dockNrm);
     }
+    else
+    {
+        distance = SdSquircleBox(pixel - outputSize * 0.5, halfSize, cornerRadius);
+    }
     const float2 screenGradient = float2(ddx(distance), ddy(distance));
     const float2 gradient = !dockStyle ? screenGradient : dockNrm;
     const float2 texel = 1.0 / outputSize;
-    const float2 uv = pixel * texel;
     const float2 outward = gradient / max(length(gradient), 0.0001);
     const float insideDistance = max(-distance, 0.0);
-    float bevelWidth = GlassBevelWidth(halfSize, cornerRadius, dpi, isPanel);
-    const float x = saturate(insideDistance / max(bevelWidth, 1e-3)); // 0 rim -> 1 flat
-    const float oneMinusX = 1.0 - x;
-    const float oneMinusX4 = oneMinusX * oneMinusX * oneMinusX * oneMinusX;
-    const float height01 = BevelHeight(oneMinusX4); // f(x): 0 rim, 1 center
-    const float slopeN = BevelSlopeN(oneMinusX, oneMinusX4);
-    const LensGeo lens = GetLensGeo(PhysicalGlassPanel(isPanel, dockStyle), bevelWidth, dpi);
-    float slopeMag = lens.slopeScale * slopeN;
+    const float bevelWidth = GlassBevelWidth(halfSize, cornerRadius, dpi, isPanel);
     const float fxBits = scene1.x;
-    const float lensOn = FxEnabled(fxBits, 2.0);
-    const float dispOn = FxEnabled(fxBits, 4.0);
-    const float thicknessPx = (0.35 + 0.65 * height01) * lens.thickScale;
-    const float thetaS = atan(slopeMag);
-    const float sinS = sin(thetaS);
-    const float sinRR = clamp(sinS / 1.5143, 0.0, 0.999);
-    const float sinRG = clamp(sinS / 1.5168, 0.0, 0.999);
-    const float sinRB = clamp(sinS / 1.5224, 0.0, 0.999);
-    const float thetaRR = asin(sinRR);
-    const float thetaRG = asin(sinRG);
-    const float thetaRB = asin(sinRB);
-    float dR = SlabPull(thicknessPx, thetaS, sinS, 1.5143, lens.gapPx) * lens.gain * lensOn;
-    float dG = SlabPull(thicknessPx, thetaS, sinS, 1.5168, lens.gapPx) * lens.gain * lensOn;
-    float dB = SlabPull(thicknessPx, thetaS, sinS, 1.5224, lens.gapPx) * lens.gain * lensOn;
-    dR = dG + (dR - dG) * kFringeBoost;
-    dB = dG + (dB - dG) * kFringeBoost;
-    dR = lerp(dG, dR, dispOn);
-    dB = lerp(dG, dB, dispOn);
-    // Must stay identical to GlassPS above (see SoftLensCap / kLensMaxPx).
-    const float lensMaxFrost = lens.capPx;
-    dR = SoftLensCap(dR, lensMaxFrost);
-    dG = SoftLensCap(dG, lensMaxFrost);
-    dB = SoftLensCap(dB, lensMaxFrost);
-    const float lensRimFadeFrost = smoothstep(0.0, lens.rimFadePx, insideDistance);
-    dR *= lensRimFadeFrost;
-    dG *= lensRimFadeFrost;
-    dB *= lensRimFadeFrost;
-    const float2 lo = texel * 0.5;
-    const float2 hi = 1.0 - texel * 0.5;
-    uvR = clamp(uv - outward * dR * texel, lo, hi);
-    uvG = clamp(uv - outward * dG * texel, lo, hi);
-    uvB = clamp(uv - outward * dB * texel, lo, hi);
-    const float frostAmt = saturate(((uint)scene1.x >> 16) / 255.0);
+    float height01;
+    float slopeMag;
+    ComputeBevelRefraction(pixel * texel, texel, outward, insideDistance, bevelWidth, dpi, isPanel,
+        dockStyle, FxEnabled(fxBits, 2.0) > 0.5, allowDispersion && FxEnabled(fxBits, 4.0) > 0.5,
+        height01, slopeMag, uvR, uvG, uvB);
+    const float frostAmt = saturate(((uint)fxBits >> 16) / 255.0);
     float micaRim;
     float micaCore;
-    const float textPanel = panelOn * FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE) * (1.0 - labelFace);
-    const float charcoalOn = panelOn * (1.0 - FxEnabled(scene1.x, (float)DOCK_FX_DOCK_FACE)) * (1.0 - labelFace);
+    const float charcoalOn = panelOn * (1.0 - FxEnabled(fxBits, (float)DOCK_FX_DOCK_FACE)) * (1.0 - labelFace);
     FrostMicaRadii(max(frostAmt, max(charcoalOn * DOCK_PANEL_FROST_BLUR_FLOOR,
-        (dockStyle ? 0.0 : textPanel * DOCK_TEXT_PANEL_FROST_FLOOR))), micaRim, micaCore);
+        (dockStyle ? 0.0 : textPanelF * DOCK_TEXT_PANEL_FROST_FLOOR))), micaRim, micaCore);
     blurPx = SpotlightPanel() ? DOCK_SPOTLIGHT_BLUR_PX * dpi : lerp(micaRim, micaCore, height01) * dpi;
 }
 
@@ -1151,7 +1184,7 @@ float4 BlurHPS(VertexOutput input) : SV_Target
     float2 uvG;
     float2 uvB;
     float blurPx;
-    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
+    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), true, uvR, uvG, uvB, blurPx);
     const float3 h = (scene1.z > 50.0) ? CcSampleAxis(backdropTexture, uvR, texel, blurPx, float2(1.0, 0.0))
         : SampleGlassAxis(backdropTexture, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
     return float4(h, 1.0);
@@ -1166,7 +1199,7 @@ float4 BlurVPS(VertexOutput input) : SV_Target
     float2 uvG;
     float2 uvB;
     float blurPx;
-    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
+    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), true, uvR, uvG, uvB, blurPx);
     const float3 v = (scene1.z > 50.0) ? CcSampleAxis(blurTemp, uvR, texel, blurPx, float2(0.0, 1.0))
         : SampleGlassAxis(blurTemp, uvR, uvG, uvB, texel, blurPx, float2(0.0, 1.0));
     return float4(v, 1.0);
@@ -1182,7 +1215,7 @@ float4 BlurHPS2(VertexOutput input) : SV_Target
     float2 uvG;
     float2 uvB;
     float blurPx;
-    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), uvR, uvG, uvB, blurPx);
+    ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), false, uvR, uvG, uvB, blurPx);
     const float3 h = (scene1.z > 50.0) ? CcSampleAxis(blurTemp2, uvR, texel, blurPx, float2(1.0, 0.0))
         : SampleGlassAxis(blurTemp2, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
     return float4(h, 1.0);

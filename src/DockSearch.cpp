@@ -838,10 +838,14 @@ void DockApp::FinishSearchHide() noexcept {
     m_searchRows.clear();
     m_searchRowRects.clear();
     m_searchGlass.clear();
+    m_searchIcons.clear();
+    m_searchIconsMissing.clear();
     std::vector<uint8_t>().swap(m_searchBits);
     std::vector<uint8_t>().swap(m_searchOverlay);
     std::vector<uint8_t>().swap(m_searchAnimScratch);
     std::vector<uint8_t>().swap(m_searchAnimPresent);
+    ReleaseLayerPresentDib(m_searchLayerDib);
+    TrimIdlePopupMemory();
 
     if (!hideDock || m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding) {
         return;
@@ -2595,7 +2599,6 @@ void DockApp::StartSearchServices() {
         Log(L"Search: Ctrl+Space is taken by another app; use the dock Search tile.");
     }
     SyncSearchHotkeyForFullscreen();
-    RefreshSearchApps();
 }
 
 void DockApp::StopSearchServices() noexcept {

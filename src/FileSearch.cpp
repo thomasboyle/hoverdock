@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <malloc.h>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -30,9 +31,13 @@ constexpr uint32_t kMaxChunkBytes = 4U << 20;
 constexpr DWORD kHelperConnectTimeoutMs = 30000;
 constexpr DWORD kPipeReadTimeoutMs = 60000;
 constexpr DWORD kActivePollMs = 250;
-constexpr DWORD kIdlePollMs = 30000;
+constexpr DWORD kWarmGracePollMs = 1000;
+constexpr DWORD kHibernatedPollMs = 60000;
+constexpr ULONGLONG kResidentIdleGraceMs = 3000ULL;
+constexpr LONGLONG kMaxHibernatedJournalBacklogBytes = 16LL << 20;
 constexpr DWORD kRetryBuildMs = 5U * 60U * 1000U;
 constexpr uint32_t kCacheFileMagic = 0x31434448U;  // "HDC1"
+constexpr uint32_t kFsiPayloadMagic = 0x31495346U; // "FSI1"
 constexpr DWORD kJournalReasons = USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_RENAME_NEW_NAME |
     USN_REASON_BASIC_INFO_CHANGE;
 
@@ -993,7 +998,6 @@ void FileSearchService::Start(HWND notify, UINT statusMessage) {
     m_stop.store(false);
     m_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_indexThread = std::thread([this] { IndexThread(); });
-    m_searchThread = std::thread([this] { SearchThread(); });
 }
 
 void FileSearchService::Stop() noexcept {
@@ -1009,11 +1013,16 @@ void FileSearchService::Stop() noexcept {
         m_hasRequest = false;
     }
     m_requestReady.notify_all();
+    m_residentCv.notify_all();
     if (m_indexThread.joinable()) {
         m_indexThread.join();
     }
     if (m_searchThread.joinable()) {
         m_searchThread.join();
+    }
+    {
+        std::lock_guard lock(m_requestLock);
+        m_searchThreadStarted = false;
     }
     if (m_wake != nullptr) {
         CloseHandle(m_wake);
@@ -1028,10 +1037,20 @@ void FileSearchService::Restart() {
     }
 }
 
+bool FileSearchService::NeedResident() const noexcept {
+    if (m_active.load(std::memory_order_acquire)) {
+        return true;
+    }
+    const ULONGLONG last = m_lastDemandTick.load(std::memory_order_relaxed);
+    return last != 0 && (GetTickCount64() - last) < kResidentIdleGraceMs;
+}
+
 void FileSearchService::SetActive(bool active) noexcept {
-    const bool was = m_active.exchange(active);
-    if (active && !was && m_wake != nullptr) {
-        SetEvent(m_wake);  // catch up on the journal right away
+    if (active) {
+        m_lastDemandTick.store(GetTickCount64(), std::memory_order_relaxed);
+    }
+    if (m_active.exchange(active) != active && m_wake != nullptr) {
+        SetEvent(m_wake);
     }
 }
 
@@ -1050,8 +1069,16 @@ void FileSearchService::SetApps(const std::vector<std::wstring>& appNames) {
 
 void FileSearchService::Query(HWND reply, UINT message, uint64_t requestId, std::wstring query, size_t fileLimit,
     size_t appLimit) {
+    m_lastDemandTick.store(GetTickCount64(), std::memory_order_relaxed);
+    if (m_wake != nullptr) {
+        SetEvent(m_wake);
+    }
     {
         std::lock_guard lock(m_requestLock);
+        if (!m_searchThreadStarted && !m_stop.load()) {
+            m_searchThread = std::thread([this] { SearchThread(); });
+            m_searchThreadStarted = true;
+        }
         m_request = {reply, message, requestId, std::move(query), fileLimit, appLimit};
         m_hasRequest = true;
     }
@@ -1135,7 +1162,7 @@ bool FileSearchService::BuildIndex(std::unique_ptr<FileIndex>& index, std::vecto
 }
 
 bool FileSearchService::LoadCachedIndex(std::unique_ptr<FileIndex>& index, std::vector<Journal>& journals,
-    FileSearchMode& mode) {
+    FileSearchMode& mode, bool metadataOnly, size_t* outLiveEntries) {
     const std::wstring path = IndexCachePath();
     if (path.empty()) {
         return false;
@@ -1144,28 +1171,42 @@ bool FileSearchService::LoadCachedIndex(std::unique_ptr<FileIndex>& index, std::
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
         FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
     LARGE_INTEGER fileSize{};
-    if (!file.Valid() || GetFileSizeEx(file.Get(), &fileSize) == FALSE || fileSize.QuadPart <= 16 ||
+    if (!file.Valid() || GetFileSizeEx(file.Get(), &fileSize) == FALSE || fileSize.QuadPart <= 28 ||
         fileSize.QuadPart > (1LL << 29)) {
         return false;
     }
-    std::vector<uint8_t> bytes(static_cast<size_t>(fileSize.QuadPart));
-    for (size_t offset = 0; offset < bytes.size();) {
-        DWORD got = 0;
-        const auto chunk = static_cast<DWORD>(std::min<size_t>(bytes.size() - offset, 1U << 20));
-        if (ReadFile(file.Get(), bytes.data() + offset, chunk, &got, nullptr) == FALSE || got == 0) {
-            return false;
-        }
-        offset += got;
+    const auto totalBytes = static_cast<size_t>(fileSize.QuadPart);
+    const size_t mapBytes = metadataOnly
+        ? (std::min)(totalBytes, static_cast<size_t>(8 + 26 * sizeof(CachedJournalHeader) + 12))
+        : totalBytes;
+    Handle mapping(CreateFileMappingW(file.Get(), nullptr, PAGE_READONLY, 0, 0, nullptr));
+    if (mapping.Get() == nullptr) {
+        return false;
+    }
+    struct MappedView {
+        const void* ptr = nullptr;
+        ~MappedView() { if (ptr != nullptr) UnmapViewOfFile(ptr); }
+    } mapped{MapViewOfFile(mapping.Get(), FILE_MAP_READ, 0, 0, mapBytes)};
+    const auto* raw = static_cast<const uint8_t*>(mapped.ptr);
+    if (raw == nullptr) {
+        return false;
     }
     uint32_t magic = 0;
-    std::memcpy(&magic, bytes.data(), sizeof(magic));
-    const uint8_t rawMode = bytes[4];
-    const uint8_t journalCount = bytes[5];
+    std::memcpy(&magic, raw, sizeof(magic));
+    const uint8_t rawMode = raw[4];
+    const uint8_t journalCount = raw[5];
     const size_t headerBytes = 8 + static_cast<size_t>(journalCount) * sizeof(CachedJournalHeader);
     if (magic != kCacheFileMagic ||
         (rawMode != static_cast<uint8_t>(FileSearchMode::Mft) &&
             rawMode != static_cast<uint8_t>(FileSearchMode::Folders)) ||
-        journalCount == 0 || journalCount > 26 || bytes.size() <= headerBytes) {
+        journalCount == 0 || journalCount > 26 || mapBytes < headerBytes + 12) {
+        return false;
+    }
+    uint32_t fsiMagic = 0;
+    uint64_t rawLive = 0;
+    std::memcpy(&fsiMagic, raw + headerBytes, sizeof(fsiMagic));
+    std::memcpy(&rawLive, raw + headerBytes + sizeof(fsiMagic), sizeof(rawLive));
+    if (fsiMagic != kFsiPayloadMagic || rawLive == 0 || rawLive > (1ULL << 27)) {
         return false;
     }
     const auto savedMode = static_cast<FileSearchMode>(rawMode);
@@ -1184,7 +1225,7 @@ bool FileSearchService::LoadCachedIndex(std::unique_ptr<FileIndex>& index, std::
     };
     for (uint8_t i = 0; i < journalCount; ++i) {
         CachedJournalHeader cj{};
-        std::memcpy(&cj, bytes.data() + 8 + static_cast<size_t>(i) * sizeof(CachedJournalHeader), sizeof(cj));
+        std::memcpy(&cj, raw + 8 + static_cast<size_t>(i) * sizeof(CachedJournalHeader), sizeof(cj));
         const auto letter = static_cast<wchar_t>(cj.letter);
         if (letter < L'A' || letter > L'Z' || cj.journalId == 0) {
             closeOpened();
@@ -1212,13 +1253,18 @@ bool FileSearchService::LoadCachedIndex(std::unique_ptr<FileIndex>& index, std::
         }
         opened.push_back({cj.volume, letter, handle, cj.journalId, cj.nextUsn, privileged});
     }
-    auto loaded = std::make_unique<FileIndex>();
-    if (!loaded->Deserialize(bytes.data() + headerBytes, bytes.size() - headerBytes) ||
-        loaded->LiveEntryCount() == 0) {
-        closeOpened();
-        return false;
+    if (!metadataOnly) {
+        auto loaded = std::make_unique<FileIndex>();
+        if (!loaded->Deserialize(raw + headerBytes, totalBytes - headerBytes) ||
+            loaded->LiveEntryCount() == 0) {
+            closeOpened();
+            return false;
+        }
+        index = std::move(loaded);
     }
-    index = std::move(loaded);
+    if (outLiveEntries != nullptr) {
+        *outLiveEntries = static_cast<size_t>(rawLive);
+    }
     journals = std::move(opened);
     mode = savedMode;
     std::lock_guard lock(m_statusLock);
@@ -1287,7 +1333,6 @@ bool FileSearchService::PollJournals() {
         std::string name;
     };
     std::vector<Update> updates;
-    // Reused across polls (4/s while Search is open).
     std::vector<BYTE>& buffer = m_journalBuffer;
     buffer.resize(kJournalBufferBytes);
     bool healthy = true;
@@ -1328,6 +1373,9 @@ bool FileSearchService::PollJournals() {
                 });
             USN next = 0;
             std::memcpy(&next, buffer.data(), sizeof(next));
+            if (next != journal.nextUsn) {
+                m_dirtySinceSave = true;
+            }
             read.StartUsn = next;
             journal.nextUsn = next;
             if (bytes < kJournalBufferBytes / 2) {
@@ -1336,6 +1384,7 @@ bool FileSearchService::PollJournals() {
         }
     }
     if (!updates.empty()) {
+        m_dirtySinceSave = true;
         std::unique_lock lock(m_indexLock);
         if (m_index != nullptr) {
             for (const Update& update : updates) {
@@ -1348,6 +1397,7 @@ bool FileSearchService::PollJournals() {
             m_index->CompactIfWasteful();
             std::lock_guard statusLock(m_statusLock);
             m_status.entries = m_index->LiveEntryCount();
+            m_status.memoryBytes = m_index->MemoryBytes();
         }
     }
     return healthy;
@@ -1355,6 +1405,21 @@ bool FileSearchService::PollJournals() {
 
 void FileSearchService::IndexThread() {
     bool forceRebuild = false;
+    auto hibernate = [&]() noexcept {
+        if (m_dirtySinceSave) {
+            SaveCachedIndex();
+            m_dirtySinceSave = false;
+        }
+        {
+            std::unique_lock lock(m_indexLock);
+            m_index.reset();
+            std::lock_guard statusLock(m_statusLock);
+            m_status.memoryBytes = 0;
+        }
+        std::vector<BYTE>().swap(m_journalBuffer);
+        static_cast<void>(_heapmin());
+    };
+
     while (!m_stop.load()) {
         {
             std::lock_guard lock(m_statusLock);
@@ -1362,17 +1427,18 @@ void FileSearchService::IndexThread() {
         }
         NotifyStatus();
         m_rebuild.store(false);
+        m_dirtySinceSave = false;
         CloseJournals();
         const auto started = std::chrono::steady_clock::now();
+
         std::unique_ptr<FileIndex> index;
         std::vector<Journal> journals;
         FileSearchMode mode = FileSearchMode::Starting;
-        bool built = !forceRebuild && LoadCachedIndex(index, journals, mode);
+        size_t cachedEntries = 0;
+        const bool probeOnly = !forceRebuild && !NeedResident();
+        bool built = !forceRebuild && LoadCachedIndex(index, journals, mode, probeOnly, &cachedEntries);
         forceRebuild = false;
         if (!built) {
-            // BELOW_NORMAL keeps the UI responsive without entering Windows
-            // THREAD_MODE_BACKGROUND_BEGIN, whose Very-Low I/O priority gets
-            // starved for tens of seconds during boot disk activity.
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             built = BuildIndex(index, journals, mode);
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
@@ -1392,42 +1458,112 @@ void FileSearchService::IndexThread() {
             std::lock_guard statusLock(m_statusLock);
             m_status.mode = built ? mode : FileSearchMode::Starting;
             m_status.indexing = false;
-            m_status.entries = m_index != nullptr ? m_index->LiveEntryCount() : 0;
+            m_status.entries = m_index != nullptr ? m_index->LiveEntryCount() : (built ? cachedEntries : 0);
             m_status.memoryBytes = m_index != nullptr ? m_index->MemoryBytes() : 0;
             m_status.buildMs = buildMs;
         }
+        m_residentCv.notify_all();
         NotifyStatus();
         if (!built) {
-            // Nothing indexable right now (e.g. profile unavailable): retry later.
             WaitForSingleObject(m_wake, kRetryBuildMs);
             continue;
         }
-        // Catch up on changes made while building (or while powered off),
-        // save a fresh snapshot, then follow the journal.
-        if (!PollJournals()) {
-            forceRebuild = true;
-            m_rebuild.store(true);
-            continue;
-        }
-        SaveCachedIndex();
-        while (!m_stop.load() && !m_rebuild.load()) {
+        if (m_index != nullptr) {
             if (!PollJournals()) {
                 forceRebuild = true;
-                m_rebuild.store(true);
+                continue;
+            }
+            SaveCachedIndex();
+            m_dirtySinceSave = false;
+            if (!NeedResident()) {
+                hibernate();
+            }
+        }
+
+        while (!m_stop.load() && !m_rebuild.load()) {
+            if (m_index == nullptr) {
+                bool needHydrate = NeedResident();
+                if (!needHydrate) {
+                    for (const Journal& j : m_journals) {
+                        USN_JOURNAL_DATA_V0 live{};
+                        DWORD returned = 0;
+                        if (j.handle == INVALID_HANDLE_VALUE ||
+                            DeviceIoControl(j.handle, FSCTL_QUERY_USN_JOURNAL, nullptr, 0, &live,
+                                sizeof(live), &returned, nullptr) == FALSE ||
+                            live.UsnJournalID != j.journalId || j.nextUsn < live.FirstUsn ||
+                            j.nextUsn > live.NextUsn) {
+                            forceRebuild = true;
+                            break;
+                        }
+                        const LONGLONG cap = live.MaximumSize > 0
+                            ? (std::min)(static_cast<LONGLONG>(live.MaximumSize / 2ULL),
+                                  kMaxHibernatedJournalBacklogBytes)
+                            : kMaxHibernatedJournalBacklogBytes;
+                        if (live.NextUsn - j.nextUsn >= cap) {
+                            needHydrate = true;
+                        }
+                    }
+                    if (forceRebuild) {
+                        break;
+                    }
+                }
+                if (needHydrate) {
+                    CloseJournals();
+                    std::unique_ptr<FileIndex> loaded;
+                    std::vector<Journal> reopened;
+                    FileSearchMode loadedMode = FileSearchMode::Starting;
+                    if (!LoadCachedIndex(loaded, reopened, loadedMode, false)) {
+                        forceRebuild = true;
+                        break;
+                    }
+                    m_journals = std::move(reopened);
+                    {
+                        std::unique_lock lock(m_indexLock);
+                        m_index = std::move(loaded);
+                        std::lock_guard statusLock(m_statusLock);
+                        m_status.mode = loadedMode;
+                        m_status.entries = m_index->LiveEntryCount();
+                        m_status.memoryBytes = m_index->MemoryBytes();
+                    }
+                    if (!PollJournals()) {
+                        forceRebuild = true;
+                        break;
+                    }
+                    m_residentCv.notify_all();
+                    if (!NeedResident()) {
+                        hibernate();
+                    }
+                    continue;
+                }
+                WaitForSingleObject(m_wake, kHibernatedPollMs);
+                continue;
+            }
+
+            if (!PollJournals()) {
+                forceRebuild = true;
                 break;
             }
-            WaitForSingleObject(m_wake, m_active.load() ? kActivePollMs : kIdlePollMs);
+            if (!NeedResident()) {
+                hibernate();
+                continue;
+            }
+            WaitForSingleObject(m_wake, m_active.load() ? kActivePollMs : kWarmGracePollMs);
         }
         if (m_rebuild.load()) {
             forceRebuild = true;
         }
+        m_residentCv.notify_all();
     }
-    SaveCachedIndex();
+    if (m_dirtySinceSave) {
+        SaveCachedIndex();
+    }
+    m_residentCv.notify_all();
     CloseJournals();
 }
 
 void FileSearchService::SearchThread() {
     const unsigned threads = std::clamp(std::thread::hardware_concurrency() / 2U, 1U, 4U);
+    static const std::wstring currentProfile = KnownFolder(FOLDERID_Profile);
     filesearch::SearchState state;
     for (;;) {
         Request request;
@@ -1439,6 +1575,19 @@ void FileSearchService::SearchThread() {
             }
             request = std::move(m_request);
             m_hasRequest = false;
+        }
+        m_lastDemandTick.store(GetTickCount64(), std::memory_order_relaxed);
+        if (m_wake != nullptr) {
+            SetEvent(m_wake);
+        }
+        {
+            std::unique_lock statusLock(m_statusLock);
+            m_residentCv.wait(statusLock, [this] {
+                return m_stop.load() || m_status.indexing || m_status.entries == 0 || m_index != nullptr;
+            });
+            if (m_stop.load()) {
+                return;
+            }
         }
         auto reply = std::make_unique<FileSearchReply>();
         reply->requestId = request.id;
@@ -1455,7 +1604,6 @@ void FileSearchService::SearchThread() {
                 reply->apps.push_back(std::move(item));
             }
             if (m_index != nullptr) {
-                const std::wstring currentProfile = KnownFolder(FOLDERID_Profile);
                 for (const filesearch::Hit& hit : m_index->Search(query, request.fileLimit, &state, threads)) {
                     FileSearchItem item;
                     item.kind = (m_index->Flags(hit.entry) & filesearch::kFlagDirectory) != 0

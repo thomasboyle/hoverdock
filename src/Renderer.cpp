@@ -1,4 +1,5 @@
 #include "Renderer.h"
+#include "ActiveDockPolicy.h"
 #include "DockTheme.hlsli"
 #include "Profile.h"
 
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -869,6 +871,81 @@ const D3D12_SHADER_BYTECODE Shader(const unsigned char* bytes, size_t size) {
     return {bytes, size};
 }
 
+// Table 0: [iconAtlas, backdrop, blurTemp, null]; Table 1: [iconAtlas, backdrop, null, blurTemp2].
+void InitDualSrvTables(ID3D12Device* device, UINT descriptorSize, ID3D12DescriptorHeap* heap,
+    ID3D12Resource* iconAtlas, UINT iconCount, ID3D12Resource* backdrop,
+    ID3D12Resource* blurTemp, ID3D12Resource* blurTemp2) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC arrayDesc{};
+    arrayDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    arrayDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    arrayDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    arrayDesc.Texture2DArray.MipLevels = 1;
+    arrayDesc.Texture2DArray.ArraySize = std::max(iconCount, 1U);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC texDesc{};
+    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    texDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    texDesc.Texture2D.MipLevels = 1;
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE start = heap->GetCPUDescriptorHandleForHeapStart();
+    ID3D12Resource* const slots[8] = {
+        iconAtlas, backdrop, blurTemp, nullptr,
+        iconAtlas, backdrop, nullptr, blurTemp2,
+    };
+    for (UINT i = 0; i < 8; ++i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE dst = start;
+        dst.ptr += static_cast<SIZE_T>(i) * descriptorSize;
+        device->CreateShaderResourceView(slots[i], (i % 4 == 0) ? &arrayDesc : &texDesc, dst);
+    }
+}
+
+void RecordFrostBlur(ID3D12GraphicsCommandList* cmd, float frostAmt,
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvBase, UINT rtvStride,
+    D3D12_GPU_DESCRIPTOR_HANDLE srvTable0, UINT srvStride,
+    ID3D12Resource* temp1, bool& temp1IsSrv, ID3D12Resource* temp2, bool& temp2IsSrv,
+    ID3D12PipelineState* h1Pso, ID3D12PipelineState* vPso, ID3D12PipelineState* h2Pso) {
+    D3D12_GPU_DESCRIPTOR_HANDLE srvTable1 = srvTable0;
+    srvTable1.ptr += 4ULL * srvStride;
+
+    auto pass = [&](ID3D12Resource* target, bool& isSrv, SIZE_T rtvOffset,
+                    D3D12_GPU_DESCRIPTOR_HANDLE table, ID3D12PipelineState* pso) {
+        if (isSrv) {
+            D3D12_RESOURCE_BARRIER toRt{};
+            toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toRt.Transition.pResource = target;
+            toRt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            toRt.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            cmd->ResourceBarrier(1, &toRt);
+            isSrv = false;
+        }
+        cmd->SetGraphicsRootDescriptorTable(2, table);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvBase;
+        rtv.ptr += rtvOffset * rtvStride;
+        cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        cmd->SetPipelineState(pso);
+        cmd->DrawInstanced(3, 1, 0, 0);
+
+        D3D12_RESOURCE_BARRIER toSrv{};
+        toSrv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toSrv.Transition.pResource = target;
+        toSrv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toSrv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toSrv.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        cmd->ResourceBarrier(1, &toSrv);
+        isSrv = true;
+    };
+
+    pass(temp1, temp1IsSrv, 0, srvTable1, h1Pso);
+    const int extraPairs = static_cast<int>(std::lround(
+        std::clamp((frostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
+    for (int pair = 0; pair < extraPairs; ++pair) {
+        pass(temp2, temp2IsSrv, 1, srvTable0, vPso);
+        pass(temp1, temp1IsSrv, 0, srvTable1, h2Pso);
+    }
+}
+
 }  // namespace
 
 void Renderer::BeginDeviceCreation() {
@@ -888,6 +965,7 @@ Renderer::~Renderer() {
     ReleasePanelGlassResources();
     ReleasePanelGlassPool();
     ReleasePanelCaptureDib();
+    ReleasePanelPipelineResources();
     ReleaseBackdropResources();
     if (m_frameLatencyWaitableObject != nullptr) {
         CloseHandle(m_frameLatencyWaitableObject);
@@ -975,13 +1053,17 @@ void Renderer::EndIconBatch() {
     m_iconBatchActive = false;
     if (m_iconAtlasRebuildPending) {
         m_iconAtlasRebuildPending = false;
-        RebuildIconAtlasFromCache();
+        RebuildIconAtlasFromStaged();
     }
+    m_stagedBatchIcons.clear();
+    m_stagedBatchIcons.rehash(0);
 }
 
 void Renderer::CancelIconBatch() noexcept {
     m_iconBatchActive = false;
     m_iconAtlasRebuildPending = false;
+    m_stagedBatchIcons.clear();
+    m_stagedBatchIcons.rehash(0);
 }
 
 void Renderer::RequestIconAtlasRebuild() {
@@ -989,7 +1071,9 @@ void Renderer::RequestIconAtlasRebuild() {
         m_iconAtlasRebuildPending = true;
         return;
     }
-    RebuildIconAtlasFromCache();
+    RebuildIconAtlasFromStaged();
+    m_stagedBatchIcons.clear();
+    m_stagedBatchIcons.rehash(0);
 }
 
 void Renderer::UploadIcons(const std::vector<std::wstring>& targets,
@@ -1005,11 +1089,13 @@ void Renderer::UploadIcons(const std::vector<std::wstring>& targets,
     }
 
     m_iconTextureByTarget.clear();
-    m_iconPixelCache.clear();
+    m_validIconTargets.clear();
+    m_stagedBatchIcons.clear();
     for (UINT index = 0; index < targets.size(); ++index) {
         m_iconTextureByTarget[targets[index]] = index;
         if (!pixelBuffers[index].empty()) {
-            m_iconPixelCache[targets[index]] = pixelBuffers[index];
+            m_validIconTargets.insert(targets[index]);
+            m_stagedBatchIcons[targets[index]] = pixelBuffers[index];
         }
     }
     // Publish the high-water mark before a deferred rebuild. Tray and trash
@@ -1027,9 +1113,25 @@ UINT Renderer::NextFreeIconSlot() const noexcept {
     return next;
 }
 
-void Renderer::RebuildIconAtlasFromCache() {
-    // Size from the highest assigned slice, not the key count. Duplicate keys
-    // leave holes, and a stale count used to alias tray glyphs onto Start/Search.
+void Renderer::UpdateIconAtlasSrvs() noexcept {
+    if (m_device == nullptr || m_srvHeap == nullptr || m_iconAtlas == nullptr) {
+        return;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray.MipLevels = 1;
+    view.Texture2DArray.ArraySize = std::max(m_iconCount, 1U);
+    D3D12_CPU_DESCRIPTOR_HANDLE iconDescriptor = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    iconDescriptor.ptr += static_cast<SIZE_T>(kIconTextureDescriptor) * m_srvDescriptorSize;
+    m_device->CreateShaderResourceView(m_iconAtlas.Get(), &view, iconDescriptor);
+    D3D12_CPU_DESCRIPTOR_HANDLE iconDescriptorTable1 = iconDescriptor;
+    iconDescriptorTable1.ptr += static_cast<SIZE_T>(kSrvDescriptorsPerTable) * m_srvDescriptorSize;
+    m_device->CreateShaderResourceView(m_iconAtlas.Get(), &view, iconDescriptorTable1);
+}
+
+void Renderer::RebuildIconAtlasFromStaged() {
     UINT iconCount = 1U;
     if (!m_iconTextureByTarget.empty()) {
         UINT maxSlot = 0;
@@ -1042,6 +1144,7 @@ void Renderer::RebuildIconAtlasFromCache() {
         throw std::runtime_error("The dock supports at most 512 visible icons.");
     }
     m_iconCount = iconCount;
+    m_iconAtlasCapacity = std::min(kMaximumIcons, std::max(8U, ((m_iconCount + 7U) / 8U) * 8U));
 
     ComApartment apartment;
     WaitForAllFrames();
@@ -1058,25 +1161,19 @@ void Renderer::RebuildIconAtlasFromCache() {
               IID_PPV_ARGS(&commandList)),
         "Create icon upload command list");
 
-    const D3D12_RESOURCE_DESC atlas = TextureDescription(displayExtent, displayExtent, TextureArraySize(m_iconCount));
+    const D3D12_RESOURCE_DESC atlas =
+        TextureDescription(displayExtent, displayExtent, TextureArraySize(m_iconAtlasCapacity));
     const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
     Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &atlas,
               D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_iconAtlas)),
         "Create icon texture array");
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-    view.Texture2DArray.MipLevels = 1;
-    view.Texture2DArray.ArraySize = m_iconCount;
-    D3D12_CPU_DESCRIPTOR_HANDLE iconDescriptor = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-    iconDescriptor.ptr += static_cast<SIZE_T>(kIconTextureDescriptor) * m_srvDescriptorSize;
-    m_device->CreateShaderResourceView(m_iconAtlas.Get(), &view, iconDescriptor);
+    UpdateIconAtlasSrvs();
 
     if (m_iconTextureByTarget.empty()) {
         CreateFallbackIcon(0, commandList.Get());
     } else {
+        std::vector<bool> populated(m_iconCount, false);
         std::vector<std::pair<UINT, std::wstring>> slots;
         slots.reserve(m_iconTextureByTarget.size());
         for (const auto& entry : m_iconTextureByTarget) {
@@ -1084,10 +1181,19 @@ void Renderer::RebuildIconAtlasFromCache() {
         }
         std::ranges::sort(slots, {}, &std::pair<UINT, std::wstring>::first);
         for (const auto& [slot, target] : slots) {
-            const auto cached = m_iconPixelCache.find(target);
-            if (cached != m_iconPixelCache.end() && !cached->second.empty()) {
-                UploadIconTexture(slot, cached->second.data(), displayExtent, displayExtent, commandList.Get());
+            if (slot >= m_iconCount || populated[slot]) {
+                continue;
+            }
+            populated[slot] = true;
+            const auto staged = m_stagedBatchIcons.find(target);
+            if (staged != m_stagedBatchIcons.end() && !staged->second.empty()) {
+                UploadIconTexture(slot, staged->second.data(), displayExtent, displayExtent, commandList.Get());
             } else {
+                CreateFallbackIcon(slot, commandList.Get());
+            }
+        }
+        for (UINT slot = 0; slot < m_iconCount; ++slot) {
+            if (!populated[slot]) {
                 CreateFallbackIcon(slot, commandList.Get());
             }
         }
@@ -1108,28 +1214,146 @@ void Renderer::RebuildIconAtlasFromCache() {
     m_pendingUploads.clear();
 }
 
+void Renderer::ApplyIncrementalIconUploads(
+    const std::vector<std::pair<UINT, const std::vector<uint8_t>*>>& uploads,
+    UINT newIconCount) {
+    if (m_device == nullptr || newIconCount == 0 || newIconCount > kMaximumIcons) {
+        return;
+    }
+    if (m_iconAtlas == nullptr) {
+        RebuildIconAtlasFromStaged();
+        return;
+    }
+
+    ComApartment apartment;
+    WaitForAllFrames();
+    m_pendingUploads.clear();
+
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+    Check(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+        "Create incremental icon allocator");
+    Check(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+              IID_PPV_ARGS(&commandList)),
+        "Create incremental icon command list");
+
+    const UINT displayExtent = m_iconPixelExtent;
+    const UINT oldIconCount = m_iconCount;
+    ComPtr<ID3D12Resource> oldAtlas;
+
+    if (newIconCount <= m_iconAtlasCapacity) {
+        D3D12_RESOURCE_BARRIER toCopy{};
+        toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy.Transition.pResource = m_iconAtlas.Get();
+        toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        commandList->ResourceBarrier(1, &toCopy);
+        m_iconCount = newIconCount;
+        if (m_iconCount != oldIconCount) {
+            UpdateIconAtlasSrvs();
+        }
+    } else {
+        const UINT newCapacity =
+            std::min(kMaximumIcons, std::max(8U, ((newIconCount + 7U) / 8U) * 8U));
+        const D3D12_RESOURCE_DESC atlasDesc =
+            TextureDescription(displayExtent, displayExtent, TextureArraySize(newCapacity));
+        const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+        ComPtr<ID3D12Resource> newAtlas;
+        Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &atlasDesc,
+                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&newAtlas)),
+            "Grow icon texture array");
+
+        D3D12_RESOURCE_BARRIER oldToSrc{};
+        oldToSrc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        oldToSrc.Transition.pResource = m_iconAtlas.Get();
+        oldToSrc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        oldToSrc.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        oldToSrc.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        commandList->ResourceBarrier(1, &oldToSrc);
+
+        std::vector<bool> replaced(newIconCount, false);
+        for (const auto& [slot, pixels] : uploads) {
+            static_cast<void>(pixels);
+            if (slot < newIconCount) {
+                replaced[slot] = true;
+            }
+        }
+        for (UINT slice = 0; slice < oldIconCount && slice < newIconCount; ++slice) {
+            if (replaced[slice]) {
+                continue;
+            }
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = m_iconAtlas.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = slice;
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = newAtlas.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = slice;
+            commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+
+        oldAtlas = std::exchange(m_iconAtlas, std::move(newAtlas));
+        m_iconAtlasCapacity = newCapacity;
+        m_iconCount = newIconCount;
+        UpdateIconAtlasSrvs();
+
+        for (UINT slice = oldIconCount; slice < newIconCount; ++slice) {
+            if (!replaced[slice]) {
+                CreateFallbackIcon(slice, commandList.Get());
+            }
+        }
+    }
+
+    for (const auto& [slot, pixels] : uploads) {
+        if (slot >= m_iconCount) {
+            continue;
+        }
+        if (pixels != nullptr && !pixels->empty()) {
+            UploadIconTexture(slot, pixels->data(), displayExtent, displayExtent, commandList.Get());
+        } else {
+            CreateFallbackIcon(slot, commandList.Get());
+        }
+    }
+
+    D3D12_RESOURCE_BARRIER toSrv{};
+    toSrv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toSrv.Transition.pResource = m_iconAtlas.Get();
+    toSrv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toSrv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    toSrv.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    commandList->ResourceBarrier(1, &toSrv);
+
+    Check(commandList->Close(), "Close incremental icon command list");
+    ID3D12CommandList* lists[] = {commandList.Get()};
+    m_queue->ExecuteCommandLists(1, lists);
+    Flush();
+    m_pendingUploads.clear();
+    oldAtlas.Reset();
+}
+
 void Renderer::AppendMissingIcons(const std::vector<std::wstring>& targets,
     const std::vector<std::vector<uint8_t>>& pixelBuffers) {
     if (targets.size() != pixelBuffers.size()) {
         throw std::runtime_error("Append icon upload buffers do not match targets.");
     }
 
-    bool added = false;
+    std::vector<std::pair<UINT, const std::vector<uint8_t>*>> uploads;
+    uploads.reserve(targets.size());
     UINT slot = NextFreeIconSlot();
     for (size_t index = 0; index < targets.size(); ++index) {
-        // A key whose earlier extraction failed (empty pixels) is retried: it
-        // keeps its slot and takes the new pixels. Only a key that already has
-        // real pixels is skipped, so a transient failure (e.g. an exe being
-        // replaced by an auto-update) no longer leaves a permanently blank icon.
-        const auto cached = m_iconPixelCache.find(targets[index]);
-        if (cached != m_iconPixelCache.end() && !cached->second.empty()) {
+        if (m_validIconTargets.contains(targets[index])) {
             continue;
         }
         const auto existingSlot = m_iconTextureByTarget.find(targets[index]);
         if (existingSlot != m_iconTextureByTarget.end()) {
             if (!pixelBuffers[index].empty()) {
-                m_iconPixelCache[targets[index]] = pixelBuffers[index];
-                added = true;
+                m_validIconTargets.insert(targets[index]);
+                if (m_iconBatchActive) {
+                    m_stagedBatchIcons[targets[index]] = pixelBuffers[index];
+                }
+                uploads.emplace_back(existingSlot->second, &pixelBuffers[index]);
             }
             continue;
         }
@@ -1137,16 +1361,25 @@ void Renderer::AppendMissingIcons(const std::vector<std::wstring>& targets,
             throw std::runtime_error("The dock supports at most 512 visible icons.");
         }
         if (!pixelBuffers[index].empty()) {
-            m_iconPixelCache[targets[index]] = pixelBuffers[index];
+            m_validIconTargets.insert(targets[index]);
+            if (m_iconBatchActive) {
+                m_stagedBatchIcons[targets[index]] = pixelBuffers[index];
+            }
         }
         m_iconTextureByTarget[targets[index]] = slot;
+        uploads.emplace_back(slot, &pixelBuffers[index]);
         ++slot;
-        added = true;
     }
-    if (added) {
-        m_iconCount = std::max(m_iconCount, slot);
-        RequestIconAtlasRebuild();
+    if (uploads.empty()) {
+        return;
     }
+    const UINT newIconCount = std::max(m_iconCount, slot);
+    if (m_iconBatchActive) {
+        m_iconCount = newIconCount;
+        m_iconAtlasRebuildPending = true;
+        return;
+    }
+    ApplyIncrementalIconUploads(uploads, newIconCount);
 }
 
 void Renderer::UpdateCachedIcons(const std::vector<std::wstring>& targets,
@@ -1156,70 +1389,45 @@ void Renderer::UpdateCachedIcons(const std::vector<std::wstring>& targets,
         return;
     }
 
-    std::vector<std::wstring> missingTargets;
-    std::vector<std::vector<uint8_t>> missingPixels;
-    std::vector<UINT> replaceSlots;
-    missingTargets.reserve(targets.size());
-    missingPixels.reserve(targets.size());
-    replaceSlots.reserve(targets.size());
-
+    std::vector<std::pair<UINT, const std::vector<uint8_t>*>> uploads;
+    uploads.reserve(targets.size());
+    UINT slot = NextFreeIconSlot();
     for (size_t index = 0; index < targets.size(); ++index) {
         const auto found = m_iconTextureByTarget.find(targets[index]);
+        UINT dstSlot = 0;
         if (found == m_iconTextureByTarget.end()) {
-            missingTargets.push_back(targets[index]);
-            missingPixels.push_back(pixelBuffers[index]);
+            if (slot >= kMaximumIcons) {
+                throw std::runtime_error("The dock supports at most 512 visible icons.");
+            }
+            dstSlot = slot++;
+            m_iconTextureByTarget[targets[index]] = dstSlot;
         } else {
-            m_iconPixelCache[targets[index]] = pixelBuffers[index];
-            replaceSlots.push_back(found->second);
+            dstSlot = found->second;
         }
+        if (!pixelBuffers[index].empty()) {
+            m_validIconTargets.insert(targets[index]);
+            if (m_iconBatchActive) {
+                m_stagedBatchIcons[targets[index]] = pixelBuffers[index];
+            }
+        } else {
+            m_validIconTargets.erase(targets[index]);
+            if (m_iconBatchActive) {
+                m_stagedBatchIcons.erase(targets[index]);
+            }
+        }
+        uploads.emplace_back(dstSlot, &pixelBuffers[index]);
     }
 
-    if (!missingTargets.empty()) {
-        AppendMissingIcons(missingTargets, missingPixels);
+    if (uploads.empty()) {
         return;
     }
-    if (replaceSlots.empty()) {
-        return;
-    }
+    const UINT newIconCount = std::max(m_iconCount, slot);
     if (m_iconBatchActive) {
+        m_iconCount = newIconCount;
         m_iconAtlasRebuildPending = true;
         return;
     }
-
-    WaitForAllFrames();
-    ComPtr<ID3D12CommandAllocator> allocator;
-    ComPtr<ID3D12GraphicsCommandList> commandList;
-    Check(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
-        "Create tray icon update allocator");
-    Check(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-              IID_PPV_ARGS(&commandList)),
-        "Create tray icon update command list");
-
-    D3D12_RESOURCE_BARRIER toCopy{};
-    toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    toCopy.Transition.pResource = m_iconAtlas.Get();
-    toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    commandList->ResourceBarrier(1, &toCopy);
-
-    const UINT displayExtent = m_iconPixelExtent;
-    for (size_t index = 0; index < targets.size(); ++index) {
-        const auto found = m_iconTextureByTarget.find(targets[index]);
-        if (found == m_iconTextureByTarget.end() || pixelBuffers[index].empty()) {
-            continue;
-        }
-        UploadIconTexture(found->second, pixelBuffers[index].data(), displayExtent, displayExtent,
-            commandList.Get());
-    }
-
-    std::swap(toCopy.Transition.StateBefore, toCopy.Transition.StateAfter);
-    commandList->ResourceBarrier(1, &toCopy);
-    Check(commandList->Close(), "Close tray icon update command list");
-    ID3D12CommandList* lists[] = {commandList.Get()};
-    m_queue->ExecuteCommandLists(1, lists);
-    Flush();
-    m_pendingUploads.clear();
+    ApplyIncrementalIconUploads(uploads, newIconCount);
 }
 
 UINT Renderer::IconAtlasPixelExtent() const noexcept {
@@ -1244,16 +1452,14 @@ void Renderer::InvalidateBackdrop() noexcept {
     // Render cannot sample a desktop frame from a previous reveal.
     m_backdropValid = false;
     m_backdropOriginValid = false;
-    m_backdropHash = 0;
     m_backdropChangeSerial = 0;
     m_backdropDwmFrameValid = false;
     m_backdropDwmFrame = 0;
     m_backdropRefreshRequested = false;
     m_backdropDirtPending = false;
-    m_backdropProbeValid = false;
-    m_backdropProbeReference.clear();
     m_backdropCommittedSamples.clear();
     m_lastBackdropSerialBumpMs = 0;
+    m_blurCache = {};
 }
 
 UINT Renderer::TextureIndexForTarget(const std::wstring& target) const noexcept {
@@ -1266,16 +1472,114 @@ bool Renderer::HasIconForTarget(const std::wstring& target) const noexcept {
 }
 
 bool Renderer::HasCachedIconPixels(const std::wstring& target) const noexcept {
-    const auto found = m_iconPixelCache.find(target);
-    return found != m_iconPixelCache.end() && !found->second.empty();
+    return m_validIconTargets.contains(target);
 }
 
-const std::vector<uint8_t>* Renderer::CachedIconPixels(const std::wstring& target) const noexcept {
-    const auto found = m_iconPixelCache.find(target);
-    if (found == m_iconPixelCache.end() || found->second.empty()) {
-        return nullptr;
+std::vector<std::vector<uint8_t>> Renderer::ReadIconPixelsBatch(
+    std::span<const std::wstring> targets) {
+    std::vector<std::vector<uint8_t>> results(targets.size());
+    if (targets.empty() || m_device == nullptr || m_queue == nullptr || m_iconAtlas == nullptr ||
+        m_iconPixelExtent == 0) {
+        return results;
     }
-    return &found->second;
+
+    struct ReadReq {
+        size_t resultIndex = 0;
+        UINT slot = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    };
+    std::vector<ReadReq> requests;
+    requests.reserve(targets.size());
+    const UINT extent = m_iconPixelExtent;
+    const D3D12_RESOURCE_DESC atlasDesc =
+        TextureDescription(extent, extent, TextureArraySize(std::max(m_iconAtlasCapacity, m_iconCount)));
+    UINT64 totalBytes = 0;
+
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (!m_validIconTargets.contains(targets[i])) {
+            continue;
+        }
+        const auto found = m_iconTextureByTarget.find(targets[i]);
+        if (found == m_iconTextureByTarget.end() || found->second >= m_iconCount) {
+            continue;
+        }
+        totalBytes = (totalBytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ULL) &
+            ~(static_cast<UINT64>(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) - 1ULL);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT rows = 0;
+        UINT64 rowSize = 0;
+        UINT64 sliceSize = 0;
+        m_device->GetCopyableFootprints(&atlasDesc, found->second, 1, totalBytes, &fp, &rows, &rowSize,
+            &sliceSize);
+        totalBytes = fp.Offset + static_cast<UINT64>(fp.Footprint.RowPitch) * std::max(rows, 1U);
+        requests.push_back({i, found->second, fp});
+    }
+    if (requests.empty() || totalBytes == 0) {
+        return results;
+    }
+
+    try {
+        WaitForAllFrames();
+        const D3D12_HEAP_PROPERTIES readbackHeap = HeapProperties(D3D12_HEAP_TYPE_READBACK);
+        const D3D12_RESOURCE_DESC readbackDesc = BufferDescription(totalBytes);
+        ComPtr<ID3D12Resource> readback;
+        Check(m_device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc,
+                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)),
+            "Create icon readback buffer");
+
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> cmd;
+        Check(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+            "Create icon readback allocator");
+        Check(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                  IID_PPV_ARGS(&cmd)),
+            "Create icon readback command list");
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = m_iconAtlas.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cmd->ResourceBarrier(1, &barrier);
+
+        for (const ReadReq& req : requests) {
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = m_iconAtlas.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = req.slot;
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = readback.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = req.footprint;
+            cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        cmd->ResourceBarrier(1, &barrier);
+        Check(cmd->Close(), "Close icon readback command list");
+        ID3D12CommandList* lists[] = {cmd.Get()};
+        m_queue->ExecuteCommandLists(1, lists);
+        Flush();
+
+        const uint8_t* mapped = nullptr;
+        Check(readback->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&mapped))),
+            "Map icon readback buffer");
+        const size_t rowBytes = static_cast<size_t>(extent) * 4U;
+        for (const ReadReq& req : requests) {
+            std::vector<uint8_t>& out = results[req.resultIndex];
+            out.resize(rowBytes * extent);
+            for (UINT y = 0; y < extent; ++y) {
+                std::memcpy(out.data() + static_cast<size_t>(y) * rowBytes,
+                    mapped + req.footprint.Offset +
+                        static_cast<size_t>(y) * req.footprint.Footprint.RowPitch,
+                    rowBytes);
+            }
+        }
+        readback->Unmap(0, nullptr);
+    } catch (...) {
+    }
+    return results;
 }
 
 std::vector<uint8_t> Renderer::ExtractIconPixels(const std::vector<std::wstring>& candidates,
@@ -1416,6 +1720,7 @@ struct MagnifierSampler {
 };
 
 MagnifierSampler g_magnifier{};
+std::atomic<bool> g_resetMagnifierPlacement{false};
 
 bool EnsureMagnifierSampler() noexcept {
     if (g_magnifier.magnifier != nullptr) {
@@ -1576,7 +1881,7 @@ bool SampleWithMagnifier(const RECT& screen, uint8_t* destBits, const HWND* excl
 // magnifier or BitBlt there drops cursor rate for the whole sample. While the
 // sample runs, this thread only dispatches sent messages, which is how the
 // hook is delivered.
-enum class ScreenSampleKind : uint8_t { Magnifier, BitBlt };
+enum class ScreenSampleKind : uint8_t { Magnifier, BitBlt, ReleaseIdle };
 enum class ScreenSampleStatus : uint8_t { Ok, Failed, Busy };
 
 struct ScreenSampleJob {
@@ -1585,6 +1890,7 @@ struct ScreenSampleJob {
     UINT excludeCount = 0;
     uint8_t* dest = nullptr;
     ScreenSampleKind kind = ScreenSampleKind::Magnifier;
+    bool hideMagnifierHost = false;
     bool ok = false;
 };
 
@@ -1603,6 +1909,24 @@ HANDLE g_sampleRequest = nullptr;
 HANDLE g_sampleDone = nullptr;
 HANDLE g_sampleThread = nullptr;
 int g_sampleWaitDepth = 0;
+
+void ReleaseWorkerBlitTargetOnSampleThread() noexcept {
+    if (g_workerBlit.dc != nullptr && g_workerBlit.previous != nullptr) {
+        SelectObject(g_workerBlit.dc, g_workerBlit.previous);
+        g_workerBlit.previous = nullptr;
+    }
+    if (g_workerBlit.bitmap != nullptr) {
+        DeleteObject(g_workerBlit.bitmap);
+        g_workerBlit.bitmap = nullptr;
+    }
+    if (g_workerBlit.dc != nullptr) {
+        DeleteDC(g_workerBlit.dc);
+        g_workerBlit.dc = nullptr;
+    }
+    g_workerBlit.bits = nullptr;
+    g_workerBlit.width = 0;
+    g_workerBlit.height = 0;
+}
 
 bool EnsureWorkerBlitTarget(int width, int height) noexcept {
     if (g_workerBlit.bits != nullptr && g_workerBlit.width == width && g_workerBlit.height == height) {
@@ -1663,19 +1987,52 @@ bool BlitScreenToBuffer(const RECT& screen, uint8_t* dest, const HWND* exclude,
 }
 
 DWORD WINAPI ScreenSampleThread(void*) noexcept {
-    MSG queue{};
-    PeekMessageW(&queue, nullptr, 0, 0, PM_NOREMOVE);
+    MSG message{};
+    PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
     for (;;) {
-        if (WaitForSingleObject(g_sampleRequest, INFINITE) != WAIT_OBJECT_0) {
+        // g_magnifier.host is a top-level WS_POPUP owned by this thread: pump
+        // incoming messages while idle so HWND_BROADCAST (WM_SETTINGCHANGE,
+        // WM_DISPLAYCHANGE, WM_POWERBROADCAST) never stalls here for 5 seconds.
+        const DWORD wait = MsgWaitForMultipleObjects(1, &g_sampleRequest, FALSE, INFINITE, QS_ALLINPUT);
+        if (wait == WAIT_OBJECT_0) {
+            if (g_resetMagnifierPlacement.exchange(false, std::memory_order_acq_rel)) {
+                g_magnifier.placed = false;
+                g_magnifier.filterCount = -1;
+            }
+            bool ok = true;
+            if (g_sampleJob.kind == ScreenSampleKind::ReleaseIdle) {
+                ReleaseWorkerBlitTargetOnSampleThread();
+                if (g_sampleJob.hideMagnifierHost && g_magnifier.host != nullptr &&
+                    IsWindowVisible(g_magnifier.host) != FALSE) {
+                    ShowWindow(g_magnifier.host, SW_HIDE);
+                    g_magnifier.placed = false;
+                    g_magnifier.filterCount = -1;
+                }
+            } else if (g_sampleJob.kind == ScreenSampleKind::Magnifier) {
+                ok = SampleWithMagnifier(g_sampleJob.screen, g_sampleJob.dest, g_sampleJob.exclude,
+                    g_sampleJob.excludeCount);
+            } else {
+                ok = BlitScreenToBuffer(g_sampleJob.screen, g_sampleJob.dest, g_sampleJob.exclude,
+                    g_sampleJob.excludeCount);
+            }
+            g_sampleJob.ok = ok;
+            SetEvent(g_sampleDone);
+            continue;
+        }
+        if (wait != WAIT_OBJECT_0 + 1) {
             return 0;
         }
-        const bool ok = g_sampleJob.kind == ScreenSampleKind::Magnifier
-            ? SampleWithMagnifier(g_sampleJob.screen, g_sampleJob.dest, g_sampleJob.exclude,
-                  g_sampleJob.excludeCount)
-            : BlitScreenToBuffer(g_sampleJob.screen, g_sampleJob.dest, g_sampleJob.exclude,
-                  g_sampleJob.excludeCount);
-        g_sampleJob.ok = ok;
-        SetEvent(g_sampleDone);
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != FALSE) {
+            if (message.message == WM_QUIT) {
+                return 0;
+            }
+            if (message.message == WM_DISPLAYCHANGE || message.message == WM_DPICHANGED) {
+                g_magnifier.placed = false;
+                g_magnifier.filterCount = -1;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
 }
 
@@ -1742,6 +2099,19 @@ ScreenSampleStatus RunScreenSample(ScreenSampleKind kind, const RECT& screen, ui
     return g_sampleJob.ok ? ScreenSampleStatus::Ok : ScreenSampleStatus::Failed;
 }
 
+void TrimSampleWorkerResources(bool hideMagnifierHost) noexcept {
+    if (g_sampleThread == nullptr || g_sampleWaitDepth > 0) {
+        return;
+    }
+    g_sampleJob = {};
+    g_sampleJob.kind = ScreenSampleKind::ReleaseIdle;
+    g_sampleJob.hideMagnifierHost = hideMagnifierHost;
+    SetEvent(g_sampleRequest);
+    ++g_sampleWaitDepth;
+    static_cast<void>(WaitForSampleDone());
+    --g_sampleWaitDepth;
+}
+
 // Desktop pixels for `screen`, with exclude[] omitted, written top-down into
 // destBits (stride = width * 4). Does not change display affinity, so video
 // and Snipping Tool keep seeing those windows. Falls back to an affinity
@@ -1800,26 +2170,6 @@ bool RectContainsRect(const RECT& outer, const RECT& inner) noexcept {
         inner.bottom <= outer.bottom && inner.left < inner.right && inner.top < inner.bottom;
 }
 
-// True when dirty intersect region has pixels outside every self-exclude rect (real desktop
-// change under the strip). Dock/glint Present dirt that sits entirely inside the
-// dock HWND is ignored - CaptureScreenExcluding already omits those pixels.
-bool DirtyAffectsOutsideSelf(const RECT& dirty, const RECT& region, const RECT* selfExclude,
-    UINT selfExcludeCount) noexcept {
-    RECT hit{};
-    if (IntersectRect(&hit, &dirty, &region) == FALSE) {
-        return false;
-    }
-    if (selfExclude == nullptr || selfExcludeCount == 0) {
-        return true;
-    }
-    for (UINT index = 0; index < selfExcludeCount; ++index) {
-        if (RectContainsRect(selfExclude[index], hit)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool EnsureStripWatch(HMONITOR monitor) {
     if (monitor == nullptr) {
         return false;
@@ -1875,8 +2225,10 @@ bool EnsureStripWatch(HMONITOR monitor) {
         return false;
     }
 
+    constexpr D3D_FEATURE_LEVEL kDupLevel = D3D_FEATURE_LEVEL_11_0;
     if (FAILED(D3D11CreateDevice(matchAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED,
+            &kDupLevel, 1, D3D11_SDK_VERSION,
             g_stripWatch.device.GetAddressOf(), nullptr, nullptr))) {
         g_stripWatch.retryAfter = now + 30000ULL;
         return false;
@@ -1899,8 +2251,6 @@ bool EnsureStripWatch(HMONITOR monitor) {
         duplicationDesc.Rotation == DXGI_MODE_ROTATION_UNSPECIFIED;
     return true;
 }
-
-enum class StripDirt { Clean, Dirty, Pending };
 
 // One duplication acquire per backdrop tick, shared by the dock strip and any
 // open menu plate. A second AcquireNextFrame in the same tick would time out
@@ -2010,69 +2360,71 @@ void PollDesktopDirt(HMONITOR monitor) noexcept {
     g_stripWatch.primed = true;
 }
 
-StripDirt DirtForRegion(const RECT& region, const RECT* selfExclude = nullptr,
-    UINT selfExcludeCount = 0) noexcept {
-    if (!g_desktopDirt.valid || g_desktopDirt.failed || g_desktopDirt.overflow) {
-        return StripDirt::Dirty;
-    }
-    if (!g_desktopDirt.fresh) {
-        return StripDirt::Pending;
-    }
-    bool sawSelfOnly = false;
-    for (UINT index = 0; index < g_desktopDirt.count; ++index) {
-        if (!RectsIntersect(g_desktopDirt.rects[index], region)) {
-            continue;
-        }
-        if (DirtyAffectsOutsideSelf(g_desktopDirt.rects[index], region, selfExclude,
-                selfExcludeCount)) {
-            return StripDirt::Dirty;
-        }
-        sawSelfOnly = true;
-    }
-    if (sawSelfOnly) {
-        ProfileScope::Mark("Renderer::SkipBackdropSelfDirt");
-    }
-    return StripDirt::Clean;
-}
-
 // Unknown: no usable poll. Quiet: trusted, but no image frame was delivered
 // this tick (a DWM frame may still be in flight; pointer-only frames do not
 // vouch for it). Clean / Dirty: a delivered image frame's accumulated dirt
 // does not / does touch the region.
 enum class StripVerdict { Unknown, Quiet, Clean, Dirty };
 
-// Dock strip gate from this tick's shared poll. Any dirt that touches the strip
-// counts, including the dock's own presents: content behind the glass lands in
-// the same rect, so self-dirt cannot be told apart and is never discarded.
-StripVerdict StripVerdictFor(const RECT& region) noexcept {
+StripVerdict StripVerdictFor(const RECT& region, uint64_t nowMs, uint64_t lastSelfPresentMs,
+    uint64_t& deferredSelfCheckDueMs) noexcept {
     if (!g_desktopDirt.valid || g_desktopDirt.failed || !g_desktopDirt.trusted ||
         !RectContainsRect(g_stripWatch.desktop, region)) {
         return StripVerdict::Unknown;
     }
     if (g_desktopDirt.overflow) {
+        deferredSelfCheckDueMs = 0;
+        return StripVerdict::Dirty;
+    }
+    if (deferredSelfCheckDueMs != 0 && nowMs >= deferredSelfCheckDueMs) {
+        deferredSelfCheckDueMs = 0;
         return StripVerdict::Dirty;
     }
     if (!g_desktopDirt.fresh || !g_desktopDirt.imageUpdate) {
         return StripVerdict::Quiet;
     }
+    bool sawSuppressedSelf = false;
     for (UINT index = 0; index < g_desktopDirt.count; ++index) {
-        if (RectsIntersect(g_desktopDirt.rects[index], region)) {
+        if (!RectsIntersect(g_desktopDirt.rects[index], region)) {
+            continue;
+        }
+        if (!active_dock_policy::IsSuppressedSelfDirt(
+                g_desktopDirt.rects[index], region, nowMs, lastSelfPresentMs)) {
+            deferredSelfCheckDueMs = 0;
             return StripVerdict::Dirty;
         }
+        sawSuppressedSelf = true;
+    }
+    if (sawSuppressedSelf) {
+        deferredSelfCheckDueMs =
+            lastSelfPresentMs + active_dock_policy::kSelfPresentCatchUpDelayMs;
     }
     return StripVerdict::Clean;
 }
 
 }  // namespace
 
+void Renderer::NotePopupSelfPresent(int popupIndex) noexcept {
+    if (popupIndex >= 0 && popupIndex < 4) {
+        m_lastPopupSelfPresentMs[popupIndex] = GetTickCount64();
+    }
+}
+
 void Renderer::RequestBackdropRefresh() noexcept {
     m_backdropRefreshRequested = true;
 }
 
-void Renderer::PollDesktopChanges() noexcept {
-    const HMONITOR monitor = m_window != nullptr
-        ? MonitorFromWindow(m_window, MONITOR_DEFAULTTONEAREST)
-        : nullptr;
+void Renderer::ResetAfterWake() noexcept {
+    InvalidateBackdrop();
+    ResetStripWatch();
+    g_resetMagnifierPlacement.store(true, std::memory_order_release);
+    m_contentOffsetValid = false;
+}
+
+void Renderer::PollDesktopChanges(HMONITOR hostMonitor) noexcept {
+    const HMONITOR monitor = hostMonitor != nullptr
+        ? hostMonitor
+        : (m_window != nullptr ? MonitorFromWindow(m_window, MONITOR_DEFAULTTONEAREST) : nullptr);
     PollDesktopDirt(monitor);
 }
 
@@ -2080,8 +2432,29 @@ void Renderer::FinishDesktopChangePoll() noexcept {
     g_desktopDirt.valid = false;
 }
 
-bool Renderer::DesktopRegionChanged(const RECT& region) const noexcept {
-    return DirtForRegion(region) == StripDirt::Dirty;
+bool Renderer::HadDesktopActivity() const noexcept {
+    return !g_desktopDirt.trusted || g_desktopDirt.failed || g_desktopDirt.overflow ||
+        (g_desktopDirt.fresh && g_desktopDirt.imageUpdate) || m_deferredSelfCheckDueMs != 0;
+}
+
+bool Renderer::DesktopRegionChanged(const RECT& region, int popupIndex) const noexcept {
+    if (!g_desktopDirt.valid || g_desktopDirt.failed || g_desktopDirt.overflow) {
+        return true;
+    }
+    if (!g_desktopDirt.fresh || !g_desktopDirt.imageUpdate) {
+        return false;
+    }
+    const uint64_t nowMs = GetTickCount64();
+    const uint64_t lastSelf =
+        (popupIndex >= 0 && popupIndex < 4) ? m_lastPopupSelfPresentMs[popupIndex] : 0ULL;
+    for (UINT index = 0; index < g_desktopDirt.count; ++index) {
+        if (RectsIntersect(g_desktopDirt.rects[index], region) &&
+            !active_dock_policy::IsSuppressedSelfDirt(
+                g_desktopDirt.rects[index], region, nowMs, lastSelf)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
@@ -2093,47 +2466,41 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
         return false;
     }
 
-    // Sample only when something under the strip may have changed. A trusted
-    // duplication poll accumulates dirt between acquires, so a delivered frame
-    // with no dirt over the strip proves the pixels behind the glass held, and
-    // DWM frames from pointer motion or changes elsewhere skip the read. When
-    // no duplication frame was delivered, fall back to sampling every newly
-    // composed DWM frame so a frame still in flight is never sampled late.
-    // The RGB check below still skips the GPU upload when the pixels did not
-    // change. cFrame / pending dirt is consumed only after a successful read
-    // so a failed sample is retried on the next tick.
     uint64_t composedFrame = 0;
     bool haveComposedFrame = false;
     if (m_backdropValid && !m_backdropRefreshRequested) {
-        const StripVerdict verdict = StripVerdictFor(screenRectangle);
+        const StripVerdict verdict = StripVerdictFor(
+            screenRectangle, GetTickCount64(), m_lastDockSelfPresentMs, m_deferredSelfCheckDueMs);
         if (verdict == StripVerdict::Dirty) {
             m_backdropDirtPending = true;
         }
-        DWM_TIMING_INFO timing{};
-        timing.cbSize = sizeof(timing);
-        if (SUCCEEDED(DwmGetCompositionTimingInfo(m_window, &timing))) {
-            composedFrame = timing.cFrame;
-            haveComposedFrame = true;
-        }
         if (!m_backdropDirtPending) {
-            bool skip = false;
-            if (verdict == StripVerdict::Clean) {
-                // Every frame composed so far is vouched for; later dirt from
-                // a frame still in flight arrives as Dirty on the next poll.
-                if (haveComposedFrame) {
-                    m_backdropDwmFrame = composedFrame;
-                    m_backdropDwmFrameValid = true;
-                }
-                skip = true;
-            } else {
-                skip = haveComposedFrame && m_backdropDwmFrameValid &&
-                    composedFrame == m_backdropDwmFrame;
-            }
-            if (skip) {
+            if (verdict == StripVerdict::Clean || verdict == StripVerdict::Quiet) {
+                m_backdropDwmFrameValid = false;
                 if (changed != nullptr) {
                     *changed = false;
                 }
                 return true;
+            }
+            DWM_TIMING_INFO timing{};
+            timing.cbSize = sizeof(timing);
+            if (SUCCEEDED(DwmGetCompositionTimingInfo(m_window, &timing))) {
+                composedFrame = timing.cFrame;
+                haveComposedFrame = true;
+            }
+            if (haveComposedFrame && m_backdropDwmFrameValid &&
+                composedFrame == m_backdropDwmFrame) {
+                if (changed != nullptr) {
+                    *changed = false;
+                }
+                return true;
+            }
+        } else {
+            DWM_TIMING_INFO timing{};
+            timing.cbSize = sizeof(timing);
+            if (SUCCEEDED(DwmGetCompositionTimingInfo(m_window, &timing))) {
+                composedFrame = timing.cFrame;
+                haveComposedFrame = true;
             }
         }
     } else {
@@ -2206,11 +2573,6 @@ bool Renderer::Render(const DockRenderState& state) {
     }
 
     if (m_frameLatencyWaitableObject != nullptr) {
-        // Never block: a signaled waitable returns immediately (~us) and an
-        // unsignaled one means the GPU is a frame behind, in which case waiting
-        // here only stalls input on the UI thread. Pacing is preserved by the
-        // blocking Present below; the fence check after this still guards
-        // resource hazards. Keeps this scope at microseconds max.
         const DWORD timeout = 0;
         DWORD waitResult = WAIT_OBJECT_0;
         {
@@ -2230,9 +2592,6 @@ bool Renderer::Render(const DockRenderState& state) {
             ProfileScope::Mark("Renderer::SkipFence");
             return false;
         }
-        // Bounded even for blocking frames: under GPU saturation the UI thread
-        // must keep pumping input. Animations are time-based, so a dropped
-        // frame merely skips ahead instead of wedging the loop.
         static constexpr DWORD kFrameFenceWaitMs = 50;
         if (!WaitForFrame(frame, kFrameFenceWaitMs)) {
             ProfileScope::Mark("Renderer::DropContention");
@@ -2260,6 +2619,39 @@ bool Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene3[2] = 0.0F;
     frame.mappedConstants->scene3[3] = 0.0F;
 
+    const bool uploadedBackdrop = m_backdropUploadDirty && m_backdropUpload != nullptr;
+    if (uploadedBackdrop) {
+        if (m_backdropInitialized) {
+            D3D12_RESOURCE_BARRIER toCopy{};
+            toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toCopy.Transition.pResource = m_backdropTexture.Get();
+            toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            m_commandList->ResourceBarrier(1, &toCopy);
+        }
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = m_backdropUpload.Get();
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = m_backdropFootprint;
+        D3D12_TEXTURE_COPY_LOCATION destination{};
+        destination.pResource = m_backdropTexture.Get();
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = 0;
+        m_commandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+
+        D3D12_RESOURCE_BARRIER toShader{};
+        toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toShader.Transition.pResource = m_backdropTexture.Get();
+        toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        m_commandList->ResourceBarrier(1, &toShader);
+
+        m_backdropInitialized = true;
+        m_backdropUploadDirty = false;
+    }
+
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = m_backBuffers[frameIndex].Get();
@@ -2271,8 +2663,6 @@ bool Renderer::Render(const DockRenderState& state) {
     D3D12_CPU_DESCRIPTOR_HANDLE renderTarget = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     renderTarget.ptr += static_cast<SIZE_T>(frameIndex) * m_rtvDescriptorSize;
     m_commandList->OMSetRenderTargets(1, &renderTarget, FALSE, nullptr);
-    constexpr float transparent[4] = {0.0F, 0.0F, 0.0F, 0.0F};
-    m_commandList->ClearRenderTargetView(renderTarget, transparent, 0, nullptr);
 
     D3D12_VIEWPORT viewport{0.0F, 0.0F, static_cast<float>(state.width),
         static_cast<float>(state.height), 0.0F, 1.0F};
@@ -2280,99 +2670,49 @@ bool Renderer::Render(const DockRenderState& state) {
     m_commandList->RSSetViewports(1, &viewport);
     m_commandList->RSSetScissorRects(1, &scissor);
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
-    m_commandList->SetGraphicsRootConstantBufferView(0, frame.constants->GetGPUVirtualAddress());
-    m_commandList->SetGraphicsRootShaderResourceView(1, frame.iconInstances->GetGPUVirtualAddress());
+    const D3D12_GPU_VIRTUAL_ADDRESS frameUploadGpu = frame.uploadBuffer->GetGPUVirtualAddress();
+    m_commandList->SetGraphicsRootConstantBufferView(0, frameUploadGpu);
+    m_commandList->SetGraphicsRootShaderResourceView(1, frameUploadGpu + sizeof(FrameConstants));
     ID3D12DescriptorHeap* heaps[] = {m_srvHeap.Get()};
     m_commandList->SetDescriptorHeaps(1, heaps);
-    m_commandList->SetGraphicsRootDescriptorTable(2,
-        m_srvHeap->GetGPUDescriptorHandleForHeapStart());
+    const D3D12_GPU_DESCRIPTOR_HANDLE srvTable0 = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    // Pixel-accurate frost: each separable pass uses a dense <=1px step
-    // kernel (see SampleGlassAxis). Iterate H/V with null-SRV on the RT
-    // target so D3D12 never sees the same resource as RTV+SRV; GlassPS
-    // finishes the last vertical axis from blurTemp. Compounded passes
-    // give heavy frost without sparse-tap pixelation.
+    const float frostAmt =
+        static_cast<float>((state.fxFlags >> 16) & 0xFFu) / 255.0F;
+    const int extraFrostPairs = static_cast<int>(std::lround(
+        std::clamp((frostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
+    if ((state.fxFlags & DOCK_FX_BLUR) != 0 && m_backdropValid && extraFrostPairs > 0 &&
+        m_blurTemp2 == nullptr) {
+        EnsureDockBlurTemp2();
+    }
     const bool frostPass = (state.fxFlags & DOCK_FX_BLUR) != 0 && m_backdropValid &&
-        m_blurTemp != nullptr && m_blurTemp2 != nullptr;
+        m_blurTemp != nullptr && (extraFrostPairs == 0 || m_blurTemp2 != nullptr);
     if (frostPass) {
-        const D3D12_CPU_DESCRIPTOR_HANDLE rtvHeapStart =
-            m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        const D3D12_CPU_DESCRIPTOR_HANDLE srvHeapStart =
-            m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-
-        D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
-        nullSrv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        nullSrv.Texture2D.MipLevels = 1;
-
-        D3D12_SHADER_RESOURCE_VIEW_DESC blurView{};
-        blurView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        blurView.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        blurView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        blurView.Texture2D.MipLevels = 1;
-
-        const auto blurPass = [&](ID3D12Resource* target, bool& isShaderResource,
-                                  SIZE_T rtvIndex, UINT srvIndex,
-                                  ID3D12PipelineState* pipeline) {
-            if (isShaderResource) {
-                D3D12_RESOURCE_BARRIER toRender{};
-                toRender.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                toRender.Transition.pResource = target;
-                toRender.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                toRender.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                toRender.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                m_commandList->ResourceBarrier(1, &toRender);
-                isShaderResource = false;
-            }
-
-            // Null this target's SRV for the draw (RTV+SRV overlap is illegal).
-            D3D12_CPU_DESCRIPTOR_HANDLE blurSrv = srvHeapStart;
-            blurSrv.ptr += static_cast<SIZE_T>(srvIndex) * m_srvDescriptorSize;
-            m_device->CreateShaderResourceView(nullptr, &nullSrv, blurSrv);
-
-            D3D12_CPU_DESCRIPTOR_HANDLE blurTarget = rtvHeapStart;
-            blurTarget.ptr += rtvIndex * m_rtvDescriptorSize;
-            m_commandList->OMSetRenderTargets(1, &blurTarget, FALSE, nullptr);
-            m_commandList->SetPipelineState(pipeline);
-            m_commandList->DrawInstanced(3, 1, 0, 0);
-
-            D3D12_RESOURCE_BARRIER toShader{};
-            toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            toShader.Transition.pResource = target;
-            toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            m_commandList->ResourceBarrier(1, &toShader);
-            isShaderResource = true;
-
-            m_device->CreateShaderResourceView(target, &blurView, blurSrv);
-        };
-
-        // Frost pass stack scales with FrostAmount (bits 16-23):
-        //   0..0.5  -> 1H (+ GlassPS V): clear/milky veil
-        //   0.5..1  -> ramp to 5H+5V: full pre-1.1.28 mica dissolve
-        const float frostAmt =
-            static_cast<float>((state.fxFlags >> 16) & 0xFFu) / 255.0F;
-        blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
-            kTempBlurDescriptor, m_blurPipeline.Get());
-        const int extraPairs = static_cast<int>(std::lround(
-            std::clamp((frostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
-        for (int pair = 0; pair < extraPairs; ++pair) {
-            blurPass(m_blurTemp2.Get(), m_blurTemp2IsShaderResource, kBufferCount + 1,
-                kTempBlurDescriptor2, m_blurVPipeline.Get());
-            blurPass(m_blurTemp.Get(), m_blurTempIsShaderResource, kBufferCount,
-                kTempBlurDescriptor, m_blurH2Pipeline.Get());
+        const BlurCacheKey blurKey{m_backdropGpuSerial, state.width, state.height,
+            state.fxFlags & ~(0x3Fu << 8)};
+        if (m_blurTempIsShaderResource && blurKey == m_blurCache) {
+            ProfileScope::Mark("Renderer::ReuseCachedBlur");
+        } else {
+            D3D12_CPU_DESCRIPTOR_HANDLE blurRtvBase =
+                m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            blurRtvBase.ptr += static_cast<SIZE_T>(kBufferCount) * m_rtvDescriptorSize;
+            RecordFrostBlur(m_commandList.Get(), frostAmt, blurRtvBase, m_rtvDescriptorSize,
+                srvTable0, m_srvDescriptorSize, m_blurTemp.Get(), m_blurTempIsShaderResource,
+                m_blurTemp2.Get(), m_blurTemp2IsShaderResource, m_blurPipeline.Get(),
+                m_blurVPipeline.Get(), m_blurH2Pipeline.Get());
+            m_blurCache = blurKey;
         }
-
         m_commandList->OMSetRenderTargets(1, &renderTarget, FALSE, nullptr);
     }
+
+    m_commandList->SetGraphicsRootDescriptorTable(2, srvTable0);
     m_commandList->SetPipelineState(m_glassPipeline.Get());
     m_commandList->DrawInstanced(3, 1, 0, 0);
 
     m_commandList->SetPipelineState(m_iconPipeline.Get());
     const UINT iconCount = std::min(static_cast<UINT>(state.icons.size()), kMaximumIcons);
+    const UINT safeIconCount = std::max(m_iconCount, 1U);
     for (UINT index = 0; index < iconCount; ++index) {
         const DockIconRenderData& icon = state.icons[index];
         IconInstanceConstants& instance = frame.mappedIcons[index];
@@ -2384,8 +2724,6 @@ bool Renderer::Render(const DockRenderState& state) {
         float mode = 0.0F;
         switch (icon.kind) {
         case DockIconKind::Divider:
-            mode = 2.0F;
-            break;
         case DockIconKind::TrayDivider:
             mode = 2.0F;
             break;
@@ -2400,9 +2738,7 @@ bool Renderer::Render(const DockRenderState& state) {
             break;
         }
         instance.iconMeta[1] = mode;
-        // z: bit0 = dragged, bit1 = adaptive chrome ink (tonemap-scaled).
         instance.iconMeta[2] = (icon.dragged ? 1.0F : 0.0F) + (icon.adaptiveInk ? 2.0F : 0.0F);
-        const UINT safeIconCount = std::max(m_iconCount, 1U);
         instance.iconMeta[3] = static_cast<float>(std::min(icon.textureIndex, safeIconCount - 1));
     }
     if (iconCount > 0) {
@@ -2418,7 +2754,11 @@ bool Renderer::Render(const DockRenderState& state) {
         ProfileScope presentScope("Renderer::Present");
         Check(m_swapChain->Present(state.allowBlockingGpuWait ? 1 : 0, 0), "Present composition frame");
     }
+    m_lastDockSelfPresentMs = GetTickCount64();
     SignalFrame(frame);
+    if (uploadedBackdrop) {
+        m_backdropCopyFenceValue = frame.fenceValue;
+    }
     return true;
 }
 
@@ -2548,26 +2888,23 @@ void Renderer::SetContentOffsetY(float offsetY) noexcept {
 }
 
 void Renderer::CreateFrameResources() {
+    static_assert(sizeof(FrameConstants) == 256, "FrameConstants must stay 256-byte aligned.");
+    const D3D12_HEAP_PROPERTIES uploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+    const D3D12_RESOURCE_DESC frameUpload =
+        BufferDescription(sizeof(FrameConstants) + sizeof(IconInstanceConstants) * kMaximumIcons);
     for (FrameResource& frame : m_frames) {
         Check(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                   IID_PPV_ARGS(&frame.allocator)),
             "Create frame allocator");
-        const D3D12_HEAP_PROPERTIES uploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
-        const D3D12_RESOURCE_DESC constantBuffer = BufferDescription(sizeof(FrameConstants));
         Check(m_device->CreateCommittedResource(&uploadHeap,
-                  D3D12_HEAP_FLAG_NONE, &constantBuffer,
-                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&frame.constants)),
-            "Create frame constant buffer");
-        Check(frame.constants->Map(0, nullptr, reinterpret_cast<void**>(&frame.mappedConstants)),
-            "Map frame constant buffer");
-
-        const D3D12_RESOURCE_DESC instanceBuffer =
-            BufferDescription(sizeof(IconInstanceConstants) * kMaximumIcons);
-        Check(m_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &instanceBuffer,
-                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&frame.iconInstances)),
-            "Create frame icon instance buffer");
-        Check(frame.iconInstances->Map(0, nullptr, reinterpret_cast<void**>(&frame.mappedIcons)),
-            "Map frame icon instance buffer");
+                  D3D12_HEAP_FLAG_NONE, &frameUpload,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&frame.uploadBuffer)),
+            "Create unified frame upload buffer");
+        uint8_t* mapped = nullptr;
+        Check(frame.uploadBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mapped)),
+            "Map unified frame upload buffer");
+        frame.mappedConstants = reinterpret_cast<FrameConstants*>(mapped);
+        frame.mappedIcons = reinterpret_cast<IconInstanceConstants*>(mapped + sizeof(FrameConstants));
     }
 
     Check(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_frames[0].allocator.Get(),
@@ -2647,7 +2984,10 @@ void Renderer::CreateRootSignatureAndPipelines() {
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline{};
     pipeline.pRootSignature = m_rootSignature.Get();
-    pipeline.BlendState = PremultipliedBlendDescription();
+    // GlassPS always draws over a freshly-cleared (0,0,0,0) target and outputs
+    // premultiplied RGBA; disabling blending eliminates destination ROP reads.
+    pipeline.BlendState = D3D12_BLEND_DESC{};
+    pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pipeline.SampleMask = UINT_MAX;
     pipeline.RasterizerState = RasterizerDescription();
     pipeline.DepthStencilState.DepthEnable = FALSE;
@@ -2670,8 +3010,6 @@ void Renderer::CreateRootSignatureAndPipelines() {
 
     // Separable frost pass 1: horizontal Gaussian into the temp target.
     // Blending disabled (full overdraw each frame); same root signature.
-    pipeline.BlendState = D3D12_BLEND_DESC{};
-    pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     if (m_shaderModel == D3D_SHADER_MODEL_6_6) {
         pipeline.VS = Shader(gGlassVs66, sizeof(gGlassVs66));
         pipeline.PS = Shader(gBlurPs66, sizeof(gBlurPs66));
@@ -2711,11 +3049,13 @@ void Renderer::CreateRootSignatureAndPipelines() {
 
     D3D12_DESCRIPTOR_HEAP_DESC descriptors{};
     descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    descriptors.NumDescriptors = 4;
+    descriptors.NumDescriptors = kSrvDescriptorsPerTable * kSrvTableCount;
     descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     Check(m_device->CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(&m_srvHeap)),
         "Create shader resource descriptor heap");
     m_srvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(descriptors.Type);
+    InitDualSrvTables(m_device.Get(), m_srvDescriptorSize, m_srvHeap.Get(),
+        nullptr, 1U, nullptr, nullptr, nullptr);
 }
 
 void Renderer::CreateRenderTargets() {
@@ -2786,16 +3126,72 @@ void Renderer::CreateBackdropResources() {
         Check(m_backdropUpload->Map(0, nullptr,
                   reinterpret_cast<void**>(&m_backdropUploadPixels)),
             "Map desktop backdrop upload resource");
+        m_backdropCopyFenceValue = 0;
 
-        Check(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                  IID_PPV_ARGS(&m_backdropCopyAllocator)),
-            "Create desktop backdrop command allocator");
-        Check(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                  m_backdropCopyAllocator.Get(), nullptr,
-                  IID_PPV_ARGS(&m_backdropCopyCommandList)),
-            "Create desktop backdrop command list");
-        Check(m_backdropCopyCommandList->Close(), "Close initial desktop backdrop command list");
+        // Separable-frost temp targets live in PIXEL_SHADER_RESOURCE between draws so
+        // static dual descriptor tables never reference a RENDER_TARGET resource.
+        D3D12_RESOURCE_DESC blurDesc = TextureDescription(m_width, m_height);
+        blurDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        const D3D12_HEAP_PROPERTIES blurHeapProps = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+        Check(m_device->CreateCommittedResource(&blurHeapProps, D3D12_HEAP_FLAG_NONE, &blurDesc,
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&m_blurTemp)),
+            "Create frost blur temp texture");
 
+        D3D12_CPU_DESCRIPTOR_HANDLE blurRtv =
+            m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        blurRtv.ptr += static_cast<SIZE_T>(kBufferCount) * m_rtvDescriptorSize;
+        m_device->CreateRenderTargetView(m_blurTemp.Get(), nullptr, blurRtv);
+
+        m_blurTemp2.Reset();
+        m_blurTemp2IsShaderResource = false;
+
+        InitDualSrvTables(m_device.Get(), m_srvDescriptorSize, m_srvHeap.Get(),
+            m_iconAtlas.Get(), m_iconCount, m_backdropTexture.Get(),
+            m_blurTemp.Get(), nullptr);
+        m_blurTempIsShaderResource = true;
+        m_blurCache = {};
+
+        static_cast<void>(UploadBackdropPixels());
+    } catch (...) {
+        ReleaseBackdropResources();
+        throw;
+    }
+}
+
+void Renderer::EnsureDockBlurTemp2() {
+    if (m_blurTemp2 != nullptr || m_device == nullptr || m_rtvHeap == nullptr || m_srvHeap == nullptr) {
+        return;
+    }
+    D3D12_RESOURCE_DESC blurDesc = TextureDescription(m_width, m_height);
+    blurDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const D3D12_HEAP_PROPERTIES blurHeapProps = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    if (FAILED(m_device->CreateCommittedResource(&blurHeapProps, D3D12_HEAP_FLAG_NONE, &blurDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&m_blurTemp2)))) {
+        m_blurTemp2.Reset();
+        return;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE blurRtv2 = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    blurRtv2.ptr += static_cast<SIZE_T>(kBufferCount + 1) * m_rtvDescriptorSize;
+    m_device->CreateRenderTargetView(m_blurTemp2.Get(), nullptr, blurRtv2);
+    InitDualSrvTables(m_device.Get(), m_srvDescriptorSize, m_srvHeap.Get(),
+        m_iconAtlas.Get(), m_iconCount, m_backdropTexture.Get(),
+        m_blurTemp.Get(), m_blurTemp2.Get());
+    m_blurTemp2IsShaderResource = true;
+}
+
+bool Renderer::EnsurePanelPipelineResources() {
+    if (m_device == nullptr) {
+        return false;
+    }
+    if (m_panelAllocator != nullptr && m_panelCommandList != nullptr &&
+        m_panelAllocator2 != nullptr && m_panelCommandList2 != nullptr &&
+        m_panelConstants != nullptr && m_panelMappedConstants != nullptr &&
+        m_panelConstants2 != nullptr && m_panelMappedConstants2 != nullptr &&
+        m_panelIconInstances != nullptr) {
+        return true;
+    }
+    try {
+        ReleasePanelPipelineResources();
         Check(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                   IID_PPV_ARGS(&m_panelAllocator)),
             "Create panel glass command allocator");
@@ -2812,87 +3208,70 @@ void Renderer::CreateBackdropResources() {
                   IID_PPV_ARGS(&m_panelCommandList2)),
             "Create second panel glass command list");
         Check(m_panelCommandList2->Close(), "Close initial second panel glass command list");
-        {
-            const D3D12_HEAP_PROPERTIES panelUploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
-            const D3D12_RESOURCE_DESC constantBuffer = BufferDescription(sizeof(FrameConstants));
-            Check(m_device->CreateCommittedResource(&panelUploadHeap, D3D12_HEAP_FLAG_NONE, &constantBuffer,
-                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_panelConstants)),
-                "Create panel constant buffer");
-            Check(m_panelConstants->Map(0, nullptr, reinterpret_cast<void**>(&m_panelMappedConstants)),
-                "Map panel constant buffer");
-            Check(m_device->CreateCommittedResource(&panelUploadHeap, D3D12_HEAP_FLAG_NONE, &constantBuffer,
-                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_panelConstants2)),
-                "Create second panel constant buffer");
-            Check(m_panelConstants2->Map(0, nullptr, reinterpret_cast<void**>(&m_panelMappedConstants2)),
-                "Map second panel constant buffer");
-            const D3D12_RESOURCE_DESC instanceBuffer =
-                BufferDescription(sizeof(IconInstanceConstants) * 128U);
-            Check(m_device->CreateCommittedResource(&panelUploadHeap, D3D12_HEAP_FLAG_NONE, &instanceBuffer,
-                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_panelIconInstances)),
-                "Create panel icon instance stub");
-        }
 
-        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        view.Texture2D.MipLevels = 1;
-        D3D12_CPU_DESCRIPTOR_HANDLE backdropDescriptor =
-            m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-        backdropDescriptor.ptr += static_cast<SIZE_T>(kBackdropTextureDescriptor) *
-            m_srvDescriptorSize;
-        m_device->CreateShaderResourceView(m_backdropTexture.Get(), &view, backdropDescriptor);
-
-        // Separable-frost temp target (pass 1 horizontal blur lands here).
-        // Same size/format as the dock backdrop; recreated on resize.
-        // Starts life as a render target (see m_blurTempIsShaderResource).
-        D3D12_RESOURCE_DESC blurDesc = TextureDescription(m_width, m_height);
-        blurDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        const D3D12_HEAP_PROPERTIES blurHeapProps = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
-        Check(m_device->CreateCommittedResource(&blurHeapProps, D3D12_HEAP_FLAG_NONE, &blurDesc,
-                  D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&m_blurTemp)),
-            "Create frost blur temp texture");
-
-        D3D12_CPU_DESCRIPTOR_HANDLE blurRtv =
-            m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        blurRtv.ptr += static_cast<SIZE_T>(kBufferCount) * m_rtvDescriptorSize;
-        m_device->CreateRenderTargetView(m_blurTemp.Get(), nullptr, blurRtv);
-
-        D3D12_SHADER_RESOURCE_VIEW_DESC blurView{};
-        blurView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        blurView.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        blurView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        blurView.Texture2D.MipLevels = 1;
-        D3D12_CPU_DESCRIPTOR_HANDLE blurSrv =
-            m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-        blurSrv.ptr += static_cast<SIZE_T>(kTempBlurDescriptor) * m_srvDescriptorSize;
-        m_device->CreateShaderResourceView(m_blurTemp.Get(), &blurView, blurSrv);
-        m_blurTempIsShaderResource = false;
-
-        // Second ping-pong target for the iterated frost (pass 2 vertical
-        // lands here; pass 3 reads it back into temp). Same size/format.
-        Check(m_device->CreateCommittedResource(&blurHeapProps, D3D12_HEAP_FLAG_NONE, &blurDesc,
-                  D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&m_blurTemp2)),
-            "Create frost blur temp2 texture");
-
-        D3D12_CPU_DESCRIPTOR_HANDLE blurRtv2 =
-            m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-        blurRtv2.ptr += static_cast<SIZE_T>(kBufferCount + 1) * m_rtvDescriptorSize;
-        m_device->CreateRenderTargetView(m_blurTemp2.Get(), nullptr, blurRtv2);
-
-        D3D12_CPU_DESCRIPTOR_HANDLE blurSrv2 =
-            m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-        blurSrv2.ptr += static_cast<SIZE_T>(kTempBlurDescriptor2) * m_srvDescriptorSize;
-        m_device->CreateShaderResourceView(m_blurTemp2.Get(), &blurView, blurSrv2);
-        m_blurTemp2IsShaderResource = false;
-
-        // Best effort: under GPU saturation the upload defers to the first
-        // capture tick instead of stalling setup.
-        static_cast<void>(UploadBackdropPixels());
+        const D3D12_HEAP_PROPERTIES panelUploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+        const D3D12_RESOURCE_DESC constantBuffer = BufferDescription(sizeof(FrameConstants));
+        Check(m_device->CreateCommittedResource(&panelUploadHeap, D3D12_HEAP_FLAG_NONE, &constantBuffer,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_panelConstants)),
+            "Create panel constant buffer");
+        Check(m_panelConstants->Map(0, nullptr, reinterpret_cast<void**>(&m_panelMappedConstants)),
+            "Map panel constant buffer");
+        Check(m_device->CreateCommittedResource(&panelUploadHeap, D3D12_HEAP_FLAG_NONE, &constantBuffer,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_panelConstants2)),
+            "Create second panel constant buffer");
+        Check(m_panelConstants2->Map(0, nullptr, reinterpret_cast<void**>(&m_panelMappedConstants2)),
+            "Map second panel constant buffer");
+        const D3D12_RESOURCE_DESC instanceBuffer =
+            BufferDescription(sizeof(IconInstanceConstants) * 128U);
+        Check(m_device->CreateCommittedResource(&panelUploadHeap, D3D12_HEAP_FLAG_NONE, &instanceBuffer,
+                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_panelIconInstances)),
+            "Create panel icon instance stub");
+        m_panelListFence[0] = 0;
+        m_panelListFence[1] = 0;
+        return true;
     } catch (...) {
-        ReleaseBackdropResources();
-        throw;
+        ReleasePanelPipelineResources();
+        return false;
     }
+}
+
+void Renderer::ReleasePanelPipelineResources() noexcept {
+    if (m_panelConstants != nullptr && m_panelMappedConstants != nullptr) {
+        m_panelConstants->Unmap(0, nullptr);
+    }
+    m_panelMappedConstants = nullptr;
+    m_panelConstants.Reset();
+    if (m_panelConstants2 != nullptr && m_panelMappedConstants2 != nullptr) {
+        m_panelConstants2->Unmap(0, nullptr);
+    }
+    m_panelMappedConstants2 = nullptr;
+    m_panelConstants2.Reset();
+    m_panelIconInstances.Reset();
+    m_panelCommandList.Reset();
+    m_panelAllocator.Reset();
+    m_panelCommandList2.Reset();
+    m_panelAllocator2.Reset();
+    m_panelListFence[0] = 0;
+    m_panelListFence[1] = 0;
+}
+
+void Renderer::TrimIdlePanelResources() noexcept {
+    CancelLiveGlassPanelBake();
+    ReleasePanelGlassResources();
+    ReleasePanelGlassPool();
+    ReleasePanelCapturePool();
+    ReleasePanelPipelineResources();
+    std::vector<CcShapeDesc>().swap(m_ccShapes);
+    std::vector<float>().swap(m_ccFaceLuma);
+    TrimSampleWorkerResources(false);
+}
+
+void Renderer::ReleaseHiddenResources() noexcept {
+    TrimIdlePanelResources();
+    ResetStripWatch();
+    m_deferredSelfCheckDueMs = 0;
+    std::vector<uint32_t>().swap(m_backdropCommittedSamples);
+    TrimSampleWorkerResources(true);
 }
 
 void Renderer::ReleaseBackdropResources() noexcept {
@@ -2900,28 +3279,26 @@ void Renderer::ReleaseBackdropResources() noexcept {
         m_backdropUpload->Unmap(0, nullptr);
     }
     m_backdropUploadPixels = nullptr;
-    m_backdropCopyCommandList.Reset();
-    m_backdropCopyAllocator.Reset();
     m_backdropUpload.Reset();
+    m_backdropUploadDirty = false;
+    m_backdropCopyFenceValue = 0;
     m_backdropTexture.Reset();
     m_blurTemp.Reset();
     m_blurTempIsShaderResource = false;
     m_blurTemp2.Reset();
     m_blurTemp2IsShaderResource = false;
+    m_blurCache = {};
     m_backdropFootprint = {};
     m_backdropRowCount = 0;
     m_backdropInitialized = false;
     m_backdropValid = false;
-    m_backdropHash = 0;
     m_backdropChangeSerial = 0;
     m_backdropDwmFrame = 0;
     m_backdropDwmFrameValid = false;
     m_backdropRefreshRequested = false;
     m_backdropDirtPending = false;
-    m_backdropProbeValid = false;
-    m_backdropProbeReference.clear();
+    m_deferredSelfCheckDueMs = 0;
     m_backdropCommittedSamples.clear();
-    ReleaseBackdropProbe();
     ResetStripWatch();
 
     if (m_backdropDc != nullptr && m_backdropPreviousBitmap != nullptr &&
@@ -2940,150 +3317,6 @@ void Renderer::ReleaseBackdropResources() noexcept {
     m_backdropDc = nullptr;
 }
 
-uint64_t Renderer::HashBackdropPixels() const noexcept {
-    if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0) {
-        return 0;
-    }
-
-    const uint32_t* words = reinterpret_cast<const uint32_t*>(m_backdropDibPixels);
-    const size_t count = static_cast<size_t>(m_width) * static_cast<size_t>(m_height);
-    uint64_t hash = 14695981039346656037ull;
-    constexpr size_t stride = 8;
-    for (size_t index = 0; index < count; index += stride) {
-        hash ^= words[index] & kBackdropRgbMask;
-        hash *= 1099511628211ull;
-    }
-    hash ^= words[count - 1] & kBackdropRgbMask;
-    hash ^= static_cast<uint64_t>(m_width) << 32;
-    hash ^= m_height;
-    return hash;
-}
-
-void Renderer::ReleaseBackdropProbe() noexcept {
-    if (m_backdropProbeDc != nullptr && m_backdropProbePrevious != nullptr &&
-        m_backdropProbePrevious != HGDI_ERROR) {
-        SelectObject(m_backdropProbeDc, m_backdropProbePrevious);
-    }
-    m_backdropProbePrevious = nullptr;
-    if (m_backdropProbeBitmap != nullptr) {
-        DeleteObject(m_backdropProbeBitmap);
-        m_backdropProbeBitmap = nullptr;
-    }
-    m_backdropProbePixels = nullptr;
-    if (m_backdropProbeDc != nullptr) {
-        DeleteDC(m_backdropProbeDc);
-        m_backdropProbeDc = nullptr;
-    }
-    m_backdropProbeWidth = 0;
-    m_backdropProbeValid = false;
-}
-
-bool Renderer::EnsureBackdropProbe(UINT width) {
-    if (width == 0) {
-        return false;
-    }
-    if (m_backdropProbeDc != nullptr && m_backdropProbeBitmap != nullptr &&
-        m_backdropProbePixels != nullptr && m_backdropProbeWidth == width) {
-        return true;
-    }
-    ReleaseBackdropProbe();
-    HDC screen = GetDC(nullptr);
-    if (screen == nullptr) {
-        return false;
-    }
-    SetICMMode(screen, ICM_OFF);
-    m_backdropProbeDc = CreateCompatibleDC(screen);
-    BITMAPV5HEADER header = CaptureDibHeader(width, kBackdropProbeRows);
-    void* bits = nullptr;
-    m_backdropProbeBitmap = CreateDIBSection(screen, reinterpret_cast<const BITMAPINFO*>(&header),
-        DIB_RGB_COLORS, &bits, nullptr, 0);
-    ReleaseDC(nullptr, screen);
-    if (m_backdropProbeDc == nullptr || m_backdropProbeBitmap == nullptr || bits == nullptr) {
-        ReleaseBackdropProbe();
-        return false;
-    }
-    m_backdropProbePrevious = SelectObject(m_backdropProbeDc, m_backdropProbeBitmap);
-    if (m_backdropProbePrevious == nullptr || m_backdropProbePrevious == HGDI_ERROR) {
-        ReleaseBackdropProbe();
-        return false;
-    }
-    m_backdropProbePixels = static_cast<uint8_t*>(bits);
-    m_backdropProbeWidth = width;
-    return true;
-}
-
-bool Renderer::ProbeBackdropUnchanged(const RECT& screenRectangle) noexcept {
-    const LONG width = screenRectangle.right - screenRectangle.left;
-    const LONG height = screenRectangle.bottom - screenRectangle.top;
-    if (width <= 0 || height <= 0 || !m_backdropProbeValid ||
-        m_backdropProbeReference.size() !=
-            static_cast<size_t>(width) * static_cast<size_t>(kBackdropProbeRows) * 4U) {
-        return false;
-    }
-    if (!EnsureBackdropProbe(static_cast<UINT>(width))) {
-        return false;
-    }
-
-    HDC screen = GetDC(nullptr);
-    if (screen == nullptr) {
-        return false;
-    }
-    BOOL ok = TRUE;
-    for (UINT row = 0; row < kBackdropProbeRows; ++row) {
-        const LONG srcY = screenRectangle.top +
-            (height <= 1 ? 0
-                         : static_cast<LONG>((static_cast<long long>(height - 1) * row) /
-                               static_cast<long long>(kBackdropProbeRows - 1)));
-        if (BitBlt(m_backdropProbeDc, 0, static_cast<int>(row), static_cast<int>(width), 1, screen,
-                screenRectangle.left, srcY, SRCCOPY) == FALSE) {
-            ok = FALSE;
-            break;
-        }
-    }
-    ReleaseDC(nullptr, screen);
-    if (ok == FALSE) {
-        return false;
-    }
-
-    const uint32_t* cur = reinterpret_cast<const uint32_t*>(m_backdropProbePixels);
-    const uint32_t* ref = reinterpret_cast<const uint32_t*>(m_backdropProbeReference.data());
-    const size_t count =
-        static_cast<size_t>(width) * static_cast<size_t>(kBackdropProbeRows);
-    size_t diffs = 0;
-    constexpr size_t stride = 4;
-    for (size_t i = 0; i < count; i += stride) {
-        if (BackdropRgbDiffers(cur[i], ref[i])) {
-            ++diffs;
-            if (diffs > kBackdropProbeNoisePixels) {
-                return false;
-            }
-        }
-    }
-    if (BackdropRgbDiffers(cur[count - 1], ref[count - 1])) {
-        ++diffs;
-    }
-    return diffs <= kBackdropProbeNoisePixels;
-}
-
-void Renderer::CommitBackdropProbeFromDib() noexcept {
-    if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0) {
-        m_backdropProbeValid = false;
-        m_backdropProbeReference.clear();
-        return;
-    }
-    const size_t rowBytes = static_cast<size_t>(m_width) * 4U;
-    m_backdropProbeReference.resize(rowBytes * kBackdropProbeRows);
-    for (UINT row = 0; row < kBackdropProbeRows; ++row) {
-        const UINT srcRow = (m_height <= 1)
-            ? 0U
-            : static_cast<UINT>((static_cast<UINT64>(m_height - 1) * row) /
-                  (kBackdropProbeRows - 1));
-        std::memcpy(m_backdropProbeReference.data() + row * rowBytes,
-            m_backdropDibPixels + static_cast<size_t>(srcRow) * rowBytes, rowBytes);
-    }
-    m_backdropProbeValid = true;
-}
-
 size_t Renderer::CountBackdropSampleDiffs() const noexcept {
     if (m_backdropDibPixels == nullptr || m_width == 0 || m_height == 0 ||
         m_backdropCommittedSamples.empty()) {
@@ -3095,7 +3328,6 @@ size_t Renderer::CountBackdropSampleDiffs() const noexcept {
     constexpr size_t stride = 8;
     size_t sampleCount = (count + stride - 1) / stride;
     if (count > 0) {
-        // HashBackdropPixels also folds words[count-1]; keep the same sample set.
         if ((count - 1) % stride != 0) {
             ++sampleCount;
         }
@@ -3107,7 +3339,9 @@ size_t Renderer::CountBackdropSampleDiffs() const noexcept {
     size_t sample = 0;
     for (size_t index = 0; index < count; index += stride) {
         if (BackdropRgbDiffers(words[index], m_backdropCommittedSamples[sample++])) {
-            ++diffs;
+            if (++diffs > kBackdropChangeMinSamples) {
+                return diffs;
+            }
         }
     }
     if (count > 0 && (count - 1) % stride != 0) {
@@ -3137,10 +3371,11 @@ void Renderer::CommitBackdropSamplesFromDib() noexcept {
 }
 
 bool Renderer::UploadBackdropPixels() {
-    // Bounded: the UI thread must keep pumping even when the GPU is saturated;
-    // a skipped upload simply retries on the next capture tick.
+    if (m_backdropDibPixels == nullptr || m_backdropUploadPixels == nullptr) {
+        return false;
+    }
     static constexpr DWORD kCopyWaitMs = 50;
-    if (!WaitForBackdropCopy(kCopyWaitMs)) {
+    if (!m_backdropUploadDirty && !WaitForBackdropCopy(kCopyWaitMs)) {
         return false;
     }
     const size_t rowBytes = static_cast<size_t>(m_width) * 4U;
@@ -3149,45 +3384,9 @@ bool Renderer::UploadBackdropPixels() {
                 static_cast<size_t>(row) * m_backdropFootprint.Footprint.RowPitch,
             m_backdropDibPixels + static_cast<size_t>(row) * rowBytes, rowBytes);
     }
-
-    Check(m_backdropCopyAllocator->Reset(), "Reset desktop backdrop command allocator");
-    Check(m_backdropCopyCommandList->Reset(m_backdropCopyAllocator.Get(), nullptr),
-        "Reset desktop backdrop command list");
-
-    if (m_backdropInitialized) {
-        D3D12_RESOURCE_BARRIER toCopy{};
-        toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        toCopy.Transition.pResource = m_backdropTexture.Get();
-        toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        m_backdropCopyCommandList->ResourceBarrier(1, &toCopy);
-    }
-
-    D3D12_TEXTURE_COPY_LOCATION source{};
-    source.pResource = m_backdropUpload.Get();
-    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    source.PlacedFootprint = m_backdropFootprint;
-    D3D12_TEXTURE_COPY_LOCATION destination{};
-    destination.pResource = m_backdropTexture.Get();
-    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    destination.SubresourceIndex = 0;
-    m_backdropCopyCommandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-
-    D3D12_RESOURCE_BARRIER toShader{};
-    toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    toShader.Transition.pResource = m_backdropTexture.Get();
-    toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    m_backdropCopyCommandList->ResourceBarrier(1, &toShader);
-
-    Check(m_backdropCopyCommandList->Close(), "Close desktop backdrop command list");
-    ID3D12CommandList* lists[] = {m_backdropCopyCommandList.Get()};
-    m_queue->ExecuteCommandLists(1, lists);
-    m_backdropCopyFenceValue = ++m_fenceValue;
-    Check(m_queue->Signal(m_fence.Get(), m_backdropCopyFenceValue), "Signal backdrop copy fence");
-    m_backdropInitialized = true;
+    m_backdropUploadDirty = true;
+    ++m_backdropGpuSerial;
+    m_blurCache = {};
     return true;
 }
 
@@ -3259,7 +3458,8 @@ void Renderer::UploadIconTexture(UINT textureIndex, const uint8_t* pixels, UINT 
     if (width > 4096 || height > 4096) {
         return;
     }
-    const D3D12_RESOURCE_DESC texture = TextureDescription(width, height, TextureArraySize(m_iconCount));
+    const D3D12_RESOURCE_DESC texture =
+        TextureDescription(width, height, TextureArraySize(std::max(m_iconAtlasCapacity, m_iconCount)));
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT rowCount = 0;
@@ -3746,10 +3946,10 @@ bool Renderer::CreatePanelGlassResourcesExact(UINT width, UINT height)
         D3D12_CLEAR_VALUE clear{};
         clear.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &rt,
-                  D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&m_panelBlurTemp)),
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&m_panelBlurTemp)),
             "Create panel blur temp");
         Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &rt,
-                  D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&m_panelBlurTemp2)),
+                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&m_panelBlurTemp2)),
             "Create panel blur temp2");
         Check(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &rt,
                   D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&m_panelColor)),
@@ -3761,7 +3961,7 @@ bool Renderer::CreatePanelGlassResourcesExact(UINT width, UINT height)
 
         D3D12_DESCRIPTOR_HEAP_DESC srvHeap{};
         srvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        srvHeap.NumDescriptors = 4;
+        srvHeap.NumDescriptors = kSrvDescriptorsPerTable * kSrvTableCount;
         srvHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         Check(m_device->CreateDescriptorHeap(&srvHeap, IID_PPV_ARGS(&m_panelSrvHeap)),
             "Create panel SRV heap");
@@ -3772,18 +3972,8 @@ bool Renderer::CreatePanelGlassResourcesExact(UINT width, UINT height)
         Check(m_device->CreateDescriptorHeap(&rtvHeap, IID_PPV_ARGS(&m_panelRtvHeap)),
             "Create panel RTV heap");
 
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-
-        const D3D12_CPU_DESCRIPTOR_HANDLE srvStart =
-            m_panelSrvHeap->GetCPUDescriptorHandleForHeapStart();
-        m_device->CreateShaderResourceView(nullptr, &srv, srvStart);
-        D3D12_CPU_DESCRIPTOR_HANDLE backdropSrv = srvStart;
-        backdropSrv.ptr += m_srvDescriptorSize;
-        m_device->CreateShaderResourceView(m_panelBackdrop.Get(), &srv, backdropSrv);
+        InitDualSrvTables(m_device.Get(), m_srvDescriptorSize, m_panelSrvHeap.Get(),
+            nullptr, 1U, m_panelBackdrop.Get(), m_panelBlurTemp.Get(), m_panelBlurTemp2.Get());
 
         const D3D12_CPU_DESCRIPTOR_HANDLE rtvStart =
             m_panelRtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -3795,8 +3985,8 @@ bool Renderer::CreatePanelGlassResourcesExact(UINT width, UINT height)
         rtv2.ptr += m_rtvDescriptorSize * 2ULL;
         m_device->CreateRenderTargetView(m_panelColor.Get(), nullptr, rtv2);
 
-        m_panelBlurTempIsSrv = false;
-        m_panelBlurTemp2IsSrv = false;
+        m_panelBlurTempIsSrv = true;
+        m_panelBlurTemp2IsSrv = true;
         return true;
     } catch (...) {
         ReleasePanelGlassResources();
@@ -3990,7 +4180,8 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
 {
     const float panelCornerRadius = std::exchange(m_panelCornerRadiusPx, 0.0F);
     outBgra.clear();
-    if (m_device == nullptr || m_queue == nullptr || m_panelCommandList == nullptr ||
+    if (m_device == nullptr || m_queue == nullptr || !EnsurePanelPipelineResources() ||
+        m_panelCommandList == nullptr ||
         m_glassPipeline == nullptr || m_blurPipeline == nullptr || m_blurVPipeline == nullptr ||
         m_blurH2Pipeline == nullptr || m_rootSignature == nullptr || width == 0 || height == 0) {
         return false;
@@ -4093,75 +4284,27 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         m_panelCommandList->SetGraphicsRootShaderResourceView(1, m_panelIconInstances->GetGPUVirtualAddress());
         ID3D12DescriptorHeap* heaps[] = {m_panelSrvHeap.Get()};
         m_panelCommandList->SetDescriptorHeaps(1, heaps);
-        m_panelCommandList->SetGraphicsRootDescriptorTable(2,
-            m_panelSrvHeap->GetGPUDescriptorHandleForHeapStart());
+        const D3D12_GPU_DESCRIPTOR_HANDLE panelSrvTable0 =
+            m_panelSrvHeap->GetGPUDescriptorHandleForHeapStart();
         m_panelCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         const D3D12_CPU_DESCRIPTOR_HANDLE rtvStart =
             m_panelRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        const D3D12_CPU_DESCRIPTOR_HANDLE srvStart =
-            m_panelSrvHeap->GetCPUDescriptorHandleForHeapStart();
 
-        D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
-        nullSrv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        nullSrv.Texture2D.MipLevels = 1;
-        D3D12_SHADER_RESOURCE_VIEW_DESC blurView = nullSrv;
-
-        const auto blurPass = [&](ID3D12Resource* target, bool& isSrv, UINT rtvIndex, UINT srvIndex,
-                                  ID3D12PipelineState* pipeline) {
-            if (isSrv) {
-                D3D12_RESOURCE_BARRIER toRt{};
-                toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                toRt.Transition.pResource = target;
-                toRt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                toRt.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                m_panelCommandList->ResourceBarrier(1, &toRt);
-                isSrv = false;
-            }
-            D3D12_CPU_DESCRIPTOR_HANDLE blurSrv = srvStart;
-            blurSrv.ptr += static_cast<SIZE_T>(srvIndex) * m_srvDescriptorSize;
-            m_device->CreateShaderResourceView(nullptr, &nullSrv, blurSrv);
-
-            D3D12_CPU_DESCRIPTOR_HANDLE blurRtv = rtvStart;
-            blurRtv.ptr += static_cast<SIZE_T>(rtvIndex) * m_rtvDescriptorSize;
-            m_panelCommandList->OMSetRenderTargets(1, &blurRtv, FALSE, nullptr);
-            m_panelCommandList->SetPipelineState(pipeline);
-            m_panelCommandList->DrawInstanced(3, 1, 0, 0);
-
-            D3D12_RESOURCE_BARRIER toShader{};
-            toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            toShader.Transition.pResource = target;
-            toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            m_panelCommandList->ResourceBarrier(1, &toShader);
-            isSrv = true;
-            m_device->CreateShaderResourceView(target, &blurView, blurSrv);
-        };
-
-        // Same frost-scaled stack as the live dock (1H at clear/mid, up to
-        // 5H+4V here + GlassPS final V at full frost).
         float panelFrostAmt =
             static_cast<float>((fxFlags >> 16) & 0xFFu) / 255.0F;
         if ((fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
             panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
         }
-        blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurPipeline.Get());
-        const int panelExtraPairs = static_cast<int>(std::lround(
-            std::clamp((panelFrostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
-        for (int pair = 0; pair < panelExtraPairs; ++pair) {
-            blurPass(m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
-            blurPass(m_panelBlurTemp.Get(), m_panelBlurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
-        }
+        RecordFrostBlur(m_panelCommandList.Get(), panelFrostAmt, rtvStart, m_rtvDescriptorSize,
+            panelSrvTable0, m_srvDescriptorSize, m_panelBlurTemp.Get(), m_panelBlurTempIsSrv,
+            m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, m_blurPipeline.Get(),
+            m_blurVPipeline.Get(), m_blurH2Pipeline.Get());
 
+        m_panelCommandList->SetGraphicsRootDescriptorTable(2, panelSrvTable0);
         D3D12_CPU_DESCRIPTOR_HANDLE colorRtv = rtvStart;
         colorRtv.ptr += m_rtvDescriptorSize * 2ULL;
-        const float clearColor[4] = {0.0F, 0.0F, 0.0F, 0.0F};
         m_panelCommandList->OMSetRenderTargets(1, &colorRtv, FALSE, nullptr);
-        m_panelCommandList->ClearRenderTargetView(colorRtv, clearColor, 0, nullptr);
         m_panelCommandList->SetPipelineState(m_glassPipeline.Get());
         m_panelCommandList->DrawInstanced(3, 1, 0, 0);
 
@@ -4379,7 +4522,8 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
     if (skippedUnchanged != nullptr) {
         *skippedUnchanged = false;
     }
-    if (m_device == nullptr || m_queue == nullptr || m_panelCommandList == nullptr ||
+    if (m_device == nullptr || m_queue == nullptr || !EnsurePanelPipelineResources() ||
+        m_panelCommandList == nullptr ||
         m_panelAllocator == nullptr || m_glassPipeline == nullptr || m_blurPipeline == nullptr ||
         m_blurVPipeline == nullptr || m_blurH2Pipeline == nullptr || m_rootSignature == nullptr ||
         m_panelMappedConstants == nullptr || m_panelConstants == nullptr ||
@@ -4546,79 +4690,27 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         m_panelCommandList->SetGraphicsRootShaderResourceView(1, m_panelIconInstances->GetGPUVirtualAddress());
         ID3D12DescriptorHeap* heaps[] = {m_panelSrvHeap.Get()};
         m_panelCommandList->SetDescriptorHeaps(1, heaps);
-        m_panelCommandList->SetGraphicsRootDescriptorTable(2,
-            m_panelSrvHeap->GetGPUDescriptorHandleForHeapStart());
+        const D3D12_GPU_DESCRIPTOR_HANDLE panelSrvTable0 =
+            m_panelSrvHeap->GetGPUDescriptorHandleForHeapStart();
         m_panelCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         const D3D12_CPU_DESCRIPTOR_HANDLE rtvStart =
             m_panelRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        const D3D12_CPU_DESCRIPTOR_HANDLE srvStart =
-            m_panelSrvHeap->GetCPUDescriptorHandleForHeapStart();
-
-        D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
-        nullSrv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        nullSrv.Texture2D.MipLevels = 1;
-        D3D12_SHADER_RESOURCE_VIEW_DESC blurView = nullSrv;
-
-        // Live bake must leave blur temps in their tracked SRV/RT states across
-        // frames; mirror BakeGlassPanel's blurPass exactly.
-        bool blurTempIsSrv = m_panelBlurTempIsSrv;
-        bool blurTemp2IsSrv = m_panelBlurTemp2IsSrv;
-        const auto blurPass = [&](ID3D12Resource* target, bool& isSrv, UINT rtvIndex, UINT srvIndex,
-                                  ID3D12PipelineState* pipeline) {
-            if (isSrv) {
-                D3D12_RESOURCE_BARRIER toRt{};
-                toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                toRt.Transition.pResource = target;
-                toRt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                toRt.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                m_panelCommandList->ResourceBarrier(1, &toRt);
-                isSrv = false;
-            }
-            D3D12_CPU_DESCRIPTOR_HANDLE blurSrv = srvStart;
-            blurSrv.ptr += static_cast<SIZE_T>(srvIndex) * m_srvDescriptorSize;
-            m_device->CreateShaderResourceView(nullptr, &nullSrv, blurSrv);
-
-            D3D12_CPU_DESCRIPTOR_HANDLE blurRtv = rtvStart;
-            blurRtv.ptr += static_cast<SIZE_T>(rtvIndex) * m_rtvDescriptorSize;
-            m_panelCommandList->OMSetRenderTargets(1, &blurRtv, FALSE, nullptr);
-            m_panelCommandList->SetPipelineState(pipeline);
-            m_panelCommandList->DrawInstanced(3, 1, 0, 0);
-
-            D3D12_RESOURCE_BARRIER toShader{};
-            toShader.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            toShader.Transition.pResource = target;
-            toShader.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            toShader.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            toShader.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            m_panelCommandList->ResourceBarrier(1, &toShader);
-            isSrv = true;
-            m_device->CreateShaderResourceView(target, &blurView, blurSrv);
-        };
 
         float panelFrostAmt =
             static_cast<float>((fxFlags >> 16) & 0xFFu) / 255.0F;
         if ((fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
             panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
         }
-        blurPass(m_panelBlurTemp.Get(), blurTempIsSrv, 0, 2, m_blurPipeline.Get());
-        const int panelExtraPairs = static_cast<int>(std::lround(
-            std::clamp((panelFrostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
-        for (int pair = 0; pair < panelExtraPairs; ++pair) {
-            blurPass(m_panelBlurTemp2.Get(), blurTemp2IsSrv, 1, 3, m_blurVPipeline.Get());
-            blurPass(m_panelBlurTemp.Get(), blurTempIsSrv, 0, 2, m_blurH2Pipeline.Get());
-        }
-        m_panelBlurTempIsSrv = blurTempIsSrv;
-        m_panelBlurTemp2IsSrv = blurTemp2IsSrv;
+        RecordFrostBlur(m_panelCommandList.Get(), panelFrostAmt, rtvStart, m_rtvDescriptorSize,
+            panelSrvTable0, m_srvDescriptorSize, m_panelBlurTemp.Get(), m_panelBlurTempIsSrv,
+            m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, m_blurPipeline.Get(),
+            m_blurVPipeline.Get(), m_blurH2Pipeline.Get());
 
+        m_panelCommandList->SetGraphicsRootDescriptorTable(2, panelSrvTable0);
         D3D12_CPU_DESCRIPTOR_HANDLE colorRtv = rtvStart;
         colorRtv.ptr += m_rtvDescriptorSize * 2ULL;
-        const float clearColor[4] = {0.0F, 0.0F, 0.0F, 0.0F};
         m_panelCommandList->OMSetRenderTargets(1, &colorRtv, FALSE, nullptr);
-        m_panelCommandList->ClearRenderTargetView(colorRtv, clearColor, 0, nullptr);
         m_panelCommandList->SetPipelineState(m_glassPipeline.Get());
         m_panelCommandList->DrawInstanced(3, 1, 0, 0);
 

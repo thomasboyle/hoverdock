@@ -144,6 +144,7 @@ private:
     std::vector<HiddenWindowCandidate>* m_hiddenCandidates = nullptr;
     std::vector<PinMatchProfile> m_pinProfiles;
     std::vector<PinnedApp> m_cachedPinProfileSources;
+    std::vector<std::pair<std::wstring, uint64_t>> m_cachedPinFileStamps;
     bool m_pinMatchingNeedsAumid = false;
     bool m_enrichedAumid = false;
     static std::unordered_map<DWORD, ProcessPathEntry> s_processPathCache;
