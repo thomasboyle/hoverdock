@@ -355,55 +355,65 @@ std::string WideToUtf8(std::wstring_view text) {
 
 std::wstring Utf8ToWide(std::string_view text) {
     std::wstring out;
-    out.reserve(text.size());
+    if (text.empty()) {
+        return out;
+    }
+    out.resize(text.size());
+    const auto* src = reinterpret_cast<const unsigned char*>(text.data());
+    wchar_t* dst = out.data();
+    const size_t n = text.size();
     size_t i = 0;
-    while (i < text.size()) {
-        const auto c = static_cast<unsigned char>(text[i]);
+    size_t w = 0;
+    while (i < n) {
+        while (i < n && src[i] < 0x80U) {
+            dst[w++] = static_cast<wchar_t>(src[i++]);
+        }
+        if (i >= n) {
+            break;
+        }
+        const unsigned char c = src[i];
         uint32_t cp = 0xFFFD;
         size_t extra = 0;
-        if (c < 0x80) {
-            cp = c;
-        } else if ((c & 0xE0) == 0xC0) {
+        if ((c & 0xE0U) == 0xC0U) {
             cp = c & 0x1FU;
             extra = 1;
-        } else if ((c & 0xF0) == 0xE0) {
+        } else if ((c & 0xF0U) == 0xE0U) {
             cp = c & 0x0FU;
             extra = 2;
-        } else if ((c & 0xF8) == 0xF0) {
+        } else if ((c & 0xF8U) == 0xF0U) {
             cp = c & 0x07U;
             extra = 3;
         }
         size_t consumed = 1;
         if (extra > 0) {
-            bool valid = i + extra < text.size();
+            bool valid = i + extra < n;
             for (size_t k = 1; valid && k <= extra; ++k) {
-                const auto next = static_cast<unsigned char>(text[i + k]);
-                if ((next & 0xC0) != 0x80) {
+                const unsigned char next = src[i + k];
+                if ((next & 0xC0U) != 0x80U) {
                     valid = false;
                 } else {
                     cp = (cp << 6U) | (next & 0x3FU);
                 }
             }
-            const bool overlong = (extra == 1 && cp < 0x80) || (extra == 2 && cp < 0x800) || (extra == 3 && cp < 0x10000);
-            if (!valid || overlong || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            const bool overlong = (extra == 1 && cp < 0x80U) || (extra == 2 && cp < 0x800U) || (extra == 3 && cp < 0x10000U);
+            if (!valid || overlong || cp > 0x10FFFFU || (cp >= 0xD800U && cp <= 0xDFFFU)) {
                 cp = 0xFFFD;
             } else {
                 consumed = extra + 1;
             }
-        } else if (c >= 0x80) {
-            cp = 0xFFFD;
         }
         i += consumed;
         if constexpr (sizeof(wchar_t) == 2) {
-            if (cp >= 0x10000) {
-                cp -= 0x10000;
-                out.push_back(static_cast<wchar_t>(0xD800 + (cp >> 10U)));
-                out.push_back(static_cast<wchar_t>(0xDC00 + (cp & 0x3FFU)));
+            if (cp >= 0x10000U) {
+                cp -= 0x10000U;
+                dst[w++] = static_cast<wchar_t>(0xD800U + (cp >> 10U));
+                dst[w++] = static_cast<wchar_t>(0xDC00U + (cp & 0x3FFU));
                 continue;
             }
         }
-        out.push_back(static_cast<wchar_t>(cp));
+        dst[w++] = static_cast<wchar_t>(cp);
     }
+    out.resize(w);
     return out;
 }
 
@@ -503,7 +513,19 @@ std::string SystemPrompt(std::string_view today, SearchMode search) {
 
 std::string BuildChatRequest(std::string_view model, const std::vector<Message>& messages, SearchMode search,
     bool stream, uint32_t maxTokens) {
-    std::string out = R"({"model":)";
+    size_t estimated = 512 + model.size();
+    for (const Message& message : messages) {
+        estimated += 64 + message.role.size() + message.content.size() + message.toolCallId.size();
+        for (size_t i = 0; i < message.images.size() && i < kMaxImages; ++i) {
+            estimated += 48 + message.images[i].size();
+        }
+        for (const ToolCall& call : message.toolCalls) {
+            estimated += 80 + call.id.size() + call.name.size() + call.arguments.size();
+        }
+    }
+    std::string out;
+    out.reserve(estimated);
+    out += R"({"model":)";
     json::AppendQuoted(out, model);
     out += R"(,"messages":[)";
     bool first = true;
@@ -883,10 +905,16 @@ std::string ErrorMessage(std::string_view body) {
 }
 
 std::string StripThinking(std::string_view content) {
+    const size_t firstOpen = content.find("<think>");
+    if (firstOpen == std::string_view::npos) {
+        const size_t first = content.find_first_not_of(" \t\r\n");
+        return first == std::string_view::npos ? std::string() : std::string(content.substr(first));
+    }
     std::string out;
+    out.reserve(content.size());
     size_t i = 0;
     while (i < content.size()) {
-        const size_t open = content.find("<think>", i);
+        const size_t open = i == 0 ? firstOpen : content.find("<think>", i);
         if (open == std::string_view::npos) {
             out.append(content.substr(i));
             break;
@@ -899,7 +927,13 @@ std::string StripThinking(std::string_view content) {
         i = close + 8;
     }
     const size_t first = out.find_first_not_of(" \t\r\n");
-    return first == std::string::npos ? std::string() : out.substr(first);
+    if (first == std::string::npos) {
+        return {};
+    }
+    if (first == 0) {
+        return out;
+    }
+    return out.substr(first);
 }
 
 // ---- streaming -----------------------------------------------------------------------------
@@ -948,15 +982,445 @@ const std::wstring& DisplayText::Update(const std::string& content) {
     return m_text;
 }
 
+namespace {
+
+class FastStreamScanner {
+public:
+    explicit FastStreamScanner(std::string_view text) : m_text(text) {}
+
+    bool Parse(std::string& content, std::string& finishReason, bool& reasoning) {
+        SkipSpace();
+        if (!Consume('{')) {
+            return false;
+        }
+        SkipSpace();
+        if (Consume('}')) {
+            return true;
+        }
+        while (true) {
+            std::string_view key;
+            if (!ReadPlainKey(key)) {
+                return false;
+            }
+            SkipSpace();
+            if (!Consume(':')) {
+                return false;
+            }
+            SkipSpace();
+            if (key == "error") {
+                return false;
+            }
+            if (key == "choices") {
+                if (!ParseChoices(content, finishReason, reasoning)) {
+                    return false;
+                }
+            } else if (!SkipValue(0)) {
+                return false;
+            }
+            SkipSpace();
+            if (Consume(',')) {
+                continue;
+            }
+            if (Consume('}')) {
+                SkipSpace();
+                return m_pos == m_text.size();
+            }
+            return false;
+        }
+    }
+
+private:
+    void SkipSpace() noexcept {
+        while (m_pos < m_text.size()) {
+            const char c = m_text[m_pos];
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+                break;
+            }
+            ++m_pos;
+        }
+    }
+
+    bool Consume(char expected) noexcept {
+        if (m_pos < m_text.size() && m_text[m_pos] == expected) {
+            ++m_pos;
+            return true;
+        }
+        return false;
+    }
+
+    bool ReadPlainKey(std::string_view& out) noexcept {
+        SkipSpace();
+        if (!Consume('"')) {
+            return false;
+        }
+        const size_t start = m_pos;
+        while (m_pos < m_text.size()) {
+            const char c = m_text[m_pos++];
+            if (c == '"') {
+                out = m_text.substr(start, m_pos - start - 1);
+                return true;
+            }
+            if (c == '\\') {
+                return false;  // escaped key: fall back to full parser
+            }
+        }
+        return false;
+    }
+
+    static void AppendCodePoint(std::string& out, uint32_t cp) {
+        if (cp < 0x80U) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp < 0x800U) {
+            out.push_back(static_cast<char>(0xC0U | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+        } else if (cp < 0x10000U) {
+            out.push_back(static_cast<char>(0xE0U | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80U | ((cp >> 6) & 0x3FU)));
+            out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+        } else {
+            out.push_back(static_cast<char>(0xF0U | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80U | ((cp >> 12) & 0x3FU)));
+            out.push_back(static_cast<char>(0x80U | ((cp >> 6) & 0x3FU)));
+            out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+        }
+    }
+
+    bool Hex4(uint32_t& value) noexcept {
+        if (m_pos + 4 > m_text.size()) {
+            return false;
+        }
+        value = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char h = m_text[m_pos++];
+            value <<= 4U;
+            if (h >= '0' && h <= '9') {
+                value |= static_cast<uint32_t>(h - '0');
+            } else if (h >= 'a' && h <= 'f') {
+                value |= static_cast<uint32_t>(h - 'a' + 10);
+            } else if (h >= 'A' && h <= 'F') {
+                value |= static_cast<uint32_t>(h - 'A' + 10);
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool AppendString(std::string& out) {
+        if (!Consume('"')) {
+            return false;
+        }
+        while (m_pos < m_text.size()) {
+            const size_t runStart = m_pos;
+            while (m_pos < m_text.size() && m_text[m_pos] != '"' && m_text[m_pos] != '\\') {
+                ++m_pos;
+            }
+            if (m_pos > runStart) {
+                out.append(m_text.data() + runStart, m_pos - runStart);
+            }
+            if (m_pos >= m_text.size()) {
+                return false;
+            }
+            const char c = m_text[m_pos++];
+            if (c == '"') {
+                return true;
+            }
+            if (m_pos >= m_text.size()) {
+                return false;
+            }
+            const char e = m_text[m_pos++];
+            switch (e) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u': {
+                uint32_t cp = 0;
+                if (!Hex4(cp)) {
+                    return false;
+                }
+                if (cp >= 0xD800U && cp <= 0xDBFFU && m_pos + 6 <= m_text.size() && m_text[m_pos] == '\\' &&
+                    m_text[m_pos + 1] == 'u') {
+                    m_pos += 2;
+                    uint32_t low = 0;
+                    if (!Hex4(low)) {
+                        return false;
+                    }
+                    if (low >= 0xDC00U && low <= 0xDFFFU) {
+                        cp = 0x10000U + ((cp - 0xD800U) << 10U) + (low - 0xDC00U);
+                    } else {
+                        AppendCodePoint(out, 0xFFFDU);
+                        cp = low;
+                    }
+                } else if (cp >= 0xD800U && cp <= 0xDFFFU) {
+                    cp = 0xFFFDU;
+                }
+                AppendCodePoint(out, cp);
+                break;
+            }
+            default:
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool SkipString() noexcept {
+        if (!Consume('"')) {
+            return false;
+        }
+        while (m_pos < m_text.size()) {
+            const char c = m_text[m_pos++];
+            if (c == '"') {
+                return true;
+            }
+            if (c == '\\') {
+                if (m_pos >= m_text.size()) {
+                    return false;
+                }
+                ++m_pos;
+            }
+        }
+        return false;
+    }
+
+    bool SkipNull() noexcept {
+        if (m_text.substr(m_pos, 4) == "null") {
+            m_pos += 4;
+            return true;
+        }
+        return false;
+    }
+
+    bool SkipValue(int depth) noexcept {
+        if (depth > 32) {
+            return false;
+        }
+        SkipSpace();
+        if (m_pos >= m_text.size()) {
+            return false;
+        }
+        const char c = m_text[m_pos];
+        if (c == '"') {
+            return SkipString();
+        }
+        if (c == '{') {
+            ++m_pos;
+            SkipSpace();
+            if (Consume('}')) {
+                return true;
+            }
+            while (true) {
+                SkipSpace();
+                if (!SkipString()) {
+                    return false;
+                }
+                SkipSpace();
+                if (!Consume(':')) {
+                    return false;
+                }
+                if (!SkipValue(depth + 1)) {
+                    return false;
+                }
+                SkipSpace();
+                if (Consume(',')) {
+                    continue;
+                }
+                return Consume('}');
+            }
+        }
+        if (c == '[') {
+            ++m_pos;
+            SkipSpace();
+            if (Consume(']')) {
+                return true;
+            }
+            while (true) {
+                if (!SkipValue(depth + 1)) {
+                    return false;
+                }
+                SkipSpace();
+                if (Consume(',')) {
+                    continue;
+                }
+                return Consume(']');
+            }
+        }
+        if (m_text.substr(m_pos, 4) == "true") {
+            m_pos += 4;
+            return true;
+        }
+        if (m_text.substr(m_pos, 5) == "false") {
+            m_pos += 5;
+            return true;
+        }
+        if (SkipNull()) {
+            return true;
+        }
+        const size_t start = m_pos;
+        if (m_text[m_pos] == '-') {
+            ++m_pos;
+        }
+        bool digits = false;
+        while (m_pos < m_text.size()) {
+            const char ch = m_text[m_pos];
+            if ((ch >= '0' && ch <= '9') || ch == '.' || ch == 'e' || ch == 'E' || ch == '+' || ch == '-') {
+                digits = true;
+                ++m_pos;
+            } else {
+                break;
+            }
+        }
+        return digits && m_pos > start;
+    }
+
+    bool ParseChoices(std::string& content, std::string& finishReason, bool& reasoning) {
+        if (!Consume('[')) {
+            return false;
+        }
+        SkipSpace();
+        if (Consume(']')) {
+            return true;
+        }
+        if (!ParseChoice(content, finishReason, reasoning)) {
+            return false;
+        }
+        SkipSpace();
+        while (Consume(',')) {
+            if (!SkipValue(1)) {
+                return false;
+            }
+            SkipSpace();
+        }
+        return Consume(']');
+    }
+
+    bool ParseChoice(std::string& content, std::string& finishReason, bool& reasoning) {
+        SkipSpace();
+        if (!Consume('{')) {
+            return false;
+        }
+        SkipSpace();
+        if (Consume('}')) {
+            return true;
+        }
+        while (true) {
+            std::string_view key;
+            if (!ReadPlainKey(key)) {
+                return false;
+            }
+            SkipSpace();
+            if (!Consume(':')) {
+                return false;
+            }
+            SkipSpace();
+            if (key == "finish_reason") {
+                if (m_pos < m_text.size() && m_text[m_pos] == '"') {
+                    std::string parsed;
+                    if (!AppendString(parsed)) {
+                        return false;
+                    }
+                    if (!parsed.empty()) {
+                        finishReason = std::move(parsed);
+                    }
+                } else if (!SkipNull()) {
+                    return false;
+                }
+            } else if (key == "delta") {
+                if (!ParseDelta(content, reasoning)) {
+                    return false;
+                }
+            } else if (key == "message") {
+                return false;
+            } else if (!SkipValue(1)) {
+                return false;
+            }
+            SkipSpace();
+            if (Consume(',')) {
+                continue;
+            }
+            return Consume('}');
+        }
+    }
+
+    bool ParseDelta(std::string& content, bool& reasoning) {
+        if (!Consume('{')) {
+            return false;
+        }
+        SkipSpace();
+        if (Consume('}')) {
+            return true;
+        }
+        while (true) {
+            std::string_view key;
+            if (!ReadPlainKey(key)) {
+                return false;
+            }
+            SkipSpace();
+            if (!Consume(':')) {
+                return false;
+            }
+            SkipSpace();
+            if (key == "content") {
+                if (m_pos < m_text.size() && m_text[m_pos] == '"') {
+                    if (!AppendString(content)) {
+                        return false;
+                    }
+                } else if (!SkipNull()) {
+                    return false;
+                }
+            } else if (key == "reasoning") {
+                if (m_pos < m_text.size() && m_text[m_pos] == '"') {
+                    const size_t before = m_pos;
+                    if (!SkipString()) {
+                        return false;
+                    }
+                    if (m_pos - before > 2) {
+                        reasoning = true;
+                    }
+                } else if (!SkipNull()) {
+                    return false;
+                }
+            } else if (key == "tool_calls" || key == "executed_tools") {
+                return false;
+            } else if (!SkipValue(2)) {
+                return false;
+            }
+            SkipSpace();
+            if (Consume(',')) {
+                continue;
+            }
+            return Consume('}');
+        }
+    }
+
+    std::string_view m_text;
+    size_t m_pos = 0;
+};
+
+}  // namespace
+
 void StreamParser::Feed(std::string_view bytes) {
     size_t start = 0;
     while (start < bytes.size()) {
         const size_t newline = bytes.find('\n', start);
-        const size_t end = newline == std::string_view::npos ? bytes.size() : newline;
-        m_line.append(bytes.data() + start, end - start);
         if (newline == std::string_view::npos) {
+            m_line.append(bytes.data() + start, bytes.size() - start);
             break;
         }
+        if (m_line.empty()) {
+            std::string_view line = bytes.substr(start, newline - start);
+            if (line.find('\r') == std::string_view::npos) {
+                HandleLine(line);
+                start = newline + 1;
+                continue;
+            }
+        }
+        m_line.append(bytes.data() + start, newline - start);
         // SSE lines end in \n or \r\n; drop any carriage returns.
         if (m_line.find('\r') != std::string::npos) {
             std::erase(m_line, '\r');
@@ -997,6 +1461,16 @@ void StreamParser::HandleLine(std::string_view line) {
 }
 
 void StreamParser::HandleEvent(std::string_view data) {
+    const size_t savedContent = m_content.size();
+    const std::string savedFinish = m_finishReason;
+    const bool savedReasoning = m_reasoning;
+    if (FastStreamScanner(data).Parse(m_content, m_finishReason, m_reasoning)) {
+        return;
+    }
+    m_content.resize(savedContent);
+    m_finishReason = savedFinish;
+    m_reasoning = savedReasoning;
+
     const std::optional<json::Value> root = json::Parse(data);
     if (!root.has_value()) {
         return;

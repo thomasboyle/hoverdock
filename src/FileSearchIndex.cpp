@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -14,6 +17,9 @@
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
+#elif defined(__ARM_NEON) || defined(_M_ARM64)
+#define FILESEARCH_NEON 1
+#include <arm_neon.h>
 #endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -168,6 +174,21 @@ size_t FindIn(std::string_view name, const Token& token, size_t from = 0) noexce
     }
     const auto* s = reinterpret_cast<const unsigned char*>(name.data());
     const size_t last = name.size() - token.length;
+    if (token.anchored) {
+        const size_t o1 = token.offset1;
+        const size_t o2 = token.offset2;
+        const unsigned char m1 = token.mask1;
+        const unsigned char m2 = token.mask2;
+        const unsigned char v1 = token.value1;
+        const unsigned char v2 = token.value2;
+        for (size_t i = from; i <= last; ++i) {
+            if (((s[i + o1] | m1) == v1) && ((s[i + o2] | m2) == v2) &&
+                MatchAt(s + i, token.bytes, token.length)) {
+                return i;
+            }
+        }
+        return std::string_view::npos;
+    }
     for (size_t i = from; i <= last; ++i) {
         if (MatchAt(s + i, token.bytes, token.length)) {
             return i;
@@ -205,19 +226,6 @@ bool EqualsFolded(std::string_view name, std::string_view folded) noexcept {
     }
     return MatchAt(reinterpret_cast<const unsigned char*>(name.data()),
         reinterpret_cast<const unsigned char*>(folded.data()), folded.size());
-}
-
-bool ExtensionIs(std::string_view name, std::string_view lowerExt) noexcept {
-    if (name.size() <= lowerExt.size()) {
-        return false;
-    }
-    const std::string_view tail = name.substr(name.size() - lowerExt.size());
-    for (size_t i = 0; i < tail.size(); ++i) {
-        if (AsciiFold(static_cast<unsigned char>(tail[i])) != static_cast<unsigned char>(lowerExt[i])) {
-            return false;
-        }
-    }
-    return true;
 }
 
 // 16-bit hash of the case-folded UTF-8 bytes of text[0, length).
@@ -258,7 +266,44 @@ uint16_t FoldedKey(std::string_view text) noexcept {
 // of dot-free queries).
 uint16_t StemKey(std::string_view name) noexcept {
     const size_t dot = name.rfind('.');
-    return FoldedKey(dot != std::string_view::npos && dot > 0 ? name.substr(0, dot) : name);
+    const std::string_view stem = dot != std::string_view::npos && dot > 0 ? name.substr(0, dot) : name;
+    uint32_t hash = 2166136261U;
+    const auto* s = reinterpret_cast<const unsigned char*>(stem.data());
+    const size_t n = stem.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char b = s[i];
+        if (b < 0x80U) {
+            hash = (hash ^ AsciiFold(b)) * 16777619U;
+            ++i;
+            continue;
+        }
+        const size_t left = n - i;
+        const Decoded d = left >= 4 ? DecodeUtf8(s + i) : Decoded{0x80000000U | b, 1};
+        if ((d.cp & 0x80000000U) != 0 || d.length > left) {
+            hash = (hash ^ b) * 16777619U;
+            ++i;
+        } else {
+            const uint32_t folded = FoldCodePoint(d.cp);
+            if (folded < 0x80U) {
+                hash = (hash ^ folded) * 16777619U;
+            } else if (folded < 0x800U) {
+                hash = (hash ^ (0xC0U | (folded >> 6))) * 16777619U;
+                hash = (hash ^ (0x80U | (folded & 0x3FU))) * 16777619U;
+            } else if (folded < 0x10000U) {
+                hash = (hash ^ (0xE0U | (folded >> 12))) * 16777619U;
+                hash = (hash ^ (0x80U | ((folded >> 6) & 0x3FU))) * 16777619U;
+                hash = (hash ^ (0x80U | (folded & 0x3FU))) * 16777619U;
+            } else {
+                hash = (hash ^ (0xF0U | (folded >> 18))) * 16777619U;
+                hash = (hash ^ (0x80U | ((folded >> 12) & 0x3FU))) * 16777619U;
+                hash = (hash ^ (0x80U | ((folded >> 6) & 0x3FU))) * 16777619U;
+                hash = (hash ^ (0x80U | (folded & 0x3FU))) * 16777619U;
+            }
+            i += d.length;
+        }
+    }
+    return static_cast<uint16_t>(hash ^ (hash >> 16));
 }
 
 // Static (query-independent) score sentinel: dead or excluded slot.
@@ -268,14 +313,23 @@ constexpr int kTokenCeiling = 600;
 // Best possible whole-name bonus.
 constexpr int kWholeNameCeiling = 600;
 
-int KindBonus(std::string_view name, uint8_t flags) noexcept {
+inline int KindBonus(std::string_view name, uint8_t flags) noexcept {
     if ((flags & kFlagDirectory) != 0) {
         return 40;
     }
-    if (ExtensionIs(name, ".lnk")) {
-        return 120;
+    const size_t n = name.size();
+    if (n > 4 && name[n - 4] == '.') {
+        const unsigned char c1 = AsciiFold(static_cast<unsigned char>(name[n - 3]));
+        const unsigned char c2 = AsciiFold(static_cast<unsigned char>(name[n - 2]));
+        const unsigned char c3 = AsciiFold(static_cast<unsigned char>(name[n - 1]));
+        if (c1 == 'l' && c2 == 'n' && c3 == 'k') {
+            return 120;
+        }
+        if (c1 == 'e' && c2 == 'x' && c3 == 'e') {
+            return 60;
+        }
     }
-    return ExtensionIs(name, ".exe") ? 60 : 0;
+    return 0;
 }
 
 int ZoneBonus(Zone zone) noexcept {
@@ -562,18 +616,58 @@ void FileIndex::Add(uint8_t volume, uint64_t id, uint64_t parentId, uint8_t flag
 
 void FileIndex::AddUtf16(uint8_t volume, uint64_t id, uint64_t parentId, uint8_t flags, const char16_t* name,
     size_t length) {
-    // Fast path: pure ASCII names (the vast majority) skip the scratch string.
-    char ascii[256];
-    if (length <= sizeof(ascii)) {
-        size_t i = 0;
-        for (; i < length && name[i] < 0x80U; ++i) {
-            ascii[i] = static_cast<char>(name[i]);
-        }
-        if (i == length) {
-            Add(volume, id, parentId, flags, std::string_view(ascii, length));
-            return;
-        }
+    const uint64_t record = Record(id);
+    Volume& vol = m_volumes[volume];
+    if (record == vol.rootRecord) {
+        return;
     }
+    if (record < kFirstUserRecord) {
+        flags |= kFlagMeta;
+    }
+    // Single-pass ASCII fast path: narrow UTF-16 directly into m_names while
+    // computing the FNV-1a stem hash, avoiding a stack copy + double scan.
+    const size_t logical = m_names.size() - kPad;
+    m_names.resize(m_names.size() + length + 1);
+    char* dst = m_names.data() + logical;
+    uint32_t hash = 2166136261U;
+    uint32_t hashAtLastDot = 0;
+    bool sawDot = false;
+    size_t i = 0;
+    for (; i < length; ++i) {
+        const char16_t ch = name[i];
+        if (ch >= 0x80U) {
+            break;
+        }
+        const auto b = static_cast<unsigned char>(ch);
+        dst[i] = static_cast<char>(b);
+        if (b == '.' && i > 0) {
+            hashAtLastDot = hash;
+            sawDot = true;
+        }
+        hash = (hash ^ AsciiFold(b)) * 16777619U;
+    }
+    if (i == length) {
+        dst[length] = '\0';
+        const auto entry = static_cast<uint32_t>(m_parent.size());
+        const auto slot = static_cast<uint32_t>(m_slotEntry.size());
+        const uint32_t stem = sawDot ? hashAtLastDot : hash;
+        m_parent.push_back(kNone);
+        m_flags.push_back(flags);
+        m_zone.push_back(static_cast<uint8_t>(Zone::Normal));
+        m_slot.push_back(slot);
+        m_slotEntry.push_back(entry);
+        m_slotBase.push_back(kNoBase);
+        m_slotKey.push_back(static_cast<uint16_t>(stem ^ (stem >> 16)));
+        m_slotStart.back() = static_cast<uint32_t>(logical);
+        m_slotStart.push_back(static_cast<uint32_t>(logical + length + 1));
+        ++m_liveEntries;
+        m_pendingParent.push_back(parentId);
+        MapRecord(vol, record, entry);
+        return;
+    }
+    // Non-ASCII fallback: restore m_names size and zero the overwritten pad bytes.
+    m_names.resize(logical + kPad);
+    std::memset(m_names.data() + logical, 0, std::min(i, kPad));
     std::string utf8;
     utf8.reserve(length * 3);
     AppendUtf8(utf8, name, length);
@@ -738,39 +832,54 @@ void FileIndex::Reorder() {
         }
         order[counts[bucketOf(m_slotBase[slot])]++] = static_cast<uint32_t>(slot);
     }
-    std::string names;
-    names.reserve(liveBytes + kPad);
-    std::vector<uint32_t> starts;
-    std::vector<uint32_t> owners;
-    std::vector<int16_t> bases;
-    std::vector<uint16_t> keys;
-    keys.reserve(live);
-    starts.reserve(live + 1);
-    owners.reserve(live);
-    bases.reserve(live);
-    for (uint32_t& slot : m_slot) {
-        slot = kNone;
-    }
-    // A gather in random order: issue the cache misses a few slots ahead so
-    // they overlap instead of stalling one by one.
-    constexpr size_t kAhead = 16;
-    for (size_t k = 0; k < order.size(); ++k) {
-        if (k + kAhead < order.size()) {
-            const uint32_t ahead = order[k + kAhead];
-            FILESEARCH_PREFETCH(m_names.data() + m_slotStart[ahead]);
-            FILESEARCH_PREFETCH(m_slot.data() + m_slotEntry[ahead]);
+    std::string names(liveBytes + kPad, '\0');
+    std::vector<uint32_t> starts(live + 1);
+    std::vector<uint32_t> owners(live);
+    std::vector<int16_t> bases(live);
+    std::vector<uint16_t> keys(live);
+    std::fill(m_slot.begin(), m_slot.end(), kNone);
+    // Two-stage prefetch: first prefetch the random slot metadata, then the
+    // name bytes and entry slot back-pointer, and write via raw pointers.
+    const char* srcNames = m_names.data();
+    const uint32_t* srcStart = m_slotStart.data();
+    const uint32_t* srcEntry = m_slotEntry.data();
+    const int16_t* srcBase = m_slotBase.data();
+    const uint16_t* srcKey = m_slotKey.data();
+    uint32_t* slotOfEntry = m_slot.data();
+    char* dstNames = names.data();
+    uint32_t* dstStart = starts.data();
+    uint32_t* dstEntry = owners.data();
+    int16_t* dstBase = bases.data();
+    uint16_t* dstKey = keys.data();
+    const uint32_t* orderData = order.data();
+    const size_t orderSize = order.size();
+    uint32_t cursor = 0;
+    constexpr size_t kAhead1 = 32;
+    constexpr size_t kAhead2 = 16;
+    for (size_t k = 0; k < orderSize; ++k) {
+        if (k + kAhead1 < orderSize) {
+            const uint32_t a1 = orderData[k + kAhead1];
+            FILESEARCH_PREFETCH(srcStart + a1);
+            FILESEARCH_PREFETCH(srcEntry + a1);
         }
-        const uint32_t slot = order[k];
-        const uint32_t entry = m_slotEntry[slot];
-        starts.push_back(static_cast<uint32_t>(names.size()));
-        names.append(m_names.data() + m_slotStart[slot], m_slotStart[slot + 1] - m_slotStart[slot]);
-        m_slot[entry] = static_cast<uint32_t>(owners.size());
-        owners.push_back(entry);
-        bases.push_back(m_slotBase[slot]);
-        keys.push_back(m_slotKey[slot]);
+        if (k + kAhead2 < orderSize) {
+            const uint32_t a2 = orderData[k + kAhead2];
+            FILESEARCH_PREFETCH(srcNames + srcStart[a2]);
+            FILESEARCH_PREFETCH(slotOfEntry + srcEntry[a2]);
+        }
+        const uint32_t slot = orderData[k];
+        const uint32_t entry = srcEntry[slot];
+        const uint32_t s0 = srcStart[slot];
+        const uint32_t len = srcStart[slot + 1] - s0;
+        dstStart[k] = cursor;
+        std::memcpy(dstNames + cursor, srcNames + s0, len);
+        cursor += len;
+        slotOfEntry[entry] = static_cast<uint32_t>(k);
+        dstEntry[k] = entry;
+        dstBase[k] = srcBase[slot];
+        dstKey[k] = srcKey[slot];
     }
-    starts.push_back(static_cast<uint32_t>(names.size()));
-    names.append(kPad, '\0');
+    dstStart[orderSize] = cursor;
     m_names = std::move(names);
     m_slotStart = std::move(starts);
     m_slotEntry = std::move(owners);
@@ -816,9 +925,8 @@ uint8_t FileIndex::ZoneForNew(uint32_t parent, uint8_t flags, std::string_view n
         return static_cast<uint8_t>(Zone::Excluded);
     }
     if (parentIsRoot) {
-        const std::string folded = FoldUtf8(name);
-        if ((!folded.empty() && folded[0] == '$') || folded == "system volume information" ||
-            folded == "config.msi" || folded == "recovery") {
+        if ((!name.empty() && name[0] == '$') || EqualsFolded(name, "system volume information") ||
+            EqualsFolded(name, "config.msi") || EqualsFolded(name, "recovery")) {
             return static_cast<uint8_t>(Zone::Excluded);
         }
     }
@@ -833,57 +941,71 @@ uint8_t FileIndex::ZoneForNew(uint32_t parent, uint8_t flags, std::string_view n
 }
 
 void FileIndex::RecomputeZones() {
-    std::unordered_map<uint32_t, uint8_t> markers;
+    const size_t entryCount = m_parent.size();
+    // State per entry: 0 = unvisited, 1 = visited, >=2 = marked with Zone(state - 2).
+    std::vector<uint8_t> state(entryCount, 0);
     for (const auto& [key, zone] : m_zoneMarkers) {
         const auto volume = static_cast<uint8_t>(key >> 56);
         const uint32_t entry = Find(volume, key & 0x00FFFFFFFFFFFFFFULL);
         if (entry != kNone) {
-            markers[entry] = zone;
+            state[entry] = static_cast<uint8_t>(zone + 2);
         }
     }
-    std::vector<uint8_t> done(m_parent.size(), 0);
-    std::vector<uint16_t> depth(m_parent.size(), 0);
+    std::vector<uint16_t> depth(entryCount, 0);
     std::vector<uint32_t> chain;
-    for (uint32_t start = 0; start < m_parent.size(); ++start) {
-        if (done[start] != 0) {
+    chain.reserve(64);
+    const uint32_t* parentArr = m_parent.data();
+    const uint8_t* flagsArr = m_flags.data();
+    uint8_t* zoneArr = m_zone.data();
+    uint8_t* stateArr = state.data();
+    uint16_t* depthArr = depth.data();
+    for (uint32_t start = 0; start < entryCount; ++start) {
+        if (stateArr[start] == 1) {
             continue;
         }
         chain.clear();
         uint32_t x = start;
-        while (done[x] == 0 && chain.size() < 4096) {
+        while (stateArr[x] != 1 && chain.size() < 4096) {
             chain.push_back(x);
-            if (m_parent[x] == x) {
+            if (parentArr[x] == x) {
                 break;
             }
-            x = m_parent[x];
+            x = parentArr[x];
         }
         while (!chain.empty()) {
             const uint32_t e = chain.back();
             chain.pop_back();
-            const uint32_t parent = m_parent[e];
-            uint8_t zone = 0;
-            depth[e] = (parent == e || done[parent] == 0)
+            const uint32_t parent = parentArr[e];
+            const uint8_t st = stateArr[e];
+            depthArr[e] = (parent == e || stateArr[parent] != 1)
                 ? uint16_t{0}
-                : static_cast<uint16_t>(std::min<int>(depth[parent] + 1, 1024));
-            if (const auto marker = markers.find(e); marker != markers.end()) {
-                zone = marker->second;
+                : static_cast<uint16_t>(std::min<int>(depthArr[parent] + 1, 1024));
+            uint8_t zone = 0;
+            if (st >= 2) {
+                zone = static_cast<uint8_t>(st - 2);
             } else if (parent == e) {
                 zone = static_cast<uint8_t>(Zone::Normal);
-            } else if (done[parent] == 0) {
+            } else if (stateArr[parent] != 1) {
                 zone = static_cast<uint8_t>(Zone::Excluded);  // cycle guard
             } else {
-                zone = ZoneForNew(parent, m_flags[e], Name(e), m_parent[parent] == parent);
+                const bool parentIsRoot = parentArr[parent] == parent;
+                zone = ZoneForNew(parent, flagsArr[e], parentIsRoot ? Name(e) : std::string_view(), parentIsRoot);
             }
-            m_zone[e] = zone;
-            done[e] = 1;
+            zoneArr[e] = zone;
+            stateArr[e] = 1;
         }
     }
-    for (size_t slot = 0; slot < m_slotEntry.size(); ++slot) {
-        const uint32_t entry = m_slotEntry[slot];
+    const size_t slotCount = m_slotEntry.size();
+    const uint32_t* slotEntryArr = m_slotEntry.data();
+    const uint32_t* slotStartArr = m_slotStart.data();
+    int16_t* slotBaseArr = m_slotBase.data();
+    const char* namesData = m_names.data();
+    for (size_t slot = 0; slot < slotCount; ++slot) {
+        const uint32_t entry = slotEntryArr[slot];
         if (entry != kNone) {
-            const uint32_t start = m_slotStart[slot];
-            m_slotBase[slot] = BaseScore(entry,
-                std::string_view(m_names.data() + start, m_slotStart[slot + 1] - start - 1), depth[entry]);
+            const uint32_t start = slotStartArr[slot];
+            slotBaseArr[slot] = BaseScore(entry,
+                std::string_view(namesData + start, slotStartArr[slot + 1] - start - 1), depthArr[entry]);
         }
     }
     Reorder();
@@ -1319,6 +1441,32 @@ void ScanWholeNameCandidates(const ScanContext& ctx, uint32_t slot, uint32_t s1,
             }
             continue;
         }
+#elif defined(FILESEARCH_NEON)
+        if (slot + 32 <= stop) {
+            const uint16x8_t vkey = vdupq_n_u16(key);
+            const uint16x8_t e0 = vceqq_u16(vld1q_u16(keys + slot), vkey);
+            const uint16x8_t e1 = vceqq_u16(vld1q_u16(keys + slot + 8), vkey);
+            const uint16x8_t e2 = vceqq_u16(vld1q_u16(keys + slot + 16), vkey);
+            const uint16x8_t e3 = vceqq_u16(vld1q_u16(keys + slot + 24), vkey);
+            const uint16x8_t any = vorrq_u16(vorrq_u16(e0, e1), vorrq_u16(e2, e3));
+            if (vmaxvq_u32(vreinterpretq_u32_u16(any)) == 0) {
+                slot += 32;
+                continue;
+            }
+            const uint16x8_t eqs[4] = {e0, e1, e2, e3};
+            for (uint32_t g = 0; g < 4; ++g) {
+                if (vmaxvq_u32(vreinterpretq_u32_u16(eqs[g])) != 0) {
+                    const uint32_t base = slot + g * 8;
+                    for (uint32_t j = 0; j < 8; ++j) {
+                        if (keys[base + j] == key && base + j < stop) {
+                            consider(base + j);
+                        }
+                    }
+                }
+            }
+            slot += 32;
+            continue;
+        }
 #endif
         if (keys[slot] == key) {
             consider(slot);
@@ -1326,6 +1474,15 @@ void ScanWholeNameCandidates(const ScanContext& ctx, uint32_t slot, uint32_t s1,
         ++slot;
     }
 }
+
+#if defined(FILESEARCH_NEON)
+inline unsigned NeonMoveMask16(uint8x16_t cmp) noexcept {
+    static constexpr uint8_t kBitPos[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t bits = vandq_u8(cmp, vld1q_u8(kBitPos));
+    return static_cast<unsigned>(vaddv_u8(vget_low_u8(bits))) |
+        (static_cast<unsigned>(vaddv_u8(vget_high_u8(bits))) << 8);
+}
+#endif
 
 // Linear scan of slots [s0, s1) for the anchor token. Every matching slot is
 // recorded (up to a cap) and offered to `top`. With `sorted`, slots are in
@@ -1459,6 +1616,82 @@ void ScanSlots(const ScanContext& ctx, uint32_t s0, uint32_t s1, bool sorted, st
         }
         return;
     }
+#elif defined(FILESEARCH_NEON)
+    if (token.anchored) {
+        const uint8x16_t v1 = vdupq_n_u8(token.value1);
+        const uint8x16_t v2 = vdupq_n_u8(token.value2);
+        const uint8x16_t m1 = vdupq_n_u8(token.mask1);
+        const uint8x16_t m2 = vdupq_n_u8(token.mask2);
+        const unsigned char* p1 = names + token.offset1;
+        const unsigned char* p2 = names + token.offset2;
+        const auto blockVec = [&](size_t at) noexcept -> uint8x16_t {
+            const uint8x16_t a = vld1q_u8(p1 + at);
+            const uint8x16_t b = vld1q_u8(p2 + at);
+            return vandq_u8(vceqq_u8(vorrq_u8(a, m1), v1), vceqq_u8(vorrq_u8(b, m2), v2));
+        };
+        while (pos <= lastStart) {
+            if (pos + 64 <= lastStart) {
+                const uint8x16_t c0 = blockVec(pos);
+                const uint8x16_t c1 = blockVec(pos + 16);
+                const uint8x16_t c2 = blockVec(pos + 32);
+                const uint8x16_t c3 = blockVec(pos + 48);
+                const uint8x16_t any = vorrq_u8(vorrq_u8(c0, c1), vorrq_u8(c2, c3));
+                if (vmaxvq_u32(vreinterpretq_u32_u8(any)) == 0) {
+                    pos += 64;
+                    continue;
+                }
+                const uint8x16_t cs[4] = {c0, c1, c2, c3};
+                size_t next = pos + 64;
+                for (size_t g = 0; g < 4; ++g) {
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(cs[g])) == 0) {
+                        continue;
+                    }
+                    unsigned mask = NeonMoveMask16(cs[g]);
+                    const size_t base = pos + g * 16;
+                    bool jumped = false;
+                    while (mask != 0) {
+                        const unsigned bit = static_cast<unsigned>(__builtin_ctz(mask));
+                        const size_t candidate = base + bit;
+                        if (candidate > lastStart) {
+                            break;
+                        }
+                        if (MatchAt(names + candidate, token.bytes, k)) {
+                            next = onCandidate(candidate);
+                            jumped = true;
+                            break;
+                        }
+                        mask &= mask - 1;
+                    }
+                    if (jumped) {
+                        break;
+                    }
+                }
+                pos = next;
+                continue;
+            }
+            const uint8x16_t c0 = blockVec(pos);
+            if (vmaxvq_u32(vreinterpretq_u32_u8(c0)) == 0) {
+                pos += 16;
+                continue;
+            }
+            unsigned mask = NeonMoveMask16(c0);
+            size_t next = pos + 16;
+            while (mask != 0) {
+                const unsigned bit = static_cast<unsigned>(__builtin_ctz(mask));
+                const size_t candidate = pos + bit;
+                if (candidate > lastStart) {
+                    break;
+                }
+                if (MatchAt(names + candidate, token.bytes, k)) {
+                    next = onCandidate(candidate);
+                    break;
+                }
+                mask &= mask - 1;
+            }
+            pos = next;
+        }
+        return;
+    }
 #endif
     while (pos <= lastStart) {
         if (token.anchored &&
@@ -1474,6 +1707,99 @@ void ScanSlots(const ScanContext& ctx, uint32_t s0, uint32_t s1, bool sorted, st
         }
     }
 }
+
+// Lightweight persistent worker pool so multi-threaded Search() avoids
+// spawning and joining OS threads on every keystroke.
+class SearchWorkerPool {
+public:
+    static SearchWorkerPool& Instance() {
+        static SearchWorkerPool pool;
+        return pool;
+    }
+
+    ~SearchWorkerPool() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+            ++m_generation;
+        }
+        m_cv.notify_all();
+        for (std::thread& t : m_threads) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    }
+
+    // Runs fn(0)..fn(workers - 1), with worker 0 on the calling thread.
+    void Run(unsigned workers, const std::function<void(unsigned)>& fn) {
+        if (workers <= 1) {
+            fn(0);
+            return;
+        }
+        std::unique_lock<std::mutex> callLock(m_callMutex, std::try_to_lock);
+        if (!callLock.owns_lock()) {
+            fn(0);
+            return;
+        }
+        const unsigned helpers = workers - 1;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            while (m_threads.size() < helpers) {
+                const unsigned id = static_cast<unsigned>(m_threads.size()) + 1;
+                m_threads.emplace_back([this, id]() { WorkerLoop(id); });
+            }
+            m_job = &fn;
+            m_activeWorkers = workers;
+            m_remaining.store(helpers, std::memory_order_release);
+            ++m_generation;
+        }
+        m_cv.notify_all();
+        fn(0);
+        while (m_remaining.load(std::memory_order_acquire) != 0) {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_doneCv.wait(lock, [&]() { return m_remaining.load(std::memory_order_acquire) == 0; });
+        }
+        m_job = nullptr;
+    }
+
+private:
+    void WorkerLoop(unsigned id) {
+        uint64_t seen = 0;
+        for (;;) {
+            const std::function<void(unsigned)>* job = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_cv.wait(lock, [&]() { return m_generation != seen || m_stop; });
+                if (m_stop) {
+                    return;
+                }
+                seen = m_generation;
+                if (id < m_activeWorkers) {
+                    job = m_job;
+                }
+            }
+            if (job != nullptr) {
+                (*job)(id);
+                if (m_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_doneCv.notify_one();
+                }
+            }
+        }
+    }
+
+    std::mutex m_callMutex;
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::condition_variable m_doneCv;
+    std::vector<std::thread> m_threads;
+    const std::function<void(unsigned)>* m_job = nullptr;
+    unsigned m_activeWorkers = 0;
+    uint64_t m_generation = 0;
+    std::atomic<unsigned> m_remaining{0};
+    bool m_stop = false;
+};
 
 }  // namespace
 
@@ -1578,8 +1904,6 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
             std::vector<TopN> partTops(workers, TopN(limit));
             std::vector<uint8_t> partCut(workers, 0);
             std::vector<uint32_t> partFirstCut(workers, sortedEnd);
-            std::vector<std::thread> pool;
-            pool.reserve(workers - 1);
             auto run = [&](unsigned w) {
                 bool partWasCut = false;
                 for (;;) {
@@ -1599,13 +1923,7 @@ std::vector<Hit> FileIndex::Search(std::string_view queryUtf8, size_t limit, Sea
                 }
                 partCut[w] = partWasCut ? 1 : 0;
             };
-            for (unsigned w = 1; w < workers; ++w) {
-                pool.emplace_back(run, w);
-            }
-            run(0);
-            for (std::thread& t : pool) {
-                t.join();
-            }
+            SearchWorkerPool::Instance().Run(workers, run);
             for (unsigned w = 0; w < workers; ++w) {
                 matches.insert(matches.end(), partMatches[w].begin(), partMatches[w].end());
                 matchCount += partCounts[w];
