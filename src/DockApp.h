@@ -817,21 +817,19 @@ private:
     void Log(const std::wstring& message) const;
 
     [[nodiscard]] bool IsCursorInBottomHotZone(POINT cursor) const noexcept;
-    // True when the foreground app is borderless / monitor-covering fullscreen on
-    // the monitor under `cursor` (typical game borderless). Used to suppress
-    // edge-show so the dock does not interrupt gameplay.
+    // True when the foreground app should suppress dock edge-show on the
+    // monitor under `cursor` (borderless/chromeless fullscreen, maximized game
+    // windows such as GLFW/LWJGL Minecraft, or active cursor capture).
     [[nodiscard]] bool IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept;
-    // Same rule without the cursor: the foreground app covers its own monitor.
-    // monitor (optional) receives that monitor.
+    // Same rule without the cursor: the foreground app suppresses dock
+    // edge-show on its own monitor. monitor (optional) receives that monitor.
     [[nodiscard]] bool IsForegroundBorderlessFullscreen(HMONITOR* monitor = nullptr) const noexcept;
-    // Focused-app fullscreen for Ctrl+Space: exclusive D3D, F11, and
-    // windowed-fullscreen engines that keep caption/frame/maximize styles.
+    // Focused-app fullscreen/game suppression for Ctrl+Space: exclusive D3D,
+    // F11, windowed-fullscreen engines, focused game windows, and cursor lock.
     [[nodiscard]] bool IsForegroundAppFullscreen() const noexcept;
     // The foreground window if it belongs to another app (not the dock, not the
     // desktop); nullptr otherwise.
     [[nodiscard]] HWND ForegroundAppWindow() const noexcept;
-    // True when `window` spans its monitor's full rect.
-    [[nodiscard]] static bool WindowCoversMonitor(HWND window, HMONITOR* monitor) noexcept;
     // Ctrl+Space stays out of fullscreen apps, like the dock's edge-show: the
     // chord is released to the app while one is focused.
     void SyncSearchHotkeyForFullscreen() noexcept;

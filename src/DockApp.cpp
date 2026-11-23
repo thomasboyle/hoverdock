@@ -14735,30 +14735,65 @@ HWND DockApp::ForegroundAppWindow() const noexcept {
     return foreground;
 }
 
-bool DockApp::WindowCoversMonitor(HWND window, HMONITOR* monitor) noexcept {
-    RECT windowRect{};
-    if (GetWindowRect(window, &windowRect) == FALSE) {
-        return false;
+namespace {
+
+active_dock_policy::ForegroundWindowSnapshot CaptureForegroundSnapshot(
+    HWND foreground, bool queryNotificationState, HMONITOR* monitor) noexcept {
+    active_dock_policy::ForegroundWindowSnapshot s{};
+    if (queryNotificationState) {
+        QUERY_USER_NOTIFICATION_STATE state{};
+        if (SHQueryUserNotificationState(&state) == S_OK) {
+            s.d3dFullscreen = state == QUNS_RUNNING_D3D_FULL_SCREEN;
+            s.qunsBusy = state == QUNS_BUSY;
+        }
     }
-    const HMONITOR windowMonitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
-    if (windowMonitor == nullptr) {
-        return false;
+    if (foreground == nullptr) {
+        return s;
     }
-    MONITORINFO info{sizeof(info)};
-    if (GetMonitorInfoW(windowMonitor, &info) == FALSE) {
-        return false;
+    s.hasForeground = true;
+    s.hasCaptionOrThickFrame =
+        (GetWindowLongPtrW(foreground, GWL_STYLE) & (WS_CAPTION | WS_THICKFRAME)) != 0;
+    s.isZoomed = IsZoomed(foreground) != FALSE;
+
+    wchar_t cls[64]{};
+    if (const int len = GetClassNameW(foreground, cls, static_cast<int>(std::size(cls))); len > 0) {
+        s.isGameWindowClass = active_dock_policy::IsGameWindowClass({cls, static_cast<size_t>(len)});
     }
-    // Allow a couple of pixels of slack for DPI/rounding quirks; require the
-    // window to essentially cover the full monitor rect (not just the work area).
-    constexpr LONG kTol = 4;
-    const RECT& mon = info.rcMonitor;
-    const bool covers = windowRect.left <= mon.left + kTol && windowRect.top <= mon.top + kTol &&
-        windowRect.right >= mon.right - kTol && windowRect.bottom >= mon.bottom - kTol;
-    if (covers && monitor != nullptr) {
-        *monitor = windowMonitor;
+
+    RECT wr{};
+    if (GetWindowRect(foreground, &wr) == FALSE) {
+        return s;
     }
-    return covers;
+    if (const HMONITOR mon = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST); mon != nullptr) {
+        if (monitor != nullptr) {
+            *monitor = mon;
+        }
+        MONITORINFO mi{sizeof(mi)};
+        if (GetMonitorInfoW(mon, &mi) != FALSE) {
+            const RECT& m = mi.rcMonitor;
+            s.coversMonitor = wr.left <= m.left + 4 && wr.top <= m.top + 4 &&
+                wr.right >= m.right - 4 && wr.bottom >= m.bottom - 4;
+            s.fillsHalfMonitor = (wr.right - wr.left) >= (m.right - m.left) / 2 &&
+                (wr.bottom - wr.top) >= (m.bottom - m.top) / 2;
+        }
+    }
+    RECT cr{};
+    if (GetClientRect(foreground, &cr) != FALSE) {
+        s.noChrome = (wr.right - wr.left) - (cr.right - cr.left) <= 8 &&
+            (wr.bottom - wr.top) - (cr.bottom - cr.top) <= 8;
+    }
+    RECT clip{};
+    if (GetClipCursor(&clip) != FALSE) {
+        const LONG vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const LONG vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const RECT vscreen{vx, vy, vx + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            vy + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+        s.cursorClippedToWindow = active_dock_policy::IsCursorClippedToWindow(clip, wr, vscreen);
+    }
+    return s;
 }
+
+}  // namespace
 
 bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept {
     const double now = QpcSeconds();
@@ -14772,17 +14807,11 @@ bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept
         return m_fgBorderlessCached;
     }
     HMONITOR resolvedMonitor = nullptr;
-    bool result = false;
-    const HWND foreground = ForegroundAppWindow();
-    if (foreground != nullptr) {
-        const LONG_PTR style = GetWindowLongPtrW(foreground, GWL_STYLE);
-        if ((style & WS_CAPTION) == 0 && (style & WS_THICKFRAME) == 0) {
-            result = WindowCoversMonitor(foreground, &resolvedMonitor);
-        }
-    }
+    const bool result = active_dock_policy::ShouldSuppressDockForForeground(
+        CaptureForegroundSnapshot(ForegroundAppWindow(), false, &resolvedMonitor));
     m_fgBorderlessHwnd = currentFg;
     m_fgBorderlessCached = result;
-    m_fgBorderlessMonitor = resolvedMonitor;
+    m_fgBorderlessMonitor = result ? resolvedMonitor : nullptr;
     m_fgBorderlessCheckedAt = now;
     m_fgBorderlessValid = true;
     if (result && monitor != nullptr) {
@@ -14792,57 +14821,8 @@ bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept
 }
 
 bool DockApp::IsForegroundAppFullscreen() const noexcept {
-    QUERY_USER_NOTIFICATION_STATE notifyState{};
-    const bool queried = SHQueryUserNotificationState(&notifyState) == S_OK;
-    if (queried && notifyState == QUNS_RUNNING_D3D_FULL_SCREEN) {
-        return true;
-    }
-
-    const HWND foreground = ForegroundAppWindow();
-    if (foreground == nullptr) {
-        return false;
-    }
-    if (IsForegroundBorderlessFullscreen()) {
-        return true;
-    }
-
-    // SDL / GLFW / Unity / F11 keep WS_CAPTION, WS_THICKFRAME, or WS_MAXIMIZE
-    // while covering the monitor with no painted non-client chrome. A normal
-    // maximized window still has a caption, so it keeps Ctrl+Space.
-    RECT windowRect{};
-    RECT clientRect{};
-    if (GetWindowRect(foreground, &windowRect) == FALSE ||
-        GetClientRect(foreground, &clientRect) == FALSE) {
-        return false;
-    }
-    constexpr LONG kChromeTol = 8;
-    const bool noChrome =
-        (windowRect.right - windowRect.left) - (clientRect.right - clientRect.left) <= kChromeTol &&
-        (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top) <= kChromeTol;
-    if (!noChrome) {
-        return false;
-    }
-    if (WindowCoversMonitor(foreground, nullptr)) {
-        return true;
-    }
-
-    // Exclusive OpenGL/Vulkan can report QUNS_BUSY while the window size is the
-    // exclusive mode, not the desktop monitor. Require a chromeless focused
-    // window that still fills most of its monitor so a tiny overlay cannot
-    // steal the chord because something else is fullscreen on another display.
-    if (!queried || notifyState != QUNS_BUSY) {
-        return false;
-    }
-    const HMONITOR windowMonitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO info{sizeof(info)};
-    if (windowMonitor == nullptr || GetMonitorInfoW(windowMonitor, &info) == FALSE) {
-        return false;
-    }
-    const LONG windowW = windowRect.right - windowRect.left;
-    const LONG windowH = windowRect.bottom - windowRect.top;
-    const LONG monitorW = info.rcMonitor.right - info.rcMonitor.left;
-    const LONG monitorH = info.rcMonitor.bottom - info.rcMonitor.top;
-    return windowW >= monitorW / 2 && windowH >= monitorH / 2;
+    return active_dock_policy::ShouldSuppressSearchHotkeyForForeground(
+        CaptureForegroundSnapshot(ForegroundAppWindow(), true, nullptr));
 }
 
 bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {

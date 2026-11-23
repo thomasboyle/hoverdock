@@ -116,11 +116,97 @@ void TestExactSlidingHoverShadowBlur() {
     EXPECT(quantDiffs == 0);
 }
 
+void TestGameAndFullscreenSuppression() {
+    using active_dock_policy::ForegroundWindowSnapshot;
+    using active_dock_policy::IsCursorClippedToWindow;
+    using active_dock_policy::IsGameWindowClass;
+    using active_dock_policy::ShouldSuppressDockForForeground;
+    using active_dock_policy::ShouldSuppressSearchHotkeyForForeground;
+
+    // Minecraft 1.13+ (GLFW30 on OpenJDK), legacy Minecraft 1.6-1.12.2 (LWJGL),
+    // and common native game-engine window classes.
+    EXPECT(IsGameWindowClass(L"GLFW30"));
+    EXPECT(IsGameWindowClass(L"glfw31"));
+    EXPECT(IsGameWindowClass(L"GLFW"));
+    EXPECT(IsGameWindowClass(L"LWJGL"));
+    EXPECT(IsGameWindowClass(L"SDL_app"));
+    EXPECT(IsGameWindowClass(L"UnityWndClass"));
+    EXPECT(IsGameWindowClass(L"UnrealWindow"));
+    EXPECT(IsGameWindowClass(L"Godot_Engine"));
+
+    // Non-game Java/desktop classes must not be classified as games.
+    EXPECT(!IsGameWindowClass(L""));
+    EXPECT(!IsGameWindowClass(L"SunAwtFrame"));
+    EXPECT(!IsGameWindowClass(L"Chrome_WidgetWin_1"));
+    EXPECT(!IsGameWindowClass(L"CabinetWClass"));
+    EXPECT(!IsGameWindowClass(L"UnityContainerWndClass"));
+    EXPECT(!IsGameWindowClass(L"GLFWHelper"));
+
+    // Cursor confinement checks.
+    const RECT virtualSingle{0, 0, 2560, 1440};
+    const RECT maximizedMc{-8, -8, 2568, 1448};
+    EXPECT(!IsCursorClippedToWindow(virtualSingle, maximizedMc, virtualSingle));
+    EXPECT(IsCursorClippedToWindow({0, 31, 2560, 1440}, maximizedMc, virtualSingle));
+    EXPECT(IsCursorClippedToWindow({508, 331, 1346, 772}, {500, 300, 1354, 780}, virtualSingle));
+    EXPECT(!IsCursorClippedToWindow({100, 100, 300, 300}, {500, 300, 1354, 780}, virtualSingle));
+
+    // Maximized Minecraft modpack (OpenJDK/GLFW30 with caption+frame, cursor
+    // free in inventory/hotbar): suppresses both dock edge-show and Ctrl+Space.
+    ForegroundWindowSnapshot maximizedMinecraft{};
+    maximizedMinecraft.hasForeground = true;
+    maximizedMinecraft.hasCaptionOrThickFrame = true;
+    maximizedMinecraft.isZoomed = true;
+    maximizedMinecraft.coversMonitor = true;
+    maximizedMinecraft.noChrome = false;
+    maximizedMinecraft.isGameWindowClass = true;
+    EXPECT(ShouldSuppressDockForForeground(maximizedMinecraft));
+    EXPECT(ShouldSuppressSearchHotkeyForForeground(maximizedMinecraft));
+
+    // Restored (non-maximized) Minecraft window: Ctrl+Space still suppressed so
+    // sprint+jump never opens Search; dock remains available when cursor is free,
+    // and suppressed while 3D camera pointer-lock clips the cursor.
+    ForegroundWindowSnapshot windowedMinecraft{};
+    windowedMinecraft.hasForeground = true;
+    windowedMinecraft.hasCaptionOrThickFrame = true;
+    windowedMinecraft.isGameWindowClass = true;
+    EXPECT(!ShouldSuppressDockForForeground(windowedMinecraft));
+    EXPECT(ShouldSuppressSearchHotkeyForForeground(windowedMinecraft));
+    windowedMinecraft.cursorClippedToWindow = true;
+    EXPECT(ShouldSuppressDockForForeground(windowedMinecraft));
+    EXPECT(ShouldSuppressSearchHotkeyForForeground(windowedMinecraft));
+
+    // Normal maximized desktop app (browser, VS Code, IntelliJ SunAwtFrame):
+    // keeps both dock edge-show and Ctrl+Space.
+    ForegroundWindowSnapshot normalMaximized{};
+    normalMaximized.hasForeground = true;
+    normalMaximized.hasCaptionOrThickFrame = true;
+    normalMaximized.isZoomed = true;
+    normalMaximized.coversMonitor = true;
+    normalMaximized.noChrome = false;
+    normalMaximized.isGameWindowClass = false;
+    EXPECT(!ShouldSuppressDockForForeground(normalMaximized));
+    EXPECT(!ShouldSuppressSearchHotkeyForForeground(normalMaximized));
+
+    // Chromeless F11 / windowed-fullscreen keeps caption/frame flags but has 0
+    // non-client chrome: suppresses both dock and Ctrl+Space.
+    ForegroundWindowSnapshot chromelessFullscreen = normalMaximized;
+    chromelessFullscreen.noChrome = true;
+    EXPECT(ShouldSuppressDockForForeground(chromelessFullscreen));
+    EXPECT(ShouldSuppressSearchHotkeyForForeground(chromelessFullscreen));
+
+    // Exclusive D3D fullscreen suppresses Ctrl+Space even without a foreground HWND.
+    ForegroundWindowSnapshot d3dOnly{};
+    d3dOnly.d3dFullscreen = true;
+    EXPECT(!ShouldSuppressDockForForeground(d3dOnly));
+    EXPECT(ShouldSuppressSearchHotkeyForForeground(d3dOnly));
+}
+
 }  // namespace
 
 int main() {
     TestMonitorHotZoneAndHookGate();
     TestExactSlidingHoverShadowBlur();
+    TestGameAndFullscreenSuppression();
     if (g_failures != 0) {
         std::fprintf(stderr, "ActiveDockPolicyTests: %d failure(s).\n", g_failures);
         return 1;

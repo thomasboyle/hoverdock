@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -97,6 +98,78 @@ inline constexpr uint32_t kBackdropIdleTicksBeforeRest = 20U;
     return lastSelfPresentMs != 0 && nowMs >= lastSelfPresentMs &&
         (nowMs - lastSelfPresentMs) <= kSelfPresentSuppressWindowMs &&
         RectContains(selfBounds, dirty);
+}
+
+[[nodiscard]] constexpr bool EqualsIgnoreCaseAscii(std::wstring_view a,
+    std::wstring_view b) noexcept {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    constexpr auto lower = [](wchar_t c) constexpr noexcept {
+        return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c + 32) : c;
+    };
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (lower(a[i]) != lower(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] constexpr bool IsGameWindowClass(std::wstring_view cls) noexcept {
+    if (cls.size() >= 4 && EqualsIgnoreCaseAscii(cls.substr(0, 4), L"GLFW")) {
+        return std::all_of(cls.begin() + 4, cls.end(),
+            [](wchar_t c) constexpr noexcept { return c >= L'0' && c <= L'9'; });
+    }
+    for (std::wstring_view name :
+        {L"LWJGL", L"SDL_app", L"UnityWndClass", L"UnrealWindow", L"Godot_Engine"}) {
+        if (EqualsIgnoreCaseAscii(cls, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] constexpr bool IsCursorClippedToWindow(const RECT& clip,
+    const RECT& window, const RECT& virtualScreen) noexcept {
+    constexpr long kTol = 4;
+    const RECT expanded{
+        window.left - kTol, window.top - kTol, window.right + kTol, window.bottom + kTol};
+    return window.right > window.left && window.bottom > window.top &&
+        virtualScreen.right > virtualScreen.left && virtualScreen.bottom > virtualScreen.top &&
+        (clip.left > virtualScreen.left || clip.top > virtualScreen.top ||
+            clip.right < virtualScreen.right || clip.bottom < virtualScreen.bottom) &&
+        RectContains(expanded, clip);
+}
+
+struct ForegroundWindowSnapshot {
+    bool hasForeground = false;
+    bool hasCaptionOrThickFrame = false;
+    bool isZoomed = false;
+    bool coversMonitor = false;
+    bool noChrome = false;
+    bool isGameWindowClass = false;
+    bool cursorClippedToWindow = false;
+    bool d3dFullscreen = false;
+    bool qunsBusy = false;
+    bool fillsHalfMonitor = false;
+};
+
+[[nodiscard]] constexpr bool ShouldSuppressDockForForeground(
+    const ForegroundWindowSnapshot& fg) noexcept {
+    return fg.hasForeground && (
+        (!fg.hasCaptionOrThickFrame && fg.coversMonitor) ||
+        (fg.noChrome && fg.coversMonitor) ||
+        (fg.isGameWindowClass && (fg.isZoomed || fg.coversMonitor)) ||
+        fg.cursorClippedToWindow);
+}
+
+[[nodiscard]] constexpr bool ShouldSuppressSearchHotkeyForForeground(
+    const ForegroundWindowSnapshot& fg) noexcept {
+    return fg.d3dFullscreen || (fg.hasForeground && (
+        ShouldSuppressDockForForeground(fg) ||
+        fg.isGameWindowClass ||
+        (fg.noChrome && fg.qunsBusy && fg.fillsHalfMonitor)));
 }
 
 inline void BoxBlurTruncated2Pass(float* data, int width, int height, int radius) {
