@@ -1817,7 +1817,9 @@ void DockApp::RefreshSearchApps() {
                 if (target.isStart) {
                     continue;
                 }
-                std::wstring name = MakeLaunchCandidate(target).name;
+                std::wstring name = !target.app.name.empty()
+                    ? target.app.name
+                    : WindowCatalog::DisplayNameForApp(target.app, target.runningWindow);
                 std::wstring key = name;
                 CharLowerBuffW(key.data(), static_cast<DWORD>(key.size()));
                 if (name.empty() || !seen.insert(std::move(key)).second) {

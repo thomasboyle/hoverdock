@@ -19,7 +19,6 @@ public:
     [[nodiscard]] std::vector<PinnedApp>& Pins() noexcept;
     [[nodiscard]] bool ShowDevBounds() const noexcept;
     void SetShowDevBounds(bool enabled) noexcept;
-    [[nodiscard]] bool FollowsTaskbarPins() const noexcept;
     void StopFollowingTaskbarPins() noexcept;
     [[nodiscard]] float DockScale() const noexcept;
     void SetDockScale(float scale) noexcept;
@@ -50,8 +49,6 @@ public:
     void SetFrostAmount(float amount) noexcept;
     // True when frost is above a whisper (blur passes worth running).
     [[nodiscard]] bool Frost() const noexcept;
-    [[nodiscard]] bool Tint() const noexcept;
-    void SetTint(bool enabled) noexcept;
     [[nodiscard]] bool Specular() const noexcept;
     void SetSpecular(bool enabled) noexcept;
     [[nodiscard]] bool DropShadow() const noexcept;
@@ -121,7 +118,6 @@ private:
     bool m_lensing = true;
     bool m_dispersion = true;
     float m_frostAmount = 1.0F;
-    bool m_tint = true;
     bool m_specular = true;
     bool m_dropShadow = true;
     bool m_depthShade = true;

@@ -4,43 +4,6 @@
 #include <string>
 #include <vector>
 
-struct LaunchCandidate {
-    std::string id;
-    std::wstring name;
-    std::wstring pinName;
-    std::wstring shortcutName;
-    std::wstring executable;
-    std::wstring executablePath;
-    std::wstring target;
-    std::wstring aumid;
-    std::wstring description;
-    std::wstring productName;
-    std::wstring publisher;
-    std::wstring startMenuFolder;
-    std::wstring comment;
-    std::wstring windowTitle;
-    bool running = false;
-};
-
-struct LaunchJudgment {
-    enum class Action {
-        Launch,
-        None,
-        Uncertain,
-        Error,
-    };
-
-    Action action = Action::Error;
-    std::string chosenId;
-    // Optional filesystem path from local AI (open via ShellExecute).
-    std::wstring openPath;
-    double exists = 0.0;
-    double confidence = 0.0;
-    std::wstring error;
-    // Set when ResolveApp fell back to lexical fuzzy ranking.
-    bool usedFuzzyFallback = false;
-};
-
 struct BoostCandidate {
     std::string id;
     std::wstring name;
@@ -66,8 +29,6 @@ struct BoostResult {
 
 class TypeSafeClient {
 public:
-    [[nodiscard]] static LaunchJudgment ResolveApp(const std::wstring& apiKey,
-        const std::wstring& request, const std::vector<LaunchCandidate>& candidates);
     [[nodiscard]] static BoostResult ClassifyForBoost(const std::wstring& apiKey,
         const std::vector<BoostCandidate>& candidates);
     // Same Jev/Noul path as ClassifyForBoost, but questions ask whether each

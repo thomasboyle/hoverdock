@@ -119,8 +119,6 @@ public:
     // One-shot: the next CaptureBackdrop BitBlts even if the strip looks idle.
     // Used for focus changes. Does not allocate.
     void RequestBackdropRefresh() noexcept;
-    [[nodiscard]] bool NeedsBackdropBitBlt(const RECT& screenRectangle) const noexcept;
-    [[nodiscard]] bool BackdropValid() const noexcept;
     void InvalidateBackdrop() noexcept;
     void ResetAfterWake() noexcept;
     [[nodiscard]] bool Render(const DockRenderState& state);
@@ -139,10 +137,6 @@ public:
     // Begin submits BitBlt + GPU work without waiting; Take copies readback when
     // the fence is signaled. Dedicated panel command list so this never races the
     // dock swap-chain Present path (the old shared-list rebake hitched the cursor).
-    // True when DWM has not composed since the last live panel capture attempt
-    // (and the forced-capture skip budget remains). TickLivePopupGlass uses this
-    // once per timer tick so round-robin targets do not burn the idle budget.
-    [[nodiscard]] bool ShouldSkipLivePanelCapture() noexcept;
     // Skip BitBlt when this exact WxH was already confirmed unchanged for the
     // current DWM composed frame (cursor motion advances cFrame without
     // changing wallpaper under the menu).
@@ -179,17 +173,12 @@ public:
     void Flush();
 
     [[nodiscard]] HANDLE FrameLatencyWaitableObject() const noexcept;
-    [[nodiscard]] D3D_FEATURE_LEVEL FeatureLevel() const noexcept;
-    [[nodiscard]] D3D_SHADER_MODEL ShaderModel() const noexcept;
 
 private:
     static constexpr UINT kBufferCount = 2;
     static constexpr UINT kMaximumIcons = 512;
     static constexpr UINT kBackdropChangeMinSamples = 96;
     static constexpr UINT kIconTextureDescriptor = 0;
-    static constexpr UINT kBackdropTextureDescriptor = 1;
-    static constexpr UINT kTempBlurDescriptor = 2;
-    static constexpr UINT kTempBlurDescriptor2 = 3;
     static constexpr UINT kSrvDescriptorsPerTable = 4;
     static constexpr UINT kSrvTableCount = 2;
 
@@ -248,8 +237,6 @@ private:
     // m_iconCount stays 0 until the deferred batch rebuild, so callers must
     // not hand out slices from that stale counter alone.
     [[nodiscard]] UINT NextFreeIconSlot() const noexcept;
-    void UploadIcon(UINT textureIndex, const std::wstring& target,
-        ID3D12GraphicsCommandList* commandList);
     void CreateFallbackIcon(UINT textureIndex, ID3D12GraphicsCommandList* commandList);
     void UploadIconTexture(UINT textureIndex, const uint8_t* pixels, UINT width, UINT height,
         ID3D12GraphicsCommandList* commandList);
@@ -258,7 +245,6 @@ private:
     HWND m_window = nullptr;
     UINT m_width = 1;
     UINT m_height = 1;
-    D3D_FEATURE_LEVEL m_featureLevel = D3D_FEATURE_LEVEL_12_0;
     D3D_SHADER_MODEL m_shaderModel = D3D_SHADER_MODEL_6_0;
     UINT64 m_fenceValue = 0;
     UINT m_rtvDescriptorSize = 0;
@@ -339,7 +325,6 @@ private:
     // Stride-8 samples of the last uploaded/accepted backdrop (noise-tolerant
     // change detection after a full BitBlt).
     std::vector<uint32_t> m_backdropCommittedSamples;
-    ULONGLONG m_lastBackdropSerialBumpMs = 0;
     UINT64 m_backdropCopyFenceValue = 0;
     HANDLE m_fenceEvent = nullptr;
 
@@ -425,14 +410,9 @@ private:
     UINT64 m_panelCapturePoolClock = 0;
     HDC m_panelCaptureDc = nullptr;
     HBITMAP m_panelCaptureBitmap = nullptr;
-    HGDIOBJ m_panelCapturePrevious = nullptr;
     uint8_t* m_panelCapturePixels = nullptr;
     UINT m_panelCaptureWidth = 0;
     UINT m_panelCaptureHeight = 0;
-    // DWM composed-frame gate for live panel BitBlt (same idea as dock backdrop).
-    uint64_t m_panelCaptureDwmFrame = 0;
-    bool m_panelCaptureDwmFrameValid = false;
-    UINT m_panelCaptureIdleSkips = 0;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_panelAllocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_panelCommandList;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_panelAllocator2;

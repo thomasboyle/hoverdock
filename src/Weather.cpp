@@ -206,11 +206,6 @@ WeatherService::Snapshot WeatherService::GetSnapshot() const {
     return m_snapshot;
 }
 
-bool WeatherService::HasIcon() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_snapshot.valid && WeatherIconsData::Find(m_snapshot.slug.c_str()) != nullptr;
-}
-
 std::vector<uint8_t> WeatherService::RasterizeIcon(UINT extent) const {
     Snapshot snap = GetSnapshot();
     const char* slug = snap.valid ? snap.slug.c_str() : "cloudy";

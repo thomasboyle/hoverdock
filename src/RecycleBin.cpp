@@ -264,22 +264,6 @@ bool RecycleBin::QueryState(RecycleBinState& state) noexcept {
     }
 }
 
-bool RecycleBin::IsEmpty() noexcept {
-    RecycleBinState state;
-    if (!QueryState(state)) {
-        return true;
-    }
-    return state.isEmpty;
-}
-
-ULONGLONG RecycleBin::ItemCount() noexcept {
-    RecycleBinState state;
-    if (!QueryState(state)) {
-        return 0;
-    }
-    return state.itemCount;
-}
-
 bool RecycleBin::Open() noexcept {
     __try {
         // explorer.exe shell:RecycleBinFolder focuses / fronts the window,

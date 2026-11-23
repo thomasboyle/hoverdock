@@ -76,10 +76,6 @@ public:
     [[nodiscard]] static const wchar_t* LabelForSlot(TraySlot slot, const TrayStatus& status) noexcept;
     [[nodiscard]] static bool SlotVisible(TraySlot slot, const TrayStatus& status) noexcept;
 
-    [[nodiscard]] std::wstring NetworkStatusText() const;    [[nodiscard]] std::wstring VolumeStatusText() const;
-    [[nodiscard]] std::wstring BatteryStatusText() const;
-    [[nodiscard]] std::wstring BrightnessStatusText() const;
-
     [[nodiscard]] std::vector<uint8_t> RasterizeGlyph(TraySlot slot, UINT extent) const;
     [[nodiscard]] std::vector<uint8_t> RasterizeSymbol(wchar_t symbol, UINT extent) const;
     [[nodiscard]] std::vector<uint8_t> RasterizeClock(UINT atlasExtent, UINT displayWidth,
@@ -89,21 +85,17 @@ public:
     [[nodiscard]] std::vector<TrayNotifyIcon> EnumerateNotifyIcons() const;
     bool ToggleMute();
     bool AdjustVolume(float delta);
-    bool SetVolumeLevel(float level);
     void ProjectVolumeStatus(float level) noexcept;
     static bool WriteSystemVolumeLevel(float level);
-    bool AdjustBrightness(int deltaPercent);
     // Absolute set without re-reading first (worker threads only). The caller
     // owns freshness; used for debounced writes of an already-projected value.
     bool SetBrightnessLevel(int percent);
     // Live DDC read into the status for worker threads. Never call on the UI
     // thread: monitor round-trips routinely stall for seconds.
     bool RefreshBrightnessFromDdc();
-    static bool OpenFlyout(TraySlot slot);
     static bool OpenNetworkPanel();
     static bool OpenSoundMixer();
     static bool OpenPowerSettings();
-    static bool OpenWindowsSettings();
     static bool OpenDisplaySettings();
     static bool OpenDateTimeSettings();
     static bool OpenNotificationCenter();

@@ -33,7 +33,6 @@ public:
     void RequestRefresh();  // non-blocking; posts notifyMessage when state changes
 
     [[nodiscard]] Snapshot GetSnapshot() const;
-    [[nodiscard]] bool HasIcon() const;
     // Premultiplied BGRA atlas-sized buffer (extent x extent), empty on failure.
     [[nodiscard]] std::vector<uint8_t> RasterizeIcon(UINT extent) const;
     [[nodiscard]] static const wchar_t* Target() noexcept { return kTarget; }

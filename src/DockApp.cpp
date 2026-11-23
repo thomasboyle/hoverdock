@@ -217,15 +217,6 @@ POINT CoalescePostedPointers(HWND window, UINT message, POINT current) {
     return point;
 }
 
-std::wstring DisplayNameFromExecutable(const std::wstring& path) {
-    const size_t fileStart = path.find_last_of(L"\\/") + 1;
-    const size_t extension = path.find_last_of(L'.');
-    const size_t fileEnd = extension == std::wstring::npos || extension < fileStart
-        ? path.size()
-        : extension;
-    return path.substr(fileStart, fileEnd - fileStart);
-}
-
 bool IsSpecialDockTarget(const std::wstring& target) {
     return target == kStartTarget || target == kSearchTarget;
 }
@@ -612,30 +603,6 @@ void CompositeConstantPremulRect(uint8_t* dest, int destWidth, int destHeight, R
     }
 }
 
-std::vector<uint8_t> ScalePremultipliedNearest(const std::vector<uint8_t>& source, int sourceWidth,
-    int sourceHeight, int destWidth, int destHeight) {
-    std::vector<uint8_t> dest(static_cast<size_t>(destWidth) * static_cast<size_t>(destHeight) * 4U, 0);
-    if (sourceWidth <= 0 || sourceHeight <= 0 || destWidth <= 0 || destHeight <= 0 ||
-        source.size() < static_cast<size_t>(sourceWidth) * static_cast<size_t>(sourceHeight) * 4U) {
-        return dest;
-    }
-    for (int y = 0; y < destHeight; ++y) {
-        const int srcY = y * sourceHeight / destHeight;
-        for (int x = 0; x < destWidth; ++x) {
-            const int srcX = x * sourceWidth / destWidth;
-            const size_t srcOffset = (static_cast<size_t>(srcY) * static_cast<size_t>(sourceWidth) +
-                static_cast<size_t>(srcX)) * 4U;
-            const size_t dstOffset = (static_cast<size_t>(y) * static_cast<size_t>(destWidth) +
-                static_cast<size_t>(x)) * 4U;
-            dest[dstOffset] = source[srcOffset];
-            dest[dstOffset + 1] = source[srcOffset + 1];
-            dest[dstOffset + 2] = source[srcOffset + 2];
-            dest[dstOffset + 3] = source[srcOffset + 3];
-        }
-    }
-    return dest;
-}
-
 void BoxBlurRgb(uint8_t* pixels, int width, int height, int radius) {
     if (pixels == nullptr || width <= 0 || height <= 0 || radius <= 0) {
         return;
@@ -904,25 +871,6 @@ void RemapPremulInkColor(std::vector<uint8_t>& pixels, uint8_t r, uint8_t g, uin
 float Srgb8ToLinear(uint8_t value) noexcept {
     const float c = static_cast<float>(value) / 255.0F;
     return c <= 0.04045F ? c / 12.92F : std::pow((c + 0.055F) / 1.055F, 2.4F);
-}
-
-void CoverageToPremulInk(uint8_t* pixels, size_t byteCount, uint8_t gray) {
-    // Popup DIBs are BGR-ordered: byte0=B, byte1=G, byte2=R.
-    // GDI writes sRGB-ish AA; convert to linear coverage before alpha so edges
-    // do not look like a second dark halo over premul glass.
-    for (size_t index = 0; index + 3 < byteCount; index += 4) {
-        const float linear =
-            Srgb8ToLinear(pixels[index]) * (19.0F / 256.0F) +
-            Srgb8ToLinear(pixels[index + 1]) * (183.0F / 256.0F) +
-            Srgb8ToLinear(pixels[index + 2]) * (54.0F / 256.0F);
-        const unsigned coverage =
-            static_cast<unsigned>(std::lround(std::clamp(linear, 0.0F, 1.0F) * 255.0F));
-        const unsigned alpha = (coverage * gray + 127U) / 255U;
-        pixels[index] = static_cast<uint8_t>((g_flyoutInkB * alpha + 127U) / 255U);
-        pixels[index + 1] = static_cast<uint8_t>((g_flyoutInkG * alpha + 127U) / 255U);
-        pixels[index + 2] = static_cast<uint8_t>((g_flyoutInkR * alpha + 127U) / 255U);
-        pixels[index + 3] = static_cast<uint8_t>(alpha);
-    }
 }
 
 IDWriteFactory* FlyoutDWriteFactory() {
@@ -1440,42 +1388,6 @@ void FillCirclePremul(uint8_t* dest, int destWidth, int destHeight, float cx, fl
         });
 }
 
-void FillCircleLevelPremul(uint8_t* dest, int destWidth, int destHeight, float cx, float cy,
-    float radius, float level, float alpha) {
-    level = std::clamp(level, 0.0F, 1.0F);
-    if (level <= 0.0F || radius <= 0.0F) {
-        return;
-    }
-    const float fillTop = cy + radius - 2.0F * radius * level;
-    const int left = std::max(0, static_cast<int>(std::floor(cx - radius - 1.0F)));
-    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 1.0F)));
-    const int right = std::min(destWidth, static_cast<int>(std::ceil(cx + radius + 1.0F)));
-    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 1.0F)));
-    const float aa = 1.15F;
-    for (int y = top; y < bottom; ++y) {
-        if (static_cast<float>(y) + 0.5F < fillTop) {
-            continue;
-        }
-        for (int x = left; x < right; ++x) {
-            const float dx = static_cast<float>(x) + 0.5F - cx;
-            const float dy = static_cast<float>(y) + 0.5F - cy;
-            const float coverage =
-                1.0F - std::clamp((std::sqrt(dx * dx + dy * dy) - radius) / aa + 0.5F, 0.0F, 1.0F);
-            if (coverage <= 0.0F) {
-                continue;
-            }
-            const float srcA = coverage * alpha;
-            uint8_t levelPixel[4] = {
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-                static_cast<uint8_t>(std::lround(255.0F * srcA)),
-            };
-            CompositePremul(dest, destWidth, destHeight, x, y, levelPixel, 1, 1);
-        }
-    }
-}
-
 void FillRectPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds, float alpha) {
     const float a = std::clamp(alpha, 0.0F, 1.0F);
     const uint8_t pixel[4] = {
@@ -1498,12 +1410,6 @@ void FillRectColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT boun
     };
     CompositeConstantPremulRect(dest, destWidth, destHeight, bounds, pixel);
 }
-
-// Concept D Minimal Sage - panel toggles/slider (#98A869).
-// Dock running-indicator dot is black in Shaders.hlsl. DIB order: B, G, R.
-constexpr uint8_t kAmberB = DOCK_PANEL_TOGGLE_B;
-constexpr uint8_t kAmberG = DOCK_PANEL_TOGGLE_G;
-constexpr uint8_t kAmberR = DOCK_PANEL_TOGGLE_R;
 
 void FillPillColorPremul(uint8_t* dest, int destWidth, int destHeight, float cxLeft,
     float cxRight, float cy, float radius, float alpha, uint8_t blue, uint8_t green,
@@ -1595,20 +1501,6 @@ float ContentSquircleRadius(const RECT& bounds, float scale) noexcept {
     return std::min(cap, std::max(6.0F * scale, 12.0F * scale));
 }
 
-RECT InsetContentRect(RECT bounds, LONG inset) noexcept {
-    bounds.left += inset;
-    bounds.top += inset;
-    bounds.right -= inset;
-    bounds.bottom -= inset;
-    if (bounds.right - bounds.left < 8 || bounds.bottom - bounds.top < 8) {
-        bounds.left -= inset;
-        bounds.top -= inset;
-        bounds.right += inset;
-        bounds.bottom += inset;
-    }
-    return bounds;
-}
-
 void FillSquircleColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
     float radius, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
     if (alpha <= 0.0F || bounds.right <= bounds.left || bounds.bottom <= bounds.top) {
@@ -1641,36 +1533,6 @@ void FillSquirclePremul(uint8_t* dest, int destWidth, int destHeight, RECT bound
     float alpha) {
     FillSquircleColorPremul(dest, destWidth, destHeight, bounds, radius, alpha, g_flyoutInkB,
         g_flyoutInkG, g_flyoutInkR);
-}
-
-void FillSquircleLevelColorPremul(uint8_t* dest, int destWidth, int destHeight, RECT bounds,
-    float radius, float level, float alpha, uint8_t blue, uint8_t green, uint8_t red) {
-    level = std::clamp(level, 0.0F, 1.0F);
-    if (level <= 0.0F || alpha <= 0.0F || bounds.right <= bounds.left ||
-        bounds.bottom <= bounds.top) {
-        return;
-    }
-    const float halfW = 0.5F * static_cast<float>(bounds.right - bounds.left);
-    const float halfH = 0.5F * static_cast<float>(bounds.bottom - bounds.top);
-    const float cx = 0.5F * static_cast<float>(bounds.left + bounds.right);
-    const float cy = 0.5F * static_cast<float>(bounds.top + bounds.bottom);
-    const float fillTop = static_cast<float>(bounds.bottom) -
-        static_cast<float>(bounds.bottom - bounds.top) * level;
-    const int left = std::max(0, static_cast<int>(bounds.left) - 1);
-    const int top = std::max(0, static_cast<int>(std::floor(fillTop)));
-    const int right = std::min(destWidth, static_cast<int>(bounds.right) + 1);
-    const int bottom = std::min(destHeight, static_cast<int>(bounds.bottom) + 1);
-    for (int y = top; y < bottom; ++y) {
-        if (static_cast<float>(y) + 0.5F < fillTop) {
-            continue;
-        }
-        for (int x = left; x < right; ++x) {
-            const float dist = SdSquircleBox(static_cast<float>(x) + 0.5F,
-                static_cast<float>(y) + 0.5F, cx, cy, halfW, halfH, radius);
-            CompositeCoverage(dest, destWidth, destHeight, x, y, SquircleCoverage(dist), alpha,
-                blue, green, red);
-        }
-    }
 }
 
 std::wstring NotifyIconTitle(const TrayNotifyIcon& icon) {
@@ -4054,8 +3916,6 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             if (m_config.CheckForUpdates() && !m_updateInFlight.load() &&
                 !m_updateInstalling.load()) {
                 CheckForUpdatesAsync(false);
-            } else {
-                m_lastUpdateCheck = QpcSeconds();
             }
         }
         return 0;
@@ -5754,10 +5614,6 @@ bool DockApp::IsTrashRenderIndex(int icon) const noexcept {
         m_iconRenderData[static_cast<size_t>(icon)].kind == DockIconKind::Trash;
 }
 
-int DockApp::TrashRenderIndex() const noexcept {
-    return m_trashIndex;
-}
-
 bool DockApp::IsPointOverTrash(POINT screen) const noexcept {
     if (m_trashIndex < 0 ||
         static_cast<size_t>(m_trashIndex) >= m_iconRenderData.size()) {
@@ -6170,8 +6026,6 @@ void DockApp::OpenTraySlot(TraySlot slot) {
         UnmarkFullscreenClaims();
         opened = SystemTray::OpenNotificationCenter();
         if (opened) {
-            m_shellFlyoutIsSearch = false;
-            m_shellFlyoutIsTray = true;
             return;
         }
         ReleaseShellFlyoutHold();
@@ -6883,7 +6737,7 @@ void DockApp::PresentOverflowLayer() noexcept {
     // Do not call PositionDockSettings here: UpdateLayeredWindow already placed
     // the overflow window, and repositioning Dock Settings on every QS hover
     // previously stormed InvalidateSettingsGlass / full panel rebuilds.
-    if (!m_overflowPresentSuppressShow && !IsWindowVisible(m_overflowWindow)) {
+    if (!IsWindowVisible(m_overflowWindow)) {
         ShowWindow(m_overflowWindow, SW_SHOWNA);
     }
 }
@@ -7001,8 +6855,7 @@ void DockApp::ArmOverflowLiveWorkers() noexcept {
     if (m_overflowWindow == nullptr) {
         return;
     }
-    SyncQuickSettingsCapturePolicy(
-        IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, m_config.HandsFree());
+    SyncQuickSettingsCapturePolicy(IsOverflowOpen(), m_qsPage, m_config.HandsFree());
     const ULONGLONG now = GetTickCount64();
     if (m_qsCache.stampNetwork == 0 || now - m_qsCache.stampNetwork >= 2500ULL ||
         m_qsCache.stampNight == 0 || now - m_qsCache.stampNight >= 8000ULL) {
@@ -7041,33 +6894,6 @@ bool DockApp::TryPresentOverflowFromCache() noexcept {
     m_overflowCaretX = caret;
     PresentOverflowLayer();
     return true;
-}
-
-void DockApp::PrewarmOverflowPopup() noexcept {
-    if (IsOverflowOpen()) {
-        return;
-    }
-    if (m_overflowWindow != nullptr && !m_overflowPresentBits.empty() &&
-        m_overflowPresentSize.cx == m_overflowSize.cx &&
-        m_overflowPresentSize.cy == m_overflowSize.cy && m_overflowPresentSize.cx > 0) {
-        return;
-    }
-    ProfileScope scope("PrewarmOverflowPopup");
-    Log(L"QsOpen PrewarmOverflowPopup start");
-    m_qsPage = QuickSettingsPage::Home;
-    m_qsReturn = QuickSettingsPage::Home;
-    m_overflowPresentSuppressShow = true;
-    m_overflowVisibility = VisibilityState::Visible;
-    PaintOverflowPopup();
-    m_overflowVisibility = VisibilityState::Hidden;
-    m_overflowPresentSuppressShow = false;
-    if (m_overflowWindow != nullptr) {
-        KillTimer(m_overflowWindow, kEnergySampleTimerId);
-        KillTimer(m_overflowWindow, kQsLiveTimerId);
-        KillTimer(m_overflowWindow, kQsTempsTimerId);
-        ShowWindow(m_overflowWindow, SW_HIDE);
-    }
-    SyncQuickSettingsCapturePolicy(false, QuickSettingsPage::Home, m_config.HandsFree());
 }
 
 void DockApp::DestroyOverflowPopup() noexcept {
@@ -7246,7 +7072,6 @@ void DockApp::CheckForUpdatesAsync(bool manual) {
     if (manual) {
         SetUpdateStatus(L"Checking for updates...");
     }
-    m_lastUpdateCheck = QpcSeconds();
     // Snapshot the reinstall-loop guard on the UI thread (DockConfig is not
     // thread-safe): version + time of the last launched install.
     const std::wstring lastInstalledVersion = m_config.LastInstalledVersion();
@@ -7737,29 +7562,6 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     }
 }
 
-void DockApp::PresentSettingsLayer() noexcept {
-    if (m_settingsWindow == nullptr || m_settingsPresentBits.empty() ||
-        m_settingsPresentSize.cx <= 0 || m_settingsPresentSize.cy <= 0) {
-        return;
-    }
-    POINT origin{};
-    if (!SettingsScreenOrigin(origin)) {
-        return;
-    }
-    const LONG width = m_settingsPresentSize.cx;
-    const LONG height = m_settingsPresentSize.cy;
-    if (!PresentLayeredBits(m_settingsWindow, origin, width, height, m_settingsPresentBits.data(),
-            m_settingsPresentBits.size(), m_settingsLayerDib)) {
-        return;
-    }
-    // Hover/glass presents must not PositionDockSettings(): that path can
-    // InvalidateSettingsGlass on origin jitter and pays SetWindowPos every time.
-    // OpenDockSettings / dock-move handlers position explicitly.
-    if (!IsWindowVisible(m_settingsWindow)) {
-        ShowWindow(m_settingsWindow, SW_SHOWNA);
-    }
-}
-
 void DockApp::PaintSettingsHoverFast() {
     POINT origin{};
     if (m_settingsBaseBits.empty() || m_settingsWindow == nullptr ||
@@ -7770,7 +7572,6 @@ void DockApp::PaintSettingsHoverFast() {
         PaintSettingsPopup();
         return;
     }
-    const ULONGLONG now = GetTickCount64();
     const int width = SaturatedInt(m_settingsPresentSize.cx);
     const int height = SaturatedInt(m_settingsPresentSize.cy);
     m_settingsPresentSize = m_settingsSize;
@@ -7841,7 +7642,6 @@ void DockApp::PaintSettingsHoverFast() {
             m_settingsLayerDib, haveDirty ? &dirty : nullptr)) {
         return;
     }
-    m_lastSettingsHoverPresentMs = now;
     if (!IsWindowVisible(m_settingsWindow)) {
         ShowWindow(m_settingsWindow, SW_SHOWNA);
     }
@@ -7948,8 +7748,6 @@ bool DockApp::TickLivePopupGlass()
             m_renderer.CancelLiveGlassPanelBake();
             m_livePopupGlassPending = -1;
         }
-        m_livePopupGlassStatic = false;
-        m_livePopupBackdropSerial = 0;
         return false;
     }
 
@@ -8092,7 +7890,6 @@ bool DockApp::TickLivePopupGlass()
                 m_overflowWindow, target == 3 ? m_searchWindow : m_contextWindow,
                 target == 3 ? m_searchLightTheme : (target != 2 && m_config.LightPanels()), target, &unchanged)) {
             m_popupGlassDirty[target] = false;
-            m_lastPopupGlassRefreshMs = GetTickCount64();
             didWork = true;
         } else if (unchanged) {
             m_popupGlassDirty[target] = false;
@@ -8397,8 +8194,7 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         ScheduleConfigSave();
         // Non-blocking: only queues a worker job for the 111E change.
         m_bluetooth.SetHandsFree(enabled, true);
-        SyncQuickSettingsCapturePolicy(
-            IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, enabled);
+        SyncQuickSettingsCapturePolicy(IsOverflowOpen(), m_qsPage, enabled);
         if (IsOverflowOpen() && m_qsPage == QuickSettingsPage::Microphone && enabled) {
             EnsureQuickSettingsCaptureAsync();
         }
@@ -10081,7 +9877,6 @@ void DockApp::PaintOverflowHoverFast() {
         return;
     }
     m_overflowCaretX = caret;
-    const ULONGLONG now = GetTickCount64();
     const int width = SaturatedInt(m_overflowPresentSize.cx);
     const int height = SaturatedInt(m_overflowPresentSize.cy);
     m_overflowPresentSize = m_overflowSize;
@@ -10209,7 +10004,6 @@ void DockApp::PaintOverflowHoverFast() {
             m_overflowLayerDib, haveDirty ? &dirty : nullptr)) {
         return;
     }
-    m_lastOverflowHoverPresentMs = now;
     if (!IsWindowVisible(m_overflowWindow)) {
         ShowWindow(m_overflowWindow, SW_SHOWNA);
     }
@@ -10852,7 +10646,6 @@ bool DockApp::AdoptMonitorForCursor(POINT cursor) {
 
 bool DockApp::CaptureLiveBackdrop() {
     ProfileScope scope("CaptureLiveBackdrop");
-    m_backdropCaptureWasIdle = false;
     if (m_shellFlyoutHold || !m_rendererInitialized || m_visibility == VisibilityState::Hidden) {
         return false;
     }
@@ -10870,7 +10663,6 @@ bool DockApp::CaptureLiveBackdrop() {
     // omits this HWND from the glass sample without toggling that.
     bool changed = true;
     const bool captured = m_renderer.CaptureBackdrop(captureBounds, &changed);
-    m_backdropCaptureWasIdle = captured && !changed;
     return captured && changed;
 }
 
@@ -12409,35 +12201,6 @@ void DockApp::ActivatePressedApp() {
     ScheduleDeferredRefresh();
 }
 
-LaunchCandidate DockApp::MakeLaunchCandidate(const LaunchTarget& target) const {
-    LaunchCandidate candidate;
-    candidate.id = target.id;
-    candidate.pinName = target.app.name;
-    candidate.shortcutName = target.shortcutName;
-    candidate.target = target.app.target;
-    candidate.aumid = target.aumid;
-    candidate.description = target.description;
-    candidate.productName = target.productName;
-    candidate.publisher = target.publisher;
-    candidate.startMenuFolder = target.startMenuFolder;
-    candidate.comment = target.comment;
-    candidate.executablePath = target.executablePath;
-    candidate.executable = target.executableName;
-    candidate.windowTitle = target.windowTitle;
-    candidate.running = target.runningWindow != nullptr;
-    candidate.name = target.isStart ? L"Start"
-        : !target.app.name.empty() ? target.app.name
-        : WindowCatalog::DisplayNameForApp(target.app, target.runningWindow);
-    if (candidate.name.empty()) {
-        candidate.name = candidate.pinName;
-    }
-    if (candidate.executable.empty() && !target.isStart &&
-        target.app.target.rfind(L"shell:", 0) != 0) {
-        candidate.executable = DisplayNameFromExecutable(target.app.target);
-    }
-    return candidate;
-}
-
 std::vector<DockApp::LaunchTarget> DockApp::CollectLaunchTargets(
     const std::vector<DisplayApp>& displayApps, const std::vector<RunningWindow>& runningWindows) const {
     std::vector<LaunchTarget> targets;
@@ -12847,7 +12610,6 @@ void DockApp::BeginDrag(POINT screenCursor) {
 
     CacheLayoutSlotBounds();
     m_draggedIcon = m_pressedIcon;
-    m_dragOriginIndex = m_pressedIcon;
     m_draggedTarget = m_pressedTarget;
     if (m_draggedTarget.empty() && static_cast<size_t>(m_draggedIcon) < m_displayApps.size()) {
         m_draggedTarget = m_displayApps[static_cast<size_t>(m_draggedIcon)].app.target;
@@ -13056,7 +12818,6 @@ void DockApp::ClearPressState() noexcept {
     m_pressedIcon = -1;
     m_draggedIcon = -1;
     m_dragInsertion = -1;
-    m_dragOriginIndex = -1;
     m_dragOriginBounds = {};
     m_dragGrabOffset = {};
     m_pressedAt = {};
@@ -13223,7 +12984,6 @@ void DockApp::RemapInteractionAfterLayoutChange(const std::wstring& pressedTarge
             return;
         }
         m_draggedIcon = remapped;
-        m_dragOriginIndex = remapped;
         m_draggedTarget = m_displayApps[static_cast<size_t>(remapped)].app.target;
         if (static_cast<size_t>(remapped) < m_iconRenderData.size()) {
             m_dragOriginBounds = m_iconRenderData[static_cast<size_t>(remapped)].bounds;
@@ -13365,19 +13125,6 @@ DockApp::RefreshSnapshot DockApp::BuildDisplayAppsSnapshot(const WindowCatalog& 
                     left.runningInBackground == right.runningInBackground;
             });
     return snapshot;
-}
-
-std::vector<std::wstring> DockApp::IconCacheKeysFromDisplayApps(
-    const std::vector<DockApp::DisplayApp>& displayApps) {
-    std::vector<std::wstring> keys;
-    keys.reserve(displayApps.size());
-    for (const DockApp::DisplayApp& app : displayApps) {
-        if (IsLayoutOnlyTarget(app.app.target)) {
-            continue;
-        }
-        keys.push_back(WindowCatalog::IconCacheKey(app.app));
-    }
-    return keys;
 }
 
 int DockApp::DividerIndexFromDisplayApps(const std::vector<DockApp::DisplayApp>& displayApps) {
@@ -13887,16 +13634,6 @@ bool DockApp::ExpandPrimaryWorkArea(bool notify) {
     return !repeat;
 }
 
-void DockApp::RestoreDesktopWorkArea() {
-    if (!m_workAreaSaved) {
-        return;
-    }
-    static_cast<void>(SystemParametersInfoW(SPI_SETWORKAREA, 0, &m_savedWorkArea, SPIF_SENDCHANGE));
-    m_workAreaSaved = false;
-    m_workAreaExpanded = false;
-    m_hasLastObservedWorkArea = false;
-}
-
 void DockApp::NotifyExplorerTraySettings() noexcept {
     SendNotifyMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
         reinterpret_cast<LPARAM>(L"TraySettings"));
@@ -13908,33 +13645,12 @@ void DockApp::NotifyExplorerTraySettings() noexcept {
 }
 
 void DockApp::DisableMultiMonitorTaskbars() {
-    if (!m_multiMonTaskbarSaved) {
-        m_multiMonTaskbarHadValue = ReadDwordValue(kMultiMonTaskbarValue, m_savedMultiMonTaskbar);
-        if (!m_multiMonTaskbarHadValue) {
-            m_savedMultiMonTaskbar = 1;
-        }
-        m_multiMonTaskbarSaved = true;
-    }
-
     DWORD current = 1;
     if (ReadDwordValue(kMultiMonTaskbarValue, current) && current == 0) {
         return;
     }
 
     WriteDwordValue(kMultiMonTaskbarValue, 0);
-    NotifyExplorerTraySettings();
-}
-
-void DockApp::RestoreMultiMonitorTaskbars() {
-    if (!m_multiMonTaskbarSaved) {
-        return;
-    }
-    if (m_multiMonTaskbarHadValue) {
-        WriteDwordValue(kMultiMonTaskbarValue, m_savedMultiMonTaskbar);
-    } else {
-        RegDeleteKeyValueW(HKEY_CURRENT_USER, kExplorerAdvancedKey, kMultiMonTaskbarValue);
-    }
-    m_multiMonTaskbarSaved = false;
     NotifyExplorerTraySettings();
 }
 
@@ -14587,8 +14303,6 @@ void DockApp::PrepareShellForStartMenu() {
         ReleaseCapture();
     }
     m_shellFlyoutHold = true;
-    m_shellFlyoutIsSearch = false;
-    m_shellFlyoutIsTray = false;
     // Wait budget for the panel to appear (adaptive hold takes over from
     // there); keeps a refused/missed panel to a sub-second hide.
     m_shellFlyoutHoldUntil = QpcSeconds() + 0.8;
@@ -14658,8 +14372,6 @@ void DockApp::ReleaseShellFlyoutHold() {
 }
 
 void DockApp::StopShellFlyoutWatch() noexcept {
-    m_shellFlyoutAttempts = 0;
-    m_shellFlyoutWindow = nullptr;
     if (m_window != nullptr) {
         KillTimer(m_window, kStartMenuTimerId);
     }
@@ -14919,19 +14631,6 @@ bool DockApp::IsCursorOverDock(POINT cursor) const noexcept {
     return active_dock_policy::PointInRect(cursor, m_pillScreenBounds);
 }
 
-bool DockApp::ShouldPostPointerUpdate(POINT cursor) const noexcept {
-    switch (m_visibility) {
-    case VisibilityState::Hidden:
-    case VisibilityState::Hiding:
-        return IsCursorInBottomHotZone(cursor) && !IsForegroundBorderlessFullscreenAt(cursor);
-    case VisibilityState::Showing:
-    case VisibilityState::Visible:
-        return !IsCursorOverDock(cursor);
-    default:
-        return false;
-    }
-}
-
 bool DockApp::NeedsHookPointerPost(POINT cursor) const noexcept {
     const bool hiddenOrHiding =
         m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding;
@@ -14974,10 +14673,6 @@ bool DockApp::IsPersistentDisplayIcon(int icon) const noexcept {
         !IsSpecialDockTarget(m_displayApps[static_cast<size_t>(icon)].app.target) &&
         !IsLayoutOnlyTarget(m_displayApps[static_cast<size_t>(icon)].app.target) &&
         m_displayApps[static_cast<size_t>(icon)].persistentPinIndex >= 0;
-}
-
-LONG DockApp::CurrentY() const noexcept {
-    return m_currentY;
 }
 
 bool DockApp::IsAnimating() const noexcept {

@@ -3015,49 +3015,6 @@ void SendMediaKey(WORD key) {
     SendInput(2, inputs, sizeof(INPUT));
 }
 
-
-void FillHGradientPill(uint8_t* dest, int destWidth, int destHeight, float x0, float x1, float cy,
-    float radius, float alpha, uint8_t b0, uint8_t g0, uint8_t r0, uint8_t b1, uint8_t g1,
-    uint8_t r1) {
-    if (dest == nullptr || alpha <= 0.0F || x1 <= x0 + 0.5F || radius <= 0.5F) {
-        return;
-    }
-    // Include the full end-cap discs (x0/x1 are stadium segment centers).
-    // Bounding only to x0..x1 clipped the semicircles and left square ends.
-    const int left = std::max(0, static_cast<int>(std::floor(x0 - radius - 2.0F)));
-    const int right = std::min(destWidth, static_cast<int>(std::ceil(x1 + radius + 2.0F)));
-    const int top = std::max(0, static_cast<int>(std::floor(cy - radius - 2.0F)));
-    const int bottom = std::min(destHeight, static_cast<int>(std::ceil(cy + radius + 2.0F)));
-    const float span = std::max(1.0F, x1 - x0);
-    constexpr float aa = 1.2F;
-    for (int y = top; y < bottom; ++y) {
-        const float dy = std::fabs(static_cast<float>(y) + 0.5F - cy);
-        for (int x = left; x < right; ++x) {
-            const float px = static_cast<float>(x) + 0.5F;
-            float dx = 0.0F;
-            if (px < x0) {
-                dx = x0 - px;
-            } else if (px > x1) {
-                dx = px - x1;
-            }
-            const float sd = (dx > 0.0F ? std::sqrt(dx * dx + dy * dy) : dy) - radius;
-            const float coverage = 1.0F - std::clamp(sd / aa + 0.5F, 0.0F, 1.0F);
-            if (coverage <= 0.0F) {
-                continue;
-            }
-            const float t = std::clamp((px - x0) / span, 0.0F, 1.0F);
-            const float srcA = coverage * alpha;
-            const auto channel = [&](uint8_t from, uint8_t to) {
-                return static_cast<uint8_t>(std::lround(
-                    ((1.0F - t) * static_cast<float>(from) + t * static_cast<float>(to)) * srcA));
-            };
-            uint8_t pixel[4] = {channel(b0, b1), channel(g0, g1), channel(r0, r1),
-                static_cast<uint8_t>(std::lround(255.0F * srcA))};
-            CompositePremul(dest, destWidth, destHeight, x, y, pixel, 1, 1);
-        }
-    }
-}
-
 void FillSoftDisc(uint8_t* dest, int destWidth, int destHeight, float cx, float cy, float radius,
     float alpha, uint8_t blue, uint8_t green, uint8_t red) {
     if (dest == nullptr || alpha <= 0.0F || radius <= 0.5F) {
@@ -3853,8 +3810,7 @@ QsLiveChange RefreshQuickSettingsLive(QuickSettingsCache& cache) {
 }
 
 void DockApp::RefreshQuickSettingsCache() {
-    SyncQuickSettingsCapturePolicy(
-        IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, m_config.HandsFree());
+    SyncQuickSettingsCapturePolicy(IsOverflowOpen(), m_qsPage, m_config.HandsFree());
     const ULONGLONG now = GetTickCount64();
     // WLAN / adapters / endpoints / WASAPI / power / HDR / Night Light: worker.
     // First paint keeps whatever is already cached (possibly stale).
@@ -3906,8 +3862,7 @@ void DockApp::OpenQuickSettingsPage(QuickSettingsPage page) {
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
     ResetQsChevronFade();
-    SyncQuickSettingsCapturePolicy(
-        IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, m_config.HandsFree());
+    SyncQuickSettingsCapturePolicy(IsOverflowOpen(), m_qsPage, m_config.HandsFree());
     if (page == QuickSettingsPage::RefreshRate) {
         m_qsRefreshNote.clear();
     }
@@ -3953,8 +3908,7 @@ void DockApp::CloseQuickSettingsPage() {
     ResetQsChevronFade();
     m_overflowHoverDirtyValid = false;
     m_qsDragging = false;
-    SyncQuickSettingsCapturePolicy(
-        IsOverflowOpen() && !m_overflowPresentSuppressShow, m_qsPage, m_config.HandsFree());
+    SyncQuickSettingsCapturePolicy(IsOverflowOpen(), m_qsPage, m_config.HandsFree());
     if (leaving == QuickSettingsPage::Bluetooth && back != QuickSettingsPage::Bluetooth &&
         m_window != nullptr && !m_bluetoothSnapshot.discovering && !m_bluetooth.IsPairing()) {
         KillTimer(m_window, kBluetoothTimerId);

@@ -126,7 +126,6 @@ private:
     bool PollJournals();
     void CloseJournals() noexcept;
     void NotifyStatus() const noexcept;
-    [[nodiscard]] bool StopRequested() const noexcept { return m_stop.load(); }
 
     HWND m_notify = nullptr;
     UINT m_statusMessage = 0;

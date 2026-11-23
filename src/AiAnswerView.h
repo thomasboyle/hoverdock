@@ -48,7 +48,6 @@ public:
     void SetAllowedImages(const std::vector<std::wstring>& urls) { m_allowedImages = urls; }
     void Clear();
     [[nodiscard]] bool Empty() const noexcept { return m_parser.Blocks().empty(); }
-    [[nodiscard]] const std::wstring& Markdown() const noexcept { return m_markdown; }
 
     // Image URLs (http/https) still to fetch; each is returned once.
     [[nodiscard]] std::vector<std::wstring> TakeImageRequests();

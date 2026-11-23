@@ -32,8 +32,6 @@ namespace active_dock_policy {
 inline constexpr uint64_t kSelfPresentSuppressWindowMs = 45ULL;
 inline constexpr uint64_t kSelfPresentCatchUpDelayMs = 65ULL;
 inline constexpr uint32_t kCalmHealthyHookWatchMs = 1000U;
-inline constexpr uint32_t kBackdropRestingPollMs = 33U;
-inline constexpr uint32_t kBackdropIdleTicksBeforeRest = 20U;
 
 [[nodiscard]] constexpr bool PointInRect(POINT pt, const RECT& r) noexcept {
     return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;

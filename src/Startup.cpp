@@ -431,13 +431,6 @@ std::wstring Startup::StartupCommand() {
     return Quoted(exe);
 }
 
-bool Startup::IsEnabled() {
-    if (RunValuePresent()) {
-        return true;
-    }
-    return TaskExists();
-}
-
 bool Startup::SetEnabled(bool enabled) {
     if (!enabled) {
         const bool runGone = DeleteRunValue();

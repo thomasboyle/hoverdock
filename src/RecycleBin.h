@@ -18,11 +18,8 @@ class RecycleBin {
 public:
     static constexpr wchar_t kEmptyTarget[] = L"dock:trash-empty";
     static constexpr wchar_t kFullTarget[] = L"dock:trash-full";
-    static constexpr wchar_t kLogicalTarget[] = L"dock:trash";
 
     [[nodiscard]] static bool QueryState(RecycleBinState& state) noexcept;
-    [[nodiscard]] static bool IsEmpty() noexcept;
-    [[nodiscard]] static ULONGLONG ItemCount() noexcept;
 
     // Opens the Recycle Bin in Explorer and brings it to the front.
     [[nodiscard]] static bool Open() noexcept;

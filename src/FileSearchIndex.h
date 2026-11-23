@@ -133,11 +133,9 @@ public:
     [[nodiscard]] size_t LiveEntryCount() const noexcept { return m_liveEntries; }
     [[nodiscard]] size_t NameBytes() const noexcept { return m_names.size(); }
     [[nodiscard]] size_t MemoryBytes() const noexcept;
-    [[nodiscard]] uint64_t Generation() const noexcept { return m_generation; }
 
     [[nodiscard]] std::string_view Name(uint32_t entry) const noexcept;
     [[nodiscard]] std::string Path(uint32_t entry) const;
-    [[nodiscard]] uint32_t Parent(uint32_t entry) const noexcept { return m_parent[entry]; }
     [[nodiscard]] uint8_t Flags(uint32_t entry) const noexcept { return m_flags[entry]; }
     [[nodiscard]] Zone ZoneOf(uint32_t entry) const noexcept { return static_cast<Zone>(m_zone[entry]); }
     [[nodiscard]] uint32_t Find(uint8_t volume, uint64_t id) const noexcept;

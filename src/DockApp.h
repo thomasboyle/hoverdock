@@ -229,12 +229,8 @@ private:
     // 0 = no timer while Hidden with a healthy LL hook (event-driven via hook + FG WinEvent).
     static constexpr UINT kCursorWatchHiddenIntervalMs = 0;
     static constexpr UINT kDeferredRefreshDelayMs = 400;
-    // Used only when the host refresh rate cannot be read. While the dock is
-    // visible the backdrop timer tracks that monitor (BackdropFrameIntervalMs).
-    static constexpr UINT kBackdropIntervalMs = 8;
     static constexpr UINT kBackdropIdleIntervalMs = 250;
     static constexpr UINT kBackdropRestingIntervalMs = 33;
-    static constexpr UINT kBackdropIdleHysteresisTicks = 15;
     static constexpr UINT kBackdropRestingHysteresisTicks = 15;
     static constexpr UINT kTaskbarMonitorIntervalMs = 100;
     static constexpr UINT kTaskbarMonitorSlowIntervalMs = 5000;
@@ -488,7 +484,6 @@ private:
     void PaintSettingsHoverFast();
     void ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height,
         const SettingsHit& hit) const;
-    void PresentSettingsLayer() noexcept;
     struct LayerPresentDib {
         HDC dc = nullptr;
         HBITMAP bitmap = nullptr;
@@ -549,8 +544,6 @@ private:
     void BeginOverflowShow();
     // Re-present the last Home frame without a full glass/content rebuild.
     [[nodiscard]] bool TryPresentOverflowFromCache() noexcept;
-    // Create HWND + bake Home off-screen so the first chevron click is warm.
-    void PrewarmOverflowPopup() noexcept;
     // Timers + async QS workers without a full PaintOverflowPopup.
     void ArmOverflowLiveWorkers() noexcept;
     void BeginOverflowHide(bool animate) noexcept;
@@ -723,7 +716,6 @@ private:
     [[nodiscard]] std::vector<LaunchTarget> CollectLaunchTargets(
         const std::vector<DisplayApp>& displayApps,
         const std::vector<RunningWindow>& runningWindows) const;
-    [[nodiscard]] LaunchCandidate MakeLaunchCandidate(const LaunchTarget& target) const;
     bool ActivateLaunchTarget(const LaunchTarget& target);
     void BeginDrag(POINT screenCursor);
     void UpdateDrag(POINT screenCursor);
@@ -763,8 +755,6 @@ private:
     bool RebuildDisplayApps(bool* structureChanged = nullptr);
     [[nodiscard]] static RefreshSnapshot BuildDisplayAppsSnapshot(const WindowCatalog& windows,
         const std::vector<PinnedApp>& pins, const std::vector<DisplayApp>& currentApps);
-    [[nodiscard]] static std::vector<std::wstring> IconCacheKeysFromDisplayApps(
-        const std::vector<DisplayApp>& displayApps);
     [[nodiscard]] static int DividerIndexFromDisplayApps(const std::vector<DisplayApp>& displayApps);
     bool OpenStartMenuFromDock();
     void PrepareShellForStartMenu();
@@ -780,9 +770,7 @@ private:
     [[nodiscard]] bool ExpandPrimaryWorkArea(bool notify);
     void CollectTaskbarWindows(std::vector<HWND>& taskbars);
     [[nodiscard]] bool ExpandSecondaryMonitorWorkAreas(bool force = false);
-    void RestoreDesktopWorkArea();
     void DisableMultiMonitorTaskbars();
-    void RestoreMultiMonitorTaskbars();
     void NotifyExplorerTraySettings() noexcept;
     void EnsureFullscreenClaimWindows();
     void DestroyFullscreenClaimWindows() noexcept;
@@ -838,11 +826,9 @@ private:
     [[nodiscard]] int InsertionIndexForDrag(POINT cursor) const noexcept;
     [[nodiscard]] bool HasCrossedDragThreshold(POINT cursor) const noexcept;
     [[nodiscard]] bool IsCursorOverDock(POINT cursor) const noexcept;
-    [[nodiscard]] bool ShouldPostPointerUpdate(POINT cursor) const noexcept;
     [[nodiscard]] bool NeedsHookPointerPost(POINT cursor) const noexcept;
     [[nodiscard]] bool IsDragActive() const noexcept;
     [[nodiscard]] bool IsPersistentDisplayIcon(int icon) const noexcept;
-    [[nodiscard]] LONG CurrentY() const noexcept;
     [[nodiscard]] bool IsAnimating() const noexcept;
     [[nodiscard]] double SecondsSinceAnimationStarted() const noexcept;
     [[nodiscard]] static double QpcSeconds();
@@ -850,7 +836,6 @@ private:
     void ReloadIconsIfExtentChanged();
     // --- Trash / Recycle Bin (macOS-style, left of Quick Settings) ---
     [[nodiscard]] bool IsTrashRenderIndex(int icon) const noexcept;
-    [[nodiscard]] int TrashRenderIndex() const noexcept;
     [[nodiscard]] bool IsPointOverTrash(POINT screen) const noexcept;
     void RefreshTrash(bool forceLayout);
     void EnsureTrashIcons();
@@ -957,7 +942,6 @@ private:
     int m_pressedIcon = -1;
     int m_draggedIcon = -1;
     int m_dragInsertion = -1;
-    int m_dragOriginIndex = -1;
     RECT m_dragOriginBounds{};
     POINT m_dragGrabOffset{};
     POINT m_dragSnapFrom{};
@@ -1042,9 +1026,6 @@ private:
     mutable HMONITOR m_fgBorderlessMonitor = nullptr;
     mutable HWND m_fgBorderlessHwnd = nullptr;
     mutable double m_fgBorderlessCheckedAt = 0.0;
-    bool m_multiMonTaskbarSaved = false;
-    bool m_multiMonTaskbarHadValue = false;
-    DWORD m_savedMultiMonTaskbar = 1;
     struct FullscreenClaim {
         HMONITOR monitor = nullptr;
         RECT bounds{};
@@ -1098,11 +1079,8 @@ private:
     LONG m_overlayRenderY = 0;
     LONG m_overlayRenderH = 0;
     UINT m_loadedIconExtent = 0;
-    UINT m_shellFlyoutAttempts = 0;
-    bool m_shellFlyoutIsSearch = false;
     bool m_shellFlyoutHold = false;
     bool m_overlayHiddenForFlyout = false;
-    HWND m_shellFlyoutWindow = nullptr;
     double m_shellFlyoutHoldUntil = 0.0;
     // Adaptive hold phase for the Win+N panel: false while waiting for it to
     // appear after the click, true once seen (hold then lasts until it closes
@@ -1116,7 +1094,6 @@ private:
     HANDLE m_backdropWaitable = nullptr;
     bool m_backdropFastArmed = false;
     UINT m_backdropIdleStreak = 0;
-    bool m_backdropCaptureWasIdle = false;
     bool m_dropPresentPending = false;
     std::atomic<bool> m_refreshInFlight{false};
     // Retry of pinned apps whose icon extraction failed (see BeginBackgroundRefresh).
@@ -1239,8 +1216,6 @@ private:
     VisibilityState m_overflowVisibility = VisibilityState::Hidden;
     std::vector<TrayNotifyIcon> m_overflowIcons;
     bool m_overflowIconsLoaded = false;
-    // When true, PresentOverflowLayer uploads pixels but does not SW_SHOWNA.
-    bool m_overflowPresentSuppressShow = false;
     std::vector<TrayFlyoutHit> m_overflowHits;
     int m_overflowHover = -1;
     QuickSettingsPage m_qsPage = QuickSettingsPage::Home;
@@ -1267,24 +1242,11 @@ private:
     std::vector<uint8_t> m_settingsBaseBits;
     std::vector<uint8_t> m_settingsPresentBits;
     LayerPresentDib m_settingsLayerDib{};
-    ULONGLONG m_lastSettingsHoverPresentMs = 0;
     RECT m_settingsHoverDirty{};
     bool m_settingsHoverDirtyValid = false;
     SIZE m_settingsPresentSize{};
     bool m_frostSliderDragging = false;
     ULONGLONG m_frostSliderLastRenderMs = 0;
-    // Last live rebake of open menu glass (Quick Settings / Dock Settings / context).
-    ULONGLONG m_lastPopupGlassRefreshMs = 0;
-    // After a confirmed unchanged capture, wait this long before BitBlt again.
-    static constexpr ULONGLONG kLivePopupStaticIntervalMs = 250;
-    bool m_livePopupGlassStatic = false;
-    // Skip live menu BitBlt/GPU until dock backdrop reports a desktop change
-    // (or kLivePopupForcedRefreshMs elapses). Keeps glass live over moving
-    // wallpaper without 120 Hz rebakes on a static desktop.
-    static constexpr ULONGLONG kLivePopupForcedRefreshMs = 8000;
-    uint64_t m_livePopupBackdropSerial = 0;
-    // Round-robin target for async menu glass rebakes (0=settings,1=overflow,2=context).
-    int m_livePopupGlassTarget = 0;
     int m_livePopupGlassPending = -1;
     // Plate still owes a GPU bake after a dirty desktop frame (0 settings, 1 quick
     // settings, 2 context). Cleared when the bake is submitted or the pixels match.
@@ -1308,7 +1270,6 @@ private:
     std::wstring m_updateStatus = L"Checking for updates...";
     std::atomic<bool> m_updateInFlight{false};
     std::atomic<bool> m_updateInstalling{false};
-    double m_lastUpdateCheck = 0.0;
     std::wstring m_overflowGlyphKey;
     std::vector<uint8_t> m_overflowGlyphGear;
     // Idle gear blit rect (top-left + extent). Hover scales about this center.
@@ -1484,7 +1445,6 @@ private:
     uint64_t m_overflowGlassCcHash = 0;
     uint64_t m_qsCcInkSig = 0;
     LayerPresentDib m_overflowLayerDib{};
-    ULONGLONG m_lastOverflowHoverPresentMs = 0;
     RECT m_overflowHoverDirty{};
     bool m_overflowHoverDirtyValid = false;
     SIZE m_overflowPresentSize{};
@@ -1544,6 +1504,5 @@ private:
     bool m_contextIsTrash = false;
 
     static DockApp* s_instance;
-    bool m_shellFlyoutIsTray = false;
     std::wstring m_trayVisualKey;
 };

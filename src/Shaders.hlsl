@@ -294,11 +294,6 @@ VertexOutput IconVS(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID
     return output;
 }
 
-float InterleavedGradientNoise(float2 pixel)
-{
-    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
-}
-
 // ---------------------------------------------------------------------------
 // 5. Separable Gaussian frost, split across two passes (smooth by
 //    construction: dense axis coverage, fixed taps, no rotation, no radius
@@ -418,9 +413,6 @@ static const float kMicaClearRim = 5.0;
 static const float kMicaClearCore = 4.0;
 static const float kMicaFullRim = 16.0;
 static const float kMicaFullCore = 16.0;
-// Legacy aliases (ComputeFrostUVs / SampleGlassAxis call sites).
-static const float kMicaBlurRim = kMicaFullRim;
-static const float kMicaBlurCore = kMicaFullCore;
 
 // Map frostAmount to per-axis mica radii.
 // 0: none; ~0.5: clear-glass veil (5/4); 1: full frost (16/16).

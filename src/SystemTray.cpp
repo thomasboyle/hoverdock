@@ -551,57 +551,6 @@ std::vector<uint8_t> RasterizeAcPower(UINT extent) {
     return pixels;
 }
 
-void PremultiplyFromLuminance(std::vector<uint8_t>& pixels, UINT width, UINT height) {
-    for (UINT y = 0; y < height; ++y) {
-        for (UINT x = 0; x < width; ++x) {
-            const size_t offset = (static_cast<size_t>(y) * width + x) * 4U;
-            const unsigned alpha = std::max({pixels[offset], pixels[offset + 1], pixels[offset + 2]});
-            pixels[offset + 3] = static_cast<uint8_t>(alpha);
-        }
-    }
-}
-
-std::vector<uint8_t> ScalePremultiplied(const std::vector<uint8_t>& source, UINT sourceWidth,
-    UINT sourceHeight, UINT destWidth, UINT destHeight) {
-    std::vector<uint8_t> dest(static_cast<size_t>(destWidth) * destHeight * 4U, 0);
-    if (sourceWidth == 0 || sourceHeight == 0 || destWidth == 0 || destHeight == 0 ||
-        source.size() < static_cast<size_t>(sourceWidth) * sourceHeight * 4U) {
-        return dest;
-    }
-    for (UINT y = 0; y < destHeight; ++y) {
-        const UINT sourceY0 = y * sourceHeight / destHeight;
-        const UINT sourceY1 = std::max(sourceY0 + 1U, (y + 1U) * sourceHeight / destHeight);
-        for (UINT x = 0; x < destWidth; ++x) {
-            const UINT sourceX0 = x * sourceWidth / destWidth;
-            const UINT sourceX1 = std::max(sourceX0 + 1U, (x + 1U) * sourceWidth / destWidth);
-            UINT blue = 0;
-            UINT green = 0;
-            UINT red = 0;
-            UINT alpha = 0;
-            UINT count = 0;
-            for (UINT sourceY = sourceY0; sourceY < sourceY1; ++sourceY) {
-                for (UINT sourceX = sourceX0; sourceX < sourceX1; ++sourceX) {
-                    const size_t offset = (static_cast<size_t>(sourceY) * sourceWidth + sourceX) * 4U;
-                    blue += source[offset];
-                    green += source[offset + 1];
-                    red += source[offset + 2];
-                    alpha += source[offset + 3];
-                    ++count;
-                }
-            }
-            if (count == 0) {
-                continue;
-            }
-            const size_t destOffset = (static_cast<size_t>(y) * destWidth + x) * 4U;
-            dest[destOffset] = static_cast<uint8_t>(blue / count);
-            dest[destOffset + 1] = static_cast<uint8_t>(green / count);
-            dest[destOffset + 2] = static_cast<uint8_t>(red / count);
-            dest[destOffset + 3] = static_cast<uint8_t>(alpha / count);
-        }
-    }
-    return dest;
-}
-
 struct SavedEndpointBalance {
     std::mutex mutex;
     std::wstring deviceId;
@@ -1125,38 +1074,6 @@ const wchar_t* SystemTray::LabelForSlot(TraySlot slot, const TrayStatus& status)
 
 bool SystemTray::SlotVisible(TraySlot slot, const TrayStatus& status) noexcept {
     return slot != TraySlot::Power || status.hasBattery;
-}
-
-std::wstring SystemTray::NetworkStatusText() const {
-    if (m_status.network == TrayNetworkKind::Disconnected) {
-        return L"Not connected";
-    }
-    if (!m_status.networkName.empty()) {
-        return m_status.networkName;
-    }
-    return m_status.network == TrayNetworkKind::Ethernet ? L"Ethernet" : L"Connected";
-}
-
-std::wstring SystemTray::VolumeStatusText() const {
-    if (m_status.volumeMuted) {
-        return L"Muted";
-    }
-    return std::to_wstring(static_cast<int>(std::lround(m_status.volumeLevel * 100.0F))) + L"%";
-}
-
-std::wstring SystemTray::BatteryStatusText() const {
-    if (!m_status.hasBattery) {
-        return L"Plugged in";
-    }
-    std::wstring text = std::to_wstring(m_status.batteryPercent) + L"%";
-    if (m_status.batteryCharging) {
-        text += L" charging";
-    }
-    return text;
-}
-
-std::wstring SystemTray::BrightnessStatusText() const {
-    return std::to_wstring(m_status.brightnessPercent) + L"%";
 }
 
 std::vector<uint8_t> SystemTray::RasterizeGlyph(TraySlot slot, UINT extent) const {
@@ -2319,15 +2236,6 @@ bool SystemTray::AdjustVolume(float delta) {
     return ok;
 }
 
-bool SystemTray::SetVolumeLevel(float level) {
-    level = std::clamp(level, 0.0F, 1.0F);
-    if (!WriteSystemVolumeLevel(level)) {
-        return false;
-    }
-    ProjectVolumeStatus(level);
-    return true;
-}
-
 void SystemTray::ProjectVolumeStatus(float level) noexcept {
     m_status.volumeLevel = std::clamp(level, 0.0F, 1.0F);
     m_status.volumeMuted = false;
@@ -2344,28 +2252,6 @@ bool SystemTray::WriteSystemVolumeLevel(float level) {
     const bool ok = WriteMasterVolumePreservingOrRepairingBalance(volume, level, isBluetooth, deviceId);
     volume->Release();
     return ok;
-}
-
-bool SystemTray::AdjustBrightness(int deltaPercent) {
-    if (!m_status.brightnessAvailable) {
-        return OpenDisplaySettings();
-    }
-    // Step from tracked state, not a live re-read: on DDC units the read can be
-    // stale or bogus (and costs a bus round-trip per call), while tracked state
-    // always reflects the last confirmed or commanded level.
-    const int next = std::clamp(m_status.brightnessPercent + deltaPercent, 0, 100);
-    if (next == m_status.brightnessPercent) {
-        return true;
-    }
-    const bool written =
-        WriteLcdBrightness(next) || WriteDdcBrightness(next) || WriteSchemeBrightness(next);
-    if (!written) {
-        return OpenDisplaySettings();
-    }
-    m_status.brightnessPercent = next;
-    m_status.brightnessAvailable = true;
-    m_ddcPercent = next;
-    return true;
 }
 
 bool SystemTray::RefreshBrightnessFromDdc() {
@@ -2395,22 +2281,6 @@ bool SystemTray::SetBrightnessLevel(int percent) {
     return true;
 }
 
-bool SystemTray::OpenFlyout(TraySlot slot) {
-    switch (slot) {
-    case TraySlot::Network:
-        return OpenNetworkPanel();
-    case TraySlot::Volume:
-        return OpenSoundMixer();
-    case TraySlot::Power:
-        return OpenPowerSettings();
-    case TraySlot::Clock:
-        return OpenNotificationCenter();
-    case TraySlot::Overflow:
-        break;
-    }
-    return false;
-}
-
 bool SystemTray::OpenNetworkPanel() {
     if (OpenShellTarget(L"ms-availablenetworks:")) {
         return true;
@@ -2437,10 +2307,6 @@ bool SystemTray::OpenPowerSettings() {
         return OpenShellTarget(L"ms-settings:batterysaver");
     }
     return OpenShellTarget(L"ms-settings:powersleep");
-}
-
-bool SystemTray::OpenWindowsSettings() {
-    return OpenShellTarget(L"ms-settings:");
 }
 
 bool SystemTray::OpenDisplaySettings() {

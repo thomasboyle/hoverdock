@@ -1476,10 +1476,6 @@ struct NativeCpuPackageSource {
         return UsesAmd() ? amd.needAdmin : intel.needAdmin;
     }
 
-    bool Loaded() const noexcept {
-        return UsesAmd() ? amd.loaded : intel.loaded;
-    }
-
     void EnsureElevatedSibling(ULONGLONG now) {
         if (now < nextEnsureAt) {
             return;

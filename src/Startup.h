@@ -19,7 +19,6 @@ class Startup {
 public:
     [[nodiscard]] static std::wstring CurrentExecutablePath();
     [[nodiscard]] static std::wstring StartupCommand();
-    [[nodiscard]] static bool IsEnabled();
     static bool SetEnabled(bool enabled);
     // Reconciles the registry with the persisted config value. Called once at
     // startup so a moved/copied Dock.exe repairs a stale Run entry and an

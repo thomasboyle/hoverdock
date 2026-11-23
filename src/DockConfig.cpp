@@ -1155,7 +1155,6 @@ bool DockConfig::Load() {
     m_lensing = true;
     m_dispersion = true;
     m_frostAmount = 0.0F;
-    m_tint = true;
     m_specular = true;
     m_dropShadow = true;
     m_depthShade = true;
@@ -1226,10 +1225,6 @@ bool DockConfig::Load() {
             } else {
                 m_frostAmount = 0.0F;
             }
-        }
-        const auto tint = dockSection->second.find(L"tint");
-        if (tint != dockSection->second.end()) {
-            m_tint = ParseBoolean(tint->second);
         }
         const auto specular = dockSection->second.find(L"specular");
         if (specular != dockSection->second.end()) {
@@ -1366,7 +1361,6 @@ bool DockConfig::Save() const {
     contents << L"Lensing=" << (m_lensing ? L"1" : L"0") << L"\n";
     contents << L"Dispersion=" << (m_dispersion ? L"1" : L"0") << L"\n";
     contents << L"Frost=" << m_frostAmount << L"\n";
-    contents << L"Tint=" << (m_tint ? L"1" : L"0") << L"\n";
     contents << L"Specular=" << (m_specular ? L"1" : L"0") << L"\n";
     contents << L"DropShadow=" << (m_dropShadow ? L"1" : L"0") << L"\n";
     contents << L"DepthShade=" << (m_depthShade ? L"1" : L"0") << L"\n";
@@ -1416,10 +1410,6 @@ bool DockConfig::ShowDevBounds() const noexcept {
 
 void DockConfig::SetShowDevBounds(bool enabled) noexcept {
     m_showDevBounds = enabled;
-}
-
-bool DockConfig::FollowsTaskbarPins() const noexcept {
-    return m_followsTaskbarPins;
 }
 
 void DockConfig::StopFollowingTaskbarPins() noexcept {
@@ -1484,14 +1474,6 @@ void DockConfig::SetFrostAmount(float amount) noexcept {
 
 bool DockConfig::Frost() const noexcept {
     return m_frostAmount > 0.001F;
-}
-
-bool DockConfig::Tint() const noexcept {
-    return m_tint;
-}
-
-void DockConfig::SetTint(bool enabled) noexcept {
-    m_tint = enabled;
 }
 
 bool DockConfig::Specular() const noexcept {
@@ -1625,7 +1607,6 @@ void DockConfig::SetDefaults() {
     m_rimLight = true;
     m_lensing = true;
     m_dispersion = true;
-    m_tint = true;
     m_specular = true;
     m_dropShadow = true;
     m_depthShade = true;

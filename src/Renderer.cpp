@@ -1443,10 +1443,6 @@ std::vector<std::wstring> Renderer::IconTargetKeys() const {
     return keys;
 }
 
-bool Renderer::BackdropValid() const noexcept {
-    return m_backdropValid;
-}
-
 void Renderer::InvalidateBackdrop() noexcept {
     // Drop the cached frost source so the next CaptureBackdrop BitBlts again and
     // Render cannot sample a desktop frame from a previous reveal.
@@ -1458,7 +1454,6 @@ void Renderer::InvalidateBackdrop() noexcept {
     m_backdropRefreshRequested = false;
     m_backdropDirtPending = false;
     m_backdropCommittedSamples.clear();
-    m_lastBackdropSerialBumpMs = 0;
     m_blurCache = {};
 }
 
@@ -1587,26 +1582,6 @@ std::vector<uint8_t> Renderer::ExtractIconPixels(const std::vector<std::wstring>
     const UINT displayExtent = std::max(1U, iconPixelExtent);
     return ExtractIconPixelsFromCandidates(candidates, IconSourceExtent(displayExtent),
         IconAtlasExtent(displayExtent));
-}
-
-bool Renderer::NeedsBackdropBitBlt(const RECT& screenRectangle) const noexcept {
-    const LONG width = screenRectangle.right - screenRectangle.left;
-    const LONG height = screenRectangle.bottom - screenRectangle.top;
-    if (m_backdropDc == nullptr || m_backdropDibPixels == nullptr || m_backdropTexture == nullptr ||
-        width != static_cast<LONG>(m_width) || height != static_cast<LONG>(m_height)) {
-        return false;
-    }
-    if (!m_backdropValid) {
-        return true;
-    }
-    DWM_TIMING_INFO timing{};
-    timing.cbSize = sizeof(timing);
-    if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
-        if (m_backdropDwmFrameValid && timing.cFrame == m_backdropDwmFrame) {
-            return false;
-        }
-    }
-    return true;
 }
 
 namespace {
@@ -2559,7 +2534,6 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     m_backdropValid = true;
     CommitBackdropSamplesFromDib();
     ++m_backdropChangeSerial;
-    m_lastBackdropSerialBumpMs = GetTickCount64();
     if (changed != nullptr) {
         *changed = true;
     }
@@ -2780,37 +2754,15 @@ HANDLE Renderer::FrameLatencyWaitableObject() const noexcept {
     return m_frameLatencyWaitableObject;
 }
 
-D3D_FEATURE_LEVEL Renderer::FeatureLevel() const noexcept {
-    return m_featureLevel;
-}
-
-D3D_SHADER_MODEL Renderer::ShaderModel() const noexcept {
-    return m_shaderModel;
-}
-
 void Renderer::CreateDevice() {
     ComPtr<IDXGIFactory2> factory;
     Check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
     Check(factory.As(&m_factory), "Query IDXGIFactory6");
 
-    // One creation at the 12_0 minimum, then query the ceiling: a failed
-    // higher-level attempt still pays the full driver initialization.
     const HRESULT created = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&m_device));
     if (FAILED(created) || m_device == nullptr) {
         ThrowFailure(created, "D3D12CreateDevice for feature levels 12_2, 12_1, or 12_0");
     }
-    constexpr std::array featureLevels = {
-        D3D_FEATURE_LEVEL_12_2,
-        D3D_FEATURE_LEVEL_12_1,
-        D3D_FEATURE_LEVEL_12_0,
-    };
-    D3D12_FEATURE_DATA_FEATURE_LEVELS levels{};
-    levels.NumFeatureLevels = static_cast<UINT>(featureLevels.size());
-    levels.pFeatureLevelsRequested = featureLevels.data();
-    m_featureLevel = SUCCEEDED(m_device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &levels,
-                         sizeof(levels)))
-        ? levels.MaxSupportedFeatureLevel
-        : D3D_FEATURE_LEVEL_12_0;
 
     D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{D3D_SHADER_MODEL_6_6};
     const HRESULT shaderQuery = m_device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,
@@ -3416,18 +3368,6 @@ void Renderer::WaitForAllFrames() {
     }
 }
 
-void Renderer::UploadIcon(UINT textureIndex, const std::wstring& target,
-    ID3D12GraphicsCommandList* commandList) {
-    const UINT atlasExtent = m_iconPixelExtent;
-    const UINT sourceExtent = IconSourceExtent(std::max(1U, atlasExtent / 2U));
-    const std::vector<uint8_t> pixels = ExtractIconPixelsImpl(target, sourceExtent, atlasExtent);
-    if (pixels.empty()) {
-        CreateFallbackIcon(textureIndex, commandList);
-        return;
-    }
-    UploadIconTexture(textureIndex, pixels.data(), atlasExtent, atlasExtent, commandList);
-}
-
 void Renderer::CreateFallbackIcon(UINT textureIndex, ID3D12GraphicsCommandList* commandList) {
     const UINT displayExtent = m_iconPixelExtent;
     std::vector<uint8_t> pixels;
@@ -3528,13 +3468,9 @@ void Renderer::ReleasePanelCapturePool() noexcept
     m_panelCapturePoolClock = 0;
     m_panelCaptureDc = nullptr;
     m_panelCaptureBitmap = nullptr;
-    m_panelCapturePrevious = nullptr;
     m_panelCapturePixels = nullptr;
     m_panelCaptureWidth = 0;
     m_panelCaptureHeight = 0;
-    m_panelCaptureDwmFrame = 0;
-    m_panelCaptureDwmFrameValid = false;
-    m_panelCaptureIdleSkips = 0;
 }
 
 void Renderer::ReleasePanelCaptureDib() noexcept
@@ -3635,7 +3571,6 @@ bool Renderer::EnsurePanelCaptureDib(UINT width, UINT height)
             entry.width == width && entry.height == height) {
             m_panelCaptureDc = entry.dc;
             m_panelCaptureBitmap = entry.bitmap;
-            m_panelCapturePrevious = entry.previous;
             m_panelCapturePixels = entry.pixels;
             m_panelCaptureWidth = entry.width;
             m_panelCaptureHeight = entry.height;
@@ -3682,7 +3617,6 @@ bool Renderer::EnsurePanelCaptureDib(UINT width, UINT height)
         // Active aliases may have pointed at the victim; clear them.
         m_panelCaptureDc = nullptr;
         m_panelCaptureBitmap = nullptr;
-        m_panelCapturePrevious = nullptr;
         m_panelCapturePixels = nullptr;
         m_panelCaptureWidth = 0;
         m_panelCaptureHeight = 0;
@@ -3736,7 +3670,6 @@ bool Renderer::EnsurePanelCaptureDib(UINT width, UINT height)
 
     m_panelCaptureDc = entry.dc;
     m_panelCaptureBitmap = entry.bitmap;
-    m_panelCapturePrevious = entry.previous;
     m_panelCapturePixels = entry.pixels;
     m_panelCaptureWidth = entry.width;
     m_panelCaptureHeight = entry.height;
@@ -4375,8 +4308,6 @@ void Renderer::CancelLiveGlassPanelBake() noexcept
     for (auto& entry : m_panelCapturePool) {
         entry.hashValid = false;
     }
-    m_panelCaptureDwmFrameValid = false;
-    m_panelCaptureIdleSkips = 0;
     auto waitFence = [this](UINT64 fence) {
         if (fence == 0 || m_fence == nullptr || m_fenceEvent == nullptr ||
             m_fence->GetCompletedValue() >= fence) {
@@ -4475,25 +4406,6 @@ bool Renderer::TakeLiveGlassPanelResult(std::vector<uint8_t>& outBgra, int* tag)
     }
 }
 
-
-bool Renderer::ShouldSkipLivePanelCapture() noexcept
-{
-    DWM_TIMING_INFO timing{};
-    timing.cbSize = sizeof(timing);
-    if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing))) {
-        return false;
-    }
-    // Same composed frame: never BitBlt. A periodic "heal" read faulted the
-    // same way the dock probe did. A new frame still has to pass the backdrop
-    // serial gate before any panel BitBlt.
-    if (m_panelCaptureDwmFrameValid && timing.cFrame == m_panelCaptureDwmFrame) {
-        return true;
-    }
-    m_panelCaptureDwmFrame = timing.cFrame;
-    m_panelCaptureDwmFrameValid = true;
-    m_panelCaptureIdleSkips = 0;
-    return false;
-}
 
 bool Renderer::ShouldSkipLivePanelBitBlt(UINT width, UINT height) noexcept
 {
