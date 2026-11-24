@@ -73,10 +73,20 @@ inline constexpr uint32_t kCalmHealthyHookWatchMs = 1000U;
 [[nodiscard]] inline bool IsPointInMonitorBottomHotZone(POINT pt,
     std::span<const std::pair<HMONITOR, RECT>> monitors, const RECT& fallbackBounds,
     long hotZonePx) noexcept {
-    const size_t idx = FindNearestMonitorIndex(pt, monitors);
-    const RECT& bounds = (idx != static_cast<size_t>(-1)) ? monitors[idx].second : fallbackBounds;
-    return pt.x >= bounds.left && pt.x < bounds.right &&
-        pt.y >= bounds.bottom - hotZonePx && pt.y < bounds.bottom;
+    if (monitors.empty()) {
+        return pt.y >= fallbackBounds.bottom - hotZonePx && pt.y < fallbackBounds.bottom &&
+            pt.x >= fallbackBounds.left && pt.x < fallbackBounds.right;
+    }
+    // Check Y first: >99% of desktop mouse moves are above the 8 px bottom
+    // strip and reject on the very first comparison without squared-distance math.
+    for (const auto& entry : monitors) {
+        const RECT& r = entry.second;
+        if (pt.y >= r.bottom - hotZonePx && pt.y < r.bottom &&
+            pt.x >= r.left && pt.x < r.right) {
+            return true;
+        }
+    }
+    return false;
 }
 
 [[nodiscard]] constexpr bool ShouldPostHookPointer(bool hiddenOrHiding,
@@ -91,11 +101,50 @@ inline constexpr uint32_t kCalmHealthyHookWatchMs = 1000U;
     return holdPopupOpen ? hasDockHoverOrGlint : true;
 }
 
+[[nodiscard]] constexpr bool RectIsEmpty(const RECT& r) noexcept {
+    return r.right <= r.left || r.bottom <= r.top;
+}
+
+[[nodiscard]] constexpr RECT UnionRects(const RECT& a, const RECT& b) noexcept {
+    if (RectIsEmpty(a)) {
+        return b;
+    }
+    if (RectIsEmpty(b)) {
+        return a;
+    }
+    return RECT{
+        a.left < b.left ? a.left : b.left,
+        a.top < b.top ? a.top : b.top,
+        a.right > b.right ? a.right : b.right,
+        a.bottom > b.bottom ? a.bottom : b.bottom,
+    };
+}
+
 [[nodiscard]] constexpr bool IsSuppressedSelfDirt(const RECT& dirty, const RECT& selfBounds,
     uint64_t nowMs, uint64_t lastSelfPresentMs) noexcept {
     return lastSelfPresentMs != 0 && nowMs >= lastSelfPresentMs &&
         (nowMs - lastSelfPresentMs) <= kSelfPresentSuppressWindowMs &&
         RectContains(selfBounds, dirty);
+}
+
+[[nodiscard]] constexpr bool IsSuppressedDockOrHoverDirt(const RECT& dirty, const RECT& dockBounds,
+    uint64_t nowMs, uint64_t lastDockSelfPresentMs, const RECT& hoverBounds,
+    uint64_t lastHoverSelfPresentMs) noexcept {
+    const bool dockRecent = lastDockSelfPresentMs != 0 && nowMs >= lastDockSelfPresentMs &&
+        (nowMs - lastDockSelfPresentMs) <= kSelfPresentSuppressWindowMs;
+    const bool hoverRecent = !RectIsEmpty(hoverBounds) && lastHoverSelfPresentMs != 0 &&
+        nowMs >= lastHoverSelfPresentMs &&
+        (nowMs - lastHoverSelfPresentMs) <= kSelfPresentSuppressWindowMs;
+    if (dockRecent && RectContains(dockBounds, dirty)) {
+        return true;
+    }
+    if (hoverRecent && RectContains(hoverBounds, dirty)) {
+        return true;
+    }
+    if (dockRecent && hoverRecent && RectContains(UnionRects(dockBounds, hoverBounds), dirty)) {
+        return true;
+    }
+    return false;
 }
 
 [[nodiscard]] constexpr bool EqualsIgnoreCaseAscii(std::wstring_view a,
@@ -209,6 +258,34 @@ inline void BoxBlurTruncated2Pass(float* data, int width, int height, int radius
             }
         }
     }
+}
+
+enum class StartMenuAction : uint8_t {
+    None = 0,
+    SysCommand = 1,
+    WinKey = 2,
+    CtrlEsc = 3,
+};
+
+[[nodiscard]] constexpr StartMenuAction NextStartMenuAction(uint8_t nextStage,
+    bool startNowVisible, bool expectedVisible, bool foregroundChangedToOtherWindow,
+    bool foregroundElevated) noexcept {
+    if (startNowVisible == expectedVisible) {
+        return StartMenuAction::None;
+    }
+    if (expectedVisible && foregroundChangedToOtherWindow) {
+        return StartMenuAction::None;
+    }
+    if (nextStage == 1U) {
+        // SendInput is silently dropped by UIPI when an elevated window holds
+        // foreground; retry WM_SYSCOMMAND/SC_TASKLIST after fullscreen-claim
+        // unmarking settles instead of injecting blocked keyboard input.
+        return foregroundElevated ? StartMenuAction::SysCommand : StartMenuAction::WinKey;
+    }
+    if (nextStage == 2U) {
+        return foregroundElevated ? StartMenuAction::None : StartMenuAction::CtrlEsc;
+    }
+    return StartMenuAction::None;
 }
 
 }  // namespace active_dock_policy

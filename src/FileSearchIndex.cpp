@@ -625,9 +625,14 @@ void FileIndex::AddUtf16(uint8_t volume, uint64_t id, uint64_t parentId, uint8_t
         flags |= kFlagMeta;
     }
     // Single-pass ASCII fast path: narrow UTF-16 directly into m_names while
-    // computing the FNV-1a stem hash, avoiding a stack copy + double scan.
-    const size_t logical = m_names.size() - kPad;
-    m_names.resize(m_names.size() + length + 1);
+    // computing the FNV-1a stem hash, growing m_names geometrically so we avoid
+    // 1.67M per-record resize/zero-fill calls during bulk MFT ingest.
+    const size_t logical = m_slotStart.back();
+    const size_t needed = logical + length + 1 + kPad;
+    if (needed > m_names.size()) {
+        const size_t grown = std::max(needed, m_names.size() + (m_names.size() >> 1) + 4096);
+        m_names.resize(grown, '\0');
+    }
     char* dst = m_names.data() + logical;
     uint32_t hash = 2166136261U;
     uint32_t hashAtLastDot = 0;
@@ -665,7 +670,7 @@ void FileIndex::AddUtf16(uint8_t volume, uint64_t id, uint64_t parentId, uint8_t
         MapRecord(vol, record, entry);
         return;
     }
-    // Non-ASCII fallback: restore m_names size and zero the overwritten pad bytes.
+    // Non-ASCII fallback: restore m_names size and zero the overwritten bytes.
     m_names.resize(logical + kPad);
     std::memset(m_names.data() + logical, 0, std::min(i, kPad));
     std::string utf8;
@@ -675,6 +680,9 @@ void FileIndex::AddUtf16(uint8_t volume, uint64_t id, uint64_t parentId, uint8_t
 }
 
 void FileIndex::FinishVolume(uint8_t volume) {
+    if (!m_slotStart.empty()) {
+        m_names.resize(static_cast<size_t>(m_slotStart.back()) + kPad, '\0');
+    }
     Volume& v = m_volumes[volume];
     const uint32_t first = v.firstPending;
     for (size_t i = 0; i < m_pendingParent.size(); ++i) {

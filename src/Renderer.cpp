@@ -2342,6 +2342,7 @@ void PollDesktopDirt(HMONITOR monitor) noexcept {
 enum class StripVerdict { Unknown, Quiet, Clean, Dirty };
 
 StripVerdict StripVerdictFor(const RECT& region, uint64_t nowMs, uint64_t lastSelfPresentMs,
+    const RECT& hoverBounds, uint64_t lastHoverSelfPresentMs,
     uint64_t& deferredSelfCheckDueMs) noexcept {
     if (!g_desktopDirt.valid || g_desktopDirt.failed || !g_desktopDirt.trusted ||
         !RectContainsRect(g_stripWatch.desktop, region)) {
@@ -2363,21 +2364,45 @@ StripVerdict StripVerdictFor(const RECT& region, uint64_t nowMs, uint64_t lastSe
         if (!RectsIntersect(g_desktopDirt.rects[index], region)) {
             continue;
         }
-        if (!active_dock_policy::IsSuppressedSelfDirt(
-                g_desktopDirt.rects[index], region, nowMs, lastSelfPresentMs)) {
+        if (!active_dock_policy::IsSuppressedDockOrHoverDirt(
+                g_desktopDirt.rects[index], region, nowMs, lastSelfPresentMs,
+                hoverBounds, lastHoverSelfPresentMs)) {
             deferredSelfCheckDueMs = 0;
             return StripVerdict::Dirty;
         }
         sawSuppressedSelf = true;
     }
     if (sawSuppressedSelf) {
+        const uint64_t latestSelf = (std::max)(lastSelfPresentMs, lastHoverSelfPresentMs);
         deferredSelfCheckDueMs =
-            lastSelfPresentMs + active_dock_policy::kSelfPresentCatchUpDelayMs;
+            latestSelf + active_dock_policy::kSelfPresentCatchUpDelayMs;
     }
     return StripVerdict::Clean;
 }
 
 }  // namespace
+
+void Renderer::SetHoverLabelWindow(HWND window) noexcept {
+    m_hoverLabelWindow = window;
+    if (window == nullptr) {
+        m_hoverLabelBounds = {};
+        m_lastHoverLabelSelfPresentMs = 0;
+    }
+}
+
+void Renderer::NoteHoverLabelSelfPresent(const RECT& bounds) noexcept {
+    if (active_dock_policy::RectIsEmpty(bounds)) {
+        return;
+    }
+    const uint64_t nowMs = GetTickCount64();
+    if (m_lastHoverLabelSelfPresentMs != 0 && nowMs >= m_lastHoverLabelSelfPresentMs &&
+        (nowMs - m_lastHoverLabelSelfPresentMs) <= active_dock_policy::kSelfPresentSuppressWindowMs) {
+        m_hoverLabelBounds = active_dock_policy::UnionRects(m_hoverLabelBounds, bounds);
+    } else {
+        m_hoverLabelBounds = bounds;
+    }
+    m_lastHoverLabelSelfPresentMs = nowMs;
+}
 
 void Renderer::NotePopupSelfPresent(int popupIndex) noexcept {
     if (popupIndex >= 0 && popupIndex < 4) {
@@ -2408,8 +2433,11 @@ void Renderer::FinishDesktopChangePoll() noexcept {
 }
 
 bool Renderer::HadDesktopActivity() const noexcept {
-    return !g_desktopDirt.trusted || g_desktopDirt.failed || g_desktopDirt.overflow ||
-        (g_desktopDirt.fresh && g_desktopDirt.imageUpdate) || m_deferredSelfCheckDueMs != 0;
+    // Only escalate to monitor-refresh backdrop cadence when real strip dirt
+    // is pending retry. Self-presents (glint, hover label), unrelated desktop
+    // updates outside the dock, and deferred catch-up checks run fine on the
+    // 33 ms resting timer without waking at 120-240 Hz.
+    return m_backdropDirtPending;
 }
 
 bool Renderer::DesktopRegionChanged(const RECT& region, int popupIndex) const noexcept {
@@ -2444,8 +2472,9 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     uint64_t composedFrame = 0;
     bool haveComposedFrame = false;
     if (m_backdropValid && !m_backdropRefreshRequested) {
-        const StripVerdict verdict = StripVerdictFor(
-            screenRectangle, GetTickCount64(), m_lastDockSelfPresentMs, m_deferredSelfCheckDueMs);
+        const StripVerdict verdict = StripVerdictFor(screenRectangle, GetTickCount64(),
+            m_lastDockSelfPresentMs, m_hoverLabelBounds, m_lastHoverLabelSelfPresentMs,
+            m_deferredSelfCheckDueMs);
         if (verdict == StripVerdict::Dirty) {
             m_backdropDirtPending = true;
         }
@@ -2500,8 +2529,10 @@ bool Renderer::CaptureBackdrop(const RECT& screenRectangle, bool* changed) {
     // Magnifier exclusion leaves display affinity at WDA_NONE, so a recording
     // still sees the dock on every frame.
     ProfileScope::Mark("Renderer::BackdropBitBlt");
-    HWND excludeDock[] = {m_window};
-    if (!CaptureScreenExcluding(screenRectangle, m_backdropDibPixels, m_backdropDc, excludeDock, 1)) {
+    HWND excludeDock[2] = {m_window, m_hoverLabelWindow};
+    const UINT excludeCount = m_hoverLabelWindow != nullptr ? 2U : 1U;
+    if (!CaptureScreenExcluding(
+            screenRectangle, m_backdropDibPixels, m_backdropDc, excludeDock, excludeCount)) {
         return false;
     }
     m_backdropOriginX = screenRectangle.left;

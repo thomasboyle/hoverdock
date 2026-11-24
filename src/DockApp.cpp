@@ -1590,14 +1590,6 @@ std::wstring NotifyIconStatus(const TrayNotifyIcon& icon) {
     return status;
 }
 
-HWND FindNamedCoreWindow(const wchar_t* title) {
-    HWND window = FindWindowW(L"Windows.UI.Core.CoreWindow", title);
-    if (window != nullptr) {
-        return window;
-    }
-    return FindWindowExW(nullptr, nullptr, L"Windows.UI.Core.CoreWindow", title);
-}
-
 bool IsVisibleUncloakedWindow(HWND window) {
     if (window == nullptr || IsWindowVisible(window) == FALSE) {
         return false;
@@ -1728,12 +1720,37 @@ bool SendCtrlEsc() {
         static_cast<UINT>(std::size(inputs));
 }
 
-bool GrantExplorerForeground();
+bool GrantExplorerForeground(HWND tray) noexcept {
+    DWORD processId = 0;
+    if (tray != nullptr) {
+        GetWindowThreadProcessId(tray, &processId);
+    }
+    if (processId != 0) {
+        return AllowSetForegroundWindow(processId) != FALSE;
+    }
+    return AllowSetForegroundWindow(ASFW_ANY) != FALSE;
+}
 
-bool InjectStartHotkey() {
-    // A NOACTIVATE dock click leaves the previous app in front. SendInput is
-    // then ignored when that app holds the foreground lock or is elevated.
-    // Join its thread, hand foreground to Explorer, then inject the hotkey.
+bool TriggerStartViaSysCommand(HWND fallbackWindow) {
+    // WM_SYSCOMMAND / SC_TASKLIST goes directly to explorer.exe (medium
+    // integrity), so UIPI does not drop it when an elevated app holds
+    // foreground, foreground keyboard hooks cannot swallow it, and posting to
+    // Shell_TrayWnd serializes behind MarkFullscreenWindow(FALSE).
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    static_cast<void>(GrantExplorerForeground(tray));
+    if (tray != nullptr && PostMessageW(tray, WM_SYSCOMMAND, SC_TASKLIST, 0) != FALSE) {
+        return true;
+    }
+    if (fallbackWindow != nullptr &&
+        PostMessageW(fallbackWindow, WM_SYSCOMMAND, SC_TASKLIST, 0) != FALSE) {
+        return true;
+    }
+    return false;
+}
+
+bool InjectStartHotkey(bool useCtrlEsc = false) {
+    // A NOACTIVATE dock click leaves the previous app in front. Join its
+    // thread and hand foreground to Explorer when possible before SendInput.
     HWND foreground = GetForegroundWindow();
     DWORD foregroundThread = 0;
     if (foreground != nullptr) {
@@ -1744,13 +1761,13 @@ bool InjectStartHotkey() {
         AttachThreadInput(thisThread, foregroundThread, TRUE) != FALSE;
 
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    static_cast<void>(GrantExplorerForeground());
-    if (tray != nullptr) {
+    static_cast<void>(GrantExplorerForeground(tray));
+    if (tray != nullptr && IsWindowVisible(tray) != FALSE) {
         SetForegroundWindow(tray);
     }
 
-    bool opened = SendWinKey();
-    if (!opened) {
+    bool opened = useCtrlEsc ? SendCtrlEsc() : SendWinKey();
+    if (!opened && !useCtrlEsc) {
         opened = SendCtrlEsc();
     }
 
@@ -1790,40 +1807,29 @@ bool IsWindowProcessElevated(HWND window) noexcept {
     return elevated;
 }
 
-bool GrantExplorerForeground() {
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    DWORD processId = 0;
-    if (tray != nullptr) {
-        GetWindowThreadProcessId(tray, &processId);
-    }
-    if (processId != 0) {
-        return AllowSetForegroundWindow(processId) != FALSE;
-    }
-    return AllowSetForegroundWindow(ASFW_ANY) != FALSE;
-}
+struct CoreWindowProcessQuery {
+    const std::wstring_view* names = nullptr;
+    size_t nameCount = 0;
+    bool requireVisible = true;
+    HWND found = nullptr;
+};
 
-bool IsStartLauncherVisible() {
-    if (IsVisibleUncloakedWindow(FindNamedCoreWindow(L"Start"))) {
-        return true;
-    }
-    return IsVisibleUncloakedWindow(FindWindowW(L"XamlExplorerHostIslandWindow", L"Start"));
-}
-
-BOOL CALLBACK FindNotificationCenterWindow(HWND window, LPARAM data) {
-    // Win+N calendar/notifications live in ShellExperienceHost (Win10 action
-    // center lineage) as a top-level Windows.UI.Core.CoreWindow; newer builds
-    // may host it in Explorer instead. Titles localize, so match class +
-    // owning process, never the title. UWP app windows are
-    // ApplicationFrameWindow at top level, so a top-level CoreWindow is
-    // effectively a shell flyout. "Windows Input Experience" is cloaked and
-    // never reaches the process check below.
-    if (IsVisibleUncloakedWindow(window) == false) {
+BOOL CALLBACK EnumCoreWindowByProcess(HWND window, LPARAM data) {
+    auto* query = reinterpret_cast<CoreWindowProcessQuery*>(data);
+    if (query->requireVisible && IsWindowVisible(window) == FALSE) {
         return TRUE;
     }
     wchar_t className[64]{};
     if (GetClassNameW(window, className, static_cast<int>(std::size(className))) == 0 ||
         std::wstring_view(className) != L"Windows.UI.Core.CoreWindow") {
         return TRUE;
+    }
+    if (query->requireVisible) {
+        int cloaked = 0;
+        if (SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) &&
+            cloaked != 0) {
+            return TRUE;
+        }
     }
     DWORD processId = 0;
     GetWindowThreadProcessId(window, &processId);
@@ -1845,24 +1851,54 @@ BOOL CALLBACK FindNotificationCenterWindow(HWND window, LPARAM data) {
     const size_t slash = image.find_last_of(L"\\/");
     const std::wstring_view fileName =
         slash == std::wstring_view::npos ? image : image.substr(slash + 1);
-    // Case-insensitive compare without EqualInsensitiveWide (defined below).
-    const auto matches = [](std::wstring_view name, std::wstring_view want) {
-        return name.size() == want.size() &&
-            std::equal(name.begin(), name.end(), want.begin(), [](wchar_t lhs, wchar_t rhs) {
-                   return std::towlower(lhs) == std::towlower(rhs);
-               });
-    };
-    if (matches(fileName, L"ShellExperienceHost.exe") || matches(fileName, L"explorer.exe")) {
-        *reinterpret_cast<bool*>(data) = true;
-        return FALSE;
+    for (size_t idx = 0; idx < query->nameCount; ++idx) {
+        const std::wstring_view want = query->names[idx];
+        if (fileName.size() == want.size() &&
+            std::equal(fileName.begin(), fileName.end(), want.begin(),
+                [](wchar_t lhs, wchar_t rhs) { return std::towlower(lhs) == std::towlower(rhs); })) {
+            query->found = window;
+            return FALSE;
+        }
     }
     return TRUE;
 }
 
+bool IsStartLauncherVisible() {
+    // Cache the Start host CoreWindow HWND so repeated visibility checks are
+    // O(1) without EnumWindows or OpenProcess (even on non-English locales).
+    static HWND s_cachedStartCore = nullptr;
+    if (s_cachedStartCore != nullptr && IsWindow(s_cachedStartCore) != FALSE) {
+        return IsVisibleUncloakedWindow(s_cachedStartCore);
+    }
+    s_cachedStartCore = nullptr;
+
+    if (HWND startCore = FindWindowW(L"Windows.UI.Core.CoreWindow", L"Start"); startCore != nullptr) {
+        s_cachedStartCore = startCore;
+        return IsVisibleUncloakedWindow(startCore);
+    }
+    if (IsVisibleUncloakedWindow(FindWindowW(L"XamlExplorerHostIslandWindow", L"Start"))) {
+        return true;
+    }
+    static constexpr std::wstring_view kStartHosts[] = {L"StartMenuExperienceHost.exe"};
+    CoreWindowProcessQuery query{kStartHosts, std::size(kStartHosts), false, nullptr};
+    EnumWindows(&EnumCoreWindowByProcess, reinterpret_cast<LPARAM>(&query));
+    if (query.found != nullptr) {
+        s_cachedStartCore = query.found;
+        return IsVisibleUncloakedWindow(query.found);
+    }
+    return false;
+}
+
 bool IsNotificationCenterVisible() {
-    bool found = false;
-    EnumWindows(&FindNotificationCenterWindow, reinterpret_cast<LPARAM>(&found));
-    return found;
+    // Win+N calendar/notifications live in ShellExperienceHost (Win10 action
+    // center lineage) or Explorer as a top-level Windows.UI.Core.CoreWindow.
+    static constexpr std::wstring_view kNotificationHosts[] = {
+        L"ShellExperienceHost.exe",
+        L"explorer.exe",
+    };
+    CoreWindowProcessQuery query{kNotificationHosts, std::size(kNotificationHosts), true, nullptr};
+    EnumWindows(&EnumCoreWindowByProcess, reinterpret_cast<LPARAM>(&query));
+    return query.found != nullptr;
 }
 
 bool IsAnyShellFlyoutVisible() {
@@ -2455,6 +2491,7 @@ int DockApp::Run() {
     try {
         m_renderer.Initialize(m_window, m_dockWidth, m_dockHeight);
         m_rendererInitialized = true;
+        m_renderer.SetHoverLabelWindow(m_hoverLabelWindow);
         ApplyIconLoad(iconLoad, initialIcons);
         AssignIconTextureIndices();
     } catch (...) {
@@ -3383,6 +3420,18 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         // the cadence sync so Task Manager / fullscreen transitions take effect now.
         m_elevatedForegroundValid = false;
         m_fgBorderlessValid = false;
+        if (m_startMenuRetryStage != 0U && m_startMenuExpectedVisible) {
+            HWND foreground = GetForegroundWindow();
+            if (foreground != nullptr &&
+                foreground != m_startMenuPrevForeground &&
+                foreground != m_window &&
+                foreground != m_inputWindow &&
+                foreground != FindWindowW(L"Shell_TrayWnd", nullptr)) {
+                // Start (or another target) already took foreground: cancel the
+                // fallback timer so the happy path does zero timer wakeups.
+                StopShellFlyoutWatch();
+            }
+        }
         EnsureMouseHook();
         SyncCursorWatchInterval();
         // Foreground changes (e.g. the notification panel closing) must
@@ -3472,6 +3521,7 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
 
     case kDeferredClickMessage: {
+        m_deferredClickPending = false;
         const POINT point{static_cast<LONG>(static_cast<SHORT>(LOWORD(lParam))),
             static_cast<LONG>(static_cast<SHORT>(HIWORD(lParam)))};
         if (m_dragSnapAnimating) {
@@ -3787,28 +3837,6 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         }
         return 0;
 
-    case kOpenStartMenuMessage:
-        // Legacy async entry: OpenStartMenuFromDock now sends synchronously.
-        // Keep the handler as a no-broadcast fallback so any in-flight message
-        // still just delivers the keystroke instead of racing Explorer with
-        // work-area/registry changes.
-        if (!m_shellFlyoutHold) {
-            return 0;
-        }
-        EnsureTaskbarList();
-        if (m_taskbarList2 != nullptr) {
-            for (FullscreenClaim& claim : m_fullscreenClaims) {
-                if (claim.window != nullptr) {
-                    m_taskbarList2->MarkFullscreenWindow(claim.window, FALSE);
-                }
-            }
-        }
-        if (!InjectStartHotkey()) {
-            ReleaseShellFlyoutHold();
-            Log(L"Start menu did not accept input.");
-        }
-        return 0;
-
     case WM_TIMER:
         if (wParam == kRefreshTimerId) {
             RefreshRunningWindows();
@@ -3832,6 +3860,8 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
             }).detach();
         } else if (wParam == kCursorWatchTimerId) {
             PumpCursorWatch();
+        } else if (wParam == kStartMenuTimerId) {
+            HandleStartMenuRetryTimer();
         } else if (wParam == kGlintTimerId) {
             TickGlint();
         } else if (wParam == kChromeInkTimerId) {
@@ -3975,13 +4005,15 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
 
     case WM_SETCURSOR:
         if (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) {
+            static const HCURSOR kSizeNsCursor = LoadCursorW(nullptr, IDC_SIZENS);
+            static const HCURSOR kArrowCursor = LoadCursorW(nullptr, IDC_ARROW);
             POINT cursor{};
             GetCursorPos(&cursor);
             if (m_scalingDivider || DividerAtScreenPoint(cursor) >= 0) {
-                SetCursor(LoadCursorW(nullptr, IDC_SIZENS));
+                SetCursor(kSizeNsCursor);
                 return TRUE;
             }
-            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            SetCursor(kArrowCursor);
             return TRUE;
         }
         break;
@@ -3999,6 +4031,7 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
     }
 
     case WM_LBUTTONDOWN: {
+        m_deferredClickPending = false;
         const POINT point = ScreenPointFromClient(window, lParam);
         ClearPressState();
         // Dismiss the tooltip on press, not just on the deferred click: the
@@ -4063,11 +4096,11 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
         const double nowMove = QpcSeconds();
         if (m_pressedIcon >= 0 && m_lastPointerSampleAt > 0.0 &&
             nowMove - m_lastPointerSampleAt > kMaxPointerStallSeconds) {
-            ClearPressState();
+            // Suppress accidental drag after a hitch, but preserve m_pressedIcon
+            // so the click itself still activates on release.
             m_suppressDragUntilRelease = true;
-        } else {
-            m_lastPointerSampleAt = nowMove;
         }
+        m_lastPointerSampleAt = nowMove;
         if (!m_suppressDragUntilRelease && !m_launchClickInProgress && m_pressedIcon >= 0 &&
             IsPersistentDisplayIcon(m_pressedIcon) &&
             (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 &&
@@ -4093,12 +4126,13 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
         // FIFO preserves ordering; the point travels in lParam because the
         // cursor may move before dispatch.
         const WPARAM branch = m_scalingDivider ? 0 : (m_draggedIcon >= 0 ? 1 : 2);
+        m_deferredClickPending = true;
         PostMessageW(m_window, kDeferredClickMessage, branch, MAKELPARAM(point.x, point.y));
         return 0;
     }
 
     case WM_CAPTURECHANGED:
-        if (!IsDragActive()) {
+        if (!IsDragActive() && !m_deferredClickPending) {
             ClearPressState();
             if (QpcSeconds() >= m_suppressBackdropUntil) {
                 QueueRenderFrame();
@@ -4124,6 +4158,7 @@ LRESULT DockApp::HandleInputMessage(HWND window, UINT message, WPARAM wParam, LP
         return 0;
 
     case WM_DESTROY:
+        m_deferredClickPending = false;
         ClearPressState();
         if (m_inputWindow == window) {
             m_inputWindow = nullptr;
@@ -4203,6 +4238,8 @@ void DockApp::CreateHoverLabelWindow() {
         0, 0, 1, 1, nullptr, nullptr, m_instance, nullptr);
     if (m_hoverLabelWindow == nullptr) {
         Log(L"Could not create the hover label window.");
+    } else if (m_rendererInitialized) {
+        m_renderer.SetHoverLabelWindow(m_hoverLabelWindow);
     }
 }
 
@@ -4238,7 +4275,13 @@ HFONT DockApp::HoverLabelFont() {
 }
 
 void DockApp::DestroyHoverLabelWindow() {
+    ClearHoverLabelCache(true);
     ReleaseLayerPresentDib(m_hoverLabelDib);
+    m_hoverLabelVisible = false;
+    m_hoverLabelScreenBounds = {};
+    if (m_rendererInitialized) {
+        m_renderer.SetHoverLabelWindow(nullptr);
+    }
     if (m_hoverLabelWindow == nullptr) {
         return;
     }
@@ -4896,7 +4939,7 @@ void DockApp::UpdateHoverLabel(bool forceGlassRefresh) {
     if (m_hoveredIcon == m_hoverLabelIcon && !forceGlassRefresh) {
         // Label sits above the dock; dock HWND_TOPMOST bumps can still sink it.
         // Re-assert topmost without re-baking glass.
-        if (m_hoverLabelWindow != nullptr && IsWindowVisible(m_hoverLabelWindow) != FALSE) {
+        if (m_hoverLabelWindow != nullptr && m_hoverLabelVisible) {
             SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, 0, 0, 0, 0,
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_NOREDRAW);
         }
@@ -4944,54 +4987,109 @@ void DockApp::UpdateHoverLabel(bool forceGlassRefresh) {
     const LONG gap = GreaterOf(4L, static_cast<LONG>(std::lround(8.0F * scale)));
     const LONG shadowMargin = DockShadowMarginPx(scale);
     const LONG glassTop = dockScreen.top + shadowMargin;
-    LONG textWidth = 0;
-    {
-        HFONT font = HoverLabelFont();
-        HDC measureDc = GetDC(nullptr);
-        if (measureDc != nullptr) {
-            HDC memory = CreateCompatibleDC(measureDc);
-            if (memory != nullptr) {
-                HGDIOBJ prev = SelectObject(memory, font);
-                SIZE textSize{};
-                if (GetTextExtentPoint32W(memory, text.c_str(), static_cast<int>(text.size()),
-                        &textSize) != FALSE) {
-                    textWidth = textSize.cx;
-                }
-                if (prev != nullptr && prev != HGDI_ERROR) {
-                    SelectObject(memory, prev);
-                }
-                DeleteDC(memory);
-            }
-            ReleaseDC(nullptr, measureDc);
+
+    HFONT font = HoverLabelFont();
+    if (dpi != m_hoverLabelCacheDpi || m_hoverLabelFontPx != m_hoverLabelCacheFontPx) {
+        m_hoverLabelCache.clear();
+        m_hoverLabelCacheDpi = dpi;
+        m_hoverLabelCacheFontPx = m_hoverLabelFontPx;
+    }
+
+    const HoverLabelCacheEntry* cached = nullptr;
+    for (const HoverLabelCacheEntry& entry : m_hoverLabelCache) {
+        if (entry.text == text) {
+            cached = &entry;
+            break;
         }
     }
-    const HoverBubbleLayout bubble = LayoutHoverBubble(textWidth, scale);
-    const LONG outerWidth = bubble.width + bubble.shadow * 2L;
-    const LONG outerHeight = bubble.height + bubble.shadow * 2L;
-    POINT destination{
-        iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L - outerWidth / 2L,
-        glassTop - outerHeight + bubble.shadow - gap};
 
-    // Hide before bake on icon change so the previous bubble is not captured.
-    // Glint refresh keeps the window up to avoid flicker.
-    if (!forceGlassRefresh && m_hoverLabelWindow != nullptr) {
-        ShowWindow(m_hoverLabelWindow, SW_HIDE);
+    if (cached == nullptr) {
+        LONG textWidth = 0;
+        HDC measureDc = m_hoverLabelDib.dc;
+        HDC tempScreen = nullptr;
+        HDC tempMemory = nullptr;
+        if (measureDc == nullptr) {
+            tempScreen = GetDC(nullptr);
+            if (tempScreen != nullptr) {
+                tempMemory = CreateCompatibleDC(tempScreen);
+                measureDc = tempMemory;
+            }
+        }
+        if (measureDc != nullptr) {
+            HGDIOBJ prev = SelectObject(measureDc, font);
+            SIZE textSize{};
+            if (GetTextExtentPoint32W(measureDc, text.c_str(), static_cast<int>(text.size()),
+                    &textSize) != FALSE) {
+                textWidth = textSize.cx;
+            }
+            if (prev != nullptr && prev != HGDI_ERROR) {
+                SelectObject(measureDc, prev);
+            }
+        }
+        if (tempMemory != nullptr) {
+            DeleteDC(tempMemory);
+        }
+        if (tempScreen != nullptr) {
+            ReleaseDC(nullptr, tempScreen);
+        }
+
+        const HoverBubbleLayout bubble = LayoutHoverBubble(textWidth, scale);
+        const LONG outerWidth = bubble.width + bubble.shadow * 2L;
+        const LONG outerHeight = bubble.height + bubble.shadow * 2L;
+        if (outerWidth <= 0 || outerHeight <= 0) {
+            HideHoverLabel();
+            return;
+        }
+        HoverLabelCacheEntry entry;
+        entry.text = text;
+        entry.shadow = bubble.shadow;
+        entry.pixels.resize(
+            static_cast<size_t>(outerWidth) * static_cast<size_t>(outerHeight) * 4U);
+        if (!RasterizeHoverLabel(
+                text, textWidth, scale, entry.labelSize, entry.pixels.data())) {
+            HideHoverLabel();
+            return;
+        }
+        if (m_hoverLabelCache.size() >= kMaxHoverLabelCacheEntries) {
+            m_hoverLabelCache.erase(m_hoverLabelCache.begin());
+        }
+        m_hoverLabelCache.push_back(std::move(entry));
+        cached = &m_hoverLabelCache.back();
     }
 
-    if (outerWidth <= 0 || outerHeight <= 0 ||
-        !EnsureLayerPresentDib(m_hoverLabelDib, outerWidth, outerHeight) ||
+    if (!EnsureLayerPresentDibAtLeast(
+            m_hoverLabelDib, cached->labelSize.cx, cached->labelSize.cy) ||
         m_hoverLabelDib.bits == nullptr || m_hoverLabelDib.dc == nullptr) {
         HideHoverLabel();
         return;
     }
 
-    SIZE labelSize{};
-    if (!RasterizeHoverLabel(
-            text, textWidth, scale, labelSize, static_cast<uint8_t*>(m_hoverLabelDib.bits))) {
-        HideHoverLabel();
-        return;
+    const size_t rowBytes = static_cast<size_t>(cached->labelSize.cx) * 4U;
+    const size_t dstStride = static_cast<size_t>(m_hoverLabelDib.width) * 4U;
+    const uint8_t* src = cached->pixels.data();
+    auto* dst = static_cast<uint8_t*>(m_hoverLabelDib.bits);
+    if (dstStride == rowBytes) {
+        std::memcpy(dst, src, cached->pixels.size());
+    } else {
+        for (LONG y = 0; y < cached->labelSize.cy; ++y) {
+            std::memcpy(dst + static_cast<size_t>(y) * dstStride,
+                src + static_cast<size_t>(y) * rowBytes, rowBytes);
+        }
     }
 
+    POINT destination{
+        iconTopLeft.x + (iconBottomRight.x - iconTopLeft.x) / 2L - cached->labelSize.cx / 2L,
+        glassTop - cached->labelSize.cy + cached->shadow - gap};
+    const RECT newBounds{destination.x, destination.y,
+        destination.x + cached->labelSize.cx, destination.y + cached->labelSize.cy};
+    if (m_rendererInitialized) {
+        const RECT dirtyUnion = m_hoverLabelVisible
+            ? active_dock_policy::UnionRects(m_hoverLabelScreenBounds, newBounds)
+            : newBounds;
+        m_renderer.NoteHoverLabelSelfPresent(dirtyUnion);
+    }
+
+    SIZE labelSize = cached->labelSize;
     POINT source{0L, 0L};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     const BOOL updated = UpdateLayeredWindow(m_hoverLabelWindow, nullptr, &destination, &labelSize,
@@ -5001,11 +5099,15 @@ void DockApp::UpdateHoverLabel(bool forceGlassRefresh) {
         HideHoverLabel();
         return;
     }
-    if (SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, SaturatedInt(destination.x),
-            SaturatedInt(destination.y), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy),
-            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW) == FALSE) {
-        Log(L"Could not position the hover label window.");
+    if (!m_hoverLabelVisible) {
+        if (SetWindowPos(m_hoverLabelWindow, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW) ==
+            FALSE) {
+            Log(L"Could not position the hover label window.");
+        }
+        m_hoverLabelVisible = true;
     }
+    m_hoverLabelScreenBounds = newBounds;
     m_hoverLabelIcon = m_hoveredIcon;
 }
 
@@ -5022,7 +5124,7 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, LONG measuredTextWid
 
     // Capsule + tail coverage, then an exact O(W*H) prefix-sum 2-pass box blur
     // for the drop shadow and direct premultiplied fill into the DIB.
-    std::vector<float> coverage(pixelCount);
+    m_hoverLabelCoverage.resize(pixelCount);
     const float originX = static_cast<float>(bubble.shadow);
     const float originY = static_cast<float>(bubble.shadow);
     const float shapeW = static_cast<float>(bubble.width);
@@ -5031,7 +5133,7 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, LONG measuredTextWid
     const float tailBase = static_cast<float>(bubble.tailBase);
     for (LONG y = 0; y < labelSize.cy; ++y) {
         float* const covRow =
-            coverage.data() + static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx);
+            m_hoverLabelCoverage.data() + static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx);
         const float localY = static_cast<float>(y) + 0.5F - originY;
         for (LONG x = 0; x < labelSize.cx; ++x) {
             const float localX = static_cast<float>(x) + 0.5F - originX;
@@ -5039,10 +5141,11 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, LONG measuredTextWid
         }
     }
 
-    std::vector<float> shadow = coverage;
+    m_hoverLabelShadow.assign(m_hoverLabelCoverage.begin(), m_hoverLabelCoverage.end());
     const int blurRadius = std::max(3, static_cast<int>(std::lround(5.0F * scale)));
     active_dock_policy::BoxBlurTruncated2Pass(
-        shadow.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy), blurRadius);
+        m_hoverLabelShadow.data(), SaturatedInt(labelSize.cx), SaturatedInt(labelSize.cy),
+        blurRadius);
 
     constexpr float kLabelC = 198.0F;
     constexpr float kLabelAlpha = 204.0F / 255.0F;
@@ -5052,10 +5155,10 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, LONG measuredTextWid
         for (LONG x = 0; x < labelSize.cx; ++x) {
             const size_t index =
                 static_cast<size_t>(y) * static_cast<size_t>(labelSize.cx) + static_cast<size_t>(x);
-            const float cov = coverage[index];
+            const float cov = m_hoverLabelCoverage[index];
             const LONG shadowY = y - shadowDrop;
             const float shade = shadowY >= 0
-                ? shadow[static_cast<size_t>(shadowY) * static_cast<size_t>(labelSize.cx) +
+                ? m_hoverLabelShadow[static_cast<size_t>(shadowY) * static_cast<size_t>(labelSize.cx) +
                       static_cast<size_t>(x)]
                 : 0.0F;
             const float glassA = kLabelAlpha * cov;
@@ -5079,8 +5182,28 @@ bool DockApp::RasterizeHoverLabel(const std::wstring& text, LONG measuredTextWid
     return true;
 }
 
+void DockApp::ClearHoverLabelCache(bool releaseScratch) noexcept {
+    m_hoverLabelCache.clear();
+    m_hoverLabelCacheDpi = 0;
+    m_hoverLabelCacheFontPx = 0;
+    if (releaseScratch) {
+        m_hoverLabelCoverage.clear();
+        m_hoverLabelCoverage.shrink_to_fit();
+        m_hoverLabelShadow.clear();
+        m_hoverLabelShadow.shrink_to_fit();
+    }
+}
+
 void DockApp::HideHoverLabel() noexcept {
     m_hoverLabelIcon = -1;
+    if (!m_hoverLabelVisible) {
+        return;
+    }
+    m_hoverLabelVisible = false;
+    if (m_rendererInitialized && !active_dock_policy::RectIsEmpty(m_hoverLabelScreenBounds)) {
+        m_renderer.NoteHoverLabelSelfPresent(m_hoverLabelScreenBounds);
+    }
+    m_hoverLabelScreenBounds = {};
     if (m_hoverLabelWindow != nullptr) {
         ShowWindow(m_hoverLabelWindow, SW_HIDE);
     }
@@ -6609,6 +6732,21 @@ bool DockApp::EnsureLayerPresentDib(LayerPresentDib& slot, LONG width, LONG heig
     slot.width = width;
     slot.height = height;
     return true;
+}
+
+bool DockApp::EnsureLayerPresentDibAtLeast(LayerPresentDib& slot, LONG minWidth,
+    LONG minHeight) noexcept
+{
+    if (minWidth <= 0 || minHeight <= 0) {
+        return false;
+    }
+    if (slot.dc != nullptr && slot.bitmap != nullptr && slot.bits != nullptr &&
+        slot.width >= minWidth && slot.height >= minHeight) {
+        return true;
+    }
+    const LONG targetWidth = (std::max)(slot.width, minWidth);
+    const LONG targetHeight = (std::max)(slot.height, minHeight);
+    return EnsureLayerPresentDib(slot, targetWidth, targetHeight);
 }
 
 void DockApp::ReleaseLayerPresentDib(LayerPresentDib& slot) noexcept
@@ -10615,6 +10753,9 @@ UINT DockApp::HostDpi() const noexcept {
 }
 
 bool DockApp::AdoptMonitorForCursor(POINT cursor) {
+    if (m_hostMonitor != nullptr && active_dock_policy::PointInRect(cursor, m_hostBounds)) {
+        return false;
+    }
     const HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
     RECT bounds{};
     if (!MonitorRect(monitor, bounds)) {
@@ -10864,6 +11005,7 @@ void DockApp::AdvanceAnimation() {
     CloseContextMenu();
     ClearPressState();
     HideHoverLabel();
+    ClearHoverLabelCache(true);
     ReleaseLayerPresentDib(m_hoverLabelDib);
     ShowWindow(m_inputWindow, SW_HIDE);
     ShowWindow(m_window, SW_HIDE);
@@ -10988,7 +11130,6 @@ void DockApp::OnBackdropTick() {
     bool active = false;
     if (m_rendererInitialized) {
         m_renderer.PollDesktopChanges(m_hostMonitor);
-        active = m_renderer.HadDesktopActivity();
     }
     if (m_visibility == VisibilityState::Visible && !IsDragActive() &&
         QpcSeconds() >= m_suppressBackdropUntil) {
@@ -11001,6 +11142,9 @@ void DockApp::OnBackdropTick() {
         active = true;
     }
     if (m_rendererInitialized) {
+        if (m_renderer.HadDesktopActivity()) {
+            active = true;
+        }
         m_renderer.FinishDesktopChangePoll();
     }
     if (active) {
@@ -11096,12 +11240,13 @@ void DockApp::SyncBackdropTimerInterval(bool wantFast, bool wantResting) noexcep
 }
 
 void DockApp::HandlePointer(POINT cursor) {
+    const double now = QpcSeconds();
     if (cursor.x != m_lastCursor.x || cursor.y != m_lastCursor.y) {
-        m_lastPointerMotionAt = QpcSeconds();
+        m_lastPointerMotionAt = now;
     }
     m_lastCursor = cursor;
     m_lastHookEventCount = m_mouseHookEventCount.load(std::memory_order_relaxed);
-    m_lastPointerSampleAt = QpcSeconds();
+    m_lastPointerSampleAt = now;
     UpdateGlintTarget(cursor);
     if (IsDragActive()) {
         if (m_draggedIcon >= 0) {
@@ -11109,53 +11254,58 @@ void DockApp::HandlePointer(POINT cursor) {
         }
         return;
     }
-
-    const bool inHotZone = IsCursorInBottomHotZone(cursor);
-    const bool borderlessFullscreen = IsForegroundBorderlessFullscreenAt(cursor);
     if (m_shellFlyoutHold) {
         return;
     }
-    if (inHotZone && !borderlessFullscreen) {
-        static_cast<void>(AdoptMonitorForCursor(cursor));
-    }
+
+    const bool inHotZone = IsCursorInBottomHotZone(cursor);
 
     if (m_visibility == VisibilityState::Hidden) {
         HideHoverLabel();
-        if (inHotZone && !borderlessFullscreen) {
+        if (inHotZone && !IsForegroundBorderlessFullscreenAt(cursor)) {
+            static_cast<void>(AdoptMonitorForCursor(cursor));
             BeginShow();
         }
         return;
     }
 
-    if (m_visibility == VisibilityState::Hiding && inHotZone && !borderlessFullscreen) {
-        BeginShow();
+    if (m_visibility == VisibilityState::Hiding) {
+        if (inHotZone && !IsForegroundBorderlessFullscreenAt(cursor)) {
+            static_cast<void>(AdoptMonitorForCursor(cursor));
+            BeginShow();
+        }
         return;
+    }
+
+    if (inHotZone && !IsForegroundBorderlessFullscreenAt(cursor)) {
+        static_cast<void>(AdoptMonitorForCursor(cursor));
     }
 
     // If a borderless fullscreen game/app took focus while the dock was up,
     // slide away unless the user is actively over the dock or a flyout.
-    if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
-        borderlessFullscreen && !IsSearchOpen() && !IsCursorOverDock(cursor) &&
-        !IsCursorWithinFlyoutZone(cursor) && !IsOverflowOpen() && !IsDockSettingsOpen() &&
-        !IsContextMenuOpen()) {
-        BeginHide();
-        return;
-    }
-
-    if ((m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible) &&
-        !inHotZone && !IsSearchOpen() && !IsCursorOverDock(cursor) &&
+    // Evaluate fullscreen lazily only when the cursor is outside dock/flyouts.
+    const bool showingOrVisible =
+        m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Visible;
+    if (showingOrVisible && !IsSearchOpen() && !IsCursorOverDock(cursor) &&
         !IsCursorWithinFlyoutZone(cursor) && !IsOverflowOpen()) {
-        const size_t monIdx =
-            active_dock_policy::FindNearestMonitorIndex(cursor, m_cachedMonitors);
-        const HMONITOR cursorMon = (monIdx != static_cast<size_t>(-1) && monIdx < m_cachedMonitors.size())
-            ? m_cachedMonitors[monIdx].first
-            : MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-        if (cursor.y < m_visibleY + DockShadowMarginPx(static_cast<float>(HostDpi()) / 96.0F) ||
-            cursorMon != m_hostMonitor) {
-            // Quick Settings stays up when a drill-in resizes out from under the
-            // cursor. Dismiss is an outside click, Escape, or Back - not mouse-leave.
+        if (!IsDockSettingsOpen() && !IsContextMenuOpen() &&
+            IsForegroundBorderlessFullscreenAt(cursor)) {
             BeginHide();
             return;
+        }
+        if (!inHotZone) {
+            const size_t monIdx =
+                active_dock_policy::FindNearestMonitorIndex(cursor, m_cachedMonitors);
+            const HMONITOR cursorMon = (monIdx != static_cast<size_t>(-1) && monIdx < m_cachedMonitors.size())
+                ? m_cachedMonitors[monIdx].first
+                : MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+            if (cursor.y < m_visibleY + DockShadowMarginPx(static_cast<float>(HostDpi()) / 96.0F) ||
+                cursorMon != m_hostMonitor) {
+                // Quick Settings stays up when a drill-in resizes out from under the
+                // cursor. Dismiss is an outside click, Escape, or Back - not mouse-leave.
+                BeginHide();
+                return;
+            }
         }
     }
 
@@ -11220,9 +11370,9 @@ void DockApp::TickGlint() {
     m_glintY += (m_glintTargetY - m_glintY) * follow;
     m_glintStrength += (m_glintTargetStrength - m_glintStrength) * fade;
 
-    const bool positionSettled = (m_glintTargetStrength <= 0.0F && m_glintStrength < 0.002F) ||
+    const bool positionSettled = (m_glintTargetStrength <= 0.0F && m_glintStrength < 0.004F) ||
         (std::abs(m_glintTargetX - m_glintX) < 0.5F && std::abs(m_glintTargetY - m_glintY) < 0.5F);
-    const bool strengthSettled = std::abs(m_glintTargetStrength - m_glintStrength) < 0.002F;
+    const bool strengthSettled = std::abs(m_glintTargetStrength - m_glintStrength) < 0.004F;
     if (positionSettled && strengthSettled) {
         m_glintX = m_glintTargetX;
         m_glintY = m_glintTargetY;
@@ -13816,6 +13966,7 @@ void DockApp::EnsureFullscreenClaimWindows() {
             SWP_NOACTIVATE | SWP_SHOWWINDOW);
         if (m_taskbarList2 != nullptr) {
             m_taskbarList2->MarkFullscreenWindow(claim->window, TRUE);
+            m_fullscreenClaimsMarked = true;
         }
     }
 }
@@ -13830,6 +13981,7 @@ void DockApp::DestroyFullscreenClaimWindows() noexcept {
         }
     }
     m_fullscreenClaims.clear();
+    m_fullscreenClaimsMarked = false;
     if (m_taskbarList2 != nullptr) {
         m_taskbarList2->Release();
         m_taskbarList2 = nullptr;
@@ -14156,11 +14308,11 @@ void DockApp::PumpCursorWatch() {
         return;
     }
     const double now = QpcSeconds();
-    // Large dt between samples means the UI thread hitch'd; drop any in-progress
-    // press so a post-stall jitter cannot begin an accidental reorder drag.
+    // Large dt between samples (including the 250 ms calm watch cadence) can
+    // mean the UI thread hitched or the cursor was stationary; suppress drag so
+    // post-stall jitter cannot start a reorder, without dropping the click.
     if (m_pressedIcon >= 0 && m_lastPointerSampleAt > 0.0 &&
         now - m_lastPointerSampleAt > kMaxPointerStallSeconds) {
-        ClearPressState();
         m_suppressDragUntilRelease = true;
     }
     m_lastPointerSampleAt = now;
@@ -14269,25 +14421,101 @@ bool DockApp::OpenStartMenuFromDock() {
     // cursor-above-threshold rule in HandlePointer/BeginHide. Do not set the
     // shell-flyout hold or hide the overlay here (that froze pointer handling
     // and dropped the dock immediately on click).
-    // Send synchronously on the click thread: the old async PostMessage path
-    // raced Explorer with work-area/registry broadcasts issued immediately
-    // before SendInput, so the Win keystroke was lost and Start never
-    // appeared. Start opens fine with the taskbar hidden and the work area
-    // expanded, so no restore/hide dance belongs on this path.
     // Still unmark the fullscreen claims first: while marked, Explorer treats
     // the dock's claim windows as fullscreen apps and can refuse the menu.
+    // Primary path is WM_SYSCOMMAND / SC_TASKLIST to Shell_TrayWnd (bypasses
+    // UIPI when an elevated window is foreground and serializes behind
+    // MarkFullscreenWindow(FALSE)). A short one-shot timer verifies that Start
+    // actually toggled and escalates to Win / Ctrl+Esc only if needed.
+    StopShellFlyoutWatch();
     if (GetCapture() != nullptr) {
         ReleaseCapture();
     }
     UnmarkFullscreenClaims();
-    if (!InjectStartHotkey()) {
+
+    const bool wasVisible = IsStartLauncherVisible();
+    m_startMenuExpectedVisible = !wasVisible;
+    m_startMenuPrevForeground = GetForegroundWindow();
+
+    bool dispatched = TriggerStartViaSysCommand(m_window);
+    uint8_t nextStage = 1U;
+    if (!dispatched) {
+        dispatched = InjectStartHotkey(false);
+        nextStage = 2U;
+    }
+    if (!dispatched) {
         Log(L"Start menu did not accept input.");
         return false;
+    }
+    if (m_window != nullptr) {
+        m_startMenuRetryStage = nextStage;
+        SetTimer(m_window, kStartMenuTimerId, 120, nullptr);
     }
     return true;
 }
 
+void DockApp::HandleStartMenuRetryTimer() {
+    if (m_window != nullptr) {
+        KillTimer(m_window, kStartMenuTimerId);
+    }
+    const uint8_t stage = m_startMenuRetryStage;
+    m_startMenuRetryStage = 0;
+    if (stage == 0U) {
+        return;
+    }
+
+    // Check visibility and foreground change before querying process elevation
+    // (OpenProcess + OpenProcessToken) so the happy path does minimal syscalls.
+    const bool nowVisible = IsStartLauncherVisible();
+    if (nowVisible == m_startMenuExpectedVisible) {
+        return;
+    }
+    HWND foreground = GetForegroundWindow();
+    const bool foregroundChanged = foreground != nullptr &&
+        foreground != m_startMenuPrevForeground &&
+        foreground != m_window &&
+        foreground != m_inputWindow &&
+        foreground != FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (m_startMenuExpectedVisible && foregroundChanged) {
+        return;
+    }
+
+    const bool foregroundElevated = IsWindowProcessElevated(foreground);
+    const active_dock_policy::StartMenuAction action =
+        active_dock_policy::NextStartMenuAction(
+            stage, nowVisible, m_startMenuExpectedVisible, foregroundChanged, foregroundElevated);
+    if (action == active_dock_policy::StartMenuAction::None) {
+        return;
+    }
+
+    UnmarkFullscreenClaims();
+    switch (action) {
+    case active_dock_policy::StartMenuAction::SysCommand:
+        if (!TriggerStartViaSysCommand(m_window)) {
+            Log(L"Start menu retry via SC_TASKLIST did not accept input.");
+        }
+        break;
+    case active_dock_policy::StartMenuAction::WinKey:
+        if (InjectStartHotkey(false) && m_window != nullptr) {
+            m_startMenuRetryStage = 2U;
+            SetTimer(m_window, kStartMenuTimerId, 140, nullptr);
+        }
+        break;
+    case active_dock_policy::StartMenuAction::CtrlEsc:
+        if (!InjectStartHotkey(true)) {
+            Log(L"Start menu Ctrl+Esc fallback did not accept input.");
+        }
+        break;
+    case active_dock_policy::StartMenuAction::None:
+        break;
+    }
+}
+
 void DockApp::UnmarkFullscreenClaims() {
+    if (!m_fullscreenClaimsMarked) {
+        return;
+    }
+    m_fullscreenClaimsMarked = false;
     EnsureTaskbarList();
     if (m_taskbarList2 != nullptr) {
         for (FullscreenClaim& claim : m_fullscreenClaims) {
@@ -14372,6 +14600,7 @@ void DockApp::ReleaseShellFlyoutHold() {
 }
 
 void DockApp::StopShellFlyoutWatch() noexcept {
+    m_startMenuRetryStage = 0;
     if (m_window != nullptr) {
         KillTimer(m_window, kStartMenuTimerId);
     }
@@ -14416,8 +14645,9 @@ void DockApp::Log(const std::wstring& message) const {
     OutputDebugStringW((message + L"\n").c_str());
 }
 
-HWND DockApp::ForegroundAppWindow() const noexcept {
-    const HWND foreground = GetForegroundWindow();
+HWND DockApp::ForegroundAppWindow(
+    HWND foreground, wchar_t* classNameOut, size_t classNameCap, int& classNameLenOut) const noexcept {
+    classNameLenOut = 0;
     if (foreground == nullptr || IsWindowVisible(foreground) == FALSE ||
         IsIconic(foreground) != FALSE) {
         return nullptr;
@@ -14428,20 +14658,22 @@ HWND DockApp::ForegroundAppWindow() const noexcept {
         foreground == m_settingsWindow || foreground == m_contextWindow) {
         return nullptr;
     }
-    wchar_t className[64]{};
-    if (GetClassNameW(foreground, className, static_cast<int>(std::size(className))) > 0) {
-        // All dock-owned windows use the LiquidGlassDock* class prefix.
-        if (_wcsnicmp(className, L"LiquidGlassDock", 15) == 0) {
-            return nullptr;
-        }
-        // Explorer desktop hosts (Progman / WorkerW / DefView) are popup-sized to
-        // the virtual desktop with no caption. Treating them as borderless
-        // fullscreen permanently suppressed edge-show after a desktop right-click
-        // (FG stays on Progman once the context menu closes).
-        if (_wcsicmp(className, L"Progman") == 0 ||
-            _wcsicmp(className, L"WorkerW") == 0 ||
-            _wcsicmp(className, L"SHELLDLL_DefView") == 0) {
-            return nullptr;
+    if (classNameOut != nullptr && classNameCap > 0) {
+        classNameLenOut = GetClassNameW(foreground, classNameOut, static_cast<int>(classNameCap));
+        if (classNameLenOut > 0) {
+            // All dock-owned windows use the LiquidGlassDock* class prefix.
+            if (_wcsnicmp(classNameOut, L"LiquidGlassDock", 15) == 0) {
+                return nullptr;
+            }
+            // Explorer desktop hosts (Progman / WorkerW / DefView) are popup-sized to
+            // the virtual desktop with no caption. Treating them as borderless
+            // fullscreen permanently suppressed edge-show after a desktop right-click
+            // (FG stays on Progman once the context menu closes).
+            if (_wcsicmp(classNameOut, L"Progman") == 0 ||
+                _wcsicmp(classNameOut, L"WorkerW") == 0 ||
+                _wcsicmp(classNameOut, L"SHELLDLL_DefView") == 0) {
+                return nullptr;
+            }
         }
     }
     return foreground;
@@ -14450,7 +14682,7 @@ HWND DockApp::ForegroundAppWindow() const noexcept {
 namespace {
 
 active_dock_policy::ForegroundWindowSnapshot CaptureForegroundSnapshot(
-    HWND foreground, bool queryNotificationState, HMONITOR* monitor) noexcept {
+    HWND foreground, std::wstring_view className, bool queryNotificationState, HMONITOR* monitor) noexcept {
     active_dock_policy::ForegroundWindowSnapshot s{};
     if (queryNotificationState) {
         QUERY_USER_NOTIFICATION_STATE state{};
@@ -14466,10 +14698,8 @@ active_dock_policy::ForegroundWindowSnapshot CaptureForegroundSnapshot(
     s.hasCaptionOrThickFrame =
         (GetWindowLongPtrW(foreground, GWL_STYLE) & (WS_CAPTION | WS_THICKFRAME)) != 0;
     s.isZoomed = IsZoomed(foreground) != FALSE;
-
-    wchar_t cls[64]{};
-    if (const int len = GetClassNameW(foreground, cls, static_cast<int>(std::size(cls))); len > 0) {
-        s.isGameWindowClass = active_dock_policy::IsGameWindowClass({cls, static_cast<size_t>(len)});
+    if (!className.empty()) {
+        s.isGameWindowClass = active_dock_policy::IsGameWindowClass(className);
     }
 
     RECT wr{};
@@ -14489,18 +14719,22 @@ active_dock_policy::ForegroundWindowSnapshot CaptureForegroundSnapshot(
                 (wr.bottom - wr.top) >= (m.bottom - m.top) / 2;
         }
     }
-    RECT cr{};
-    if (GetClientRect(foreground, &cr) != FALSE) {
-        s.noChrome = (wr.right - wr.left) - (cr.right - cr.left) <= 8 &&
-            (wr.bottom - wr.top) - (cr.bottom - cr.top) <= 8;
+    if (s.coversMonitor || queryNotificationState) {
+        RECT cr{};
+        if (GetClientRect(foreground, &cr) != FALSE) {
+            s.noChrome = (wr.right - wr.left) - (cr.right - cr.left) <= 8 &&
+                (wr.bottom - wr.top) - (cr.bottom - cr.top) <= 8;
+        }
     }
-    RECT clip{};
-    if (GetClipCursor(&clip) != FALSE) {
-        const LONG vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        const LONG vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        const RECT vscreen{vx, vy, vx + GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            vy + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
-        s.cursorClippedToWindow = active_dock_policy::IsCursorClippedToWindow(clip, wr, vscreen);
+    if (!active_dock_policy::ShouldSuppressDockForForeground(s)) {
+        RECT clip{};
+        if (GetClipCursor(&clip) != FALSE) {
+            const LONG vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            const LONG vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            const RECT vscreen{vx, vy, vx + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                vy + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+            s.cursorClippedToWindow = active_dock_policy::IsCursorClippedToWindow(clip, wr, vscreen);
+        }
     }
     return s;
 }
@@ -14519,8 +14753,13 @@ bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept
         return m_fgBorderlessCached;
     }
     HMONITOR resolvedMonitor = nullptr;
+    wchar_t cls[64]{};
+    int clsLen = 0;
+    const HWND appFg = ForegroundAppWindow(currentFg, cls, std::size(cls), clsLen);
+    const std::wstring_view clsView =
+        clsLen > 0 ? std::wstring_view(cls, static_cast<size_t>(clsLen)) : std::wstring_view{};
     const bool result = active_dock_policy::ShouldSuppressDockForForeground(
-        CaptureForegroundSnapshot(ForegroundAppWindow(), false, &resolvedMonitor));
+        CaptureForegroundSnapshot(appFg, clsView, false, &resolvedMonitor));
     m_fgBorderlessHwnd = currentFg;
     m_fgBorderlessCached = result;
     m_fgBorderlessMonitor = result ? resolvedMonitor : nullptr;
@@ -14533,8 +14772,13 @@ bool DockApp::IsForegroundBorderlessFullscreen(HMONITOR* monitor) const noexcept
 }
 
 bool DockApp::IsForegroundAppFullscreen() const noexcept {
+    wchar_t cls[64]{};
+    int clsLen = 0;
+    const HWND appFg = ForegroundAppWindow(GetForegroundWindow(), cls, std::size(cls), clsLen);
+    const std::wstring_view clsView =
+        clsLen > 0 ? std::wstring_view(cls, static_cast<size_t>(clsLen)) : std::wstring_view{};
     return active_dock_policy::ShouldSuppressSearchHotkeyForForeground(
-        CaptureForegroundSnapshot(ForegroundAppWindow(), true, nullptr));
+        CaptureForegroundSnapshot(appFg, clsView, true, nullptr));
 }
 
 bool DockApp::IsForegroundBorderlessFullscreenAt(POINT cursor) const noexcept {
@@ -14632,6 +14876,9 @@ bool DockApp::IsCursorOverDock(POINT cursor) const noexcept {
 }
 
 bool DockApp::NeedsHookPointerPost(POINT cursor) const noexcept {
+    if (m_shellFlyoutHold) {
+        return false;
+    }
     const bool hiddenOrHiding =
         m_visibility == VisibilityState::Hidden || m_visibility == VisibilityState::Hiding;
     if (hiddenOrHiding) {

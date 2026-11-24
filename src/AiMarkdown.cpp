@@ -701,39 +701,48 @@ public:
                 m_checkpoints->push_back({i, listIndents, m_out.size(), lines.seen});
             }
             const std::wstring_view line = lines[i];
-            if (IsBlank(line)) {
+            const std::wstring_view trimmed = LeftTrim(line);
+            if (trimmed.empty()) {
                 ++i;
                 continue;
             }
+            const wchar_t first = trimmed.front();
+            const bool couldBeList = first == L'-' || first == L'*' || first == L'+' ||
+                (first >= L'0' && first <= L'9');
+            const bool couldBeRule = first == L'-' || first == L'*' || first == L'_';
             ListMarker marker;
-            const bool listItem = IsListItem(line, marker) && !IsRule(line);
+            const bool rule = couldBeRule && IsRule(line);
+            const bool listItem = couldBeList && !rule && IsListItem(line, marker);
             if (!listItem) {
                 listIndents.clear();
             }
 
-            wchar_t fenceChar = 0;
-            size_t fenceLength = 0;
-            if (IsFence(line, fenceChar, fenceLength)) {
-                i = ParseFence(lines, i, fenceChar, fenceLength, quote);
-                continue;
+            if (first == L'`' || first == L'~') {
+                wchar_t fenceChar = 0;
+                size_t fenceLength = 0;
+                if (IsFence(line, fenceChar, fenceLength)) {
+                    i = ParseFence(lines, i, fenceChar, fenceLength, quote);
+                    continue;
+                }
             }
-            const std::wstring_view trimmed = LeftTrim(line);
-            if (StartsWith(trimmed, L"$$")) {
+            if (first == L'$' && trimmed.size() >= 2 && trimmed[1] == L'$') {
                 i = ParseMath(lines, i, quote);
                 continue;
             }
-            int level = 0;
-            std::wstring_view headingText;
-            if (IsHeading(line, level, headingText)) {
-                Block block;
-                block.kind = BlockKind::Heading;
-                block.level = level;
-                block.quote = quote;
-                AddInline(block, headingText);
-                ++i;
-                continue;
+            if (first == L'#') {
+                int level = 0;
+                std::wstring_view headingText;
+                if (IsHeading(line, level, headingText)) {
+                    Block block;
+                    block.kind = BlockKind::Heading;
+                    block.level = level;
+                    block.quote = quote;
+                    AddInline(block, headingText);
+                    ++i;
+                    continue;
+                }
             }
-            if (IsRule(line)) {
+            if (rule) {
                 Block block;
                 block.kind = BlockKind::Rule;
                 block.quote = quote;
@@ -741,7 +750,7 @@ public:
                 ++i;
                 continue;
             }
-            if (trimmed.front() == L'>') {
+            if (first == L'>') {
                 LineList inner;
                 while (i < lines.size() && !IsBlank(lines[i]) && !LeftTrim(lines[i]).empty() &&
                        LeftTrim(lines[i]).front() == L'>') {
@@ -771,13 +780,13 @@ public:
 
 private:
     void AddInline(Block& block, std::wstring_view text) {
-        std::vector<InlineImage> images;
-        block.text = ParseInline(TrimView(text), &images);
+        m_inlineImages.clear();
+        block.text = ParseInline(TrimView(text), &m_inlineImages);
         const int quote = block.quote;
         if (!TrimView(block.text.text).empty() || block.kind == BlockKind::ListItem) {
             m_out.push_back(std::move(block));
         }
-        for (InlineImage& image : images) {
+        for (InlineImage& image : m_inlineImages) {
             Block imageBlock;
             imageBlock.kind = BlockKind::Image;
             imageBlock.quote = quote;
@@ -999,16 +1008,14 @@ private:
         Block block;
         block.kind = BlockKind::Table;
         block.quote = quote;
-        std::vector<std::wstring_view> header;
-        std::vector<std::wstring_view> cells;
-        SplitRowInto(lines[i], header);
-        SplitRowInto(lines[i + 1], cells);
-        const size_t columns = std::max<size_t>(1, header.size());
+        SplitRowInto(lines[i], m_rowHeader);
+        SplitRowInto(lines[i + 1], m_rowCells);
+        const size_t columns = std::max<size_t>(1, m_rowHeader.size());
         block.align.reserve(columns);
         for (size_t c = 0; c < columns; ++c) {
             Align align = Align::Left;
-            if (c < cells.size()) {
-                const std::wstring_view d = cells[c];
+            if (c < m_rowCells.size()) {
+                const std::wstring_view d = m_rowCells[c];
                 const bool left = !d.empty() && d.front() == L':';
                 const bool right = !d.empty() && d.back() == L':';
                 align = left && right ? Align::Center : right ? Align::Right : Align::Left;
@@ -1023,11 +1030,11 @@ private:
             }
             block.rows.push_back(std::move(row));
         };
-        addRow(header);
+        addRow(m_rowHeader);
         i += 2;
         while (i < lines.size() && !IsBlank(lines[i]) && lines[i].find(L'|') != std::wstring_view::npos) {
-            SplitRowInto(lines[i], cells);
-            addRow(cells);
+            SplitRowInto(lines[i], m_rowCells);
+            addRow(m_rowCells);
             ++i;
         }
         m_out.push_back(std::move(block));
@@ -1070,6 +1077,9 @@ private:
 
     std::vector<Block>& m_out;
     std::vector<ParseCheckpoint>* m_checkpoints;
+    std::vector<InlineImage> m_inlineImages;
+    std::vector<std::wstring_view> m_rowHeader;
+    std::vector<std::wstring_view> m_rowCells;
 };
 
 LineList SplitLines(std::wstring_view markdown) {
@@ -1211,8 +1221,9 @@ constexpr std::array<std::wstring_view, TableSize> BuildKeywordHashTable(
 }
 
 template <size_t TableSize>
-inline bool ContainsHashed(const std::array<std::wstring_view, TableSize>& table, std::wstring_view word) noexcept {
-    size_t slot = KeywordHash(word) & (TableSize - 1);
+inline bool ContainsHashedWithHash(
+    const std::array<std::wstring_view, TableSize>& table, std::wstring_view word, uint32_t hash) noexcept {
+    size_t slot = hash & (TableSize - 1);
     while (!table[slot].empty()) {
         if (table[slot] == word) {
             return true;
@@ -1222,7 +1233,7 @@ inline bool ContainsHashed(const std::array<std::wstring_view, TableSize>& table
     return false;
 }
 
-bool IsKeyword(std::wstring_view word, bool sql) noexcept {
+bool IsKeywordWithHash(std::wstring_view word, uint32_t hash, bool sql) noexcept {
     static constexpr std::array<std::wstring_view, 157> kKeywords = {
         L"False", L"None", L"Self", L"True", L"abstract", L"and", L"as", L"assert", L"async", L"auto", L"await",
         L"begin", L"bool", L"boolean", L"break", L"case", L"catch", L"chan", L"char", L"class", L"const",
@@ -1253,34 +1264,68 @@ bool IsKeyword(std::wstring_view word, bool sql) noexcept {
     static constexpr auto kKeywordTable = BuildKeywordHashTable<512>(kKeywords);
     static constexpr auto kSqlKeywordTable = BuildKeywordHashTable<256>(kSqlKeywords);
 
-    if (word.size() < 2 || word.size() > 10) {
-        return false;
-    }
     if (sql) {
         wchar_t lowered[16];
+        uint32_t lowHash = 2166136261U;
         for (size_t i = 0; i < word.size(); ++i) {
-            lowered[i] = FoldAscii(word[i]);
+            const wchar_t lc = FoldAscii(word[i]);
+            lowered[i] = lc;
+            lowHash = (lowHash ^ static_cast<uint32_t>(lc)) * 16777619U;
         }
-        return ContainsHashed(kSqlKeywordTable, std::wstring_view(lowered, word.size()));
+        return ContainsHashedWithHash(kSqlKeywordTable, std::wstring_view(lowered, word.size()), lowHash);
     }
-    return ContainsHashed(kKeywordTable, word);
+    return ContainsHashedWithHash(kKeywordTable, word, hash);
 }
 
-inline bool IsIdentStart(wchar_t c) noexcept {
-    return c == L'_' || (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z');
+// ASCII character classes for HighlightCode:
+// 0 = skip/plain, 1 = ident start, 2 = digit, 3 = special lexer trigger.
+constexpr std::array<uint8_t, 128> MakeCodeCharClassTable() noexcept {
+    std::array<uint8_t, 128> t{};
+    t['_'] = 1;
+    for (int c = 'a'; c <= 'z'; ++c) t[static_cast<size_t>(c)] = 1;
+    for (int c = 'A'; c <= 'Z'; ++c) t[static_cast<size_t>(c)] = 1;
+    for (int c = '0'; c <= '9'; ++c) t[static_cast<size_t>(c)] = 2;
+    t['/'] = 3;
+    t['#'] = 3;
+    t['-'] = 3;
+    t['<'] = 3;
+    t['"'] = 3;
+    t['\''] = 3;
+    t['`'] = 3;
+    return t;
 }
+
+inline constexpr std::array<uint8_t, 128> kCodeCharClass = MakeCodeCharClassTable();
 
 inline bool IsIdentChar(wchar_t c) noexcept {
-    return c == L'_' || (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9');
+    if (static_cast<unsigned int>(c) >= 128U) {
+        return false;
+    }
+    const uint8_t cls = kCodeCharClass[static_cast<size_t>(c)];
+    return cls == 1 || cls == 2;
 }
 
 }  // namespace
 
 InlineText ParseInline(std::wstring_view text, std::vector<InlineImage>* images) {
     InlineText out;
-    out.text.reserve(text.size());
+    if (text.empty()) {
+        return out;
+    }
+    const wchar_t* data = text.data();
+    const size_t n = text.size();
+    size_t i = 0;
+    while (i < n && !IsInlineTriggerAt(data, i, n)) {
+        ++i;
+    }
+    if (i == n) {
+        out.text.assign(data, n);
+        return out;
+    }
+    out.text.reserve(n);
+    out.text.append(data, i);
     InlineParser parser(out, images);
-    parser.Run(text, 0, {}, 0);
+    parser.Run(text.substr(i), 0, {}, 0);
     return out;
 }
 
@@ -1397,19 +1442,44 @@ std::vector<Token> HighlightCode(std::wstring_view code, std::wstring_view langu
     size_t i = 0;
     while (i < n) {
         const wchar_t c = data[i];
-        if (IsIdentStart(c)) {
+        if (static_cast<unsigned int>(c) >= 128U) {
+            ++i;
+            continue;
+        }
+        const uint8_t cls = kCodeCharClass[static_cast<size_t>(c)];
+        if (cls == 0) {
+            ++i;
+            continue;
+        }
+        if (cls == 1) {
+            uint32_t hash = (2166136261U ^ static_cast<uint32_t>(c)) * 16777619U;
             size_t j = i + 1;
-            while (j < n && IsIdentChar(data[j])) {
+            while (j < n) {
+                const wchar_t ch = data[j];
+                if (static_cast<unsigned int>(ch) >= 128U ||
+                    (kCodeCharClass[static_cast<size_t>(ch)] != 1 && kCodeCharClass[static_cast<size_t>(ch)] != 2)) {
+                    break;
+                }
+                hash = (hash ^ static_cast<uint32_t>(ch)) * 16777619U;
                 ++j;
             }
-            if (!plain && IsKeyword(code.substr(i, j - i), info.sql)) {
+            const size_t len = j - i;
+            if (!plain && len >= 2 && len <= 10 && IsKeywordWithHash(code.substr(i, len), hash, info.sql)) {
                 push(i, j, TokenClass::Keyword);
             }
             i = j;
             continue;
         }
-        if (c == L' ' || c == L'\n' || c == L'\t' || c == L'(' || c == L')' || c == L',' || c == L'.' ||
-            c == L':' || c == L'=' || c == L';' || c == L'{' || c == L'}' || c == L'[' || c == L']') {
+        if (cls == 2) {
+            if (i == 0 || !IsIdentChar(data[i - 1])) {
+                size_t j = i + 1;
+                while (j < n && (IsIdentChar(data[j]) || data[j] == L'.')) {
+                    ++j;
+                }
+                push(i, j, TokenClass::Number);
+                i = j;
+                continue;
+            }
             ++i;
             continue;
         }
@@ -1480,15 +1550,6 @@ std::vector<Token> HighlightCode(std::wstring_view code, std::wstring_view langu
             } else {
                 ++i;
             }
-            continue;
-        }
-        if (c >= L'0' && c <= L'9' && (i == 0 || !IsIdentChar(data[i - 1]))) {
-            size_t j = i + 1;
-            while (j < n && (IsIdentChar(data[j]) || data[j] == L'.')) {
-                ++j;
-            }
-            push(i, j, TokenClass::Number);
-            i = j;
             continue;
         }
         ++i;

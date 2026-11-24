@@ -5,6 +5,14 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(__ARM_NEON) || defined(_M_ARM64)
+#include <arm_neon.h>
+#define GROQ_HAS_NEON 1
+#elif defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h>
+#define GROQ_HAS_SSE2 1
+#endif
+
 namespace groq {
 namespace json {
 namespace {
@@ -280,23 +288,53 @@ std::optional<Value> Parse(std::string_view text) {
 void AppendQuoted(std::string& out, std::string_view utf8) {
     static constexpr char kHex[] = "0123456789abcdef";
     out.push_back('"');
+    const char* data = utf8.data();
+    const size_t n = utf8.size();
     size_t i = 0;
-    while (i < utf8.size()) {
+    while (i < n) {
         // Copy the run of bytes that need no escaping in one append (image
         // data URLs are megabytes of plain base64).
         size_t run = i;
-        while (run < utf8.size()) {
-            const auto c = static_cast<unsigned char>(utf8[run]);
+#if defined(GROQ_HAS_NEON)
+        const uint8x16_t vSpace = vdupq_n_u8(0x20U);
+        const uint8x16_t vQuote = vdupq_n_u8('"');
+        const uint8x16_t vSlash = vdupq_n_u8('\\');
+        while (run + 16 <= n) {
+            const uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(data + run));
+            const uint8x16_t bad = vorrq_u8(vcltq_u8(v, vSpace), vorrq_u8(vceqq_u8(v, vQuote), vceqq_u8(v, vSlash)));
+            if (vmaxvq_u32(vreinterpretq_u32_u8(bad)) != 0) {
+                break;
+            }
+            run += 16;
+        }
+#elif defined(GROQ_HAS_SSE2)
+        const __m128i vZero = _mm_setzero_si128();
+        const __m128i vCtrl = _mm_set1_epi8(0x1F);
+        const __m128i vQuote = _mm_set1_epi8('"');
+        const __m128i vSlash = _mm_set1_epi8('\\');
+        while (run + 16 <= n) {
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + run));
+            // Unsigned c < 0x20 iff c >= 0 && c <= 0x1F in signed 8-bit.
+            const __m128i isCtrl = _mm_andnot_si128(_mm_cmpgt_epi8(vZero, v), _mm_cmpeq_epi8(_mm_max_epu8(v, vCtrl), vCtrl));
+            const __m128i bad = _mm_or_si128(isCtrl, _mm_or_si128(_mm_cmpeq_epi8(v, vQuote), _mm_cmpeq_epi8(v, vSlash)));
+            if (_mm_movemask_epi8(bad) != 0) {
+                break;
+            }
+            run += 16;
+        }
+#endif
+        while (run < n) {
+            const auto c = static_cast<unsigned char>(data[run]);
             if (c < 0x20 || c == '"' || c == '\\') {
                 break;
             }
             ++run;
         }
-        out.append(utf8.data() + i, run - i);
-        if (run >= utf8.size()) {
+        out.append(data + i, run - i);
+        if (run >= n) {
             break;
         }
-        const auto c = static_cast<unsigned char>(utf8[run]);
+        const auto c = static_cast<unsigned char>(data[run]);
         i = run + 1;
         switch (c) {
         case '"': out += "\\\""; break;
@@ -365,6 +403,41 @@ std::wstring Utf8ToWide(std::string_view text) {
     size_t i = 0;
     size_t w = 0;
     while (i < n) {
+#if defined(GROQ_HAS_NEON)
+        while (i + 16 <= n) {
+            const uint8x16_t v = vld1q_u8(src + i);
+            if (vmaxvq_u8(v) >= 0x80U) {
+                break;
+            }
+            const uint16x8_t lo16 = vmovl_u8(vget_low_u8(v));
+            const uint16x8_t hi16 = vmovl_u8(vget_high_u8(v));
+            if constexpr (sizeof(wchar_t) == 2) {
+                vst1q_u16(reinterpret_cast<uint16_t*>(dst + w), lo16);
+                vst1q_u16(reinterpret_cast<uint16_t*>(dst + w + 8), hi16);
+            } else {
+                vst1q_u32(reinterpret_cast<uint32_t*>(dst + w), vmovl_u16(vget_low_u16(lo16)));
+                vst1q_u32(reinterpret_cast<uint32_t*>(dst + w + 4), vmovl_u16(vget_high_u16(lo16)));
+                vst1q_u32(reinterpret_cast<uint32_t*>(dst + w + 8), vmovl_u16(vget_low_u16(hi16)));
+                vst1q_u32(reinterpret_cast<uint32_t*>(dst + w + 12), vmovl_u16(vget_high_u16(hi16)));
+            }
+            i += 16;
+            w += 16;
+        }
+#elif defined(GROQ_HAS_SSE2)
+        if constexpr (sizeof(wchar_t) == 2) {
+            const __m128i zero = _mm_setzero_si128();
+            while (i + 16 <= n) {
+                const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+                if (_mm_movemask_epi8(v) != 0) {
+                    break;
+                }
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + w), _mm_unpacklo_epi8(v, zero));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + w + 8), _mm_unpackhi_epi8(v, zero));
+                i += 16;
+                w += 16;
+            }
+        }
+#endif
         while (i < n && src[i] < 0x80U) {
             dst[w++] = static_cast<wchar_t>(src[i++]);
         }

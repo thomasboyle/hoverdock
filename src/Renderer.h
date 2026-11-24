@@ -107,6 +107,8 @@ public:
     [[nodiscard]] static std::vector<uint8_t> ExtractIconPixels(
         const std::vector<std::wstring>& candidates, UINT iconPixelExtent);
     [[nodiscard]] bool CaptureBackdrop(const RECT& screenRectangle, bool* changed = nullptr);
+    void SetHoverLabelWindow(HWND window) noexcept;
+    void NoteHoverLabelSelfPresent(const RECT& bounds) noexcept;
     void NotePopupSelfPresent(int popupIndex) noexcept;
     void TrimIdlePanelResources() noexcept;
     void ReleaseHiddenResources() noexcept;
@@ -319,6 +321,9 @@ private:
     // Duplication reported dirt over the strip that no successful sample has
     // consumed yet (a failed read or upload must retry on the next tick).
     bool m_backdropDirtPending = false;
+    HWND m_hoverLabelWindow = nullptr;
+    RECT m_hoverLabelBounds{};
+    uint64_t m_lastHoverLabelSelfPresentMs = 0;
     uint64_t m_lastDockSelfPresentMs = 0;
     uint64_t m_deferredSelfCheckDueMs = 0;
     uint64_t m_lastPopupSelfPresentMs[4] = {};

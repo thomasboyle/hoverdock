@@ -158,7 +158,6 @@ private:
     static constexpr UINT kRenderMessage = WM_APP + 2;
     static constexpr UINT kRefreshApplyMessage = WM_APP + 5;
     static constexpr UINT kSearchResultMessage = WM_APP + 6;
-    static constexpr UINT kOpenStartMenuMessage = WM_APP + 7;
     static constexpr UINT kOverflowPaintMessage = WM_APP + 8;
     static constexpr UINT kOverflowWheelMessage = WM_APP + 9;
     static constexpr UINT kBoostResultMessage = WM_APP + 11;
@@ -410,6 +409,7 @@ private:
     void ClearWakeLayout() noexcept;
     void UpdateHoverLabel(bool forceGlassRefresh = false);
     void HideHoverLabel() noexcept;
+    void ClearHoverLabelCache(bool releaseScratch = false) noexcept;
     // Liquid-glass hover label: BakeGlassPanel plate + flyout ink glyphs.
     // screenOrigin is the layered-window top-left (label sits above the dock).
     // Height is uniform for every label; width follows text up to a max with
@@ -494,6 +494,8 @@ private:
         bool contentValid = false;
     };
     [[nodiscard]] bool EnsureLayerPresentDib(LayerPresentDib& slot, LONG width, LONG height) noexcept;
+    [[nodiscard]] bool EnsureLayerPresentDibAtLeast(LayerPresentDib& slot, LONG minWidth,
+        LONG minHeight) noexcept;
     void ReleaseLayerPresentDib(LayerPresentDib& slot) noexcept;
     bool PresentLayeredBits(HWND window, const POINT& origin, LONG width, LONG height,
         const uint8_t* pixels, size_t byteCount, LayerPresentDib& slot,
@@ -757,6 +759,7 @@ private:
         const std::vector<PinnedApp>& pins, const std::vector<DisplayApp>& currentApps);
     [[nodiscard]] static int DividerIndexFromDisplayApps(const std::vector<DisplayApp>& displayApps);
     bool OpenStartMenuFromDock();
+    void HandleStartMenuRetryTimer();
     void PrepareShellForStartMenu();
     void UnmarkFullscreenClaims();
     void HideOverlayForShellFlyout();
@@ -817,7 +820,8 @@ private:
     [[nodiscard]] bool IsForegroundAppFullscreen() const noexcept;
     // The foreground window if it belongs to another app (not the dock, not the
     // desktop); nullptr otherwise.
-    [[nodiscard]] HWND ForegroundAppWindow() const noexcept;
+    [[nodiscard]] HWND ForegroundAppWindow(
+        HWND foreground, wchar_t* classNameOut, size_t classNameCap, int& classNameLenOut) const noexcept;
     // Ctrl+Space stays out of fullscreen apps, like the dock's edge-show: the
     // chord is released to the app while one is focused.
     void SyncSearchHotkeyForFullscreen() noexcept;
@@ -862,10 +866,25 @@ private:
     HWND m_searchWindow = nullptr;
     HHOOK m_mouseHook = nullptr;
     HHOOK m_overflowDismissHook = nullptr;
+    struct HoverLabelCacheEntry {
+        std::wstring text;
+        SIZE labelSize{};
+        LONG shadow = 0;
+        std::vector<uint8_t> pixels;
+    };
+    static constexpr size_t kMaxHoverLabelCacheEntries = 32;
+
     HFONT m_hoverLabelFont = nullptr;
     UINT m_hoverLabelFontDpi = 0;
     int m_hoverLabelFontPx = 0;
     LayerPresentDib m_hoverLabelDib{};
+    std::vector<HoverLabelCacheEntry> m_hoverLabelCache;
+    UINT m_hoverLabelCacheDpi = 0;
+    int m_hoverLabelCacheFontPx = 0;
+    std::vector<float> m_hoverLabelCoverage;
+    std::vector<float> m_hoverLabelShadow;
+    bool m_hoverLabelVisible = false;
+    RECT m_hoverLabelScreenBounds{};
     HBITMAP m_dragGhostBitmap = nullptr;
     HDC m_dragGhostMemoryDc = nullptr;
     HGDIOBJ m_dragGhostPreviousBitmap = nullptr;
@@ -985,6 +1004,11 @@ private:
     uint64_t m_chromeInkBackdropSerial = ~0ULL;
     bool m_suppressDragUntilRelease = false;
     bool m_launchClickInProgress = false;
+    bool m_deferredClickPending = false;
+    uint8_t m_startMenuRetryStage = 0;
+    bool m_startMenuExpectedVisible = false;
+    HWND m_startMenuPrevForeground = nullptr;
+    bool m_fullscreenClaimsMarked = false;
     std::wstring m_pressedTarget;
     std::wstring m_draggedTarget;
     bool m_taskbarHidden = false;

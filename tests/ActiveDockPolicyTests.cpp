@@ -201,12 +201,65 @@ void TestGameAndFullscreenSuppression() {
     EXPECT(ShouldSuppressSearchHotkeyForForeground(d3dOnly));
 }
 
+void TestStartMenuFallbackPolicy() {
+    using active_dock_policy::NextStartMenuAction;
+    using active_dock_policy::StartMenuAction;
+
+    // Already opened (or closed): never fire a second toggle.
+    EXPECT(NextStartMenuAction(1U, true, true, false, false) == StartMenuAction::None);
+    EXPECT(NextStartMenuAction(1U, false, false, false, false) == StartMenuAction::None);
+
+    // Foreground moved to another window (e.g. Start host or third-party Start
+    // menu) while trying to open: treat as opened so we don't toggle it shut.
+    EXPECT(NextStartMenuAction(1U, false, true, true, false) == StartMenuAction::None);
+
+    // Non-elevated foreground and Start still closed: escalate WinKey -> CtrlEsc -> None.
+    EXPECT(NextStartMenuAction(1U, false, true, false, false) == StartMenuAction::WinKey);
+    EXPECT(NextStartMenuAction(2U, false, true, false, false) == StartMenuAction::CtrlEsc);
+    EXPECT(NextStartMenuAction(3U, false, true, false, false) == StartMenuAction::None);
+
+    // Elevated foreground blocks SendInput via UIPI: retry SC_TASKLIST once, then stop.
+    EXPECT(NextStartMenuAction(1U, false, true, false, true) == StartMenuAction::SysCommand);
+    EXPECT(NextStartMenuAction(2U, false, true, false, true) == StartMenuAction::None);
+}
+
+void TestHoverLabelSelfDirtSuppression() {
+    using active_dock_policy::IsSuppressedDockOrHoverDirt;
+
+    const RECT dockRect{680, 1310, 1880, 1436};
+    // Hover bubble overlaps the top shadow margin of dockRect and extends above it.
+    const RECT hoverRect{900, 1270, 1100, 1335};
+
+    // Dock-only self-dirt.
+    EXPECT(IsSuppressedDockOrHoverDirt({700, 1320, 1860, 1430}, dockRect, 1020ULL, 1000ULL,
+        hoverRect, 0ULL));
+    // Hover-label-only dirt extending above dockRect.top.
+    EXPECT(IsSuppressedDockOrHoverDirt({900, 1270, 1100, 1335}, dockRect, 1020ULL, 0ULL,
+        hoverRect, 1000ULL));
+    // Merged DWM dirty rect covering both dock and hover label when both presented recently.
+    EXPECT(IsSuppressedDockOrHoverDirt({680, 1270, 1880, 1436}, dockRect, 1020ULL, 1005ULL,
+        hoverRect, 1010ULL));
+    // Merged rect must NOT be suppressed if only the dock (or only the hover label) presented.
+    EXPECT(!IsSuppressedDockOrHoverDirt({680, 1270, 1880, 1436}, dockRect, 1020ULL, 1005ULL,
+        hoverRect, 0ULL));
+    EXPECT(!IsSuppressedDockOrHoverDirt({680, 1270, 1880, 1436}, dockRect, 1020ULL, 0ULL,
+        hoverRect, 1010ULL));
+    // External window dirt outside both dock and hover label must never be suppressed.
+    EXPECT(!IsSuppressedDockOrHoverDirt({0, 0, 2560, 1440}, dockRect, 1020ULL, 1005ULL,
+        hoverRect, 1010ULL));
+    // Past the suppression window: no longer suppressed.
+    EXPECT(!IsSuppressedDockOrHoverDirt({900, 1270, 1100, 1335}, dockRect, 1100ULL, 1005ULL,
+        hoverRect, 1010ULL));
+}
+
 }  // namespace
 
 int main() {
     TestMonitorHotZoneAndHookGate();
     TestExactSlidingHoverShadowBlur();
     TestGameAndFullscreenSuppression();
+    TestStartMenuFallbackPolicy();
+    TestHoverLabelSelfDirtSuppression();
     if (g_failures != 0) {
         std::fprintf(stderr, "ActiveDockPolicyTests: %d failure(s).\n", g_failures);
         return 1;
