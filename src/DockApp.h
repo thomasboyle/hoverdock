@@ -629,6 +629,9 @@ private:
     void HandlePointer(POINT cursor);
     void UpdateGlintTarget(POINT cursor);
     void TickGlint();
+    [[nodiscard]] LONGLONG GlintFrameInterval100ns() const noexcept;
+    void ArmGlintTimer() noexcept;
+    void DisarmGlintTimer() noexcept;
     // Re-measure the desktop behind the tray + clock group and start the
     // black/white ink crossfade when it crosses the hysteresis band.
     void UpdateChromeInkTarget();
@@ -994,6 +997,8 @@ private:
     float m_glintTargetStrength = 0.0F;
     double m_glintLastTickAt = 0.0;
     bool m_glintTimerRunning = false;
+    HANDLE m_glintWaitable = nullptr;
+    bool m_glintWaitableArmed = false;
     // Adaptive chrome ink: 0 = white ink, 1 = black ink. m_chromeInk eases
     // toward m_chromeInkTarget; unknown until the first backdrop sample.
     float m_chromeInk = 0.0F;

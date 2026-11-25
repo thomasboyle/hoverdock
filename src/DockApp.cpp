@@ -2391,6 +2391,11 @@ DockApp::~DockApp() {
         CloseHandle(m_backdropWaitable);
         m_backdropWaitable = nullptr;
     }
+    if (m_glintWaitable != nullptr) {
+        CancelWaitableTimer(m_glintWaitable);
+        CloseHandle(m_glintWaitable);
+        m_glintWaitable = nullptr;
+    }
     if (s_instance == this) {
         s_instance = nullptr;
     }
@@ -2538,10 +2543,11 @@ int DockApp::Run() {
         const bool slideAnimating = m_visibility == VisibilityState::Showing ||
             m_visibility == VisibilityState::Hiding;
         HANDLE frameWaitable = slideAnimating ? m_renderer.FrameLatencyWaitableObject() : nullptr;
-        HANDLE waits[2]{};
+        HANDLE waits[3]{};
         DWORD waitCount = 0;
         DWORD frameSlot = static_cast<DWORD>(-1);
         DWORD backdropSlot = static_cast<DWORD>(-1);
+        DWORD glintSlot = static_cast<DWORD>(-1);
         if (frameWaitable != nullptr) {
             frameSlot = waitCount;
             waits[waitCount++] = frameWaitable;
@@ -2549,6 +2555,10 @@ int DockApp::Run() {
         if (m_backdropFastArmed && m_backdropWaitable != nullptr) {
             backdropSlot = waitCount;
             waits[waitCount++] = m_backdropWaitable;
+        }
+        if (m_glintWaitableArmed && m_glintWaitable != nullptr) {
+            glintSlot = waitCount;
+            waits[waitCount++] = m_glintWaitable;
         }
         const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
         // WH_MOUSE_LL is delivered by a sent message, which sets QS_SENDMESSAGE.
@@ -2580,6 +2590,10 @@ int DockApp::Run() {
         if (objectSignaled && backdropSlot != static_cast<DWORD>(-1) &&
             wait == WAIT_OBJECT_0 + backdropSlot) {
             OnBackdropTick();
+        }
+        if (objectSignaled && glintSlot != static_cast<DWORD>(-1) &&
+            wait == WAIT_OBJECT_0 + glintSlot) {
+            TickGlint();
         }
 
         if (wait == WAIT_OBJECT_0 + waitCount || wait == WAIT_FAILED || objectSignaled ||
@@ -11323,6 +11337,43 @@ void DockApp::HandlePointer(POINT cursor) {
     UpdateHoverLabel();
 }
 
+LONGLONG DockApp::GlintFrameInterval100ns() const noexcept {
+    const UINT hz = m_hostRefreshHz >= 30 ? m_hostRefreshHz : 60;
+    return (std::max)(10000LL, 10000000LL / static_cast<LONGLONG>(hz));
+}
+
+void DockApp::ArmGlintTimer() noexcept {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    if (m_glintWaitable == nullptr) {
+        m_glintWaitable = CreateWaitableTimerExW(nullptr, nullptr,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    }
+    if (m_glintWaitable != nullptr) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -GlintFrameInterval100ns();
+        if (SetWaitableTimer(m_glintWaitable, &due, 0, nullptr, nullptr, FALSE) != FALSE) {
+            m_glintWaitableArmed = true;
+            return;
+        }
+    }
+    m_glintWaitableArmed = false;
+    if (m_window != nullptr) {
+        SetTimer(m_window, kGlintTimerId, BackdropFrameIntervalMs(), nullptr);
+    }
+}
+
+void DockApp::DisarmGlintTimer() noexcept {
+    if (m_glintWaitable != nullptr) {
+        CancelWaitableTimer(m_glintWaitable);
+    }
+    m_glintWaitableArmed = false;
+    if (m_window != nullptr) {
+        KillTimer(m_window, kGlintTimerId);
+    }
+}
+
 void DockApp::UpdateGlintTarget(POINT cursor) {
     // Visible only: the show/hide slide renders every frame itself and must
     // never share the thread or frame-skip policy with glint easing.
@@ -11342,14 +11393,14 @@ void DockApp::UpdateGlintTarget(POINT cursor) {
     const bool fadedOut = m_glintTargetStrength <= 0.0F && m_glintStrength <= 0.001F;
     const bool atTarget = std::abs(m_glintTargetX - m_glintX) < 0.5F &&
         std::abs(m_glintTargetY - m_glintY) < 0.5F &&
-        std::abs(m_glintTargetStrength - m_glintStrength) < 0.002F;
+        std::abs(m_glintTargetStrength - m_glintStrength) < 0.004F;
     if (fadedOut || atTarget || m_glintTimerRunning || m_window == nullptr ||
         !m_rendererInitialized) {
         return;
     }
     m_glintLastTickAt = QpcSeconds();
     m_glintTimerRunning = true;
-    SetTimer(m_window, kGlintTimerId, kGlintIntervalMs, nullptr);
+    ArmGlintTimer();
 }
 
 void DockApp::TickGlint() {
@@ -11377,8 +11428,10 @@ void DockApp::TickGlint() {
         m_glintX = m_glintTargetX;
         m_glintY = m_glintTargetY;
         m_glintStrength = m_glintTargetStrength;
-        KillTimer(m_window, kGlintTimerId);
+        DisarmGlintTimer();
         m_glintTimerRunning = false;
+    } else if (m_glintWaitableArmed) {
+        ArmGlintTimer();
     }
     QueueRenderFrame(false);
 }
@@ -11455,8 +11508,8 @@ void DockApp::TickChromeInk() {
 }
 
 void DockApp::StopGlint() noexcept {
-    if (m_glintTimerRunning && m_window != nullptr) {
-        KillTimer(m_window, kGlintTimerId);
+    if (m_glintTimerRunning || m_glintWaitableArmed) {
+        DisarmGlintTimer();
     }
     m_glintTimerRunning = false;
     m_glintStrength = 0.0F;
