@@ -1,6 +1,7 @@
 #include "SystemTray.h"
 #include "AudioPolicy.h"
 #include "DockTheme.hlsli"
+#include "TrayIconPolicy.h"
 
 #include <Unknwn.h>
 #include <dwmapi.h>
@@ -1309,42 +1310,11 @@ std::wstring ProcessImagePath(DWORD pid) {
     return path;
 }
 
-std::wstring LowerCopy(std::wstring value) {
-    for (wchar_t& character : value) {
-        character = static_cast<wchar_t>(std::towlower(character));
-    }
-    return value;
-}
-
-std::wstring FileStem(const std::wstring& path) {
-    const size_t slash = path.find_last_of(L"\\/");
-    const std::wstring file = slash == std::wstring::npos ? path : path.substr(slash + 1);
-    const size_t dot = file.find_last_of(L'.');
-    return dot == std::wstring::npos ? file : file.substr(0, dot);
-}
-
-// Display name for a tray host executable: strip helper suffixes (steamwebhelper
-// identifies as Steam, not as a second app) and capitalize the stem.
-std::wstring PrettyTrayName(const std::wstring& exePath) {
-    std::wstring stem = FileStem(exePath);
-    if (stem.empty()) {
-        return {};
-    }
-    static constexpr std::wstring_view kHelperSuffixes[] = {
-        L"webhelper", L"helper", L"launcher", L"updater", L"service", L"tray"};
-    const std::wstring lowered = LowerCopy(stem);
-    for (const std::wstring_view suffix : kHelperSuffixes) {
-        if (lowered.size() > suffix.size() &&
-            lowered.compare(lowered.size() - suffix.size(), suffix.size(), suffix) == 0) {
-            stem.resize(stem.size() - suffix.size());
-            break;
-        }
-    }
-    if (!stem.empty()) {
-        stem[0] = static_cast<wchar_t>(std::towupper(stem[0]));
-    }
-    return stem;
-}
+using tray_policy::CompactLower;
+using tray_policy::FileStem;
+using tray_policy::LowerCopy;
+using tray_policy::PrettyTrayName;
+using tray_policy::TrimEdges;
 
 bool IsTrayHostWindowClass(const std::wstring& className) {
     const std::wstring lowered = LowerCopy(className);
@@ -1448,13 +1418,6 @@ struct MainWindowSearch {
     bool includeHidden = false;
 };
 
-bool EqualExePath(const std::wstring& left, const std::wstring& right) {
-    if (left.size() != right.size()) {
-        return false;
-    }
-    return LowerCopy(left) == LowerCopy(right);
-}
-
 BOOL CALLBACK FindMainWindowForExe(HWND window, LPARAM data) {
     auto* search = reinterpret_cast<MainWindowSearch*>(data);
     if (search->found != nullptr || GetWindow(window, GW_OWNER) != nullptr) {
@@ -1483,7 +1446,7 @@ BOOL CALLBACK FindMainWindowForExe(HWND window, LPARAM data) {
     if (path.empty()) {
         return TRUE;
     }
-    if (!EqualExePath(path, search->exePath)) {
+    if (!tray_policy::MatchesTrayAppExe(path, search->exePath)) {
         return TRUE;
     }
     int cloaked = 0;
@@ -1579,29 +1542,6 @@ HWND ChildByClassFragment(HWND parent, const wchar_t* fragment) {
     ClassSearch search{fragment, nullptr};
     EnumChildWindows(parent, FindChildClassFragment, reinterpret_cast<LPARAM>(&search));
     return search.found;
-}
-
-std::wstring TrimEdges(std::wstring value) {
-    size_t begin = 0;
-    while (begin < value.size() && std::iswspace(value[begin]) != 0) {
-        ++begin;
-    }
-    size_t end = value.size();
-    while (end > begin && std::iswspace(value[end - 1]) != 0) {
-        --end;
-    }
-    return value.substr(begin, end - begin);
-}
-
-std::wstring CompactLower(std::wstring_view text) {
-    std::wstring out;
-    out.reserve(text.size());
-    for (wchar_t character : text) {
-        if (std::iswalnum(character) != 0) {
-            out.push_back(static_cast<wchar_t>(std::towlower(character)));
-        }
-    }
-    return out;
 }
 
 std::vector<std::wstring> AlphaWords(const std::wstring& lower) {
@@ -1859,8 +1799,9 @@ struct ShellButtonCollector {
             if (!notifyItem || raw.empty()) {
                 continue;
             }
-            const bool duplicate = std::ranges::any_of(icons, [&raw](const TrayNotifyIcon& known) {
-                return known.shellName == raw;
+            const std::wstring loweredRaw = LowerCopy(raw);
+            const bool duplicate = std::ranges::any_of(icons, [&loweredRaw](const TrayNotifyIcon& known) {
+                return LowerCopy(known.shellName) == loweredRaw;
             });
             if (duplicate) {
                 continue;
@@ -1876,7 +1817,68 @@ struct ShellButtonCollector {
     }
 };
 
-int ShellButtonMatchScore(const std::wstring& stored, const std::wstring& current);
+tray_policy::TrayIdentity ToTrayIdentity(const TrayNotifyIcon& icon) {
+    return {icon.executablePath, icon.exeName, icon.tip, icon.shellName};
+}
+
+TrayNotifyIcon* FindSameTrayApp(std::vector<TrayNotifyIcon>& icons, const TrayNotifyIcon& candidate) {
+    const tray_policy::TrayIdentity candId = ToTrayIdentity(candidate);
+    for (TrayNotifyIcon& existing : icons) {
+        if (candidate.window != nullptr && existing.window == candidate.window) {
+            return &existing;
+        }
+        if (tray_policy::AreSameTrayApp(ToTrayIdentity(existing), candId)) {
+            return &existing;
+        }
+    }
+    return nullptr;
+}
+
+void MergeTrayIcon(TrayNotifyIcon& target, TrayNotifyIcon& source, bool preferSourceTip) {
+    if (tray_policy::PreferExecutablePath(source.executablePath, target.executablePath)) {
+        target.executablePath = std::move(source.executablePath);
+        target.exeName = FileStem(target.executablePath);
+        if (source.icon != nullptr) {
+            if (target.icon != nullptr) {
+                DestroyIcon(target.icon);
+            }
+            target.icon = source.icon;
+            source.icon = nullptr;
+        }
+    }
+    if (target.exeName.empty() && !source.exeName.empty()) {
+        target.exeName = std::move(source.exeName);
+    }
+    if (target.window == nullptr && source.window != nullptr) {
+        target.window = source.window;
+        source.window = nullptr;
+    }
+    if (target.id == 0 && source.id != 0) {
+        target.id = source.id;
+    }
+    if (source.shellButton) {
+        target.shellButton = true;
+        if (!source.shellName.empty()) {
+            target.shellName = std::move(source.shellName);
+        }
+    }
+    if (!source.tip.empty() && (target.tip.empty() || preferSourceTip)) {
+        target.tip = std::move(source.tip);
+    }
+    if (target.icon == nullptr && source.icon != nullptr) {
+        target.icon = source.icon;
+        source.icon = nullptr;
+    }
+}
+
+void UpsertTrayIcon(std::vector<TrayNotifyIcon>& icons, TrayNotifyIcon& candidate,
+    bool preferCandidateTip) {
+    if (TrayNotifyIcon* existing = FindSameTrayApp(icons, candidate); existing != nullptr) {
+        MergeTrayIcon(*existing, candidate, preferCandidateTip);
+    } else {
+        icons.push_back(std::move(candidate));
+    }
+}
 
 std::vector<TrayNotifyIcon> EnumerateShellButtons(bool assignIcons = true) {
     std::vector<TrayNotifyIcon> icons;
@@ -2016,7 +2018,6 @@ std::vector<TrayNotifyIcon> EnumerateNotifyIconSettings(const RunningProcessInde
         ERROR_SUCCESS) {
         return icons;
     }
-    std::vector<std::wstring> seen;
     for (DWORD index = 0;; ++index) {
         wchar_t keyName[64]{};
         DWORD keyLen = static_cast<DWORD>(std::size(keyName));
@@ -2051,10 +2052,6 @@ std::vector<TrayNotifyIcon> EnumerateNotifyIconSettings(const RunningProcessInde
         if (!running.Matches(path)) {
             continue;
         }
-        if (std::ranges::find(seen, stem) != seen.end()) {
-            continue;
-        }
-        seen.push_back(stem);
 
         TrayNotifyIcon icon;
         icon.executablePath = std::move(path);
@@ -2067,37 +2064,10 @@ std::vector<TrayNotifyIcon> EnumerateNotifyIconSettings(const RunningProcessInde
             icon.tip = PrettyTrayName(icon.executablePath);
         }
         icon.icon = ExtractExeIcon(icon.executablePath, 64);
-        icons.push_back(std::move(icon));
+        UpsertTrayIcon(icons, icon, false);
     }
     RegCloseKey(root);
     return icons;
-}
-
-void LinkHostWindows(std::vector<TrayNotifyIcon>& icons, std::vector<TrayNotifyIcon>& hosts) {
-    for (TrayNotifyIcon& icon : icons) {
-        if (icon.window != nullptr || icon.executablePath.empty()) {
-            continue;
-        }
-        const std::wstring lower = LowerCopy(icon.executablePath);
-        const std::wstring stem = LowerCopy(icon.exeName);
-        for (TrayNotifyIcon& host : hosts) {
-            if (host.window == nullptr) {
-                continue;
-            }
-            const std::wstring hostPath = LowerCopy(host.executablePath);
-            const bool same = (!hostPath.empty() && hostPath == lower) ||
-                (!stem.empty() && LowerCopy(host.exeName) == stem);
-            if (!same) {
-                continue;
-            }
-            icon.window = host.window;
-            if (icon.id == 0) {
-                icon.id = host.id;
-            }
-            host.window = nullptr;
-            break;
-        }
-    }
 }
 
 void LinkShellButtons(std::vector<TrayNotifyIcon>& icons, std::vector<TrayNotifyIcon>& buttons) {
@@ -2109,20 +2079,15 @@ void LinkShellButtons(std::vector<TrayNotifyIcon>& icons, std::vector<TrayNotify
             if (icon.shellButton) {
                 continue;
             }
-            const int tipScore = ShellButtonMatchScore(button.shellName, icon.tip);
-            const int exeScore = ShellButtonMatchScore(button.shellName, icon.exeName);
-            const int score = std::max(tipScore, exeScore);
-            const int needed = static_cast<int>(std::min<size_t>(12, icon.tip.size()));
-            if (score > bestScore &&
-                (score >= 100000 || (needed > 0 && score >= needed) ||
-                    score >= static_cast<int>(icon.exeName.size()))) {
+            const int score = tray_policy::BestShellButtonMatchScore(
+                ToTrayIdentity(icon), button.shellName);
+            if (score > bestScore && tray_policy::IsStrongShellButtonMatch(score)) {
                 best = &icon;
                 bestScore = score;
             }
         }
         if (best != nullptr) {
-            best->shellButton = true;
-            best->shellName = button.shellName;
+            MergeTrayIcon(*best, button, true);
         } else {
             unmatched.push_back(std::move(button));
         }
@@ -2130,7 +2095,7 @@ void LinkShellButtons(std::vector<TrayNotifyIcon>& icons, std::vector<TrayNotify
     if (!unmatched.empty()) {
         AssignShellIcons(unmatched);
         for (TrayNotifyIcon& button : unmatched) {
-            icons.push_back(std::move(button));
+            UpsertTrayIcon(icons, button, true);
         }
     }
 }
@@ -2173,18 +2138,9 @@ std::vector<TrayNotifyIcon> SystemTray::EnumerateNotifyIcons() const {
     const RunningProcessIndex running = CollectRunningProcesses();
     std::vector<TrayNotifyIcon> icons = EnumerateNotifyIconSettings(running);
 
-    std::vector<TrayNotifyIcon> hosts = EnumerateHostIcons();
-    LinkHostWindows(icons, hosts);
-    for (TrayNotifyIcon& host : hosts) {
-        if (host.window == nullptr) {
-            continue;
-        }
-        const std::wstring stem = LowerCopy(host.exeName);
-        const bool known = std::ranges::any_of(icons, [&stem](const TrayNotifyIcon& icon) {
-            return LowerCopy(icon.exeName) == stem;
-        });
-        if (!known) {
-            icons.push_back(std::move(host));
+    for (TrayNotifyIcon& host : EnumerateHostIcons()) {
+        if (host.window != nullptr) {
+            UpsertTrayIcon(icons, host, false);
         }
     }
 
@@ -2324,18 +2280,6 @@ bool SystemTray::OpenNotificationCenter() {
     return OpenDateTimeSettings();
 }
 
-int ShellButtonMatchScore(const std::wstring& stored, const std::wstring& current) {
-    if (stored == current) {
-        return 100000;
-    }
-    size_t length = 0;
-    const size_t limit = std::min(stored.size(), current.size());
-    while (length < limit && stored[length] == current[length]) {
-        ++length;
-    }
-    return static_cast<int>(length);
-}
-
 void HideShellTrayIfShown() noexcept {
     HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
     if (tray != nullptr && IsWindowVisible(tray) != FALSE) {
@@ -2348,75 +2292,163 @@ void HideShellTrayIfShown() noexcept {
     }
 }
 
+int FindBestShellButtonInBridge(const ShellButtonCollector& collector, HWND bridge,
+    const tray_policy::TrayIdentity& identity, IUIAutomationElement*& best, int& bestScore) {
+    if (bridge == nullptr || collector.automation == nullptr || collector.buttons == nullptr) {
+        return 0;
+    }
+    IUIAutomationElement* root = nullptr;
+    if (FAILED(collector.automation->ElementFromHandle(bridge, &root)) || root == nullptr) {
+        return 0;
+    }
+    IUIAutomationElementArray* found = nullptr;
+    if (FAILED(root->FindAll(TreeScope_Descendants, collector.buttons, &found)) ||
+        found == nullptr) {
+        root->Release();
+        return 0;
+    }
+    int notifyItemCount = 0;
+    int length = 0;
+    found->get_Length(&length);
+    for (int index = 0; index < length; ++index) {
+        IUIAutomationElement* element = nullptr;
+        if (FAILED(found->GetElement(index, &element)) || element == nullptr) {
+            continue;
+        }
+        BSTR automationId = nullptr;
+        BSTR name = nullptr;
+        element->get_CurrentAutomationId(&automationId);
+        element->get_CurrentName(&name);
+        const bool notifyItem = automationId != nullptr &&
+            std::wstring_view(automationId) == L"NotifyItemIcon";
+        const std::wstring current =
+            TrimEdges(name == nullptr ? std::wstring() : std::wstring(name));
+        SysFreeString(automationId);
+        SysFreeString(name);
+        if (!notifyItem) {
+            element->Release();
+            continue;
+        }
+        ++notifyItemCount;
+        const int score = tray_policy::BestShellButtonMatchScore(identity, current);
+        if (score > bestScore) {
+            if (best != nullptr) {
+                best->Release();
+            }
+            best = element;
+            bestScore = score;
+        } else {
+            element->Release();
+        }
+    }
+    found->Release();
+    root->Release();
+    return notifyItemCount;
+}
+
+// On Win11 with the taskbar hidden, TopLevelWindowForOverflowXamlIsland is not
+// populated until the system tray chevron has been invoked once. Invoking it
+// via UIA on demand realizes the overflow buttons without showing Shell_TrayWnd.
+bool InvokeOverflowChevron(const ShellButtonCollector& collector, HWND trayBridge) {
+    if (trayBridge == nullptr || collector.automation == nullptr) {
+        return false;
+    }
+    IUIAutomationElement* root = nullptr;
+    if (FAILED(collector.automation->ElementFromHandle(trayBridge, &root)) || root == nullptr) {
+        return false;
+    }
+
+    struct Probe {
+        PROPERTYID id;
+        const wchar_t* value;
+    };
+    const Probe probes[] = {
+        {UIA_AutomationIdPropertyId, L"SystemTrayChevron"},
+        {UIA_ClassNamePropertyId, L"SystemTray.ChevronButton"},
+    };
+    IUIAutomationElement* chevron = nullptr;
+    for (const Probe& probe : probes) {
+        VARIANT var{};
+        VariantInit(&var);
+        var.vt = VT_BSTR;
+        var.bstrVal = SysAllocString(probe.value);
+        IUIAutomationCondition* cond = nullptr;
+        if (SUCCEEDED(collector.automation->CreatePropertyCondition(probe.id, var, &cond)) &&
+            cond != nullptr) {
+            root->FindFirst(TreeScope_Descendants, cond, &chevron);
+            cond->Release();
+        }
+        VariantClear(&var);
+        if (chevron != nullptr) {
+            break;
+        }
+    }
+    root->Release();
+    if (chevron == nullptr) {
+        return false;
+    }
+
+    bool invoked = false;
+    IUIAutomationInvokePattern* invoke = nullptr;
+    if (SUCCEEDED(chevron->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke))) &&
+        invoke != nullptr) {
+        invoked = SUCCEEDED(invoke->Invoke());
+        invoke->Release();
+    } else {
+        IUIAutomationTogglePattern* toggle = nullptr;
+        if (SUCCEEDED(chevron->GetCurrentPatternAs(UIA_TogglePatternId, IID_PPV_ARGS(&toggle))) &&
+            toggle != nullptr) {
+            invoked = SUCCEEDED(toggle->Toggle());
+            toggle->Release();
+        }
+    }
+    chevron->Release();
+    return invoked;
+}
+
 // Activates a shell notification button through UI Automation. The Windows
 // tray and its overflow island stay hidden, so the dock's taskbar suppression
 // is never torn down by a show/hide cycle.
-bool ActivateShellButton(const std::wstring& shellName, bool rightClick) {
-    if (shellName.empty()) {
-        return false;
-    }
+bool ActivateShellButton(const tray_policy::TrayIdentity& identity, bool rightClick) {
     ShellButtonCollector collector;
     if (!collector.Open()) {
         return false;
     }
-    const HWND bridges[] = {
-        ChildByClassFragment(FindWindowW(L"Shell_TrayWnd", nullptr), L"DesktopWindowContentBridge"),
-        ChildByClassFragment(FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr),
-            L"DesktopWindowContentBridge"),
-    };
+    const HWND trayBridge =
+        ChildByClassFragment(FindWindowW(L"Shell_TrayWnd", nullptr), L"DesktopWindowContentBridge");
+    HWND overflowBridge = ChildByClassFragment(
+        FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr),
+        L"DesktopWindowContentBridge");
+
     IUIAutomationElement* best = nullptr;
     int bestScore = 0;
-    for (HWND bridge : bridges) {
-        if (bridge == nullptr) {
-            continue;
-        }
-        IUIAutomationElement* root = nullptr;
-        if (FAILED(collector.automation->ElementFromHandle(bridge, &root)) || root == nullptr) {
-            continue;
-        }
-        IUIAutomationElementArray* found = nullptr;
-        if (FAILED(root->FindAll(TreeScope_Descendants, collector.buttons, &found)) ||
-            found == nullptr) {
-            root->Release();
-            continue;
-        }
-        int length = 0;
-        found->get_Length(&length);
-        for (int index = 0; index < length; ++index) {
-            IUIAutomationElement* element = nullptr;
-            if (FAILED(found->GetElement(index, &element)) || element == nullptr) {
-                continue;
-            }
-            BSTR automationId = nullptr;
-            BSTR name = nullptr;
-            element->get_CurrentAutomationId(&automationId);
-            element->get_CurrentName(&name);
-            const bool notifyItem = automationId != nullptr &&
-                std::wstring_view(automationId) == L"NotifyItemIcon";
-            const std::wstring current = TrimEdges(name == nullptr ? std::wstring() : std::wstring(name));
-            SysFreeString(automationId);
-            SysFreeString(name);
-            if (!notifyItem) {
-                element->Release();
-                continue;
-            }
-            const int score = ShellButtonMatchScore(shellName, current);
-            if (score > bestScore) {
-                if (best != nullptr) {
-                    best->Release();
-                }
-                best = element;
-                bestScore = score;
-            } else {
-                element->Release();
+    FindBestShellButtonInBridge(collector, trayBridge, identity, best, bestScore);
+    const int overflowNotifyCount =
+        FindBestShellButtonInBridge(collector, overflowBridge, identity, best, bestScore);
+
+    bool realizedOverflow = false;
+    if ((best == nullptr || !tray_policy::IsStrongShellButtonMatch(bestScore)) &&
+        overflowNotifyCount == 0 && trayBridge != nullptr &&
+        InvokeOverflowChevron(collector, trayBridge)) {
+        realizedOverflow = true;
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            Sleep(20);
+            overflowBridge = ChildByClassFragment(
+                FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr),
+                L"DesktopWindowContentBridge");
+            FindBestShellButtonInBridge(collector, overflowBridge, identity, best, bestScore);
+            if (best != nullptr && tray_policy::IsStrongShellButtonMatch(bestScore)) {
+                break;
             }
         }
-        found->Release();
-        root->Release();
     }
-    if (best == nullptr || (bestScore < 100000 && bestScore < 12)) {
+
+    if (best == nullptr || !tray_policy::IsStrongShellButtonMatch(bestScore)) {
         if (best != nullptr) {
             best->Release();
+        }
+        if (realizedOverflow) {
+            HideShellTrayIfShown();
         }
         return false;
     }
@@ -2443,39 +2475,20 @@ bool ActivateShellButton(const std::wstring& shellName, bool rightClick) {
     return activated;
 }
 
-bool SystemTray::InvokeNotifyIcon(const TrayNotifyIcon& icon, UINT mouseMessage) {
-    const bool rightClick = mouseMessage == WM_RBUTTONUP;
-
-    if (icon.shellButton &&
-        ActivateShellButton(icon.shellName.empty() ? icon.tip : icon.shellName, rightClick)) {
-        return true;
-    }
-
-    // Host-window fallback for builds without the XAML tray island. Never
-    // reveals the Windows taskbar: showing it and hiding it again breaks the dock.
-    if (!rightClick && !icon.executablePath.empty() &&
-        FocusTrayAppWindow(icon.executablePath, true)) {
-        return true;
-    }
-
+bool PostTrayCallback(const TrayNotifyIcon& icon, bool rightClick) {
     if (icon.window == nullptr || IsWindow(icon.window) == FALSE) {
         return false;
     }
 
-    // Best-effort fallback: foreground the app's visible window when there is
-    // one (menus need it to track and dismiss), then forward across the
-    // callback IDs in common use.
+    // Foreground the tray owner window so Win32 TrackPopupMenu tracks and
+    // dismisses properly when clicking outside.
     AllowSetForegroundWindow(ASFW_ANY);
     DWORD processId = 0;
     GetWindowThreadProcessId(icon.window, &processId);
     if (processId != 0) {
         AllowSetForegroundWindow(processId);
     }
-    if (rightClick && !icon.executablePath.empty()) {
-        FocusTrayAppWindow(icon.executablePath, false);
-    } else {
-        SetForegroundWindow(icon.window);
-    }
+    SetForegroundWindow(icon.window);
 
     // Forward the click across the callback message IDs in common use. Apps
     // listen on exactly one registered message and ignore the rest, so this
@@ -2487,19 +2500,58 @@ bool SystemTray::InvokeNotifyIcon(const TrayNotifyIcon& icon, UINT mouseMessage)
     const UINT iconId = icon.id != 0 ? icon.id : 1;
     const LPARAM down = rightClick ? WM_RBUTTONDOWN : WM_LBUTTONDOWN;
     const LPARAM up = rightClick ? WM_RBUTTONUP : WM_LBUTTONUP;
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    const WPARAM anchor = MAKEWPARAM(static_cast<WORD>(cursor.x), static_cast<WORD>(cursor.y));
+    const LPARAM v4ContextMenu =
+        MAKELPARAM(WM_CONTEXTMENU, static_cast<WORD>(iconId & 0xFFFFU));
     for (const UINT callback : kCallbackIds) {
         PostMessageW(icon.window, callback, iconId, down);
         PostMessageW(icon.window, callback, iconId, up);
+        if (rightClick) {
+            PostMessageW(icon.window, callback, anchor, v4ContextMenu);
+        }
     }
     if (kQtTrayMessage != 0) {
         PostMessageW(icon.window, kQtTrayMessage, iconId, down);
         PostMessageW(icon.window, kQtTrayMessage, iconId, up);
     }
     if (rightClick) {
-        POINT cursor{};
-        GetCursorPos(&cursor);
         PostMessageW(icon.window, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(icon.window),
             MAKELPARAM(cursor.x, cursor.y));
     }
     return true;
+}
+
+bool LaunchTrayAppExecutable(const std::wstring& executablePath) {
+    if (executablePath.empty() || IsIgnoredIconPath(LowerCopy(executablePath))) {
+        return false;
+    }
+    if (GetFileAttributesW(executablePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    std::wstring directory;
+    const size_t slash = executablePath.find_last_of(L"\\/");
+    if (slash != std::wstring::npos && slash > 0) {
+        directory = executablePath.substr(0, slash);
+    }
+    SHELLEXECUTEINFOW launch{sizeof(launch)};
+    // ASYNCOK keeps the UI thread (which services WH_MOUSE_LL) responsive.
+    launch.fMask = SEE_MASK_ASYNCOK | SEE_MASK_FLAG_NO_UI;
+    launch.lpVerb = L"open";
+    launch.lpFile = executablePath.c_str();
+    launch.lpDirectory = directory.empty() ? nullptr : directory.c_str();
+    launch.nShow = SW_SHOWNORMAL;
+    return ShellExecuteExW(&launch) != FALSE;
+}
+
+bool SystemTray::InvokeNotifyIcon(const TrayNotifyIcon& icon, UINT mouseMessage) {
+    const bool rightClick = mouseMessage == WM_RBUTTONUP;
+    if (!rightClick && !icon.executablePath.empty() && FocusTrayAppWindow(icon.executablePath, true)) {
+        return true;
+    }
+    if (ActivateShellButton(ToTrayIdentity(icon), rightClick) || PostTrayCallback(icon, rightClick)) {
+        return true;
+    }
+    return !rightClick && LaunchTrayAppExecutable(icon.executablePath);
 }
