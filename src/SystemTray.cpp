@@ -1414,17 +1414,18 @@ HICON IconForKnownTrayTip(const std::wstring& tipLower, int size) {
 
 struct MainWindowSearch {
     std::wstring exePath;
-    HWND found = nullptr;
+    HWND visibleFound = nullptr;
+    HWND hiddenFound = nullptr;
     bool includeHidden = false;
 };
 
 BOOL CALLBACK FindMainWindowForExe(HWND window, LPARAM data) {
     auto* search = reinterpret_cast<MainWindowSearch*>(data);
-    if (search->found != nullptr || GetWindow(window, GW_OWNER) != nullptr) {
+    if (search->visibleFound != nullptr || GetWindow(window, GW_OWNER) != nullptr) {
         return TRUE;
     }
     const bool visible = IsWindowVisible(window) != FALSE;
-    if (!visible && !search->includeHidden) {
+    if (!visible && (!search->includeHidden || search->hiddenFound != nullptr)) {
         return TRUE;
     }
     const LONG_PTR extendedStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
@@ -1432,8 +1433,15 @@ BOOL CALLBACK FindMainWindowForExe(HWND window, LPARAM data) {
         return TRUE;
     }
     if (!visible) {
-        // Hidden candidates must still look like a main window, not an aux
-        // popup (e.g. Steam's 64x24 hidden vgui windows).
+        // Hidden candidates must look like a real titled app window, never an
+        // invisible CEF/GPU/message helper window.
+        if (IsWindowEnabled(window) == FALSE || GetWindowTextLengthW(window) <= 0) {
+            return TRUE;
+        }
+        const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+        if ((style & (WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_SYSMENU)) == 0) {
+            return TRUE;
+        }
         RECT bounds{};
         if (GetWindowRect(window, &bounds) == FALSE ||
             bounds.right - bounds.left < 240 || bounds.bottom - bounds.top < 180) {
@@ -1442,11 +1450,8 @@ BOOL CALLBACK FindMainWindowForExe(HWND window, LPARAM data) {
     }
     DWORD pid = 0;
     GetWindowThreadProcessId(window, &pid);
-    std::wstring path = ProcessImagePath(pid);
-    if (path.empty()) {
-        return TRUE;
-    }
-    if (!tray_policy::MatchesTrayAppExe(path, search->exePath)) {
+    const std::wstring path = ProcessImagePath(pid);
+    if (path.empty() || !tray_policy::MatchesTrayAppExe(path, search->exePath)) {
         return TRUE;
     }
     int cloaked = 0;
@@ -1454,13 +1459,54 @@ BOOL CALLBACK FindMainWindowForExe(HWND window, LPARAM data) {
         cloaked != 0) {
         return TRUE;
     }
-    search->found = window;
-    return FALSE;
+    if (visible) {
+        search->visibleFound = window;
+        return FALSE;
+    }
+    search->hiddenFound = window;
+    return TRUE;
 }
 
-// Brings the app's main window forward. With includeHidden, tray-hidden main
-// windows are restored too (native single-click semantics). Returns false
-// when the app has no focusable window.
+// Brings a window to the foreground reliably even when invoked from Hoverdock's
+// WS_EX_NOACTIVATE popup (where direct SetForegroundWindow can be denied).
+bool ForceForegroundWindow(HWND target, bool showWindow) {
+    if (target == nullptr || IsWindow(target) == FALSE) {
+        return false;
+    }
+    if (showWindow) {
+        if (IsIconic(target) != FALSE) {
+            ShowWindowAsync(target, SW_RESTORE);
+        } else if (IsWindowVisible(target) == FALSE) {
+            ShowWindowAsync(target, SW_SHOW);
+        }
+        SetWindowPos(target, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(target, &pid);
+    if (pid != 0) {
+        AllowSetForegroundWindow(pid);
+    }
+    BringWindowToTop(target);
+    if (SetForegroundWindow(target) != FALSE) {
+        return true;
+    }
+    const HWND fg = GetForegroundWindow();
+    const DWORD fgThread = fg != nullptr ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    const DWORD curThread = GetCurrentThreadId();
+    if (fgThread != 0 && fgThread != curThread &&
+        AttachThreadInput(curThread, fgThread, TRUE) != FALSE) {
+        BringWindowToTop(target);
+        SetForegroundWindow(target);
+        AttachThreadInput(curThread, fgThread, FALSE);
+    }
+    if (showWindow && GetForegroundWindow() != target) {
+        SwitchToThisWindow(target, TRUE);
+    }
+    return true;
+}
+
+// Brings the app's main window forward (visible windows preferred over titled
+// tray-hidden windows). Returns false when the app has no focusable window.
 bool FocusTrayAppWindow(const std::wstring& exePath, bool includeHidden) {
     if (exePath.empty()) {
         return false;
@@ -1469,21 +1515,8 @@ bool FocusTrayAppWindow(const std::wstring& exePath, bool includeHidden) {
     search.exePath = exePath;
     search.includeHidden = includeHidden;
     EnumWindows(&FindMainWindowForExe, reinterpret_cast<LPARAM>(&search));
-    if (search.found == nullptr || IsWindow(search.found) == FALSE) {
-        return false;
-    }
-    if (IsIconic(search.found) != FALSE) {
-        ShowWindowAsync(search.found, SW_RESTORE);
-    } else if (IsWindowVisible(search.found) == FALSE) {
-        ShowWindowAsync(search.found, SW_SHOW);
-    }
-    BringWindowToTop(search.found);
-    DWORD pid = 0;
-    GetWindowThreadProcessId(search.found, &pid);
-    if (pid != 0) {
-        AllowSetForegroundWindow(pid);
-    }
-    return SetForegroundWindow(search.found) != FALSE;
+    HWND target = search.visibleFound != nullptr ? search.visibleFound : search.hiddenFound;
+    return ForceForegroundWindow(target, true);
 }
 
 struct HostIconSearch {
@@ -1522,7 +1555,7 @@ BOOL CALLBACK CollectTrayHostIcon(HWND window, LPARAM data) {
 
 struct ClassSearch {
     const wchar_t* fragment = nullptr;
-    HWND found = nullptr;
+    std::vector<HWND> found;
 };
 
 BOOL CALLBACK FindChildClassFragment(HWND window, LPARAM data) {
@@ -1530,16 +1563,16 @@ BOOL CALLBACK FindChildClassFragment(HWND window, LPARAM data) {
     wchar_t name[200]{};
     if (GetClassNameW(window, name, static_cast<int>(std::size(name))) > 0 &&
         std::wstring_view(name).find(search->fragment) != std::wstring_view::npos) {
-        search->found = window;
+        search->found.push_back(window);
     }
     return TRUE;
 }
 
-HWND ChildByClassFragment(HWND parent, const wchar_t* fragment) {
+std::vector<HWND> ChildrenByClassFragment(HWND parent, const wchar_t* fragment) {
     if (parent == nullptr) {
-        return nullptr;
+        return {};
     }
-    ClassSearch search{fragment, nullptr};
+    ClassSearch search{fragment, {}};
     EnumChildWindows(parent, FindChildClassFragment, reinterpret_cast<LPARAM>(&search));
     return search.found;
 }
@@ -1886,12 +1919,15 @@ std::vector<TrayNotifyIcon> EnumerateShellButtons(bool assignIcons = true) {
     if (!collector.Open()) {
         return icons;
     }
-    const HWND trayBridge =
-        ChildByClassFragment(FindWindowW(L"Shell_TrayWnd", nullptr), L"DesktopWindowContentBridge");
-    const HWND overflowBridge = ChildByClassFragment(
-        FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr), L"DesktopWindowContentBridge");
-    collector.Collect(trayBridge, icons);
-    collector.Collect(overflowBridge, icons);
+    for (HWND bridge : ChildrenByClassFragment(
+             FindWindowW(L"Shell_TrayWnd", nullptr), L"DesktopWindowContentBridge")) {
+        collector.Collect(bridge, icons);
+    }
+    for (HWND bridge : ChildrenByClassFragment(
+             FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr),
+             L"DesktopWindowContentBridge")) {
+        collector.Collect(bridge, icons);
+    }
     if (assignIcons) {
         AssignShellIcons(icons);
     }
@@ -2293,7 +2329,8 @@ void HideShellTrayIfShown() noexcept {
 }
 
 int FindBestShellButtonInBridge(const ShellButtonCollector& collector, HWND bridge,
-    const tray_policy::TrayIdentity& identity, IUIAutomationElement*& best, int& bestScore) {
+    const tray_policy::TrayIdentity& identity, IUIAutomationElement*& best, HWND& bestBridge,
+    int& bestScore) {
     if (bridge == nullptr || collector.automation == nullptr || collector.buttons == nullptr) {
         return 0;
     }
@@ -2336,6 +2373,7 @@ int FindBestShellButtonInBridge(const ShellButtonCollector& collector, HWND brid
                 best->Release();
             }
             best = element;
+            bestBridge = bridge;
             bestScore = score;
         } else {
             element->Release();
@@ -2349,15 +2387,11 @@ int FindBestShellButtonInBridge(const ShellButtonCollector& collector, HWND brid
 // On Win11 with the taskbar hidden, TopLevelWindowForOverflowXamlIsland is not
 // populated until the system tray chevron has been invoked once. Invoking it
 // via UIA on demand realizes the overflow buttons without showing Shell_TrayWnd.
-bool InvokeOverflowChevron(const ShellButtonCollector& collector, HWND trayBridge) {
-    if (trayBridge == nullptr || collector.automation == nullptr) {
+bool InvokeOverflowChevron(const ShellButtonCollector& collector,
+    const std::vector<HWND>& trayBridges) {
+    if (collector.automation == nullptr) {
         return false;
     }
-    IUIAutomationElement* root = nullptr;
-    if (FAILED(collector.automation->ElementFromHandle(trayBridge, &root)) || root == nullptr) {
-        return false;
-    }
-
     struct Probe {
         PROPERTYID id;
         const wchar_t* value;
@@ -2365,45 +2399,74 @@ bool InvokeOverflowChevron(const ShellButtonCollector& collector, HWND trayBridg
     const Probe probes[] = {
         {UIA_AutomationIdPropertyId, L"SystemTrayChevron"},
         {UIA_ClassNamePropertyId, L"SystemTray.ChevronButton"},
+        {UIA_AutomationIdPropertyId, L"ShowHiddenIcons"},
     };
-    IUIAutomationElement* chevron = nullptr;
-    for (const Probe& probe : probes) {
-        VARIANT var{};
-        VariantInit(&var);
-        var.vt = VT_BSTR;
-        var.bstrVal = SysAllocString(probe.value);
-        IUIAutomationCondition* cond = nullptr;
-        if (SUCCEEDED(collector.automation->CreatePropertyCondition(probe.id, var, &cond)) &&
-            cond != nullptr) {
-            root->FindFirst(TreeScope_Descendants, cond, &chevron);
-            cond->Release();
+    for (HWND trayBridge : trayBridges) {
+        IUIAutomationElement* root = nullptr;
+        if (FAILED(collector.automation->ElementFromHandle(trayBridge, &root)) || root == nullptr) {
+            continue;
         }
-        VariantClear(&var);
-        if (chevron != nullptr) {
-            break;
+        IUIAutomationElement* chevron = nullptr;
+        for (const Probe& probe : probes) {
+            VARIANT var{};
+            VariantInit(&var);
+            var.vt = VT_BSTR;
+            var.bstrVal = SysAllocString(probe.value);
+            IUIAutomationCondition* cond = nullptr;
+            if (SUCCEEDED(collector.automation->CreatePropertyCondition(probe.id, var, &cond)) &&
+                cond != nullptr) {
+                root->FindFirst(TreeScope_Descendants, cond, &chevron);
+                cond->Release();
+            }
+            VariantClear(&var);
+            if (chevron != nullptr) {
+                break;
+            }
+        }
+        root->Release();
+        if (chevron == nullptr) {
+            continue;
+        }
+        bool invoked = false;
+        IUIAutomationInvokePattern* invoke = nullptr;
+        if (SUCCEEDED(chevron->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke))) &&
+            invoke != nullptr) {
+            invoked = SUCCEEDED(invoke->Invoke());
+            invoke->Release();
+        } else {
+            IUIAutomationTogglePattern* toggle = nullptr;
+            if (SUCCEEDED(chevron->GetCurrentPatternAs(
+                    UIA_TogglePatternId, IID_PPV_ARGS(&toggle))) &&
+                toggle != nullptr) {
+                invoked = SUCCEEDED(toggle->Toggle());
+                toggle->Release();
+            }
+        }
+        chevron->Release();
+        if (invoked) {
+            return true;
         }
     }
-    root->Release();
-    if (chevron == nullptr) {
+    return false;
+}
+
+bool PostRightClickToShellButton(IUIAutomationElement* button, HWND bridge) {
+    if (button == nullptr || bridge == nullptr || IsWindow(bridge) == FALSE) {
         return false;
     }
-
-    bool invoked = false;
-    IUIAutomationInvokePattern* invoke = nullptr;
-    if (SUCCEEDED(chevron->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke))) &&
-        invoke != nullptr) {
-        invoked = SUCCEEDED(invoke->Invoke());
-        invoke->Release();
-    } else {
-        IUIAutomationTogglePattern* toggle = nullptr;
-        if (SUCCEEDED(chevron->GetCurrentPatternAs(UIA_TogglePatternId, IID_PPV_ARGS(&toggle))) &&
-            toggle != nullptr) {
-            invoked = SUCCEEDED(toggle->Toggle());
-            toggle->Release();
-        }
+    RECT rect{};
+    if (FAILED(button->get_CurrentBoundingRectangle(&rect)) ||
+        rect.right <= rect.left || rect.bottom <= rect.top) {
+        return false;
     }
-    chevron->Release();
-    return invoked;
+    POINT center{(rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2};
+    if (ScreenToClient(bridge, &center) == FALSE) {
+        return false;
+    }
+    const LPARAM lParam = MAKELPARAM(center.x, center.y);
+    PostMessageW(bridge, WM_RBUTTONDOWN, MK_RBUTTON, lParam);
+    PostMessageW(bridge, WM_RBUTTONUP, 0, lParam);
+    return true;
 }
 
 // Activates a shell notification button through UI Automation. The Windows
@@ -2414,29 +2477,38 @@ bool ActivateShellButton(const tray_policy::TrayIdentity& identity, bool rightCl
     if (!collector.Open()) {
         return false;
     }
-    const HWND trayBridge =
-        ChildByClassFragment(FindWindowW(L"Shell_TrayWnd", nullptr), L"DesktopWindowContentBridge");
-    HWND overflowBridge = ChildByClassFragment(
+    const std::vector<HWND> trayBridges = ChildrenByClassFragment(
+        FindWindowW(L"Shell_TrayWnd", nullptr), L"DesktopWindowContentBridge");
+    std::vector<HWND> overflowBridges = ChildrenByClassFragment(
         FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr),
         L"DesktopWindowContentBridge");
 
     IUIAutomationElement* best = nullptr;
+    HWND bestBridge = nullptr;
     int bestScore = 0;
-    FindBestShellButtonInBridge(collector, trayBridge, identity, best, bestScore);
-    const int overflowNotifyCount =
-        FindBestShellButtonInBridge(collector, overflowBridge, identity, best, bestScore);
+    for (HWND bridge : trayBridges) {
+        FindBestShellButtonInBridge(collector, bridge, identity, best, bestBridge, bestScore);
+    }
+    int overflowNotifyCount = 0;
+    for (HWND bridge : overflowBridges) {
+        overflowNotifyCount +=
+            FindBestShellButtonInBridge(collector, bridge, identity, best, bestBridge, bestScore);
+    }
 
     bool realizedOverflow = false;
     if ((best == nullptr || !tray_policy::IsStrongShellButtonMatch(bestScore)) &&
-        overflowNotifyCount == 0 && trayBridge != nullptr &&
-        InvokeOverflowChevron(collector, trayBridge)) {
+        overflowNotifyCount == 0 && !trayBridges.empty() &&
+        InvokeOverflowChevron(collector, trayBridges)) {
         realizedOverflow = true;
         for (int attempt = 0; attempt < 6; ++attempt) {
             Sleep(20);
-            overflowBridge = ChildByClassFragment(
+            overflowBridges = ChildrenByClassFragment(
                 FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr),
                 L"DesktopWindowContentBridge");
-            FindBestShellButtonInBridge(collector, overflowBridge, identity, best, bestScore);
+            for (HWND bridge : overflowBridges) {
+                FindBestShellButtonInBridge(
+                    collector, bridge, identity, best, bestBridge, bestScore);
+            }
             if (best != nullptr && tray_policy::IsStrongShellButtonMatch(bestScore)) {
                 break;
             }
@@ -2461,6 +2533,9 @@ bool ActivateShellButton(const tray_policy::TrayIdentity& identity, bool rightCl
             activated = SUCCEEDED(element3->ShowContextMenu());
             element3->Release();
         }
+        if (!activated) {
+            activated = PostRightClickToShellButton(best, bestBridge);
+        }
     } else {
         IUIAutomationInvokePattern* invoke = nullptr;
         if (SUCCEEDED(best->GetCurrentPatternAs(
@@ -2471,6 +2546,9 @@ bool ActivateShellButton(const tray_policy::TrayIdentity& identity, bool rightCl
         }
     }
     best->Release();
+    if (realizedOverflow) {
+        Sleep(40);
+    }
     HideShellTrayIfShown();
     return activated;
 }
@@ -2483,18 +2561,14 @@ bool PostTrayCallback(const TrayNotifyIcon& icon, bool rightClick) {
     // Foreground the tray owner window so Win32 TrackPopupMenu tracks and
     // dismisses properly when clicking outside.
     AllowSetForegroundWindow(ASFW_ANY);
-    DWORD processId = 0;
-    GetWindowThreadProcessId(icon.window, &processId);
-    if (processId != 0) {
-        AllowSetForegroundWindow(processId);
-    }
-    SetForegroundWindow(icon.window);
+    ForceForegroundWindow(icon.window, false);
 
     // Forward the click across the callback message IDs in common use. Apps
     // listen on exactly one registered message and ignore the rest, so this
     // is safe to fan out. (Explorer's own routing table is not exposed, and
     // synthetic clicks can't reach a suppressed taskbar.)
-    static constexpr UINT kCallbackIds[] = {WM_USER, WM_APP, WM_USER + 1, WM_USER + 2};
+    static constexpr UINT kCallbackIds[] = {
+        WM_USER, WM_APP, WM_USER + 1, WM_USER + 2, WM_APP + 1, WM_USER + 1024};
     // Qt uses its own registered message rather than WM_USER-family IDs.
     static const UINT kQtTrayMessage = RegisterWindowMessageW(L"QSystemTrayIconSysMsg");
     const UINT iconId = icon.id != 0 ? icon.id : 1;
@@ -2547,11 +2621,13 @@ bool LaunchTrayAppExecutable(const std::wstring& executablePath) {
 
 bool SystemTray::InvokeNotifyIcon(const TrayNotifyIcon& icon, UINT mouseMessage) {
     const bool rightClick = mouseMessage == WM_RBUTTONUP;
-    if (!rightClick && !icon.executablePath.empty() && FocusTrayAppWindow(icon.executablePath, true)) {
-        return true;
+    if (!rightClick) {
+        if (!icon.executablePath.empty() &&
+            (FocusTrayAppWindow(icon.executablePath, true) ||
+                LaunchTrayAppExecutable(icon.executablePath))) {
+            return true;
+        }
+        return ActivateShellButton(ToTrayIdentity(icon), false) || PostTrayCallback(icon, false);
     }
-    if (ActivateShellButton(ToTrayIdentity(icon), rightClick) || PostTrayCallback(icon, rightClick)) {
-        return true;
-    }
-    return !rightClick && LaunchTrayAppExecutable(icon.executablePath);
+    return ActivateShellButton(ToTrayIdentity(icon), true) || PostTrayCallback(icon, true);
 }
