@@ -618,7 +618,8 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
     float3 accum = float3(0.0, 0.0, 0.0);
     float alpha = 0.0;
     float ring = 0.0;
-    float minS = 1e6;
+    float2 bbMin = float2(1e6, 1e6);
+    float2 bbMax = float2(-1e6, -1e6);
     for (uint i = 0u; i < 48u; ++i)
     {
         if (i >= n)
@@ -630,8 +631,9 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         const float2 centre = a.iconRect.xy;
         const float2 halfSize = a.iconRect.zw;
         const float r = a.iconMeta.x;
+        bbMin = min(bbMin, centre - halfSize);
+        bbMax = max(bbMax, centre + halfSize);
         const float s = SdRoundRectCc(pixel - centre, halfSize, r);
-        minS = min(minS, s);
         if (s > 1.6)
         {
             continue;
@@ -708,12 +710,16 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
     const float outA = alpha + (1.0 - alpha) * ring;
     if (liquid && hasBackdrop && n > 1u && outA < 1.0)
     {
-        // macOS Control Centre: softly blurred + gently dimmed backdrop field
-        // behind and between floating buttons, feathered to 0 at the edges.
-        const float tBg = 1.0 - saturate(max(minS, 0.0) / (28.0 * dpi));
+        // macOS Control Centre: one continuous blurred + subtly dimmed backdrop
+        // field spanning the entire module bounding box (no unblurred gaps
+        // between buttons), softly feathered out around the outer perimeter.
+        const float2 bgCentre = 0.5 * (bbMin + bbMax);
+        const float2 bgHalf = 0.5 * (bbMax - bbMin) + float2(8.0 * dpi, 8.0 * dpi);
+        const float bgSdf = SdRoundRectCc(pixel - bgCentre, bgHalf, 34.0 * dpi);
+        const float tBg = 1.0 - saturate(max(bgSdf, 0.0) / (14.0 * dpi));
         const float edgeDist = min(min(pixel.x, outputSize.x - pixel.x),
             min(pixel.y, outputSize.y - pixel.y));
-        const float bgMask = tBg * tBg * (3.0 - 2.0 * tBg) * smoothstep(0.0, 14.0 * dpi, edgeDist);
+        const float bgMask = tBg * tBg * (3.0 - 2.0 * tBg) * smoothstep(0.0, 6.0 * dpi, edgeDist);
         if (bgMask > 0.0)
         {
             const float2 uv0 = clamp(pixel * texel, lo, hi);

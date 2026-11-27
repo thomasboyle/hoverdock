@@ -2557,31 +2557,18 @@ int DockApp::Run() {
     StartUpdateTimer(kUpdateInitialDelayMs);
 
     for (;;) {
-        bool slideAnimating = m_visibility == VisibilityState::Showing ||
+        const bool slideAnimating = m_visibility == VisibilityState::Showing ||
             m_visibility == VisibilityState::Hiding;
-        DWORD timeout = INFINITE;
-        if (slideAnimating) {
-            const double hz = static_cast<double>(std::clamp(
-                m_hostRefreshHz == 0 ? 60U : m_hostRefreshHz, 30U, 240U));
-            const double frameInterval = 1.0 / hz;
-            const double now = QpcSeconds();
-            if (m_lastSlideTickAt <= 0.0 || (now - m_lastSlideTickAt) >= frameInterval) {
-                AdvanceAnimation();
-                slideAnimating = m_visibility == VisibilityState::Showing ||
-                    m_visibility == VisibilityState::Hiding;
-            }
-            if (slideAnimating) {
-                const double remainingMs = (m_lastSlideTickAt + frameInterval - QpcSeconds()) * 1000.0;
-                timeout = std::max<DWORD>(1U, static_cast<DWORD>(std::ceil(std::max(0.0, remainingMs))));
-            }
-        }
-        if (m_dragSnapAnimating) {
-            timeout = std::min<DWORD>(timeout, 16U);
-        }
-        HANDLE waits[2]{};
+        HANDLE frameWaitable = slideAnimating ? m_renderer.FrameLatencyWaitableObject() : nullptr;
+        HANDLE waits[3]{};
         DWORD waitCount = 0;
+        DWORD frameSlot = static_cast<DWORD>(-1);
         DWORD backdropSlot = static_cast<DWORD>(-1);
         DWORD glintSlot = static_cast<DWORD>(-1);
+        if (frameWaitable != nullptr) {
+            frameSlot = waitCount;
+            waits[waitCount++] = frameWaitable;
+        }
         if (m_backdropFastArmed && m_backdropWaitable != nullptr) {
             backdropSlot = waitCount;
             waits[waitCount++] = m_backdropWaitable;
@@ -2590,6 +2577,7 @@ int DockApp::Run() {
             glintSlot = waitCount;
             waits[waitCount++] = m_glintWaitable;
         }
+        const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
         // WH_MOUSE_LL is delivered by a sent message, which sets QS_SENDMESSAGE.
         // That bit is in QS_ALLINPUT but not QS_INPUT, so an idle wait missed the
         // hook until LowLevelHooksTimeout and the system cursor stalled. The dock
@@ -2602,7 +2590,18 @@ int DockApp::Run() {
 
         const bool objectSignaled = waitCount > 0 && wait >= WAIT_OBJECT_0 &&
             wait < WAIT_OBJECT_0 + waitCount;
-        if (m_dragSnapAnimating && wait != WAIT_FAILED) {
+        if (wait == WAIT_TIMEOUT ||
+            (objectSignaled && frameSlot != static_cast<DWORD>(-1) &&
+                wait == WAIT_OBJECT_0 + frameSlot)) {
+            if (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Hiding) {
+                AdvanceAnimation();
+            }
+            if (m_dragSnapAnimating) {
+                AdvanceDragSnapBack();
+            }
+        } else if (m_dragSnapAnimating && wait != WAIT_FAILED) {
+            // The 8 ms backdrop timer wakes this wait before the 16 ms snap
+            // timeout, so the ghost would otherwise stay at the drop point.
             AdvanceDragSnapBack();
         }
         if (objectSignaled && backdropSlot != static_cast<DWORD>(-1) &&
@@ -11098,11 +11097,9 @@ void DockApp::BeginShow() {
     m_animationFromY = m_currentY;
     m_animationToY = m_visibleY;
     m_animationStartedAt = QpcSeconds();
-    m_lastSlideTickAt = 0.0;
     StartCursorWatch();
-    if (m_config.RevealDurationMs() <= 0) {
-        AdvanceAnimation();
-    }
+    QueueRenderFrame(false);
+    PostMessageW(m_window, kBeginShowDeferredMessage, static_cast<WPARAM>(m_showSessionId), 0);
 }
 
 void DockApp::BeginHide() {
@@ -11137,15 +11134,10 @@ void DockApp::BeginHide() {
     m_animationFromY = m_currentY;
     m_animationToY = m_hiddenY;
     m_animationStartedAt = QpcSeconds();
-    m_lastSlideTickAt = 0.0;
-    if (m_config.RevealDurationMs() <= 0) {
-        AdvanceAnimation();
-    }
 }
 
 void DockApp::AdvanceAnimation() {
     ProfileScope scope("AdvanceAnimation");
-    m_lastSlideTickAt = QpcSeconds();
     const double duration = m_config.RevealDurationSeconds();
     const double elapsed = SecondsSinceAnimationStarted();
     const double linear = duration <= 0.0
@@ -11173,7 +11165,6 @@ void DockApp::AdvanceAnimation() {
         ScheduleDeferredRefresh();
         UpdateHoverLabel();
         UpdateGlintTarget(m_lastCursor);
-        PostMessageW(m_window, kBeginShowDeferredMessage, static_cast<WPARAM>(m_showSessionId), 0);
         return;
     }
 

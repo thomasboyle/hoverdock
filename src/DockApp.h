@@ -961,7 +961,6 @@ private:
     std::vector<DockIconRenderData> m_iconRenderData;
     VisibilityState m_visibility = VisibilityState::Hidden;
     double m_animationStartedAt = 0.0;
-    double m_lastSlideTickAt = 0.0;
     LONG m_animationFromY = 0;
     LONG m_animationToY = 0;
     LONG m_windowX = 0;
