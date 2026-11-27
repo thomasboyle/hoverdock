@@ -640,7 +640,7 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         {
             const float shSdf = SdRoundRectCc(pixel - centre - float2(0.0, 4.0 * dpi), halfSize, r);
             const float u = 1.0 - saturate(max(shSdf, 0.0) / (11.0 * dpi));
-            shadowA = max(shadowA, (shSdf > 0.0 ? u * u * (3.0 - 2.0 * u) * 0.22 : 0.0));
+            shadowA = max(shadowA, u * u * (3.0 - 2.0 * u) * 0.22);
         }
         // One-pixel darkened ring just outside the shape.
         if (s > 0.0)

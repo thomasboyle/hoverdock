@@ -950,16 +950,34 @@ struct FlyoutTextRenderer final : IDWriteTextRenderer {
 
 void LinearCoverageToPremulInk(uint8_t* pixels, int width, int height, int strideBytes,
     uint8_t gray) {
+    // DirectWrite renders with gamma=1.0 (linear coverage) and CompositePremul
+    // blends in sRGB. For light ink on dark glass, sRGB blending erodes ~30%
+    // of anti-aliased stem weight; gamma-encoding coverage (~1/1.8) restores
+    // crisp stems matching macOS CoreText.
+    const bool lightInk = (static_cast<unsigned>(g_flyoutInkR) * 54U +
+        static_cast<unsigned>(g_flyoutInkG) * 183U +
+        static_cast<unsigned>(g_flyoutInkB) * 19U) > (128U << 8U);
+    static const auto kLightGammaLut = []() {
+        std::array<uint8_t, 256> lut{};
+        for (size_t i = 0; i < 256U; ++i) {
+            const float c = static_cast<float>(i) / 255.0F;
+            lut[i] = static_cast<uint8_t>(std::lround(std::pow(c, 1.0F / 1.8F) * 255.0F));
+        }
+        return lut;
+    }();
     for (int y = 0; y < height; ++y) {
         uint8_t* row = pixels + static_cast<size_t>(y) * static_cast<size_t>(strideBytes);
         for (int x = 0; x < width; ++x) {
             uint8_t* px = row + static_cast<size_t>(x) * 4U;
             // BitmapRenderTarget is BGRX; gamma=1.0 rendering params emit linear coverage.
-            const unsigned coverage =
+            unsigned coverage =
                 (static_cast<unsigned>(px[0]) * 19U +
                     static_cast<unsigned>(px[1]) * 183U +
                     static_cast<unsigned>(px[2]) * 54U) >>
                 8U;
+            if (lightInk) {
+                coverage = kLightGammaLut[coverage];
+            }
             const unsigned alpha = (coverage * gray + 127U) / 255U;
             px[0] = static_cast<uint8_t>((g_flyoutInkB * alpha + 127U) / 255U);
             px[1] = static_cast<uint8_t>((g_flyoutInkG * alpha + 127U) / 255U);
@@ -2539,18 +2557,31 @@ int DockApp::Run() {
     StartUpdateTimer(kUpdateInitialDelayMs);
 
     for (;;) {
-        const bool slideAnimating = m_visibility == VisibilityState::Showing ||
+        bool slideAnimating = m_visibility == VisibilityState::Showing ||
             m_visibility == VisibilityState::Hiding;
-        HANDLE frameWaitable = slideAnimating ? m_renderer.FrameLatencyWaitableObject() : nullptr;
-        HANDLE waits[3]{};
+        DWORD timeout = INFINITE;
+        if (slideAnimating) {
+            const double hz = static_cast<double>(std::clamp(
+                m_hostRefreshHz == 0 ? 60U : m_hostRefreshHz, 30U, 240U));
+            const double frameInterval = 1.0 / hz;
+            const double now = QpcSeconds();
+            if (m_lastSlideTickAt <= 0.0 || (now - m_lastSlideTickAt) >= frameInterval) {
+                AdvanceAnimation();
+                slideAnimating = m_visibility == VisibilityState::Showing ||
+                    m_visibility == VisibilityState::Hiding;
+            }
+            if (slideAnimating) {
+                const double remainingMs = (m_lastSlideTickAt + frameInterval - QpcSeconds()) * 1000.0;
+                timeout = std::max<DWORD>(1U, static_cast<DWORD>(std::ceil(std::max(0.0, remainingMs))));
+            }
+        }
+        if (m_dragSnapAnimating) {
+            timeout = std::min<DWORD>(timeout, 16U);
+        }
+        HANDLE waits[2]{};
         DWORD waitCount = 0;
-        DWORD frameSlot = static_cast<DWORD>(-1);
         DWORD backdropSlot = static_cast<DWORD>(-1);
         DWORD glintSlot = static_cast<DWORD>(-1);
-        if (frameWaitable != nullptr) {
-            frameSlot = waitCount;
-            waits[waitCount++] = frameWaitable;
-        }
         if (m_backdropFastArmed && m_backdropWaitable != nullptr) {
             backdropSlot = waitCount;
             waits[waitCount++] = m_backdropWaitable;
@@ -2559,7 +2590,6 @@ int DockApp::Run() {
             glintSlot = waitCount;
             waits[waitCount++] = m_glintWaitable;
         }
-        const DWORD timeout = (slideAnimating || m_dragSnapAnimating) ? 16 : INFINITE;
         // WH_MOUSE_LL is delivered by a sent message, which sets QS_SENDMESSAGE.
         // That bit is in QS_ALLINPUT but not QS_INPUT, so an idle wait missed the
         // hook until LowLevelHooksTimeout and the system cursor stalled. The dock
@@ -2572,18 +2602,7 @@ int DockApp::Run() {
 
         const bool objectSignaled = waitCount > 0 && wait >= WAIT_OBJECT_0 &&
             wait < WAIT_OBJECT_0 + waitCount;
-        if (wait == WAIT_TIMEOUT ||
-            (objectSignaled && frameSlot != static_cast<DWORD>(-1) &&
-                wait == WAIT_OBJECT_0 + frameSlot)) {
-            if (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Hiding) {
-                AdvanceAnimation();
-            }
-            if (m_dragSnapAnimating) {
-                AdvanceDragSnapBack();
-            }
-        } else if (m_dragSnapAnimating && wait != WAIT_FAILED) {
-            // The 8 ms backdrop timer wakes this wait before the 16 ms snap
-            // timeout, so the ghost would otherwise stay at the drop point.
+        if (m_dragSnapAnimating && wait != WAIT_FAILED) {
             AdvanceDragSnapBack();
         }
         if (objectSignaled && backdropSlot != static_cast<DWORD>(-1) &&
@@ -7910,6 +7929,39 @@ bool DockApp::ApplyLivePopupGlass(std::vector<uint8_t>& glassBits, SIZE size,
     return true;
 }
 
+bool DockApp::ApplyOverflowLiveGlass(std::vector<uint8_t>& glassBits)
+{
+    const int width = SaturatedInt(m_overflowSize.cx);
+    const int height = SaturatedInt(m_overflowSize.cy);
+    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4U;
+    if (width <= 0 || height <= 0 || glassBits.size() != bytes || m_overflowGlass.size() != bytes) {
+        return false;
+    }
+    if (std::memcmp(glassBits.data(), m_overflowGlass.data(), bytes) == 0) {
+        return false;
+    }
+    const float scale = static_cast<float>(HostDpi()) / 96.0F;
+    const LONG shadowMargin = std::max(1L, std::lround(DOCK_SHADOW_MARGIN_PT * scale));
+    const int contentWidth = width - static_cast<int>(shadowMargin * 2L);
+    const int contentHeight = height - static_cast<int>(shadowMargin * 2L);
+    if (contentWidth <= 0 || contentHeight <= 0 ||
+        m_qsContentScratch.size() !=
+            static_cast<size_t>(contentWidth) * static_cast<size_t>(contentHeight) * 4U) {
+        return ApplyLivePopupGlass(glassBits, m_overflowSize, m_overflowGlass, m_overflowBaseBits,
+            m_overflowPresentBits, m_overflowPresentSize);
+    }
+    m_overflowGlass.swap(glassBits);
+    m_overflowUnderlayBits = m_overflowGlass;
+    CompositePremul(m_overflowUnderlayBits.data(), width, height,
+        static_cast<int>(shadowMargin), static_cast<int>(shadowMargin),
+        m_qsContentScratch.data(), contentWidth, contentHeight);
+    m_overflowBaseBits = m_overflowUnderlayBits;
+    PaintQsLiveOverlays(m_overflowBaseBits.data(), width, height, scale);
+    m_overflowPresentBits = m_overflowBaseBits;
+    m_overflowPresentSize = m_overflowSize;
+    return true;
+}
+
 bool DockApp::TickLivePopupGlass()
 {
     if (!m_rendererInitialized || m_frostSliderDragging) {
@@ -7956,8 +8008,7 @@ bool DockApp::TickLivePopupGlass()
             if (glass.size() == m_overflowGlass.size() &&
                 m_overflowGlassSize.cx == m_overflowSize.cx &&
                 m_overflowGlassSize.cy == m_overflowSize.cy) {
-                if (ApplyLivePopupGlass(glass, m_overflowSize, m_overflowGlass, m_overflowBaseBits,
-                        m_overflowPresentBits, m_overflowPresentSize)) {
+                if (ApplyOverflowLiveGlass(glass)) {
                     m_overflowLayerDib.contentValid = false;
                     m_overflowHoverDirtyValid = false;
                     PaintOverflowHoverFast();
@@ -8051,7 +8102,8 @@ bool DockApp::TickLivePopupGlass()
             continue;
         }
         const RECT screenRect{origin.x, origin.y, origin.x + width, origin.y + height};
-        if (m_renderer.DesktopRegionChanged(screenRect, target)) {
+        const int dirtPopupIndex = (target == 1 && m_config.MacosControlCentreGlass()) ? -1 : target;
+        if (m_renderer.DesktopRegionChanged(screenRect, dirtPopupIndex)) {
             m_popupGlassDirty[target] = true;
         }
         if (!m_popupGlassDirty[target]) {
@@ -11046,12 +11098,10 @@ void DockApp::BeginShow() {
     m_animationFromY = m_currentY;
     m_animationToY = m_visibleY;
     m_animationStartedAt = QpcSeconds();
+    m_lastSlideTickAt = 0.0;
     StartCursorWatch();
-    PostMessageW(m_window, kBeginShowDeferredMessage, static_cast<WPARAM>(m_showSessionId), 0);
     if (m_config.RevealDurationMs() <= 0) {
         AdvanceAnimation();
-    } else {
-        QueueRenderFrame(false);
     }
 }
 
@@ -11087,6 +11137,7 @@ void DockApp::BeginHide() {
     m_animationFromY = m_currentY;
     m_animationToY = m_hiddenY;
     m_animationStartedAt = QpcSeconds();
+    m_lastSlideTickAt = 0.0;
     if (m_config.RevealDurationMs() <= 0) {
         AdvanceAnimation();
     }
@@ -11094,6 +11145,7 @@ void DockApp::BeginHide() {
 
 void DockApp::AdvanceAnimation() {
     ProfileScope scope("AdvanceAnimation");
+    m_lastSlideTickAt = QpcSeconds();
     const double duration = m_config.RevealDurationSeconds();
     const double elapsed = SecondsSinceAnimationStarted();
     const double linear = duration <= 0.0
@@ -11121,6 +11173,7 @@ void DockApp::AdvanceAnimation() {
         ScheduleDeferredRefresh();
         UpdateHoverLabel();
         UpdateGlintTarget(m_lastCursor);
+        PostMessageW(m_window, kBeginShowDeferredMessage, static_cast<WPARAM>(m_showSessionId), 0);
         return;
     }
 

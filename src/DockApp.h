@@ -625,6 +625,7 @@ private:
     [[nodiscard]] bool ApplyLivePopupGlass(std::vector<uint8_t>& glassBits, SIZE size,
         std::vector<uint8_t>& cachedGlass, std::vector<uint8_t>& baseBits,
         std::vector<uint8_t>& presentBits, SIZE& presentSize);
+    [[nodiscard]] bool ApplyOverflowLiveGlass(std::vector<uint8_t>& glassBits);
     void BeginHide();
     void AdvanceAnimation();
     bool RenderFrame(bool allowBlockingGpuWait = true);
@@ -960,6 +961,7 @@ private:
     std::vector<DockIconRenderData> m_iconRenderData;
     VisibilityState m_visibility = VisibilityState::Hidden;
     double m_animationStartedAt = 0.0;
+    double m_lastSlideTickAt = 0.0;
     LONG m_animationFromY = 0;
     LONG m_animationToY = 0;
     LONG m_windowX = 0;
