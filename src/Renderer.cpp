@@ -4350,6 +4350,8 @@ void Renderer::CancelLiveGlassPanelBake() noexcept
         }
     };
     waitFence(m_panelFenceValue);
+    waitFence(m_panelListFence[0]);
+    waitFence(m_panelListFence[1]);
     m_panelBakePending = false;
     m_panelBakeTag = -1;
     for (auto& entry : m_panelPool) {

@@ -2556,6 +2556,7 @@ int DockApp::Run() {
     // running. The worker skips itself when auto-checks are disabled.
     StartUpdateTimer(kUpdateInitialDelayMs);
 
+    double lastSlideTickAt = 0.0;
     for (;;) {
         const bool slideAnimating = m_visibility == VisibilityState::Showing ||
             m_visibility == VisibilityState::Hiding;
@@ -2590,13 +2591,17 @@ int DockApp::Run() {
 
         const bool objectSignaled = waitCount > 0 && wait >= WAIT_OBJECT_0 &&
             wait < WAIT_OBJECT_0 + waitCount;
-        if (wait == WAIT_TIMEOUT ||
+        const bool frameDue = wait == WAIT_TIMEOUT ||
             (objectSignaled && frameSlot != static_cast<DWORD>(-1) &&
-                wait == WAIT_OBJECT_0 + frameSlot)) {
+                wait == WAIT_OBJECT_0 + frameSlot);
+        const double slideInterval = 1.0 / static_cast<double>(
+            std::clamp(m_hostRefreshHz == 0 ? 60U : m_hostRefreshHz, 30U, 240U));
+        if (frameDue || (slideAnimating && (QpcSeconds() - lastSlideTickAt) >= slideInterval)) {
             if (m_visibility == VisibilityState::Showing || m_visibility == VisibilityState::Hiding) {
+                lastSlideTickAt = QpcSeconds();
                 AdvanceAnimation();
             }
-            if (m_dragSnapAnimating) {
+            if (frameDue && m_dragSnapAnimating) {
                 AdvanceDragSnapBack();
             }
         } else if (m_dragSnapAnimating && wait != WAIT_FAILED) {
@@ -3090,17 +3095,20 @@ LRESULT CALLBACK DockApp::MouseHook(int code, WPARAM wParam, LPARAM lParam) {
                        wParam == WM_MBUTTONDOWN) &&
             s_instance->IsContextMenuOpen() &&
             !s_instance->IsCursorOverContextMenu(mouse->pt)) {
-            // Clicking elsewhere dismisses the context menu. A right-button
-            // press on another icon is allowed through so its RBUTTONUP can
-            // open a fresh menu for that icon.
-            s_instance->CloseContextMenu();
+            // Defer dismissal off the WH_MOUSE_LL callback so TrimIdlePanelResources
+            // never runs re-entrantly mid-bake or mid-present.
+            if (s_instance->m_window != nullptr) {
+                PostMessageW(s_instance->m_window, kOverflowDismissMessage, 0, 0);
+            }
         } else if (wParam == WM_LBUTTONDOWN && s_instance->IsOverflowOpen() &&
             !s_instance->m_bluetooth.IsPairing() &&
             !s_instance->IsCursorOverOverflow(mouse->pt) &&
             !s_instance->IsCursorOverSettings(mouse->pt) &&
             !s_instance->IsCursorOverContextMenu(mouse->pt) &&
             s_instance->IconAtScreenPoint(mouse->pt) < 0) {
-            s_instance->CloseOverflowPopup();
+            if (s_instance->m_window != nullptr) {
+                PostMessageW(s_instance->m_window, kOverflowDismissMessage, 1, 0);
+            }
         } else if (wParam == WM_MOUSEWHEEL && s_instance->IsOverflowOpen() &&
             s_instance->IsCursorOverOverflow(mouse->pt) &&
             s_instance->m_overflowWindow != nullptr) {
@@ -3688,7 +3696,11 @@ LRESULT DockApp::HandleRendererMessage(HWND window, UINT message, WPARAM wParam,
         return 0;
 
     case kOverflowDismissMessage:
-        DismissQuickSettings();
+        if (wParam == 1) {
+            CloseOverflowPopup();
+        } else {
+            DismissQuickSettings();
+        }
         return 0;
 
     case kOverflowWheelMessage: {
@@ -10945,6 +10957,14 @@ bool DockApp::AdoptMonitorForCursor(POINT cursor) {
     NoteHostRefreshHz();
     RebuildLayout(previousDpi != HostDpi());
     PositionOverlayWindows();
+    if (IsOverflowOpen()) {
+        InvalidateOverflowGlass();
+        PaintOverflowPopup();
+    }
+    if (IsDockSettingsOpen()) {
+        InvalidateSettingsGlass();
+        PaintSettingsPopup();
+    }
     if (m_visibility == VisibilityState::Visible) {
         static_cast<void>(CaptureLiveBackdrop());
         QueueRenderFrame();
@@ -11099,7 +11119,6 @@ void DockApp::BeginShow() {
     m_animationStartedAt = QpcSeconds();
     StartCursorWatch();
     QueueRenderFrame(false);
-    PostMessageW(m_window, kBeginShowDeferredMessage, static_cast<WPARAM>(m_showSessionId), 0);
 }
 
 void DockApp::BeginHide() {
@@ -11165,6 +11184,7 @@ void DockApp::AdvanceAnimation() {
         ScheduleDeferredRefresh();
         UpdateHoverLabel();
         UpdateGlintTarget(m_lastCursor);
+        PostMessageW(m_window, kBeginShowDeferredMessage, static_cast<WPARAM>(m_showSessionId), 0);
         return;
     }
 
