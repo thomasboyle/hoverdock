@@ -2385,69 +2385,101 @@ int FindBestShellButtonInBridge(const ShellButtonCollector& collector, HWND brid
 }
 
 // On Win11 with the taskbar hidden, TopLevelWindowForOverflowXamlIsland is not
-// populated until the system tray chevron has been invoked once. Invoking it
-// via UIA on demand realizes the overflow buttons without showing Shell_TrayWnd.
+// populated until the system tray chevron has been invoked once. On Win11 XAML
+// SystemTray, the chevron is a SystemTray.NormalButton with AutomationId
+// "SystemTrayIcon" positioned before any promoted NotifyItemIcon buttons.
 bool InvokeOverflowChevron(const ShellButtonCollector& collector,
     const std::vector<HWND>& trayBridges) {
-    if (collector.automation == nullptr) {
+    if (collector.automation == nullptr || collector.buttons == nullptr) {
         return false;
     }
-    struct Probe {
-        PROPERTYID id;
-        const wchar_t* value;
-    };
-    const Probe probes[] = {
-        {UIA_AutomationIdPropertyId, L"SystemTrayChevron"},
-        {UIA_ClassNamePropertyId, L"SystemTray.ChevronButton"},
-        {UIA_AutomationIdPropertyId, L"ShowHiddenIcons"},
-    };
+    IUIAutomationElement* chevron = nullptr;
+    int chevronPriority = 0;
     for (HWND trayBridge : trayBridges) {
         IUIAutomationElement* root = nullptr;
         if (FAILED(collector.automation->ElementFromHandle(trayBridge, &root)) || root == nullptr) {
             continue;
         }
-        IUIAutomationElement* chevron = nullptr;
-        for (const Probe& probe : probes) {
-            VARIANT var{};
-            VariantInit(&var);
-            var.vt = VT_BSTR;
-            var.bstrVal = SysAllocString(probe.value);
-            IUIAutomationCondition* cond = nullptr;
-            if (SUCCEEDED(collector.automation->CreatePropertyCondition(probe.id, var, &cond)) &&
-                cond != nullptr) {
-                root->FindFirst(TreeScope_Descendants, cond, &chevron);
-                cond->Release();
-            }
-            VariantClear(&var);
-            if (chevron != nullptr) {
-                break;
-            }
-        }
-        root->Release();
-        if (chevron == nullptr) {
+        IUIAutomationElementArray* found = nullptr;
+        if (FAILED(root->FindAll(TreeScope_Descendants, collector.buttons, &found)) ||
+            found == nullptr) {
+            root->Release();
             continue;
         }
-        bool invoked = false;
-        IUIAutomationInvokePattern* invoke = nullptr;
-        if (SUCCEEDED(chevron->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke))) &&
-            invoke != nullptr) {
-            invoked = SUCCEEDED(invoke->Invoke());
-            invoke->Release();
-        } else {
-            IUIAutomationTogglePattern* toggle = nullptr;
-            if (SUCCEEDED(chevron->GetCurrentPatternAs(
-                    UIA_TogglePatternId, IID_PPV_ARGS(&toggle))) &&
-                toggle != nullptr) {
-                invoked = SUCCEEDED(toggle->Toggle());
-                toggle->Release();
+        bool seenNotifyItem = false;
+        int length = 0;
+        found->get_Length(&length);
+        for (int index = 0; index < length; ++index) {
+            IUIAutomationElement* element = nullptr;
+            if (FAILED(found->GetElement(index, &element)) || element == nullptr) {
+                continue;
+            }
+            BSTR automationId = nullptr;
+            BSTR name = nullptr;
+            element->get_CurrentAutomationId(&automationId);
+            element->get_CurrentName(&name);
+            const std::wstring_view idView =
+                automationId != nullptr ? std::wstring_view(automationId) : std::wstring_view();
+            const std::wstring nameLower =
+                LowerCopy(TrimEdges(name != nullptr ? std::wstring_view(name) : std::wstring_view()));
+            const bool isNotifyItem = idView == L"NotifyItemIcon";
+            const bool isSystemTrayIcon = idView == L"SystemTrayIcon";
+            SysFreeString(automationId);
+            SysFreeString(name);
+
+            if (isNotifyItem) {
+                seenNotifyItem = true;
+                element->Release();
+                continue;
+            }
+            int priority = 0;
+            if (nameLower.find(L"hidden") != std::wstring::npos ||
+                nameLower.find(L"chevron") != std::wstring::npos ||
+                nameLower.find(L"overflow") != std::wstring::npos) {
+                priority = 3;
+            } else if (isSystemTrayIcon && !seenNotifyItem) {
+                priority = 2;
+            } else if (isSystemTrayIcon) {
+                priority = 1;
+            }
+            // Use >= for priority 2 so the SystemTrayIcon immediately preceding
+            // the first NotifyItemIcon wins.
+            if (priority > chevronPriority || (priority == 2 && chevronPriority == 2)) {
+                if (chevron != nullptr) {
+                    chevron->Release();
+                }
+                chevron = element;
+                chevronPriority = priority;
+            } else {
+                element->Release();
             }
         }
-        chevron->Release();
-        if (invoked) {
-            return true;
+        found->Release();
+        root->Release();
+        if (chevronPriority == 3) {
+            break;
         }
     }
-    return false;
+    if (chevron == nullptr) {
+        return false;
+    }
+
+    bool invoked = false;
+    IUIAutomationInvokePattern* invoke = nullptr;
+    if (SUCCEEDED(chevron->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke))) &&
+        invoke != nullptr) {
+        invoked = SUCCEEDED(invoke->Invoke());
+        invoke->Release();
+    } else {
+        IUIAutomationTogglePattern* toggle = nullptr;
+        if (SUCCEEDED(chevron->GetCurrentPatternAs(UIA_TogglePatternId, IID_PPV_ARGS(&toggle))) &&
+            toggle != nullptr) {
+            invoked = SUCCEEDED(toggle->Toggle());
+            toggle->Release();
+        }
+    }
+    chevron->Release();
+    return invoked;
 }
 
 bool PostRightClickToShellButton(IUIAutomationElement* button, HWND bridge) {
@@ -2479,20 +2511,25 @@ bool ActivateShellButton(const tray_policy::TrayIdentity& identity, bool rightCl
     }
     const std::vector<HWND> trayBridges = ChildrenByClassFragment(
         FindWindowW(L"Shell_TrayWnd", nullptr), L"DesktopWindowContentBridge");
-    std::vector<HWND> overflowBridges = ChildrenByClassFragment(
-        FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr),
-        L"DesktopWindowContentBridge");
+    HWND overflowWindow = FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr);
+    std::vector<HWND> overflowBridges =
+        ChildrenByClassFragment(overflowWindow, L"DesktopWindowContentBridge");
 
     IUIAutomationElement* best = nullptr;
     HWND bestBridge = nullptr;
+    bool bestInOverflow = false;
     int bestScore = 0;
     for (HWND bridge : trayBridges) {
         FindBestShellButtonInBridge(collector, bridge, identity, best, bestBridge, bestScore);
     }
     int overflowNotifyCount = 0;
     for (HWND bridge : overflowBridges) {
+        const int prevScore = bestScore;
         overflowNotifyCount +=
             FindBestShellButtonInBridge(collector, bridge, identity, best, bestBridge, bestScore);
+        if (bestScore > prevScore) {
+            bestInOverflow = true;
+        }
     }
 
     bool realizedOverflow = false;
@@ -2500,14 +2537,18 @@ bool ActivateShellButton(const tray_policy::TrayIdentity& identity, bool rightCl
         overflowNotifyCount == 0 && !trayBridges.empty() &&
         InvokeOverflowChevron(collector, trayBridges)) {
         realizedOverflow = true;
-        for (int attempt = 0; attempt < 6; ++attempt) {
+        for (int attempt = 0; attempt < 10; ++attempt) {
             Sleep(20);
-            overflowBridges = ChildrenByClassFragment(
-                FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr),
-                L"DesktopWindowContentBridge");
+            overflowWindow = FindWindowW(L"TopLevelWindowForOverflowXamlIsland", nullptr);
+            overflowBridges =
+                ChildrenByClassFragment(overflowWindow, L"DesktopWindowContentBridge");
             for (HWND bridge : overflowBridges) {
+                const int prevScore = bestScore;
                 FindBestShellButtonInBridge(
                     collector, bridge, identity, best, bestBridge, bestScore);
+                if (bestScore > prevScore) {
+                    bestInOverflow = true;
+                }
             }
             if (best != nullptr && tray_policy::IsStrongShellButtonMatch(bestScore)) {
                 break;
@@ -2523,6 +2564,15 @@ bool ActivateShellButton(const tray_policy::TrayIdentity& identity, bool rightCl
             HideShellTrayIfShown();
         }
         return false;
+    }
+
+    // Win11's XAML overflow island silently ignores ShowContextMenu() while
+    // hidden; briefly showing it lets Explorer dispatch the app's tray context
+    // menu before HideShellTrayIfShown() immediately re-hides it.
+    if (rightClick && bestInOverflow && overflowWindow != nullptr &&
+        IsWindowVisible(overflowWindow) == FALSE) {
+        ShowWindowAsync(overflowWindow, SW_SHOW);
+        Sleep(20);
     }
 
     AllowSetForegroundWindow(ASFW_ANY);
@@ -2546,8 +2596,8 @@ bool ActivateShellButton(const tray_policy::TrayIdentity& identity, bool rightCl
         }
     }
     best->Release();
-    if (realizedOverflow) {
-        Sleep(40);
+    if (rightClick && (realizedOverflow || bestInOverflow)) {
+        Sleep(50);
     }
     HideShellTrayIfShown();
     return activated;
