@@ -615,11 +615,10 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
     const float2 hi = 1.0 - texel * 0.5;
     const bool hasBackdrop = scene1.w > 0.5;
     const bool liquid = FxEnabled(scene1.x, (float)DOCK_FX_CC_LIQUID) > 0.5;
-    const float cullDist = liquid ? (16.0 * dpi) : 1.6;
     float3 accum = float3(0.0, 0.0, 0.0);
     float alpha = 0.0;
     float ring = 0.0;
-    float shadowA = 0.0;
+    float minS = 1e6;
     for (uint i = 0u; i < 48u; ++i)
     {
         if (i >= n)
@@ -632,20 +631,15 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         const float2 halfSize = a.iconRect.zw;
         const float r = a.iconMeta.x;
         const float s = SdRoundRectCc(pixel - centre, halfSize, r);
-        if (s > cullDist)
+        minS = min(minS, s);
+        if (s > 1.6)
         {
             continue;
-        }
-        if (liquid && s > -1.0)
-        {
-            const float shSdf = SdRoundRectCc(pixel - centre - float2(0.0, 4.0 * dpi), halfSize, r);
-            const float u = 1.0 - saturate(max(shSdf, 0.0) / (11.0 * dpi));
-            shadowA = max(shadowA, u * u * (3.0 - 2.0 * u) * 0.22);
         }
         // One-pixel darkened ring just outside the shape.
         if (s > 0.0)
         {
-            ring = max(ring, saturate(1.0 - abs(s - 0.85 * dpi) / max(0.85 * dpi, 0.5)) * (liquid ? 0.28 : 0.16));
+            ring = max(ring, saturate(1.0 - abs(s - 0.85 * dpi) / max(0.85 * dpi, 0.5)) * (liquid ? 0.24 : 0.16));
         }
         const float cov = saturate(0.5 - s);
         if (cov <= 0.0)
@@ -710,10 +704,25 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         accum = color * cov + accum * (1.0 - cov);
         alpha = cov + alpha * (1.0 - cov);
     }
-    const float outerDark = liquid ? (1.0 - (1.0 - ring) * (1.0 - shadowA)) : ring;
     accum *= (1.0 - ring);
-    alpha = alpha + (1.0 - alpha) * outerDark;
-    return float4(accum, alpha);
+    const float outA = alpha + (1.0 - alpha) * ring;
+    if (liquid && hasBackdrop && n > 1u && outA < 1.0)
+    {
+        // macOS Control Centre: softly blurred + gently dimmed backdrop field
+        // behind and between floating buttons, feathered to 0 at the edges.
+        const float tBg = 1.0 - saturate(max(minS, 0.0) / (28.0 * dpi));
+        const float edgeDist = min(min(pixel.x, outputSize.x - pixel.x),
+            min(pixel.y, outputSize.y - pixel.y));
+        const float bgMask = tBg * tBg * (3.0 - 2.0 * tBg) * smoothstep(0.0, 14.0 * dpi, edgeDist);
+        if (bgMask > 0.0)
+        {
+            const float2 uv0 = clamp(pixel * texel, lo, hi);
+            const float bgBlurPx = max(iconInstances[0u].iconMeta.w, 12.0 * dpi);
+            const float3 bg = CcSampleAxis(blurTemp, uv0, texel, bgBlurPx, float2(0.0, 1.0)) * 0.86;
+            return float4(accum + bg * bgMask * (1.0 - outA), outA + bgMask * (1.0 - outA));
+        }
+    }
+    return float4(accum, outA);
 }
 // Shared bevel + Snell refraction helper used by GlassPS and ComputeFrostUVs.
 void ComputeBevelRefraction(float2 uv, float2 texel, float2 outward, float insideDistance,
