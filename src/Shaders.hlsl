@@ -609,7 +609,7 @@ uint CcShapeCount()
 }
 
 // Blur width (px, SampleGlassAxis units) of the topmost shape under a pixel.
-float CcBlurPxAt(float2 pixel, float dpi, bool verticalPass)
+float CcBlurPxAt(float2 pixel, float dpi)
 {
     const uint n = CcShapeCount();
     if (n == 0u)
@@ -617,7 +617,7 @@ float CcBlurPxAt(float2 pixel, float dpi, bool verticalPass)
         return 1.0;
     }
     const bool liquid = FxEnabled(scene1.x, (float)DOCK_FX_CC_LIQUID) > 0.5;
-    const uint stopK = (verticalPass && liquid && n > 1u) ? n : (n - 1u);
+    const uint stopK = (liquid && n > 1u) ? n : (n - 1u);
     for (uint k = 0u; k < 48u; ++k)
     {
         if (k >= stopK)
@@ -639,9 +639,11 @@ float CcBlurPxAt(float2 pixel, float dpi, bool verticalPass)
             return max(a.iconMeta.w, 1.0);
         }
     }
-    if (verticalPass && liquid && n > 1u)
+    if (liquid && n > 1u)
     {
-        return max(iconInstances[0u].iconMeta.w, 12.0 * dpi);
+        // macOS 26 Control Centre BentoBackdrop: kCAFilterVariableBlur(inputRadius: 1.5),
+        // measured sigma ~= 2.2 pt (blurPx = 2 * sigma = 4.4 * dpi).
+        return 4.4 * dpi;
     }
     return max(iconInstances[0u].iconMeta.w, 1.0);
 }
@@ -652,7 +654,7 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
     const bool liquid = FxEnabled(scene1.x, (float)DOCK_FX_CC_LIQUID) > 0.5;
     const float2 bgCentre = scene2.xy;
     const float2 bbHalf = scene2.zw;
-    const float2 activeHalf = bbHalf + ((liquid && n > 1u) ? float2(22.0 * dpi, 22.0 * dpi) : float2(1.6, 1.6));
+    const float2 activeHalf = bbHalf + ((liquid && n > 1u) ? float2(38.0 * dpi, 38.0 * dpi) : float2(1.6, 1.6));
     const float2 pBounds = abs(pixel - bgCentre);
     if (n == 0u || pBounds.x > activeHalf.x || pBounds.y > activeHalf.y)
     {
@@ -784,19 +786,29 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
     const float outA = alpha + (1.0 - alpha) * ring;
     if (liquid && hasBackdrop && n > 1u && outA < 1.0)
     {
-        // macOS Control Centre: one continuous blurred + subtly dimmed backdrop
-        // field spanning the entire module bounding box (no unblurred gaps
-        // between buttons), softly feathered out around the outer perimeter.
-        const float2 bgHalf = bbHalf + float2(8.0 * dpi, 8.0 * dpi);
-        const float bgSdf = SdRoundRectCc(pixel - bgCentre, bgHalf, 34.0 * dpi);
-        const float tBg = 1.0 - saturate(max(bgSdf, 0.0) / (14.0 * dpi));
+        // macOS 26 Control Centre (WindowBackdrop.swift):
+        //   1. BentoBackdrop: pure untinted CABackdropLayer variableBlur (sigma ~= 2.2 pt)
+        //      masked by a 40 pt rounded rect expanded past the grid and Gaussian-feathered
+        //      across the full outer margin.
+        //   2. LocalDimmingView: ultra-soft 50 pt shadow (black 0.10 over >100 pt, ~3-4%
+        //      local contrast across the 38 pt margin), leaving barely any tint over light
+        //      backgrounds while gently grounding the floating modules.
+        const float2 bgHalf = bbHalf + float2(14.0 * dpi, 14.0 * dpi);
+        const float bgRadius = min(40.0 * dpi, min(bgHalf.x, bgHalf.y));
+        const float bgSdf = SdRoundRectCc(pixel - bgCentre, bgHalf, bgRadius);
+        const float tBg = 1.0 - saturate((bgSdf + 10.0 * dpi) / (34.0 * dpi));
         const float edgeDist = min(min(pixel.x, outputSize.x - pixel.x),
             min(pixel.y, outputSize.y - pixel.y));
-        const float bgMask = tBg * tBg * (3.0 - 2.0 * tBg) * smoothstep(0.0, 6.0 * dpi, edgeDist);
+        const float bgMask = tBg * tBg * (3.0 - 2.0 * tBg) * smoothstep(0.0, 8.0 * dpi, edgeDist);
         if (bgMask > 0.0)
         {
             const float2 uv0 = clamp(pixel * texel, lo, hi);
-            const float3 bg = blurTemp2.SampleLevel(linearClamp, clamp(uv0 * 0.5, halfLo, halfHi), 0).rgb * 0.86;
+            const float2 dimHalf = bbHalf + float2(12.0 * dpi, 12.0 * dpi);
+            const float dimRadius = min(50.0 * dpi, min(dimHalf.x, dimHalf.y));
+            const float dimSdf = SdRoundRectCc(pixel - bgCentre, dimHalf, dimRadius);
+            const float dimT = 1.0 - saturate((dimSdf + 34.0 * dpi) / (60.0 * dpi));
+            const float dim = 1.0 - 0.035 * dimT * dimT * (3.0 - 2.0 * dimT) * smoothstep(0.0, 12.0 * dpi, edgeDist);
+            const float3 bg = blurTemp2.SampleLevel(linearClamp, clamp(uv0 * 0.5, halfLo, halfHi), 0).rgb * dim;
             return float4(accum + bg * bgMask * (1.0 - outA), outA + bgMask * (1.0 - outA));
         }
     }
@@ -1420,7 +1432,7 @@ float4 BlurHPS(VertexOutput input) : SV_Target
     {
         const float2 fullPixel = input.position.xy * 2.0;
         const float2 ccUv = clamp(fullPixel * texel, texel * 0.5, 1.0 - texel * 0.5);
-        const float blurPx = CcBlurPxAt(fullPixel, max(scene1.y, 1.0), false);
+        const float blurPx = CcBlurPxAt(fullPixel, max(scene1.y, 1.0));
         return float4(CcSampleAxis(backdropTexture, ccUv, texel, blurPx, float2(1.0, 0.0)), 1.0);
     }
     float2 uvR;
@@ -1440,7 +1452,7 @@ float4 BlurVPS(VertexOutput input) : SV_Target
     if (scene1.z > 50.0)
     {
         const float2 halfUv = input.position.xy * texel;
-        const float blurPx = CcBlurPxAt(input.position.xy * 2.0, max(scene1.y, 1.0), true);
+        const float blurPx = CcBlurPxAt(input.position.xy * 2.0, max(scene1.y, 1.0));
         return float4(CcSampleAxisHalf(blurTemp, halfUv, outputSize, texel, blurPx, float2(0.0, 1.0)), 1.0);
     }
     float2 uvR;
@@ -1462,7 +1474,7 @@ float4 BlurHPS2(VertexOutput input) : SV_Target
     if (scene1.z > 50.0)
     {
         const float2 halfUv = input.position.xy * texel;
-        const float blurPx = CcBlurPxAt(input.position.xy * 2.0, max(scene1.y, 1.0), false);
+        const float blurPx = CcBlurPxAt(input.position.xy * 2.0, max(scene1.y, 1.0));
         return float4(CcSampleAxisHalf(blurTemp2, halfUv, outputSize, texel, blurPx, float2(1.0, 0.0)), 1.0);
     }
     float2 uvR;

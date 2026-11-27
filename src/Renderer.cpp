@@ -4160,7 +4160,7 @@ bool Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale, bool liqu
     }
     m_panelIconInstances->Unmap(0, nullptr);
     if (liquidGlass && count > 1U) {
-        maxBlurPx = (std::max)(maxBlurPx, 12.0F * dpi);
+        maxBlurPx = (std::max)(maxBlurPx, 4.4F * dpi);
     }
     m_panelMappedConstants->scene1[2] = 100.0F + static_cast<float>(count);
     m_panelMappedConstants->scene2[0] = 0.5F * (bbMinX + bbMaxX);
@@ -4168,7 +4168,7 @@ bool Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale, bool liqu
     m_panelMappedConstants->scene2[2] = 0.5F * (bbMaxX - bbMinX);
     m_panelMappedConstants->scene2[3] = 0.5F * (bbMaxY - bbMinY);
 
-    const float activePad = (liquidGlass && count > 1U) ? (22.0F * dpi) : 2.0F;
+    const float activePad = (liquidGlass && count > 1U) ? (38.0F * dpi) : 2.0F;
     const LONG vLeft = std::clamp(
         static_cast<LONG>(std::floor((bbMinX - activePad) * 0.5F)) - 1L, 0L, halfW);
     const LONG vTop = std::clamp(
@@ -4311,7 +4311,7 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
 
         float panelFrostAmt =
             static_cast<float>((fxFlags >> 16) & 0xFFu) / 255.0F;
-        if ((fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
+        if (!ccActive && (fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
             panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
         }
         if (ccActive) {
@@ -4723,7 +4723,7 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
 
         float panelFrostAmt =
             static_cast<float>((fxFlags >> 16) & 0xFFu) / 255.0F;
-        if ((fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
+        if (!ccActive && (fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
             panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
         }
         if (ccActive) {
