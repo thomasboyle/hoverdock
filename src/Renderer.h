@@ -436,7 +436,8 @@ private:
     std::vector<CcShapeDesc> m_ccShapes;
     float m_panelCornerRadiusPx = 0.0F;
     std::vector<float> m_ccFaceLuma;
-    void UploadCcShapes(UINT width, UINT height, float dpiScale, bool liquidGlass) noexcept;
+    bool UploadCcShapes(UINT width, UINT height, float dpiScale, bool liquidGlass,
+        D3D12_RECT& outHalfHScissor, D3D12_RECT& outHalfVScissor) noexcept;
     int m_panelBakeTag = -1;
     UINT m_panelBakeWidth = 0;
     UINT m_panelBakeHeight = 0;

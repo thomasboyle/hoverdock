@@ -560,17 +560,43 @@ float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
 //   [2i+1].iconRect = W, B, fill alpha, fill black(1)/white(0)
 // scene1.z carries 100 + shape count (the dock path uses scene1.z as a 0/1
 // dev-bounds flag and its packed fx word overlaps every low bit, so the CC path
-// is keyed on scene1.z alone). Shape 0 is the panel, later shapes sit on
-// top. Lens depends only on distance from each shape's edge.
+// is keyed on scene1.z alone). scene2 carries the CPU-precomputed shape union
+// bounds (centre.xy, halfSize.zw). Shape 0 is the panel (or first module in
+// liquid mode), later shapes sit on top. Lens depends only on distance from
+// each shape's edge.
+//
+// CC blur runs in the top-left half-resolution quadrant of blurTemp/blurTemp2
+// (BlurHPS -> blurTemp, BlurVPS -> blurTemp2); every CC Gaussian has sigma >=
+// 4.5 px, well below half-res Nyquist, so CcGlass reads blurTemp2 with a
+// single bilinear fetch while keeping all SDFs, rims, and crisp bevel blend
+// at full resolution.
 // ---------------------------------------------------------------------------
-// CC blur axis: kGaussW has sigma = 8 taps (truncated at 2 sigma), so tap
-// spacing = blurPx/16 gives sigma_px = blurPx/2 = the spec sigma (2 r pt).
+void CcHalfBounds(float2 outputSize, float2 texel, out float2 halfLo, out float2 halfHi)
+{
+    const float2 halfSize = floor((outputSize + 1.0) * 0.5);
+    halfLo = texel * 0.5;
+    halfHi = (halfSize - 0.5) * texel;
+}
+
+// CC blur axis on full-res backdropTexture (BlurHPS). kGaussW has sigma = 8
+// taps (truncated at 2 sigma), so tap spacing = blurPx/16 gives sigma_px =
+// blurPx/2 = the spec sigma (2 r pt).
 float3 CcSampleAxis(Texture2D tex, float2 uv, float2 texel, float blurPx, float2 axis)
 {
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
     return SampleBlurRgb(tex, uv, texel, lo, hi, max(blurPx * 0.0625, 0.25), axis, true);
 }
+
+// CC blur axis on half-res blurTemp/blurTemp2 (BlurVPS, BlurHPS2).
+float3 CcSampleAxisHalf(Texture2D tex, float2 uv, float2 outputSize, float2 texel, float blurPx, float2 axis)
+{
+    float2 halfLo;
+    float2 halfHi;
+    CcHalfBounds(outputSize, texel, halfLo, halfHi);
+    return SampleBlurRgb(tex, uv, texel, halfLo, halfHi, max(blurPx * 0.0625, 0.25) * 0.5, axis, true);
+}
+
 float SdRoundRectCc(float2 p, float2 halfSize, float r)
 {
     const float2 q = abs(p) - halfSize + r;
@@ -583,26 +609,39 @@ uint CcShapeCount()
 }
 
 // Blur width (px, SampleGlassAxis units) of the topmost shape under a pixel.
-float CcBlurPxAt(float2 pixel)
+float CcBlurPxAt(float2 pixel, float dpi, bool verticalPass)
 {
     const uint n = CcShapeCount();
     if (n == 0u)
     {
         return 1.0;
     }
-    for (uint k = 1u; k < 48u; ++k)
+    const bool liquid = FxEnabled(scene1.x, (float)DOCK_FX_CC_LIQUID) > 0.5;
+    const uint stopK = (verticalPass && liquid && n > 1u) ? n : (n - 1u);
+    for (uint k = 0u; k < 48u; ++k)
     {
-        if (k >= n)
+        if (k >= stopK)
         {
             break;
         }
-        const uint i = n - k;
+        const uint i = n - 1u - k;
         const IconInstance a = iconInstances[2u * i];
-        const float s = SdRoundRectCc(pixel - a.iconRect.xy, a.iconRect.zw, a.iconMeta.x);
+        const float2 p = pixel - a.iconRect.xy;
+        const float2 ap = abs(p);
+        if (ap.x > a.iconRect.z || ap.y > a.iconRect.w)
+        {
+            continue;
+        }
+        const float2 q = ap - a.iconRect.zw + a.iconMeta.x;
+        const float s = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - a.iconMeta.x;
         if (s < 0.0)
         {
             return max(a.iconMeta.w, 1.0);
         }
+    }
+    if (verticalPass && liquid && n > 1u)
+    {
+        return max(iconInstances[0u].iconMeta.w, 12.0 * dpi);
     }
     return max(iconInstances[0u].iconMeta.w, 1.0);
 }
@@ -610,30 +649,47 @@ float CcBlurPxAt(float2 pixel)
 float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
 {
     const uint n = CcShapeCount();
+    const bool liquid = FxEnabled(scene1.x, (float)DOCK_FX_CC_LIQUID) > 0.5;
+    const float2 bgCentre = scene2.xy;
+    const float2 bbHalf = scene2.zw;
+    const float2 activeHalf = bbHalf + ((liquid && n > 1u) ? float2(22.0 * dpi, 22.0 * dpi) : float2(1.6, 1.6));
+    const float2 pBounds = abs(pixel - bgCentre);
+    if (n == 0u || pBounds.x > activeHalf.x || pBounds.y > activeHalf.y)
+    {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
     const float2 texel = 1.0 / outputSize;
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
+    float2 halfLo;
+    float2 halfHi;
+    CcHalfBounds(outputSize, texel, halfLo, halfHi);
     const bool hasBackdrop = scene1.w > 0.5;
-    const bool liquid = FxEnabled(scene1.x, (float)DOCK_FX_CC_LIQUID) > 0.5;
     float3 accum = float3(0.0, 0.0, 0.0);
     float alpha = 0.0;
+    float rem = 1.0;
     float ring = 0.0;
-    float2 bbMin = float2(1e6, 1e6);
-    float2 bbMax = float2(-1e6, -1e6);
-    for (uint i = 0u; i < 48u; ++i)
+    // Front-to-back traversal: opaque front tiles skip shading/sampling of
+    // occluded shapes behind them (e.g. shape 0 panel under every tile).
+    for (uint k = 0u; k < 48u; ++k)
     {
-        if (i >= n)
+        if (k >= n)
         {
             break;
         }
+        const uint i = n - 1u - k;
         const IconInstance a = iconInstances[2u * i];
-        const IconInstance b = iconInstances[2u * i + 1u];
         const float2 centre = a.iconRect.xy;
         const float2 halfSize = a.iconRect.zw;
+        const float2 p = pixel - centre;
+        const float2 ap = abs(p);
+        if (ap.x > halfSize.x + 1.6 || ap.y > halfSize.y + 1.6)
+        {
+            continue;
+        }
         const float r = a.iconMeta.x;
-        bbMin = min(bbMin, centre - halfSize);
-        bbMax = max(bbMax, centre + halfSize);
-        const float s = SdRoundRectCc(pixel - centre, halfSize, r);
+        const float2 q = ap - halfSize + r;
+        const float s = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
         if (s > 1.6)
         {
             continue;
@@ -643,20 +699,28 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         {
             ring = max(ring, saturate(1.0 - abs(s - 0.85 * dpi) / max(0.85 * dpi, 0.5)) * (liquid ? 0.24 : 0.16));
         }
+        if (rem <= 0.0)
+        {
+            continue;
+        }
         const float cov = saturate(0.5 - s);
         if (cov <= 0.0)
         {
             continue;
         }
+        const IconInstance b = iconInstances[2u * i + 1u];
         const float d = max(-s, 0.0);
-        // Outward normal from the SDF gradient (central differences).
-        const float e = 0.5;
-        const float2 g = float2(
-            SdRoundRectCc(pixel + float2(e, 0.0) - centre, halfSize, r) -
-                SdRoundRectCc(pixel - float2(e, 0.0) - centre, halfSize, r),
-            SdRoundRectCc(pixel + float2(0.0, e) - centre, halfSize, r) -
-                SdRoundRectCc(pixel - float2(0.0, e) - centre, halfSize, r));
-        const float2 nOut = g / max(length(g), 1e-4);
+        // Analytic outward unit normal of the Euclidean rounded rectangle.
+        const float2 sp = float2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+        float2 nOut;
+        if (q.x > 0.0 && q.y > 0.0)
+        {
+            nOut = sp * q / max(length(q), 1e-4);
+        }
+        else
+        {
+            nOut = (q.x > q.y) ? float2(sp.x, 0.0) : float2(0.0, sp.y);
+        }
         float3 color;
         if (hasBackdrop)
         {
@@ -664,28 +728,33 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
             const float t = saturate(1.0 - d / max(a.iconMeta.z, 1e-3));
             const float rimFade = liquid ? smoothstep(0.0, 1.0 * dpi, d) : smoothstep(0.5 * dpi, 1.0 * dpi, d);
             const float disp = a.iconMeta.y * (1.0 - sqrt(max(1.0 - t * t, 0.0))) * rimFade;
-            const float2 uv = clamp((pixel - nOut * disp) * texel, lo, hi);
-            float3 c = CcSampleAxis(blurTemp, uv, texel, a.iconMeta.w, float2(0.0, 1.0));
-            if (liquid)
-            {
-                if (t > 0.0)
-                {
-                    c = lerp(c, backdropTexture.SampleLevel(linearClamp, uv, 0).rgb, 0.28 * t * t);
-                }
-                const float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
-                c = saturate(lerp(float3(luma, luma, luma), c, 1.25));
-            }
             const float3 fillRgb = b.iconRect.w > 0.5 ? float3(0.0, 0.0, 0.0) : float3(1.0, 1.0, 1.0);
             // gain > 0: the face is a fixed colour plus the refraction signature
             // (displaced minus undisplaced blurred backdrop), so the lens stays
             // visible while uniform backdrops give an identical face.
             const float gain = b.iconMeta.x;
-            float3 face = b.iconRect.y + (b.iconRect.x - b.iconRect.y) * c;
-            if (gain > 0.0 && disp > 0.0)
+            const float wbDiff = b.iconRect.x - b.iconRect.y;
+            float3 face = b.iconRect.yyy;
+            if (wbDiff != 0.0 || (gain > 0.0 && disp > 0.0))
             {
-                const float2 uv0 = clamp(pixel * texel, lo, hi);
-                const float3 c0 = CcSampleAxis(blurTemp, uv0, texel, a.iconMeta.w, float2(0.0, 1.0));
-                face += gain * (c - c0);
+                const float2 uv = clamp((pixel - nOut * disp) * texel, lo, hi);
+                float3 c = blurTemp2.SampleLevel(linearClamp, clamp(uv * 0.5, halfLo, halfHi), 0).rgb;
+                if (liquid)
+                {
+                    if (t > 0.0)
+                    {
+                        c = lerp(c, backdropTexture.SampleLevel(linearClamp, uv, 0).rgb, 0.28 * t * t);
+                    }
+                    const float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
+                    c = saturate(lerp(float3(luma, luma, luma), c, 1.25));
+                }
+                face += wbDiff * c;
+                if (gain > 0.0 && disp > 0.0)
+                {
+                    const float2 uv0 = clamp(pixel * texel, lo, hi);
+                    const float3 c0 = blurTemp2.SampleLevel(linearClamp, clamp(uv0 * 0.5, halfLo, halfHi), 0).rgb;
+                    face += gain * (c - c0);
+                }
             }
             color = lerp(saturate(face), fillRgb, b.iconRect.z);
         }
@@ -694,17 +763,22 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
             color = liquid ? float3(0.16, 0.16, 0.18) : float3(0.8, 0.8, 0.82);
         }
         // Rim: peaks top-left / bottom-right, minima top-right / bottom-left.
-        const float ang = atan2(-nOut.y, nOut.x);
-        const float diag = pow(abs(cos(ang - 2.356194)), liquid ? 1.15 : 1.08);
-        const float rimA = (liquid ? 0.24 : 0.18) + (liquid ? 0.56 : 0.545) * diag;
+        // |cos(atan2(-nOut.y, nOut.x) - 3*pi/4)| == |nOut.x + nOut.y| / sqrt(2).
         const float band = saturate(1.0 - d / (liquid ? max(1.25 * dpi, 1.0) : dpi));
-        const float glow = liquid
-            ? ((0.045 + 0.105 * diag) * exp(-d / max(4.5 * dpi, 1.0)) +
-                0.035 * saturate(-nOut.y) * exp(-d / max(8.0 * dpi, 1.0)))
-            : 0.0;
-        color = lerp(color, float3(1.0, 1.0, 1.0), saturate(rimA * band + glow));
-        accum = color * cov + accum * (1.0 - cov);
-        alpha = cov + alpha * (1.0 - cov);
+        if (liquid || band > 0.0)
+        {
+            const float diag = pow(0.70710678 * abs(nOut.x + nOut.y), liquid ? 1.15 : 1.08);
+            const float rimA = (liquid ? 0.24 : 0.18) + (liquid ? 0.56 : 0.545) * diag;
+            const float glow = liquid
+                ? ((0.045 + 0.105 * diag) * exp(-d / max(4.5 * dpi, 1.0)) +
+                    0.035 * saturate(-nOut.y) * exp(-d / max(8.0 * dpi, 1.0)))
+                : 0.0;
+            color = lerp(color, float3(1.0, 1.0, 1.0), saturate(rimA * band + glow));
+        }
+        const float w = rem * cov;
+        accum += color * w;
+        alpha += w;
+        rem *= (1.0 - cov);
     }
     accum *= (1.0 - ring);
     const float outA = alpha + (1.0 - alpha) * ring;
@@ -713,8 +787,7 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         // macOS Control Centre: one continuous blurred + subtly dimmed backdrop
         // field spanning the entire module bounding box (no unblurred gaps
         // between buttons), softly feathered out around the outer perimeter.
-        const float2 bgCentre = 0.5 * (bbMin + bbMax);
-        const float2 bgHalf = 0.5 * (bbMax - bbMin) + float2(8.0 * dpi, 8.0 * dpi);
+        const float2 bgHalf = bbHalf + float2(8.0 * dpi, 8.0 * dpi);
         const float bgSdf = SdRoundRectCc(pixel - bgCentre, bgHalf, 34.0 * dpi);
         const float tBg = 1.0 - saturate(max(bgSdf, 0.0) / (14.0 * dpi));
         const float edgeDist = min(min(pixel.x, outputSize.x - pixel.x),
@@ -723,8 +796,7 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         if (bgMask > 0.0)
         {
             const float2 uv0 = clamp(pixel * texel, lo, hi);
-            const float bgBlurPx = max(iconInstances[0u].iconMeta.w, 12.0 * dpi);
-            const float3 bg = CcSampleAxis(blurTemp, uv0, texel, bgBlurPx, float2(0.0, 1.0)) * 0.86;
+            const float3 bg = blurTemp2.SampleLevel(linearClamp, clamp(uv0 * 0.5, halfLo, halfHi), 0).rgb * 0.86;
             return float4(accum + bg * bgMask * (1.0 - outA), outA + bgMask * (1.0 - outA));
         }
     }
@@ -1280,15 +1352,6 @@ float4 GlassPS(VertexOutput input) : SV_Target
 void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi, bool allowDispersion,
     out float2 uvR, out float2 uvG, out float2 uvB, out float blurPx)
 {
-    if (scene1.z > 50.0)
-    {
-        const float2 ccUv = clamp(pixel / outputSize, 0.5 / outputSize, 1.0 - 0.5 / outputSize);
-        uvR = ccUv;
-        uvG = ccUv;
-        uvB = ccUv;
-        blurPx = CcBlurPxAt(pixel);
-        return;
-    }
     if (MacosLiquidGlassDock())
     {
         const float2 macUv = clamp(pixel / outputSize, 0.5 / outputSize, 1.0 - 0.5 / outputSize);
@@ -1353,13 +1416,19 @@ float4 BlurHPS(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 texel = 1.0 / outputSize;
+    if (scene1.z > 50.0)
+    {
+        const float2 fullPixel = input.position.xy * 2.0;
+        const float2 ccUv = clamp(fullPixel * texel, texel * 0.5, 1.0 - texel * 0.5);
+        const float blurPx = CcBlurPxAt(fullPixel, max(scene1.y, 1.0), false);
+        return float4(CcSampleAxis(backdropTexture, ccUv, texel, blurPx, float2(1.0, 0.0)), 1.0);
+    }
     float2 uvR;
     float2 uvG;
     float2 uvB;
     float blurPx;
     ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), true, uvR, uvG, uvB, blurPx);
-    const float3 h = (scene1.z > 50.0) ? CcSampleAxis(backdropTexture, uvR, texel, blurPx, float2(1.0, 0.0))
-        : SampleGlassAxis(backdropTexture, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
+    const float3 h = SampleGlassAxis(backdropTexture, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
     return float4(h, 1.0);
 }
 
@@ -1368,29 +1437,40 @@ float4 BlurVPS(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 texel = 1.0 / outputSize;
+    if (scene1.z > 50.0)
+    {
+        const float2 halfUv = input.position.xy * texel;
+        const float blurPx = CcBlurPxAt(input.position.xy * 2.0, max(scene1.y, 1.0), true);
+        return float4(CcSampleAxisHalf(blurTemp, halfUv, outputSize, texel, blurPx, float2(0.0, 1.0)), 1.0);
+    }
     float2 uvR;
     float2 uvG;
     float2 uvB;
     float blurPx;
     ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), true, uvR, uvG, uvB, blurPx);
-    const float3 v = (scene1.z > 50.0) ? CcSampleAxis(blurTemp, uvR, texel, blurPx, float2(0.0, 1.0))
-        : SampleGlassAxis(blurTemp, uvR, uvG, uvB, texel, blurPx, float2(0.0, 1.0));
+    const float3 v = SampleGlassAxis(blurTemp, uvR, uvG, uvB, texel, blurPx, float2(0.0, 1.0));
     return float4(v, 1.0);
 }
 
 // Pass 3: horizontal Gaussian axis from temp2 back into temp; GlassPS
-// finishes the final vertical axis from temp.
+// finishes the final vertical axis from temp (except CC, which finishes with
+// BlurVPS into temp2 and samples temp2 directly in CcGlass).
 float4 BlurHPS2(VertexOutput input) : SV_Target
 {
     const float2 outputSize = scene0.xy;
     const float2 texel = 1.0 / outputSize;
+    if (scene1.z > 50.0)
+    {
+        const float2 halfUv = input.position.xy * texel;
+        const float blurPx = CcBlurPxAt(input.position.xy * 2.0, max(scene1.y, 1.0), false);
+        return float4(CcSampleAxisHalf(blurTemp2, halfUv, outputSize, texel, blurPx, float2(1.0, 0.0)), 1.0);
+    }
     float2 uvR;
     float2 uvG;
     float2 uvB;
     float blurPx;
     ComputeFrostUVs(input.position.xy, outputSize, max(scene1.y, 1.0), false, uvR, uvG, uvB, blurPx);
-    const float3 h = (scene1.z > 50.0) ? CcSampleAxis(blurTemp2, uvR, texel, blurPx, float2(1.0, 0.0))
-        : SampleGlassAxis(blurTemp2, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
+    const float3 h = SampleGlassAxis(blurTemp2, uvR, uvG, uvB, texel, blurPx, float2(1.0, 0.0));
     return float4(h, 1.0);
 }
 

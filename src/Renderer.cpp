@@ -904,7 +904,9 @@ void RecordFrostBlur(ID3D12GraphicsCommandList* cmd, float frostAmt,
     D3D12_CPU_DESCRIPTOR_HANDLE rtvBase, UINT rtvStride,
     D3D12_GPU_DESCRIPTOR_HANDLE srvTable0, UINT srvStride,
     ID3D12Resource* temp1, bool& temp1IsSrv, ID3D12Resource* temp2, bool& temp2IsSrv,
-    ID3D12PipelineState* h1Pso, ID3D12PipelineState* vPso, ID3D12PipelineState* h2Pso) {
+    ID3D12PipelineState* h1Pso, ID3D12PipelineState* vPso, ID3D12PipelineState* h2Pso,
+    bool finalVPass = false, const D3D12_RECT* hScissor = nullptr,
+    const D3D12_RECT* vScissor = nullptr) {
     D3D12_GPU_DESCRIPTOR_HANDLE srvTable1 = srvTable0;
     srvTable1.ptr += 4ULL * srvStride;
 
@@ -937,12 +939,21 @@ void RecordFrostBlur(ID3D12GraphicsCommandList* cmd, float frostAmt,
         isSrv = true;
     };
 
-    pass(temp1, temp1IsSrv, 0, srvTable1, h1Pso);
     const int extraPairs = static_cast<int>(std::lround(
         std::clamp((frostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
+    if (extraPairs == 0 && hScissor != nullptr) {
+        cmd->RSSetScissorRects(1, hScissor);
+    }
+    pass(temp1, temp1IsSrv, 0, srvTable1, h1Pso);
     for (int pair = 0; pair < extraPairs; ++pair) {
         pass(temp2, temp2IsSrv, 1, srvTable0, vPso);
         pass(temp1, temp1IsSrv, 0, srvTable1, h2Pso);
+    }
+    if (finalVPass) {
+        if (extraPairs == 0 && vScissor != nullptr) {
+            cmd->RSSetScissorRects(1, vScissor);
+        }
+        pass(temp2, temp2IsSrv, 1, srvTable0, vPso);
     }
 }
 
@@ -4080,24 +4091,27 @@ bool Renderer::SampleBackdropLuma(const RECT& region, float& luma) const noexcep
 
 // Control Centre shapes -> panel instance buffer (two slots per shape) and the
 // per-shape adaptive face (macOS 26 Regular style tables, measured).
-void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale, bool liquidGlass) noexcept
+bool Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale, bool liquidGlass,
+    D3D12_RECT& outHalfHScissor, D3D12_RECT& outHalfVScissor) noexcept
 {
-    static_cast<void>(width);
-    static_cast<void>(height);
     m_ccFaceLuma.clear();
+    const LONG halfW = static_cast<LONG>((width + 1U) / 2U);
+    const LONG halfH = static_cast<LONG>((height + 1U) / 2U);
+    outHalfHScissor = D3D12_RECT{0, 0, halfW, halfH};
+    outHalfVScissor = D3D12_RECT{0, 0, halfW, halfH};
     if (m_panelMappedConstants == nullptr) {
-        return;
+        return false;
     }
     if (m_ccShapes.empty() || m_panelIconInstances == nullptr) {
         m_panelMappedConstants->scene1[2] = 0.0F;
-        return;
+        return false;
     }
     const size_t count = (std::min)(m_ccShapes.size(), static_cast<size_t>(48));
     IconInstanceConstants* slots = nullptr;
     if (FAILED(m_panelIconInstances->Map(0, nullptr, reinterpret_cast<void**>(&slots))) ||
         slots == nullptr) {
         m_panelMappedConstants->scene1[2] = 0.0F;
-        return;
+        return false;
     }
     const float dpi = (std::max)(dpiScale, 1.0F);
     const float x = liquidGlass ? 0.25F : 0.5F;
@@ -4107,14 +4121,25 @@ void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale, bool liqu
     const float gain = liquidGlass ? 0.0F : 0.6F;
     const bool black = liquidGlass;
     const float faceLuma = (B + (W - B) * x) * (1.0F - fillA) + (black ? 0.0F : fillA);
+    float bbMinX = 1e6F;
+    float bbMinY = 1e6F;
+    float bbMaxX = -1e6F;
+    float bbMaxY = -1e6F;
+    float maxBlurPx = 4.0F;
     for (size_t i = 0; i < count; ++i) {
         const CcShapeDesc& sh = m_ccShapes[i];
+        bbMinX = (std::min)(bbMinX, sh.cx - sh.hw);
+        bbMinY = (std::min)(bbMinY, sh.cy - sh.hh);
+        bbMaxX = (std::max)(bbMaxX, sh.cx + sh.hw);
+        bbMaxY = (std::max)(bbMaxY, sh.cy + sh.hh);
         const float sPt = 2.0F * (std::min)(sh.hw, sh.hh) / dpi;
         const float amountPt = liquidGlass ? (std::min)(0.68F * sPt, 46.0F) : (std::min)(0.8F * sPt, 60.0F);
         const float heightPt = liquidGlass ? (std::min)(0.28F * sPt, 18.0F) : (std::min)(0.25F * sPt, 20.0F);
         const float blurR = liquidGlass ? std::clamp(2.5F + (sPt - 48.0F) / 64.0F, 2.5F, 4.5F)
                                         : std::clamp(2.0F + (sPt - 48.0F) / 56.0F, 2.0F, 4.0F);
         const float sigmaPx = 2.0F * blurR * dpi;
+        const float blurPx = 2.0F * sigmaPx;
+        maxBlurPx = (std::max)(maxBlurPx, blurPx);
         IconInstanceConstants& a = slots[2 * i];
         IconInstanceConstants& b = slots[2 * i + 1];
         a.iconRect[0] = sh.cx;
@@ -4124,7 +4149,7 @@ void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale, bool liqu
         a.iconMeta[0] = sh.radius;
         a.iconMeta[1] = amountPt * dpi;
         a.iconMeta[2] = heightPt * dpi;
-        a.iconMeta[3] = 2.0F * sigmaPx;
+        a.iconMeta[3] = blurPx;
         b.iconRect[0] = W;
         b.iconRect[1] = B;
         b.iconRect[2] = fillA;
@@ -4134,7 +4159,33 @@ void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale, bool liqu
         m_ccFaceLuma.push_back(faceLuma);
     }
     m_panelIconInstances->Unmap(0, nullptr);
+    if (liquidGlass && count > 1U) {
+        maxBlurPx = (std::max)(maxBlurPx, 12.0F * dpi);
+    }
     m_panelMappedConstants->scene1[2] = 100.0F + static_cast<float>(count);
+    m_panelMappedConstants->scene2[0] = 0.5F * (bbMinX + bbMaxX);
+    m_panelMappedConstants->scene2[1] = 0.5F * (bbMinY + bbMaxY);
+    m_panelMappedConstants->scene2[2] = 0.5F * (bbMaxX - bbMinX);
+    m_panelMappedConstants->scene2[3] = 0.5F * (bbMaxY - bbMinY);
+
+    const float activePad = (liquidGlass && count > 1U) ? (22.0F * dpi) : 2.0F;
+    const LONG vLeft = std::clamp(
+        static_cast<LONG>(std::floor((bbMinX - activePad) * 0.5F)) - 1L, 0L, halfW);
+    const LONG vTop = std::clamp(
+        static_cast<LONG>(std::floor((bbMinY - activePad) * 0.5F)) - 1L, 0L, halfH);
+    const LONG vRight = std::clamp(
+        static_cast<LONG>(std::ceil((bbMaxX + activePad) * 0.5F)) + 1L, vLeft, halfW);
+    const LONG vBottom = std::clamp(
+        static_cast<LONG>(std::ceil((bbMaxY + activePad) * 0.5F)) + 1L, vTop, halfH);
+    const LONG blurPadHalf = static_cast<LONG>(std::ceil(maxBlurPx * 0.5F)) + 1L;
+    outHalfVScissor = D3D12_RECT{vLeft, vTop, vRight, vBottom};
+    outHalfHScissor = D3D12_RECT{
+        vLeft,
+        (std::max)(0L, vTop - blurPadHalf),
+        vRight,
+        (std::min)(halfH, vBottom + blurPadHalf),
+    };
+    return true;
 }
 bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, UINT fxFlags,
     float glassAlpha, float dpiScale, HWND excludeA, HWND excludeB, HWND excludeC,
@@ -4215,8 +4266,12 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         m_panelMappedConstants->scene2[3] = (std::max)(0.0F, (std::min)(faceMilkBoost, 1.0F));
         std::fill(std::begin(m_panelMappedConstants->scene3), std::end(m_panelMappedConstants->scene3), 0.0F);
         m_panelMappedConstants->scene3[1] = (std::max)(panelCornerRadius, 0.0F);
+        bool ccActive = false;
+        D3D12_RECT ccHalfHScissor{};
+        D3D12_RECT ccHalfVScissor{};
         if ((fxFlags & DOCK_FX_CC) != 0) {
-            UploadCcShapes(width, height, dpiScale, (fxFlags & DOCK_FX_CC_LIQUID) != 0);
+            ccActive = UploadCcShapes(width, height, dpiScale, (fxFlags & DOCK_FX_CC_LIQUID) != 0,
+                ccHalfHScissor, ccHalfVScissor);
         }
 
         D3D12_TEXTURE_COPY_LOCATION srcLoc{};
@@ -4259,12 +4314,33 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         if ((fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
             panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
         }
-        RecordFrostBlur(m_panelCommandList.Get(), panelFrostAmt, rtvStart, m_rtvDescriptorSize,
-            panelSrvTable0, m_srvDescriptorSize, m_panelBlurTemp.Get(), m_panelBlurTempIsSrv,
-            m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, m_blurPipeline.Get(),
-            m_blurVPipeline.Get(), m_blurH2Pipeline.Get());
+        if (ccActive) {
+            const UINT halfW = (width + 1U) / 2U;
+            const UINT halfH = (height + 1U) / 2U;
+            D3D12_VIEWPORT halfViewport{0.0F, 0.0F, static_cast<float>(halfW),
+                static_cast<float>(halfH), 0.0F, 1.0F};
+            D3D12_RECT halfScissor{0, 0, static_cast<LONG>(halfW), static_cast<LONG>(halfH)};
+            m_panelCommandList->RSSetViewports(1, &halfViewport);
+            m_panelCommandList->RSSetScissorRects(1, &halfScissor);
+            RecordFrostBlur(m_panelCommandList.Get(), panelFrostAmt, rtvStart, m_rtvDescriptorSize,
+                panelSrvTable0, m_srvDescriptorSize, m_panelBlurTemp.Get(), m_panelBlurTempIsSrv,
+                m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, m_blurPipeline.Get(),
+                m_blurVPipeline.Get(), m_blurH2Pipeline.Get(), true, &ccHalfHScissor,
+                &ccHalfVScissor);
+            m_panelCommandList->RSSetViewports(1, &viewport);
+            m_panelCommandList->RSSetScissorRects(1, &scissor);
+        } else {
+            RecordFrostBlur(m_panelCommandList.Get(), panelFrostAmt, rtvStart, m_rtvDescriptorSize,
+                panelSrvTable0, m_srvDescriptorSize, m_panelBlurTemp.Get(), m_panelBlurTempIsSrv,
+                m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, m_blurPipeline.Get(),
+                m_blurVPipeline.Get(), m_blurH2Pipeline.Get());
+        }
 
-        m_panelCommandList->SetGraphicsRootDescriptorTable(2, panelSrvTable0);
+        D3D12_GPU_DESCRIPTOR_HANDLE glassSrvTable = panelSrvTable0;
+        if (ccActive) {
+            glassSrvTable.ptr += 4ULL * m_srvDescriptorSize;
+        }
+        m_panelCommandList->SetGraphicsRootDescriptorTable(2, glassSrvTable);
         D3D12_CPU_DESCRIPTOR_HANDLE colorRtv = rtvStart;
         colorRtv.ptr += m_rtvDescriptorSize * 2ULL;
         m_panelCommandList->OMSetRenderTargets(1, &colorRtv, FALSE, nullptr);
@@ -4602,8 +4678,12 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
             std::end(m_panelMappedConstants->scene2), 0.0F);
         std::fill(std::begin(m_panelMappedConstants->scene3), std::end(m_panelMappedConstants->scene3), 0.0F);
         m_panelMappedConstants->scene3[1] = (std::max)(panelCornerRadius, 0.0F);
+        bool ccActive = false;
+        D3D12_RECT ccHalfHScissor{};
+        D3D12_RECT ccHalfVScissor{};
         if ((fxFlags & DOCK_FX_CC) != 0) {
-            UploadCcShapes(width, height, dpiScale, (fxFlags & DOCK_FX_CC_LIQUID) != 0);
+            ccActive = UploadCcShapes(width, height, dpiScale, (fxFlags & DOCK_FX_CC_LIQUID) != 0,
+                ccHalfHScissor, ccHalfVScissor);
         }
 
         D3D12_TEXTURE_COPY_LOCATION srcLoc{};
@@ -4646,12 +4726,33 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         if ((fxFlags & DOCK_FX_DOCK_FACE) != 0 && lightPlate) {
             panelFrostAmt = (std::max)(panelFrostAmt, DOCK_TEXT_PANEL_FROST_FLOOR);
         }
-        RecordFrostBlur(m_panelCommandList.Get(), panelFrostAmt, rtvStart, m_rtvDescriptorSize,
-            panelSrvTable0, m_srvDescriptorSize, m_panelBlurTemp.Get(), m_panelBlurTempIsSrv,
-            m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, m_blurPipeline.Get(),
-            m_blurVPipeline.Get(), m_blurH2Pipeline.Get());
+        if (ccActive) {
+            const UINT halfW = (width + 1U) / 2U;
+            const UINT halfH = (height + 1U) / 2U;
+            D3D12_VIEWPORT halfViewport{0.0F, 0.0F, static_cast<float>(halfW),
+                static_cast<float>(halfH), 0.0F, 1.0F};
+            D3D12_RECT halfScissor{0, 0, static_cast<LONG>(halfW), static_cast<LONG>(halfH)};
+            m_panelCommandList->RSSetViewports(1, &halfViewport);
+            m_panelCommandList->RSSetScissorRects(1, &halfScissor);
+            RecordFrostBlur(m_panelCommandList.Get(), panelFrostAmt, rtvStart, m_rtvDescriptorSize,
+                panelSrvTable0, m_srvDescriptorSize, m_panelBlurTemp.Get(), m_panelBlurTempIsSrv,
+                m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, m_blurPipeline.Get(),
+                m_blurVPipeline.Get(), m_blurH2Pipeline.Get(), true, &ccHalfHScissor,
+                &ccHalfVScissor);
+            m_panelCommandList->RSSetViewports(1, &viewport);
+            m_panelCommandList->RSSetScissorRects(1, &scissor);
+        } else {
+            RecordFrostBlur(m_panelCommandList.Get(), panelFrostAmt, rtvStart, m_rtvDescriptorSize,
+                panelSrvTable0, m_srvDescriptorSize, m_panelBlurTemp.Get(), m_panelBlurTempIsSrv,
+                m_panelBlurTemp2.Get(), m_panelBlurTemp2IsSrv, m_blurPipeline.Get(),
+                m_blurVPipeline.Get(), m_blurH2Pipeline.Get());
+        }
 
-        m_panelCommandList->SetGraphicsRootDescriptorTable(2, panelSrvTable0);
+        D3D12_GPU_DESCRIPTOR_HANDLE glassSrvTable = panelSrvTable0;
+        if (ccActive) {
+            glassSrvTable.ptr += 4ULL * m_srvDescriptorSize;
+        }
+        m_panelCommandList->SetGraphicsRootDescriptorTable(2, glassSrvTable);
         D3D12_CPU_DESCRIPTOR_HANDLE colorRtv = rtvStart;
         colorRtv.ptr += m_rtvDescriptorSize * 2ULL;
         m_panelCommandList->OMSetRenderTargets(1, &colorRtv, FALSE, nullptr);
