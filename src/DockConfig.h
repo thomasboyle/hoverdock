@@ -58,6 +58,13 @@ public:
     // Switch between the current dock glass and the macOS 26 Liquid Glass dock replica.
     [[nodiscard]] bool MacosLiquidGlass() const noexcept;
     void SetMacosLiquidGlass(bool enabled) noexcept;
+    // Switch between the current Quick Settings look and the macOS 26 Control Centre liquid glass replica.
+    [[nodiscard]] bool MacosControlCentreGlass() const noexcept;
+    void SetMacosControlCentreGlass(bool enabled) noexcept;
+    // Dock reveal and hide animation duration in milliseconds (0 = instant, up to 2000ms).
+    [[nodiscard]] int RevealDurationMs() const noexcept;
+    [[nodiscard]] double RevealDurationSeconds() const noexcept;
+    void SetRevealDurationMs(int ms) noexcept;
     // Quick Settings and Dock Settings. Off is the dark plate.
     [[nodiscard]] bool LightPanels() const noexcept;
     void SetLightPanels(bool enabled) noexcept;
@@ -125,6 +132,8 @@ private:
     bool m_dropShadow = true;
     bool m_depthShade = true;
     bool m_macosLiquidGlass = false;
+    bool m_macosControlCentreGlass = false;
+    int m_revealDurationMs = 50;
     bool m_lightPanels = false;
     bool m_handsFree = true;
     unsigned m_qsIconColor = kDefaultQsIconColor;

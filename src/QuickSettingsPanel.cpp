@@ -2877,9 +2877,34 @@ int MeterBucket(float peak) noexcept {
     return static_cast<int>(std::lround(shaped * 32.0F));
 }
 
+struct QsAccents {
+    uint8_t accentR, accentG, accentB;
+    uint8_t fillR, fillG, fillB;
+};
+
+QsAccents ResolveQsAccents(bool macosCc) noexcept {
+    if (macosCc) {
+        return {0, 122, 255, 255, 255, 255};
+    }
+    return {g_qsAccentR, g_qsAccentG, g_qsAccentB, g_qsAccentR, g_qsAccentG, g_qsAccentB};
+}
+
+// macOS Control Centre flat white pill bar on a translucent white track.
+void PaintWhitePillSlider(uint8_t* pixels, int width, int height, LONG left, LONG right, float cy,
+    float radius, float level) {
+    const float x0 = static_cast<float>(left) + radius;
+    const float x1 = std::max(x0 + 1.0F, static_cast<float>(right) - radius);
+    const float clamped = std::clamp(level, 0.0F, 1.0F);
+    FillPillColorPremul(pixels, width, height, x0, x1, cy, radius, 0.22F, 255, 255, 255);
+    if (clamped > 0.01F) {
+        FillPillColorPremul(pixels, width, height, x0, std::max(x0, x0 + (x1 - x0) * clamped), cy,
+            radius, 0.98F, 255, 255, 255);
+    }
+}
+
 // Home Mic capsule meter: slim rounded track with an accent fill, confined to `meter`.
 void PaintMicPillMeter(uint8_t* pixels, int width, int height, const RECT& meter, float level,
-    uint8_t inkR, uint8_t inkG, uint8_t inkB) {
+    uint8_t inkR, uint8_t inkG, uint8_t inkB, uint8_t fillR, uint8_t fillG, uint8_t fillB) {
     const float barH = static_cast<float>(meter.bottom - meter.top);
     const float radius = std::max(1.0F, barH * 0.5F);
     const float cy = 0.5F * static_cast<float>(meter.top + meter.bottom);
@@ -2889,7 +2914,7 @@ void PaintMicPillMeter(uint8_t* pixels, int width, int height, const RECT& meter
     const float clamped = std::clamp(level, 0.0F, 1.0F);
     if (clamped > 0.02F) {
         FillPillColorPremul(pixels, width, height, left, left + (right - left) * clamped, cy, radius, 1.0F,
-            g_qsAccentB, g_qsAccentG, g_qsAccentR);
+            fillB, fillG, fillR);
     }
 }
 
@@ -4072,8 +4097,9 @@ void DockApp::PaintQuickSettings(uint8_t* pixels, int width, int height, HDC mem
 void DockApp::QsLiveSignatures(int64_t& meter, int64_t& scrub) const noexcept {
     meter = -1;
     scrub = -1;
+    const bool macosCc = m_config.MacosControlCentreGlass();
     const int64_t accent = (static_cast<int64_t>(g_qsAccentR) << 16) | (static_cast<int64_t>(g_qsAccentG) << 8) |
-        static_cast<int64_t>(g_qsAccentB);
+        static_cast<int64_t>(g_qsAccentB) | (macosCc ? (1LL << 24) : 0LL);
     if (m_qsMeterValid) {
         const int64_t ink = (static_cast<int64_t>(m_qsMeterInkR) << 16) |
             (static_cast<int64_t>(m_qsMeterInkG) << 8) | static_cast<int64_t>(m_qsMeterInkB);
@@ -4130,6 +4156,8 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
     if (pixels == nullptr || width <= 0 || height <= 0) {
         return;
     }
+    const bool macosCc = m_config.MacosControlCentreGlass();
+    const QsAccents pal = ResolveQsAccents(macosCc);
     const uint8_t inkR = m_qsMeterInkR;
     const uint8_t inkG = m_qsMeterInkG;
     const uint8_t inkB = m_qsMeterInkB;
@@ -4148,13 +4176,15 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
                 const LONG left = meter.left + 12 + index * (segW + segGap);
                 const RECT seg{left, meter.top + 8, left + segW, meter.bottom - 8};
                 FillSquircleColorPremul(pixels, width, height, seg, 2.0F, index < lit ? 0.95F : 0.25F,
-                    index < lit ? g_qsAccentB : inkB, index < lit ? g_qsAccentG : inkG, index < lit ? g_qsAccentR : inkR);
+                    index < lit ? pal.accentB : inkB, index < lit ? pal.accentG : inkG,
+                    index < lit ? pal.accentR : inkR);
             }
         } else {
             const float level = m_qsCache.inputMuted
                 ? 0.0F
                 : std::pow(std::clamp(m_qsCache.inputPeak, 0.0F, 1.0F), 0.45F);
-            PaintMicPillMeter(pixels, width, height, meter, level, inkR, inkG, inkB);
+            PaintMicPillMeter(pixels, width, height, meter, level, inkR, inkG, inkB,
+                pal.fillR, pal.fillG, pal.fillB);
         }
     }
     if (includeScrub && m_qsScrubValid && m_qsPage == QuickSettingsPage::Home) {
@@ -4175,11 +4205,13 @@ void DockApp::PaintQsLiveOverlays(uint8_t* pixels, int width, int height, float 
             const float fill = left + (right - left) * level;
             if (level > 0.0F) {
                 FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
-                    g_qsAccentB, g_qsAccentG, g_qsAccentR);
+                    pal.fillB, pal.fillG, pal.fillR);
             }
-            const float knob = media.mediaScrubPreview >= 0.0F ? 2.6F : 1.8F;
-            FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(1.5F, knob * scale), 0.99F,
-                false);
+            if (!macosCc || media.mediaScrubPreview >= 0.0F) {
+                const float knob = media.mediaScrubPreview >= 0.0F ? 2.6F : 1.8F;
+                FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(1.5F, knob * scale), 0.99F,
+                    false);
+            }
         }
         for (size_t button = 0; button < 3U; ++button) {
             const RECT& area = m_qsMediaTransportRect[button];
@@ -4360,6 +4392,40 @@ void CcDrawSlider(uint8_t* pixels, int width, int height, RECT track, float leve
         false);
 }
 
+void CcDrawNotchedSlider(uint8_t* pixels, int width, int height, RECT track, float level,
+    int notchCount, float scale, uint8_t accentR, uint8_t accentG, uint8_t accentB,
+    uint8_t inkR, uint8_t inkG, uint8_t inkB, LONG& outKnobMinX, LONG& outKnobMaxX) {
+    level = std::clamp(level, 0.0F, 1.0F);
+    const float cy = 0.5F * static_cast<float>(track.top + track.bottom);
+    const float trackR = std::max(2.0F, 2.5F * scale);
+    const float thumbR = std::max(6.0F, 7.5F * scale);
+    const float thumbSeg = std::max(3.5F, 5.0F * scale);
+    const float trackLeft = static_cast<float>(track.left) + trackR;
+    const float trackRight = std::max(trackLeft + 1.0F, static_cast<float>(track.right) - trackR);
+    const float knobMinX = static_cast<float>(track.left) + thumbR + thumbSeg;
+    const float knobMaxX = std::max(knobMinX + 1.0F, static_cast<float>(track.right) - thumbR - thumbSeg);
+    outKnobMinX = static_cast<LONG>(std::lround(knobMinX));
+    outKnobMaxX = static_cast<LONG>(std::lround(knobMaxX));
+    const float knobX = knobMinX + (knobMaxX - knobMinX) * level;
+
+    auto pill = [&](float x0, float x1, float y, float r, float a, uint8_t b, uint8_t g, uint8_t red) {
+        FillPillColorPremul(pixels, width, height, x0, x1, y, r, a, b, g, red);
+    };
+    pill(trackLeft, trackRight, cy, trackR, 0.22F, inkB, inkG, inkR);
+    if (level > 0.005F) {
+        pill(trackLeft, std::max(trackLeft, knobX), cy, trackR, 0.98F, accentB, accentG, accentR);
+    }
+    const float dotY = cy + trackR + std::max(5.0F, 5.5F * scale);
+    const float dotR = std::max(1.4F, 1.6F * scale);
+    for (int i = 0; i <= notchCount && notchCount > 0; ++i) {
+        const float dotX = knobMinX + (knobMaxX - knobMinX) * (static_cast<float>(i) / static_cast<float>(notchCount));
+        pill(dotX, dotX, dotY, dotR, 0.34F, inkB, inkG, inkR);
+    }
+    pill(knobX - thumbSeg, knobX + thumbSeg, cy + std::max(1.5F, 2.0F * scale), thumbR + std::max(1.5F, 2.0F * scale), 0.09F, 40, 40, 46);
+    pill(knobX - thumbSeg, knobX + thumbSeg, cy + std::max(1.0F, 1.2F * scale), thumbR + std::max(0.8F, 1.0F * scale), 0.15F, 40, 40, 46);
+    pill(knobX - thumbSeg, knobX + thumbSeg, cy, thumbR, 0.99F, 255, 255, 255);
+}
+
 }  // namespace dock_detail
 
 void RemoveLegacyAutomaticPowerPlan() {
@@ -4523,10 +4589,20 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         m_qsTrayArrowRects.clear();
     }
     SetQsAccent(m_config.QsIconColor());
+    const bool macosCc = m_config.MacosControlCentreGlass();
+    const QsAccents pal = ResolveQsAccents(macosCc);
+    const uint8_t accentR = pal.accentR;
+    const uint8_t accentG = pal.accentG;
+    const uint8_t accentB = pal.accentB;
+    const uint8_t meterFillR = pal.fillR;
+    const uint8_t meterFillG = pal.fillG;
+    const uint8_t meterFillB = pal.fillB;
     const bool home = m_qsPage == QuickSettingsPage::Home;
     panelWidth = std::max(320L, std::lround((home ? 600.0F : 380.0F) * scale));
     m_qsCcShapes.clear();
-    m_qsCcShapes.push_back({RECT{0, 0, 0, 0}, 34.0F * scale});
+    if (!macosCc || !home) {
+        m_qsCcShapes.push_back({RECT{0, 0, 0, 0}, (macosCc ? 30.0F : 34.0F) * scale});
+    }
     if (home) {
         // Control Centre grid: 4 x 63pt cells, 13pt gutters = 291pt of content.
         padding = std::max(12L, std::lround(20.0F * scale));
@@ -4536,11 +4612,12 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     const LONG sliderH = std::max(22L, std::lround(28.0F * scale));
     const LONG listRow = std::max(52L, std::lround(58.0F * scale));
     const LONG sectionH = std::max(22L, std::lround(26.0F * scale));
-    // The CC panel face is always light (spec W/B tables), so panel ink is dark.
-    const bool light = true;
-    const uint8_t inkR = kInkDarkR;
-    const uint8_t inkG = kInkDarkG;
-    const uint8_t inkB = kInkDarkB;
+    // Legacy CC panel face is light (dark ink); macOS Control Centre liquid
+    // glass is smoked dark glass (crisp white ink).
+    const bool light = !macosCc;
+    const uint8_t inkR = light ? kInkDarkR : kInkLightR;
+    const uint8_t inkG = light ? kInkDarkG : kInkLightG;
+    const uint8_t inkB = light ? kInkDarkB : kInkLightB;
     LONG y = padding;
 
     auto push = [&](TrayFlyoutHitKind kind, RECT bounds, int index = -1) {
@@ -4585,10 +4662,12 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         }
         const float radius = ContentSquircleRadius(bounds, scale);
         if (active) {
-            FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.96F, g_qsAccentB, g_qsAccentG,
-                g_qsAccentR);
+            FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.96F, accentB, accentG,
+                accentR);
         } else if (light) {
             FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.72F, 255, 255, 255);
+        } else if (macosCc) {
+            FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.10F, 255, 255, 255);
         } else {
             FillSquircleColorPremul(pixels, width, height, bounds, radius, 0.42F, 32, 34, 40);
         }
@@ -4597,9 +4676,13 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         if (!draw) {
             return;
         }
-        level = std::clamp(level, 0.0F, 1.0F);
         const float radius = std::max(3.0F, static_cast<float>(track.bottom - track.top) * 0.5F);
         const float cy = 0.5F * static_cast<float>(track.top + track.bottom);
+        if (macosCc) {
+            PaintWhitePillSlider(pixels, width, height, track.left, track.right, cy, radius, level);
+            return;
+        }
+        level = std::clamp(level, 0.0F, 1.0F);
         const float left = static_cast<float>(track.left) + radius;
         const float right = std::max(left + 1.0F, static_cast<float>(track.right) - radius);
         FillPillColorPremul(pixels, width, height, left, right, cy, radius, light ? 0.28F : 0.35F,
@@ -4607,7 +4690,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         const float fill = left + (right - left) * level;
         if (level > 0.015F) {
             FillPillColorPremul(pixels, width, height, left, std::max(left, fill), cy, radius, 0.98F,
-                g_qsAccentB, g_qsAccentG, g_qsAccentR);
+                accentB, accentG, accentR);
         }
         FillCirclePremul(pixels, width, height, fill, cy, radius + std::max(2.0F, 3.0F * scale),
             0.98F, false);
@@ -4621,8 +4704,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         FillPillColorPremul(pixels, width, height, cx, cx, cy, radius - 1.8F, 0.96F,
             light ? 255 : 32, light ? 255 : 34, light ? 255 : 40);
         if (selected) {
-            FillPillColorPremul(pixels, width, height, cx, cx, cy, radius * 0.46F, 1.0F, g_qsAccentB,
-                g_qsAccentG, g_qsAccentR);
+            FillPillColorPremul(pixels, width, height, cx, cx, cy, radius * 0.46F, 1.0F, accentB,
+                accentG, accentR);
         }
     };
     auto toggleRect = [&](LONG centerY, LONG right, bool enabled) {
@@ -4634,7 +4717,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const float radius = static_cast<float>(switchH) * 0.5F;
             CcDrawSwitch(pixels, width, height, static_cast<float>(left) + radius,
                 static_cast<float>(right) - radius, static_cast<float>(top) + radius, radius, scale,
-                enabled, g_qsAccentR, g_qsAccentG, g_qsAccentB, inkR, inkG, inkB);
+                enabled, accentR, accentG, accentB, inkR, inkG, inkB);
         }
         return RECT{left - 8, top - 6, right + 6, top + switchH + 6};
     };
@@ -4688,8 +4771,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     auto footer = [&](const wchar_t* label, int link) {
         const RECT row{padding, y, panelWidth - padding, y + listRow};
         if (draw) {
-            // Links follow the dock's Quick Settings colour (QuickSettingsIconColor).
-            SetFlyoutChromeInk(g_qsAccentR, g_qsAccentG, g_qsAccentB);
+            SetFlyoutChromeInk(accentR, accentG, accentB);
             text(row, labelFont, std::wstring(label) + L"    \u203A",
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
             restoreInk();
@@ -4708,13 +4790,15 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     const std::wstring inputName = m_qsCache.inputName.empty() ? L"Microphone" : m_qsCache.inputName;
 
     if (home) {
-        beginHeader(L"Quick Settings", true, -1, false);
+        if (!macosCc) {
+            beginHeader(L"Quick Settings", true, -1, false);
+        }
         // ---- macOS 26 Control Centre grid (pt scaled by DPI) ---------------
         // Cell 63, gutter 13 (pitch 76), 4 columns = 291 wide. Every module is a
         // separate glass shape baked by the renderer (DOCK_FX_CC); this pass
         // only lays out shapes, glyphs, text and live controls on top.
         auto P = [&](float pt) { return static_cast<LONG>(std::lround(pt * scale)); };
-        const LONG gridTop = y + P(10.0F);
+        const LONG gridTop = macosCc ? padding : (y + P(10.0F));
         auto cellRect = [&](int col, int row, int w, int h) {
             return QsGridCellRect(padding, gridTop, scale, col, row, w, h);
         };
@@ -4752,6 +4836,9 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         };
         // Glyph/text ink follows the adaptive face luminance with hysteresis.
         auto ccInk = [&](size_t idx) {
+            if (macosCc) {
+                return CcInk{kInkLightR, kInkLightG, kInkLightB, false};
+            }
             const std::vector<float>& faces = m_renderer.CcFaceLuma();
             const float face = idx < faces.size() ? faces[idx] : 0.80F;
             const bool prev = idx < 64U && ((m_qsCcInkSig >> idx) & 1ULL) != 0ULL;
@@ -4765,26 +4852,22 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         uint8_t kOnAccentR = 30;
         uint8_t kOnAccentG = 33;
         uint8_t kOnAccentB = 24;
-        CcOnAccentInk(g_qsAccentR, g_qsAccentG, g_qsAccentB, kOnAccentR, kOnAccentG, kOnAccentB);
+        CcOnAccentInk(accentR, accentG, accentB, kOnAccentR, kOnAccentG, kOnAccentB);
         auto glyphDisc = [&](float cx, float cy, float radius, bool active, const CcInk& ink,
                              wchar_t symbol, UINT extent) {
             if (!draw) {
                 return;
             }
-            if (active) {
-                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, g_qsAccentB, g_qsAccentG,
-                    g_qsAccentR);
-            } else {
-                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.16F, ink.b, ink.g,
-                    ink.r);
-            }
+            const uint8_t dR = active ? meterFillR : ink.r;
+            const uint8_t dG = active ? meterFillG : ink.g;
+            const uint8_t dB = active ? meterFillB : ink.b;
+            FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, active ? 0.98F : 0.16F, dB, dG, dR);
             const LONG left = static_cast<LONG>(std::lround(cx - static_cast<float>(extent) * 0.5F));
             const LONG top = static_cast<LONG>(std::lround(cy - static_cast<float>(extent) * 0.5F));
-            if (active) {
-                icon(left, top, symbol, extent, kOnAccentR, kOnAccentG, kOnAccentB);
-            } else {
-                icon(left, top, symbol, extent, ink.r, ink.g, ink.b);
-            }
+            const uint8_t gR = active ? (macosCc ? accentR : kOnAccentR) : ink.r;
+            const uint8_t gG = active ? (macosCc ? accentG : kOnAccentG) : ink.g;
+            const uint8_t gB = active ? (macosCc ? accentB : kOnAccentB) : ink.b;
+            icon(left, top, symbol, extent, gR, gG, gB);
         };
         // Hover arrow for a Home tile (kQsChevronTiles order), centred in `area`.
         // Only the glyph is cached here; PaintQsTileChevrons fades it in.
@@ -4889,34 +4972,55 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             if (!draw) {
                 return;
             }
-            CcDrawSlider(pixels, width, height, track, level, scale, g_qsAccentR, g_qsAccentG,
-                g_qsAccentB, ink.r, ink.g, ink.b);
+            CcDrawSlider(pixels, width, height, track, level, scale, accentR, accentG,
+                accentB, ink.r, ink.g, ink.b);
         };
-        auto sliderCapsule = [&](RECT b, wchar_t symbol, const wchar_t* title, const std::wstring& value,
-                                 float level, TrayFlyoutHitKind sliderKind, bool sliderEnabled,
-                                 TrayFlyoutHitKind drillKind, int chevronTile) {
+        auto sliderCapsule = [&](RECT b, wchar_t symbol, wchar_t rightSymbol, const wchar_t* title,
+                                 const std::wstring& value, float level, TrayFlyoutHitKind sliderKind,
+                                 bool sliderEnabled, TrayFlyoutHitKind drillKind, int chevronTile) {
             const float h = static_cast<float>(b.bottom - b.top);
             const size_t idx = addShape(b, h * 0.5F);
             const CcInk ink = ccInk(idx);
-            const LONG padX = P(22.0F);
-            const UINT extent = static_cast<UINT>(std::max(14L, P(18.0F)));
+            const LONG padX = P(macosCc ? 18.0F : 22.0F);
+            const LONG rowTop = b.top + P(8.0F);
+            const LONG rowBottom = rowTop + P(macosCc ? 20.0F : 22.0F);
+            LONG titleLeft = b.left + padX;
             if (draw) {
                 SetFlyoutChromeInk(ink.r, ink.g, ink.b);
-                icon(b.left + padX, b.top + P(10.0F), symbol, extent, ink.r, ink.g, ink.b);
             }
-            const LONG rowTop = b.top + P(8.0F);
-            const LONG rowBottom = rowTop + P(22.0F);
-            text({b.left + padX + static_cast<LONG>(extent) + P(8.0F), rowTop, b.right - padX - P(56.0F), rowBottom},
+            if (!macosCc) {
+                const UINT extent = static_cast<UINT>(std::max(14L, P(18.0F)));
+                icon(b.left + padX, b.top + P(10.0F), symbol, extent, ink.r, ink.g, ink.b);
+                titleLeft += static_cast<LONG>(extent) + P(8.0F);
+            }
+            text({titleLeft, rowTop, b.right - padX - P(56.0F), rowBottom},
                 labelFont, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
             text({b.right - padX - P(56.0F), rowTop, b.right - padX, rowBottom}, statusFont, value,
                 DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 190);
-            const RECT track{b.left + padX, b.top + P(36.0F), b.right - padX, b.top + P(54.0F)};
-            accentSlider(track, level, ink);
+            RECT track{};
+            if (macosCc) {
+                const LONG cy = b.top + P(43.0F);
+                const UINT leftExt = static_cast<UINT>(std::max(12L, P(14.0F)));
+                const UINT rightExt = static_cast<UINT>(std::max(15L, P(18.0F)));
+                const LONG leftX = b.left + P(16.0F);
+                const LONG rightX = b.right - P(16.0F) - static_cast<LONG>(rightExt);
+                icon(leftX, cy - static_cast<LONG>(leftExt) / 2L, symbol, leftExt, ink.r, ink.g, ink.b);
+                icon(rightX, cy - static_cast<LONG>(rightExt) / 2L, rightSymbol, rightExt, ink.r, ink.g, ink.b);
+                const LONG trackL = leftX + static_cast<LONG>(leftExt) + P(10.0F);
+                const LONG trackR = std::max(trackL + P(8.0F), rightX - P(10.0F));
+                if (draw) {
+                    PaintWhitePillSlider(pixels, width, height, trackL, trackR, static_cast<float>(cy),
+                        std::max(2.0F, static_cast<float>(P(2.5F))), level);
+                }
+                track = {trackL, cy - P(10.0F), trackR, cy + P(10.0F)};
+            } else {
+                track = {b.left + padX, b.top + P(36.0F), b.right - padX, b.top + P(54.0F)};
+                accentSlider(track, level, ink);
+            }
             if (sliderEnabled) {
                 push(sliderKind, track);
             }
             push(drillKind, b);
-            // Title-row arrow, 12pt in from the edge (right of the value text).
             tileChevron(chevronTile, {std::max(b.left, b.right - P(24.0F)), rowTop, b.right, rowBottom}, ink);
         };
 
@@ -4968,18 +5072,20 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 m_qsMeterInkR = ink.r;
                 m_qsMeterInkG = ink.g;
                 m_qsMeterInkB = ink.b;
-                PaintMicPillMeter(pixels, width, height, meter, 0.0F, ink.r, ink.g, ink.b);
+                PaintMicPillMeter(pixels, width, height, meter, 0.0F, ink.r, ink.g, ink.b,
+                    meterFillR, meterFillG, meterFillB);
             }
             push(TrayFlyoutHitKind::Microphone, b);
             tileChevron(7, {std::max(b.left, b.right - P(24.0F)), b.top, b.right, b.bottom}, ink);
         }
         // Row 3: Sound slider capsule (4x1).
-        sliderCapsule(moduleRect(QsModule::Sound), tray.volumeMuted ? L'\uE74F' : L'\uE767', L"Sound",
+        sliderCapsule(moduleRect(QsModule::Sound),
+            tray.volumeMuted ? L'\uE74F' : (macosCc ? L'\uE992' : L'\uE767'), L'\uE767', L"Sound",
             std::wstring{}, volume,
             TrayFlyoutHitKind::VolumeSlider, true, TrayFlyoutHitKind::Sound, 4);
         // Row 4: Display slider capsule (4x1, brightness).
         const bool brightnessUsable = tray.brightnessAvailable || projected >= 0;
-        sliderCapsule(moduleRect(QsModule::Display), L'\uE706', L"Display",
+        sliderCapsule(moduleRect(QsModule::Display), L'\uE706', L'\uE706', L"Display",
             brightnessUsable
                 ? std::wstring{}
                 : ((m_qsCache.nightKnown && m_qsCache.nightLight) ? std::wstring(L"Night light")
@@ -5110,16 +5216,38 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 SetFlyoutChromeInk(ink.r, ink.g, ink.b);
             }
             text(button, labelFont, m_qsEditMode ? L"Done" : L"Edit Controls",
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, macosCc ? 225 : 255);
             push(TrayFlyoutHitKind::QsEditControls, button);
+            if (macosCc) {
+                // Floating circular liquid glass Dock Settings button aligned
+                // on the Edit Controls row (since Home has no top header bar).
+                const RECT gearBtn{panelWidth - padding - buttonH, top, panelWidth - padding, top + buttonH};
+                const size_t gearIdx = addShape(gearBtn, static_cast<float>(buttonH) * 0.5F);
+                const CcInk gearInk = ccInk(gearIdx);
+                const UINT gearExtent = static_cast<UINT>(std::max(12L, std::min(buttonH - P(10.0F), gearSize)));
+                if (draw) {
+                    SetFlyoutChromeInk(gearInk.r, gearInk.g, gearInk.b);
+                    EnsureOverflowGlyphs(gearExtent, gearExtent);
+                    m_overflowGearX = static_cast<int>(gearBtn.left + (buttonH - static_cast<LONG>(gearExtent)) / 2L);
+                    m_overflowGearY = static_cast<int>(gearBtn.top + (buttonH - static_cast<LONG>(gearExtent)) / 2L);
+                    m_overflowGearExtent = gearExtent;
+                    if (!m_overflowGlyphGear.empty()) {
+                        CompositePremul(pixels, width, height, m_overflowGearX, m_overflowGearY,
+                            m_overflowGlyphGear.data(), static_cast<int>(gearExtent),
+                            static_cast<int>(gearExtent));
+                    }
+                }
+                push(TrayFlyoutHitKind::Settings, gearBtn);
+            }
             y = button.bottom + padding;
         }
         if (draw) {
             m_qsCcInkSig = inkSigNew;
         }
         contentBottom = y;
-    m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
-        m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
+        if (!macosCc && !m_qsCcShapes.empty()) {
+            m_qsCcShapes[0].bounds = RECT{0, 0, panelWidth, y};
+        }
         return;
     }
     auto infoRow = [&](RECT row, const wchar_t* title, const std::wstring& value) {
@@ -5145,13 +5273,13 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     // glass split by hairlines, round glyph discs, and a "Settings..." link.
     const LONG menuRow = std::max(40L, std::lround(44.0F * scale));
     const LONG menuInset = std::max(4L, std::lround(6.0F * scale));
-    constexpr uint8_t dimR = 128;
-    constexpr uint8_t dimG = 130;
-    constexpr uint8_t dimB = 134;
+    const uint8_t dimR = macosCc ? static_cast<uint8_t>(168) : static_cast<uint8_t>(128);
+    const uint8_t dimG = macosCc ? static_cast<uint8_t>(170) : static_cast<uint8_t>(130);
+    const uint8_t dimB = macosCc ? static_cast<uint8_t>(176) : static_cast<uint8_t>(134);
     uint8_t onAccentR = 30;
     uint8_t onAccentG = 33;
     uint8_t onAccentB = 24;
-    CcOnAccentInk(g_qsAccentR, g_qsAccentG, g_qsAccentB, onAccentR, onAccentG, onAccentB);
+    CcOnAccentInk(accentR, accentG, accentB, onAccentR, onAccentG, onAccentB);
     auto hairline = [&]() {
         const LONG lineY = y + gap / 2L;
         if (draw) {
@@ -5183,8 +5311,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
         const UINT extent = static_cast<UINT>(std::max(12L, std::lround(16.0F * scale)));
         if (draw) {
             if (active) {
-                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, g_qsAccentB, g_qsAccentG,
-                    g_qsAccentR);
+                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, accentB, accentG,
+                    accentR);
             } else {
                 FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, dim ? 0.08F : 0.14F, inkB, inkG,
                     inkR);
@@ -5237,8 +5365,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
     auto menuLink = [&](const wchar_t* label, int link) {
         const RECT row{padding, y, panelWidth - padding, y + menuRow};
         if (draw) {
-            // Links follow the dock's Quick Settings colour (QuickSettingsIconColor).
-            SetFlyoutChromeInk(g_qsAccentR, g_qsAccentG, g_qsAccentB);
+            SetFlyoutChromeInk(accentR, accentG, accentB);
             text({row.left + menuInset, row.top, row.right - menuInset, row.bottom}, labelFont, label,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE, 255);
             restoreInk();
@@ -5409,7 +5536,7 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 const LONG left = level.left + 12 + index * (segW + segGap);
                 const RECT seg{left, level.top + 8, left + segW, level.bottom - 8};
                 FillSquircleColorPremul(pixels, width, height, seg, 2.0F, index < lit ? 0.95F : 0.25F,
-                    index < lit ? g_qsAccentB : inkB, index < lit ? g_qsAccentG : inkG, index < lit ? g_qsAccentR : inkR);
+                    index < lit ? accentB : inkB, index < lit ? accentG : inkG, index < lit ? accentR : inkR);
             }
         }
         y += 28 + gap;
@@ -5756,8 +5883,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const float cy = 0.5F * static_cast<float>(row.top + row.bottom);
             const UINT extent = static_cast<UINT>(std::max(14L, P(19.0F)));
             if (draw) {
-                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, g_qsAccentB, g_qsAccentG,
-                    g_qsAccentR);
+                FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, accentB, accentG,
+                    accentR);
             }
             icon(static_cast<LONG>(std::lround(cx - static_cast<float>(extent) * 0.5F)),
                 static_cast<LONG>(std::lround(cy - static_cast<float>(extent) * 0.5F)), L'\uE945', extent,
@@ -5895,8 +6022,13 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
             const RECT track{row.left + static_cast<LONG>(sunSmall) + P(12.0F), cy - trackH / 2L,
                 row.right - static_cast<LONG>(sunLarge) - P(12.0F), cy - trackH / 2L + trackH};
             if (draw) {
-                CcDrawSlider(pixels, width, height, track, brightness, scale, g_qsAccentR, g_qsAccentG, g_qsAccentB,
-                    inkR, inkG, inkB);
+                if (macosCc) {
+                    PaintWhitePillSlider(pixels, width, height, track.left, track.right, static_cast<float>(cy),
+                        std::max(2.0F, static_cast<float>(P(2.5F))), brightness);
+                } else {
+                    CcDrawSlider(pixels, width, height, track, brightness, scale, accentR, accentG, accentB,
+                        inkR, inkG, inkB);
+                }
             }
             // Pushed even when DDC/WMI brightness is unavailable: a click then
             // opens Windows display settings (ApplyQuickSettingsSlider).
@@ -5947,8 +6079,8 @@ void DockApp::LayoutQuickSettings(bool draw, uint8_t* pixels, int width, int hei
                 const float cy = static_cast<float>(discTop) + radius;
                 if (draw) {
                     if (button.active) {
-                        FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, g_qsAccentB,
-                            g_qsAccentG, g_qsAccentR);
+                        FillPillColorPremul(pixels, width, height, cx, cx, cy, radius, 0.98F, accentB,
+                            accentG, accentR);
                     } else {
                         FillPillColorPremul(pixels, width, height, cx, cx, cy, radius,
                             button.enabled ? 0.14F : 0.07F, inkB, inkG, inkR);
@@ -6374,17 +6506,21 @@ bool DockApp::BeginQsReorder(int module, POINT cursor) {
     if (!OverflowScreenOrigin(origin, caret)) {
         return false;
     }
-    // Tile-free backdrop: the same panel glass baked with only shape 0. Tile
-    // faces are a fixed colour, so moved snapshots match a real rebake.
-    std::vector<uint8_t> panel(bytes);
-    const std::vector<Renderer::CcShapeDesc> shapes = m_qsCcDescs;
-    m_qsCcDescs.assign(shapes.begin(), shapes.begin() + 1);
-    const bool baked = TryBakePopupGlass(origin, width, height, panel.data(), panel.size(), true, true);
-    m_qsCcDescs = shapes;
-    m_renderer.SetCcShapes(shapes);
-    if (!baked) {
-        Log(L"Quick Settings reorder: panel glass bake unavailable.");
-        return false;
+    // Tile-free backdrop: the same panel glass baked with only shape 0. In
+    // macOS Control Centre mode there is no outer container panel, so the
+    // tile-free backdrop is transparent.
+    const bool macosCc = m_config.MacosControlCentreGlass();
+    std::vector<uint8_t> panel(bytes, 0);
+    if (!macosCc) {
+        const std::vector<Renderer::CcShapeDesc> shapes = m_qsCcDescs;
+        m_qsCcDescs.assign(shapes.begin(), shapes.begin() + 1);
+        const bool baked = TryBakePopupGlass(origin, width, height, panel.data(), panel.size(), true, true);
+        m_qsCcDescs = shapes;
+        m_renderer.SetCcShapes(shapes);
+        if (!baked) {
+            Log(L"Quick Settings reorder: panel glass bake unavailable.");
+            return false;
+        }
     }
 
     const uint8_t* base = m_overflowBaseBits.data();
@@ -6449,8 +6585,8 @@ bool DockApp::BeginQsReorder(int module, POINT cursor) {
                 }
             }
         }
-        // Backdrop: tile (plus its 1-2px AA ring) replaced by bare panel glass.
-        const LONG ring = 3;
+        // Backdrop: tile (plus its AA ring / floating drop shadow) replaced by bare panel glass.
+        const LONG ring = macosCc ? std::max(12L, std::lround(12.0F * m_qsGridScale)) : 3L;
         for (LONG y = std::max(0L, rect.top - ring); y < std::min(height, rect.bottom + ring); ++y) {
             const LONG left = std::max(0L, rect.left - ring);
             const LONG right = std::min(width, rect.right + ring);

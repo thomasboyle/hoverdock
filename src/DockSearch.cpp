@@ -3,6 +3,7 @@
 // Opened by the dock's Search tile or Ctrl+Space.
 
 #include "DockApp.h"
+#include "DockConfigIni.h"
 #include "DockTheme.hlsli"
 #include "GroqProtocol.h"
 
@@ -799,7 +800,7 @@ void DockApp::CloseSearch(bool hideDockIfAway) {
     KillTimer(m_searchWindow, kCaretTimerId);
     KillTimer(m_searchWindow, kAiSpinnerTimerId);
     const bool dismissCollapsed = m_searchMode != SearchMode::Ai && m_searchRows.empty();
-    if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry) {
+    if (IsSearchEntryMode(m_searchMode)) {
         ExitSearchEntry(false);
     }
     m_fileSearch.SetActive(false);
@@ -1173,7 +1174,7 @@ void DockApp::PaintSearch() {
     const LONG barLeft = Px(14.0F, scale);
     const RECT glyphRect{barLeft, 0, barLeft + m.glyphBox, m.barHeight};
     const wchar_t* barGlyph = m_searchMode == SearchMode::KeyEntry ? kGlyphKey
-        : m_searchMode == SearchMode::ModelEntry                   ? kGlyphSettings
+        : IsSearchEntryMode(m_searchMode)                          ? kGlyphSettings
                                                                    : kGlyphSearch;
     DrawFlyoutText(pixels, width, height, glyphRect, m_searchBigGlyphFont, barGlyph,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE, 200);
@@ -1198,7 +1199,7 @@ void DockApp::PaintSearch() {
         hint = L"Ask AI  Ctrl+\u21B5";
     } else if (m_searchMode == SearchMode::Ai) {
         hint = L"Esc  Back to results";
-    } else if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry) {
+    } else if (IsSearchEntryMode(m_searchMode)) {
         hint = L"\u21B5  Save";
     }
     if (hint != nullptr) {
@@ -1221,6 +1222,8 @@ void DockApp::PaintSearch() {
             placeholder = L"Paste your Groq API key (gsk_\u2026)";
         } else if (m_searchMode == SearchMode::ModelEntry) {
             placeholder = L"Groq model ID (default qwen/qwen3.8-27b)";
+        } else if (m_searchMode == SearchMode::RevealSpeedEntry) {
+            placeholder = L"Duration (0ms\u20132s, e.g. 50ms or 0.4s)";
         }
         DrawFlyoutText(pixels, width, height, {textLeft, lineTop, textRight, lineTop + lineHeight},
             m_searchQueryFont, placeholder, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 120);
@@ -1414,7 +1417,7 @@ bool DockApp::HandleSearchKey(WPARAM key) {
         PaintSearch();
     };
 
-    const bool entry = m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry;
+    const bool entry = IsSearchEntryMode(m_searchMode);
     const bool ai = m_searchMode == SearchMode::Ai;
     const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
     const int page = std::max(1, static_cast<int>(m_aiViewport.bottom - m_aiViewport.top) - Px(40.0F, scale));
@@ -1620,7 +1623,7 @@ void DockApp::SearchTextChanged() {
     if (m_searchWindow != nullptr) {
         SetTimer(m_searchWindow, kCaretTimerId, kCaretBlinkMs, nullptr);
     }
-    if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry) {
+    if (IsSearchEntryMode(m_searchMode)) {
         PaintSearch();
         return;
     }
@@ -2328,7 +2331,7 @@ void DockApp::CopyAiAnswer() {
 // ---- AI image attachments --------------------------------------------------------------
 
 LONG DockApp::AttachStripHeight(float scale) const noexcept {
-    if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry ||
+    if (IsSearchEntryMode(m_searchMode) ||
         (m_aiAttachments.empty() && m_aiAttachNotice.empty())) {
         return 0;
     }
@@ -2484,14 +2487,14 @@ void DockApp::PaintAttachStrip(uint8_t* pixels, int width, int height, float sca
         m_searchSubFont, caption, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 150);
 }
 
-// ---- Dock Settings entries (Groq API key / AI model) ------------------------------------
+// ---- Dock Settings entries (Groq API key / AI model / reveal speed) ---------------------
 
 void DockApp::OpenSearchEntry(SearchMode mode) {
-    if (mode != SearchMode::KeyEntry && mode != SearchMode::ModelEntry) {
+    if (!IsSearchEntryMode(mode)) {
         return;
     }
     const bool askAfterKey = m_aiAskAfterKey;
-    if (m_searchMode == SearchMode::KeyEntry || m_searchMode == SearchMode::ModelEntry) {
+    if (IsSearchEntryMode(m_searchMode)) {
         SecureZeroMemory(m_searchText.data(), m_searchText.size() * sizeof(wchar_t));
     } else {
         m_searchSavedText = m_searchText;
@@ -2499,7 +2502,9 @@ void DockApp::OpenSearchEntry(SearchMode mode) {
     ExitAiState();
     m_aiAskAfterKey = askAfterKey && mode == SearchMode::KeyEntry;
     m_searchMode = mode;
-    m_searchText = mode == SearchMode::ModelEntry ? m_config.AiModel() : std::wstring();
+    m_searchText = mode == SearchMode::ModelEntry ? m_config.AiModel()
+        : mode == SearchMode::RevealSpeedEntry    ? std::to_wstring(m_config.RevealDurationMs()) + L"ms"
+                                                  : std::wstring();
     m_searchCaret = m_searchText.size();
     if (!IsSearchOpen() && !OpenSearch()) {
         ExitSearchEntry(false);
@@ -2517,6 +2522,12 @@ void DockApp::BuildSearchEntryRows() {
     m_searchSelected = -1;
     SearchRow info;
     info.kind = SearchRow::Kind::Info;
+    if (m_searchMode == SearchMode::RevealSpeedEntry) {
+        info.title = L"Type a reveal/hide duration (0ms to 2s) and press Enter";
+        info.subtitle = L"Examples: 0ms (instant), 50ms, 250ms, 0.4s, 1.5s, 2s.";
+        m_searchRows.push_back(std::move(info));
+        return;
+    }
     SearchRow link;
     link.kind = SearchRow::Kind::Link;
     if (m_searchMode == SearchMode::KeyEntry) {
@@ -2556,6 +2567,22 @@ void DockApp::CommitSearchEntry() {
         notice.title = L"AI model set to " + m_config.AiModel() + L".";
         notice.subtitle = L"Used for Ctrl+Enter answers in Search.";
         Log(L"AI: model set to " + m_config.AiModel() + L".");
+    } else if (mode == SearchMode::RevealSpeedEntry) {
+        const std::optional<int> parsedMs = dockconfig::ParseRevealDurationMs(value);
+        if (!parsedMs.has_value()) {
+            BuildSearchEntryRows();
+            m_searchRows.front().title = L"Enter a duration between 0ms and 2s";
+            m_searchSelectAll = !m_searchText.empty();
+            PaintSearch();
+            return;
+        }
+        m_config.SetRevealDurationMs(*parsedMs);
+        notice.title = L"Reveal / hide speed set to " +
+            dockconfig::FormatRevealDurationLabel(*parsedMs) + L".";
+        notice.subtitle = *parsedMs == 0
+            ? L"Dock will appear and hide instantly."
+            : L"Applies to both dock reveal and hide animations.";
+        Log(L"Dock: reveal/hide duration set to " + std::to_wstring(*parsedMs) + L" ms.");
     } else {
         return;
     }
@@ -2575,7 +2602,7 @@ void DockApp::CommitSearchEntry() {
 }
 
 void DockApp::ExitSearchEntry(bool refresh) {
-    if (m_searchMode != SearchMode::KeyEntry && m_searchMode != SearchMode::ModelEntry) {
+    if (!IsSearchEntryMode(m_searchMode)) {
         return;
     }
     SecureZeroMemory(m_searchText.data(), m_searchText.size() * sizeof(wchar_t));

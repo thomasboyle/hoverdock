@@ -115,6 +115,10 @@
 // shapes read from the panel instance buffer; see CcGlass in Shaders.hlsl).
 // Halo bits 8-13 are unused for panels, so bit 10 is free.
 #define DOCK_FX_CC 0x400u
+// With DOCK_FX_CC: exact macOS 26 Tahoe Control Centre dark liquid glass
+// (floating smoked-glass modules, crisp bevel refraction, diagonal specular
+// rim, inner bevel glow, and soft drop shadow).
+#define DOCK_FX_CC_LIQUID 0x1000u
 // With PANEL | DOCK_FACE: macOS Spotlight material for the Search panel - the
 // dock silhouette with a wide frost (per-pass sigma = SPOTLIGHT_BLUR_PX / 2,
 // full 5H + 5V stack), 180% vibrancy and the system light/dark fill (scene0.w).

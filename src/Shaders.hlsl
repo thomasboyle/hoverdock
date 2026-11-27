@@ -614,9 +614,12 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
     const bool hasBackdrop = scene1.w > 0.5;
+    const bool liquid = FxEnabled(scene1.x, (float)DOCK_FX_CC_LIQUID) > 0.5;
+    const float cullDist = liquid ? (16.0 * dpi) : 1.6;
     float3 accum = float3(0.0, 0.0, 0.0);
     float alpha = 0.0;
     float ring = 0.0;
+    float shadowA = 0.0;
     for (uint i = 0u; i < 48u; ++i)
     {
         if (i >= n)
@@ -629,14 +632,20 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         const float2 halfSize = a.iconRect.zw;
         const float r = a.iconMeta.x;
         const float s = SdRoundRectCc(pixel - centre, halfSize, r);
-        if (s > 1.6)
+        if (s > cullDist)
         {
             continue;
         }
-        // One-pixel darkened ring just outside the shape (AA edge, no shadow).
+        if (liquid && s > -1.0)
+        {
+            const float shSdf = SdRoundRectCc(pixel - centre - float2(0.0, 4.0 * dpi), halfSize, r);
+            const float u = 1.0 - saturate(max(shSdf, 0.0) / (11.0 * dpi));
+            shadowA = max(shadowA, (shSdf > 0.0 ? u * u * (3.0 - 2.0 * u) * 0.22 : 0.0));
+        }
+        // One-pixel darkened ring just outside the shape.
         if (s > 0.0)
         {
-            ring = max(ring, saturate(1.0 - abs(s - 0.9)) * 0.16);
+            ring = max(ring, saturate(1.0 - abs(s - 0.85 * dpi) / max(0.85 * dpi, 0.5)) * (liquid ? 0.28 : 0.16));
         }
         const float cov = saturate(0.5 - s);
         if (cov <= 0.0)
@@ -657,10 +666,19 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         {
             // Quarter-circle bevel: disp = |A| (1 - sqrt(1 - t^2)), t = 1 - d/h.
             const float t = saturate(1.0 - d / max(a.iconMeta.z, 1e-3));
-            const float disp = a.iconMeta.y * (1.0 - sqrt(max(1.0 - t * t, 0.0))) *
-                smoothstep(0.5 * dpi, 1.0 * dpi, d);
+            const float rimFade = liquid ? smoothstep(0.0, 1.0 * dpi, d) : smoothstep(0.5 * dpi, 1.0 * dpi, d);
+            const float disp = a.iconMeta.y * (1.0 - sqrt(max(1.0 - t * t, 0.0))) * rimFade;
             const float2 uv = clamp((pixel - nOut * disp) * texel, lo, hi);
-            const float3 c = CcSampleAxis(blurTemp, uv, texel, a.iconMeta.w, float2(0.0, 1.0));
+            float3 c = CcSampleAxis(blurTemp, uv, texel, a.iconMeta.w, float2(0.0, 1.0));
+            if (liquid)
+            {
+                if (t > 0.0)
+                {
+                    c = lerp(c, backdropTexture.SampleLevel(linearClamp, uv, 0).rgb, 0.28 * t * t);
+                }
+                const float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
+                c = saturate(lerp(float3(luma, luma, luma), c, 1.25));
+            }
             const float3 fillRgb = b.iconRect.w > 0.5 ? float3(0.0, 0.0, 0.0) : float3(1.0, 1.0, 1.0);
             // gain > 0: the face is a fixed colour plus the refraction signature
             // (displaced minus undisplaced blurred backdrop), so the lens stays
@@ -677,18 +695,24 @@ float4 CcGlass(float2 pixel, float2 outputSize, float dpi)
         }
         else
         {
-            color = float3(0.8, 0.8, 0.82);
+            color = liquid ? float3(0.16, 0.16, 0.18) : float3(0.8, 0.8, 0.82);
         }
         // Rim: peaks top-left / bottom-right, minima top-right / bottom-left.
         const float ang = atan2(-nOut.y, nOut.x);
-        const float rimA = 0.18 + 0.545 * pow(abs(cos(ang - 2.356194)), 1.08);
-        const float band = saturate(1.0 - d / dpi);
-        color = lerp(color, float3(1.0, 1.0, 1.0), rimA * band);
+        const float diag = pow(abs(cos(ang - 2.356194)), liquid ? 1.15 : 1.08);
+        const float rimA = (liquid ? 0.24 : 0.18) + (liquid ? 0.56 : 0.545) * diag;
+        const float band = saturate(1.0 - d / (liquid ? max(1.25 * dpi, 1.0) : dpi));
+        const float glow = liquid
+            ? ((0.045 + 0.105 * diag) * exp(-d / max(4.5 * dpi, 1.0)) +
+                0.035 * saturate(-nOut.y) * exp(-d / max(8.0 * dpi, 1.0)))
+            : 0.0;
+        color = lerp(color, float3(1.0, 1.0, 1.0), saturate(rimA * band + glow));
         accum = color * cov + accum * (1.0 - cov);
         alpha = cov + alpha * (1.0 - cov);
     }
+    const float outerDark = liquid ? (1.0 - (1.0 - ring) * (1.0 - shadowA)) : ring;
     accum *= (1.0 - ring);
-    alpha = alpha + (1.0 - alpha) * ring;
+    alpha = alpha + (1.0 - alpha) * outerDark;
     return float4(accum, alpha);
 }
 // Shared bevel + Snell refraction helper used by GlassPS and ComputeFrostUVs.

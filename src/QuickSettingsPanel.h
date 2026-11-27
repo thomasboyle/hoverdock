@@ -248,4 +248,7 @@ void CcDrawSwitch(uint8_t* pixels, int width, int height, float cxLeft, float cx
     uint8_t inkR, uint8_t inkG, uint8_t inkB);
 void CcDrawSlider(uint8_t* pixels, int width, int height, RECT track, float level, float scale,
     uint8_t accentR, uint8_t accentG, uint8_t accentB, uint8_t inkR, uint8_t inkG, uint8_t inkB);
+void CcDrawNotchedSlider(uint8_t* pixels, int width, int height, RECT track, float level,
+    int notchCount, float scale, uint8_t accentR, uint8_t accentG, uint8_t accentB,
+    uint8_t inkR, uint8_t inkG, uint8_t inkB, LONG& outKnobMinX, LONG& outKnobMaxX);
 }  // namespace dock_detail

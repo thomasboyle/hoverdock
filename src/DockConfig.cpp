@@ -1159,6 +1159,8 @@ bool DockConfig::Load() {
     m_dropShadow = true;
     m_depthShade = true;
     m_macosLiquidGlass = false;
+    m_macosControlCentreGlass = false;
+    m_revealDurationMs = dockconfig::kDefaultRevealDurationMs;
     m_lightPanels = false;
     m_handsFree = true;
     m_qsIconColor = kDefaultQsIconColor;
@@ -1242,6 +1244,19 @@ bool DockConfig::Load() {
         const auto macosLiquidGlass = dockSection->second.find(L"macosliquidglass");
         if (macosLiquidGlass != dockSection->second.end()) {
             m_macosLiquidGlass = ParseBoolean(macosLiquidGlass->second);
+        }
+        const auto macosControlCentreGlass = dockSection->second.find(L"macoscontrolcentreglass");
+        if (macosControlCentreGlass != dockSection->second.end()) {
+            m_macosControlCentreGlass = ParseBoolean(macosControlCentreGlass->second);
+        }
+        const auto revealDurationMs = dockSection->second.find(L"revealdurationms");
+        if (revealDurationMs != dockSection->second.end()) {
+            try {
+                m_revealDurationMs = dockconfig::ClampRevealDurationMs(
+                    std::stoi(Trim(revealDurationMs->second)));
+            } catch (...) {
+                m_revealDurationMs = dockconfig::kDefaultRevealDurationMs;
+            }
         }
         const auto lightPanels = dockSection->second.find(L"lightpanels");
         if (lightPanels != dockSection->second.end()) {
@@ -1370,6 +1385,8 @@ bool DockConfig::Save() const {
     contents << L"DropShadow=" << (m_dropShadow ? L"1" : L"0") << L"\n";
     contents << L"DepthShade=" << (m_depthShade ? L"1" : L"0") << L"\n";
     contents << L"MacosLiquidGlass=" << (m_macosLiquidGlass ? L"1" : L"0") << L"\n";
+    contents << L"MacosControlCentreGlass=" << (m_macosControlCentreGlass ? L"1" : L"0") << L"\n";
+    contents << L"RevealDurationMs=" << m_revealDurationMs << L"\n";
     contents << L"LightPanels=" << (m_lightPanels ? L"1" : L"0") << L"\n";
     contents << L"HandsFree=" << (m_handsFree ? L"1" : L"0") << L"\n";
     {
@@ -1514,6 +1531,26 @@ void DockConfig::SetMacosLiquidGlass(bool enabled) noexcept {
     m_macosLiquidGlass = enabled;
 }
 
+bool DockConfig::MacosControlCentreGlass() const noexcept {
+    return m_macosControlCentreGlass;
+}
+
+void DockConfig::SetMacosControlCentreGlass(bool enabled) noexcept {
+    m_macosControlCentreGlass = enabled;
+}
+
+int DockConfig::RevealDurationMs() const noexcept {
+    return m_revealDurationMs;
+}
+
+double DockConfig::RevealDurationSeconds() const noexcept {
+    return static_cast<double>(m_revealDurationMs) / 1000.0;
+}
+
+void DockConfig::SetRevealDurationMs(int ms) noexcept {
+    m_revealDurationMs = dockconfig::ClampRevealDurationMs(ms);
+}
+
 // Quick Settings / Dock Settings always use the dock's own glass tint with light ink;
 // the old light plate made them milky next to the dock. The ini key is still parsed
 // (and written back) for compatibility but no longer has any effect.
@@ -1625,6 +1662,8 @@ void DockConfig::SetDefaults() {
     m_dropShadow = true;
     m_depthShade = true;
     m_macosLiquidGlass = false;
+    m_macosControlCentreGlass = false;
+    m_revealDurationMs = dockconfig::kDefaultRevealDurationMs;
     m_lightPanels = false;
     m_handsFree = true;
     m_qsIconColor = kDefaultQsIconColor;

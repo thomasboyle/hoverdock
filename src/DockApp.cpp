@@ -1,4 +1,5 @@
 #include "DockApp.h"
+#include "DockConfigIni.h"
 #include "DockTheme.hlsli"
 #include "PerfBoost.h"
 #include "Profile.h"
@@ -105,8 +106,6 @@ std::vector<uint8_t> BoxDownsamplePremultiplied(const std::vector<uint8_t>& sour
 
 namespace dock_detail {
 
-constexpr double kShowDurationSeconds = 0.050;
-constexpr double kHideDurationSeconds = 0.050;
 constexpr double kDragSnapDurationSeconds = 0.050;
 constexpr double kDragThresholdLogicalPixels = 20.0;
 constexpr double kMinDragPressSeconds = 0.100;
@@ -7432,6 +7431,8 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
             app->m_settingsHover = -1;
             app->m_settingsPaintQueued = false;
             app->m_settingsHoverPaintOnly = false;
+            app->m_frostSliderDragging = false;
+            app->m_dsDragKind = SettingsHitKind::None;
             std::vector<uint8_t>().swap(app->m_settingsBaseBits);
             std::vector<uint8_t>().swap(app->m_settingsPresentBits);
             app->m_settingsPresentSize = {};
@@ -7457,11 +7458,13 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
                 app->ApplyFrostSliderAt(point.x);
                 return 0;
             }
-            if (downKind == SettingsHitKind::QsColorHue || downKind == SettingsHitKind::QsColorSat ||
+            if (downKind == SettingsHitKind::RevealSpeed ||
+                downKind == SettingsHitKind::QsColorHue || downKind == SettingsHitKind::QsColorSat ||
                 downKind == SettingsHitKind::QsColorVal) {
                 SetCapture(window);
                 app->m_dsDragKind = downKind;
-                app->ApplyQsColorDragAt(point.x);
+                downKind == SettingsHitKind::RevealSpeed ? app->ApplyRevealSliderAt(point.x)
+                                                         : app->ApplyQsColorDragAt(point.x);
                 return 0;
             }
         }
@@ -7478,7 +7481,8 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
             return 0;
         }
         if (app->m_dsDragKind != SettingsHitKind::None) {
-            app->ApplyQsColorDragAt(point.x);
+            app->m_dsDragKind == SettingsHitKind::RevealSpeed ? app->ApplyRevealSliderAt(point.x)
+                                                              : app->ApplyQsColorDragAt(point.x);
             return 0;
         }
         const int hover = app->SettingsHitIndex(point);
@@ -7505,23 +7509,37 @@ LRESULT CALLBACK DockApp::DockSettingsProcedure(HWND window, UINT message, WPARA
             return 0;
         }
         if (app->m_dsDragKind != SettingsHitKind::None) {
-            app->ApplyQsColorDragAt(point.x);
+            const SettingsHitKind dragKind = app->m_dsDragKind;
             app->m_dsDragKind = SettingsHitKind::None;
             ReleaseCapture();
+            dragKind == SettingsHitKind::RevealSpeed ? app->ApplyRevealSliderAt(point.x)
+                                                     : app->ApplyQsColorDragAt(point.x);
             app->ScheduleConfigSave();
-            app->QueueSettingsPaint();
+            if (dragKind != SettingsHitKind::RevealSpeed) {
+                app->QueueSettingsPaint();
+            }
             return 0;
         }
         const int hit = app->SettingsHitIndex(point);
         if (hit >= 0 && static_cast<size_t>(hit) < app->m_settingsHits.size()) {
-            // Frost is a drag slider (handled above); ignore click toggles.
-            if (app->m_settingsHits[static_cast<size_t>(hit)].kind == SettingsHitKind::Frost) {
+            // Sliders are handled via drag above; ignore click toggles.
+            const SettingsHitKind hitKind = app->m_settingsHits[static_cast<size_t>(hit)].kind;
+            if (hitKind == SettingsHitKind::Frost || hitKind == SettingsHitKind::RevealSpeed) {
                 return 0;
             }
             app->HandleSettingsClick(app->m_settingsHits[static_cast<size_t>(hit)], message);
         }
         return 0;
     }
+
+    case WM_CAPTURECHANGED:
+        if (app != nullptr &&
+            (app->m_frostSliderDragging || app->m_dsDragKind != SettingsHitKind::None)) {
+            app->m_frostSliderDragging = false;
+            app->m_dsDragKind = SettingsHitKind::None;
+            app->ScheduleConfigSave();
+        }
+        return 0;
 
     case WM_MOUSELEAVE:
         if (app != nullptr && app->m_settingsHover >= 0) {
@@ -7673,7 +7691,8 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
             radius, 0.10F, 36, 34, 33);
         break;
     }
-    case SettingsHitKind::QsColorReset: {
+    case SettingsHitKind::QsColorReset:
+    case SettingsHitKind::RevealSpeedOverride: {
         SetFlyoutChromeInk(33, 34, 36);
         const float scale = static_cast<float>(HostDpi() == 0 ? 96U : HostDpi()) / 96.0F;
         FillSquirclePremul(pixels, width, height, hit.bounds, ContentSquircleRadius(hit.bounds, scale),
@@ -7683,6 +7702,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     case SettingsHitKind::Startup:
     case SettingsHitKind::Updates:
     case SettingsHitKind::MacosLiquidGlass:
+    case SettingsHitKind::MacosControlCentreGlass:
     case SettingsHitKind::RimLight:
     case SettingsHitKind::Lensing:
     case SettingsHitKind::Dispersion:
@@ -7705,6 +7725,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
         break;
     }
     case SettingsHitKind::Frost:
+    case SettingsHitKind::RevealSpeed:
     case SettingsHitKind::QsColorSwatch:
     case SettingsHitKind::QsColorHue:
     case SettingsHitKind::QsColorSat:
@@ -7854,6 +7875,9 @@ UINT DockApp::PackPopupGlassFxFlags(bool dockFace, bool popupShadow, bool allowC
         ((popupShadow && !m_qsCcShapes.empty()) || (dockFace && !popupShadow && !m_dsCcDescs.empty()))) {
         // Quick Settings / Dock Settings: macOS 26 Control Centre material (own blur/lens stack).
         glassFx |= DOCK_FX_CC;
+        if (popupShadow && m_config.MacosControlCentreGlass()) {
+            glassFx |= DOCK_FX_CC_LIQUID;
+        }
         frostByte = 0;
     }
     return (frostByte << 16) | (haloSlots << 8) | glassFx;
@@ -8254,6 +8278,21 @@ void DockApp::ApplyFrostSliderAt(LONG clientX) {
     }
     QueueRenderFrame();
 }
+
+void DockApp::ApplyRevealSliderAt(LONG clientX) {
+    const LONG left = m_revealSliderTrack.left;
+    const LONG right = m_revealSliderTrack.right;
+    const LONG span = std::max(1L, right - left);
+    const float fraction = std::clamp(
+        static_cast<float>(clientX - left) / static_cast<float>(span), 0.0F, 1.0F);
+    const int snappedMs = dockconfig::SnapRevealSliderFractionToMs(fraction);
+    if (snappedMs == m_config.RevealDurationMs()) {
+        return;
+    }
+    m_config.SetRevealDurationMs(snappedMs);
+    QueueSettingsPaint();
+}
+
 void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
     (void)message;
     switch (hit.kind) {
@@ -8295,6 +8334,16 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         QueueRenderFrame();
         break;
     }
+    case SettingsHitKind::MacosControlCentreGlass: {
+        m_config.SetMacosControlCentreGlass(!m_config.MacosControlCentreGlass());
+        ScheduleConfigSave();
+        InvalidateOverflowGlass();
+        QueueSettingsPaint();
+        if (IsOverflowOpen()) {
+            PaintOverflowPopup();
+        }
+        break;
+    }
     case SettingsHitKind::RimLight: {
         const bool enabled = !m_config.RimLight();
         m_config.SetRimLight(enabled);
@@ -8319,9 +8368,15 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         QueueRenderFrame();
         break;
     }
-    case SettingsHitKind::Frost: {
-        // Click/drag on the frost slider sets the amount from the cursor X
-        // within the track (0 = clear glass, 1 = full mica).
+    case SettingsHitKind::Frost:
+    case SettingsHitKind::RevealSpeed: {
+        // Sliders are updated on drag (DockSettingsProcedure).
+        break;
+    }
+    case SettingsHitKind::RevealSpeedOverride: {
+        // Search owns the text entry; post so this click handler returns first.
+        PostMessageW(m_window, kOpenSearchEntryMessage,
+            static_cast<WPARAM>(SearchMode::RevealSpeedEntry), 0);
         break;
     }
     case SettingsHitKind::Specular: {
@@ -8458,6 +8513,8 @@ void DockApp::ToggleDockSettings() {
 
 void DockApp::CloseDockSettings() noexcept {
     m_settingsHover = -1;
+    m_frostSliderDragging = false;
+    m_dsDragKind = SettingsHitKind::None;
     if (m_settingsWindow != nullptr) {
         ShowWindow(m_settingsWindow, SW_HIDE);
     }
@@ -8502,6 +8559,7 @@ void DockApp::PaintSettingsPopup() {
     const LONG gutter = P(13.0F);
     const LONG rowHeight = P(44.0F);
     const LONG frostRowHeight = P(58.0F);
+    const LONG revealRowHeight = P(74.0F);
     const LONG buttonHeight = P(44.0F);
     const LONG colorHeight = P(166.0F);
     const LONG subHeight = P(15.0F);
@@ -8521,6 +8579,8 @@ void DockApp::PaintSettingsPopup() {
         float amount;
         // Opens an editor (chevron) instead of toggling a switch.
         bool link = false;
+        // macOS notched pill slider with clickable manual override value chip.
+        bool notchedSlider = false;
     };
     const SettingsRow generalRows[] = {
         {SettingsHitKind::Startup, L"Launch at startup", L"Start Hoverdock with Windows", false,
@@ -8529,10 +8589,15 @@ void DockApp::PaintSettingsPopup() {
             m_config.CheckForUpdates(), 0.0F},
         {SettingsHitKind::HandsFree, L"Hands-free (mic) for headsets",
             L"Restore Hands-Free after Bluetooth connect", false, m_config.HandsFree(), 0.0F},
+        {SettingsHitKind::RevealSpeed, L"Reveal / hide speed",
+            L"0s instant to 1s \u00B7 click value for 0ms\u20132s", false, false,
+            dockconfig::RevealDurationMsToSliderFraction(m_config.RevealDurationMs()), false, true},
     };
     const SettingsRow glassRows[] = {
         {SettingsHitKind::MacosLiquidGlass, L"macOS Liquid Glass",
             L"Exact macOS 26 Tahoe dock glass", false, m_config.MacosLiquidGlass(), 0.0F},
+        {SettingsHitKind::MacosControlCentreGlass, L"macOS Control Centre",
+            L"Exact macOS 26 Tahoe Control Centre glass", false, m_config.MacosControlCentreGlass(), 0.0F},
         {SettingsHitKind::RimLight, L"Rim light", L"Edge glow and caustic on the glass", false,
             m_config.RimLight(), 0.0F},
         {SettingsHitKind::Lensing, L"Lensing", L"Refraction warp through the bevel", false,
@@ -8573,7 +8638,7 @@ void DockApp::PaintSettingsPopup() {
 
     LONG contentY = padding + headerHeight + P(10.0F);
     const RECT generalRect{padding, contentY, padding + moduleWidth,
-        contentY + rowHeight * generalCount};
+        contentY + rowHeight * (generalCount - 1L) + revealRowHeight};
     contentY = generalRect.bottom + gutter;
     const RECT aiRect{padding, contentY, padding + moduleWidth, contentY + rowHeight * aiCount};
     contentY = aiRect.bottom + gutter;
@@ -8833,9 +8898,41 @@ void DockApp::PaintSettingsPopup() {
         LONG rowTop = module.top;
         for (LONG i = 0; i < count; ++i) {
             const SettingsRow& row = list[i];
-            const LONG rowH = row.slider ? frostRowHeight : rowHeight;
+            const LONG rowH = row.notchedSlider ? revealRowHeight
+                : (row.slider ? frostRowHeight : rowHeight);
             const LONG textLeft = module.left + insetX;
-            if (row.slider) {
+            if (row.notchedSlider) {
+                const LONG textRight = module.right - insetX;
+                const LONG chipW = P(78.0F);
+                const RECT chipBounds{textRight - chipW, rowTop + P(5.0F), textRight,
+                    rowTop + P(5.0F) + P(20.0F)};
+                const RECT labelBounds{textLeft, rowTop + P(6.0F), chipBounds.left - P(6.0F),
+                    rowTop + P(6.0F) + labelHeight};
+                const RECT subBounds{textLeft, labelBounds.bottom, textRight,
+                    labelBounds.bottom + subHeight};
+                DrawFlyoutText(pixels, width, height, labelBounds, labelFont, row.label,
+                    DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS, 255);
+                FillSquirclePremul(pixels, width, height, chipBounds,
+                    ContentSquircleRadius(chipBounds, scale), 0.07F);
+                const std::wstring valueLabel =
+                    dockconfig::FormatRevealDurationLabel(m_config.RevealDurationMs()) + L" \u203A";
+                DrawFlyoutText(pixels, width, height, chipBounds, statusFont, valueLabel,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 230);
+                pushHit(SettingsHitKind::RevealSpeedOverride, {chipBounds.left - P(3.0F),
+                    chipBounds.top - P(3.0F), chipBounds.right + P(3.0F), chipBounds.bottom + P(3.0F)});
+                DrawFlyoutText(pixels, width, height, subBounds, statusFont, row.sublabel,
+                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, 190);
+                const RECT track{textLeft, rowTop + P(44.0F), textRight, rowTop + P(60.0F)};
+                LONG knobMinX = track.left;
+                LONG knobMaxX = track.right;
+                CcDrawNotchedSlider(pixels, width, height, track, row.amount,
+                    dockconfig::kRevealSliderNotchCount, scale, accentR, accentG, accentB,
+                    inkR, inkG, inkB, knobMinX, knobMaxX);
+                m_revealSliderTrack = {knobMinX, track.top - P(8.0F), knobMaxX,
+                    track.bottom + P(10.0F)};
+                pushHit(row.kind, {track.left - P(4.0F), track.top - P(8.0F), track.right + P(4.0F),
+                    track.bottom + P(12.0F)});
+            } else if (row.slider) {
                 const LONG textRight = module.right - insetX;
                 const RECT labelBounds{textLeft, rowTop + P(6.0F), textRight,
                     rowTop + P(6.0F) + labelHeight};
@@ -10345,7 +10442,8 @@ void DockApp::PaintOverflowPopup() {
     m_overflowSize.cx = panelWidth + shadowMargin * 2L;
     m_overflowSize.cy = contentHeight + caretHeight + shadowMargin * 2L;
     // Hand the layout's glass shapes (window px) to the renderer.
-    uint64_t ccHash = 1469598103934665603ULL;
+    uint64_t ccHash = (1469598103934665603ULL ^
+        (m_config.MacosControlCentreGlass() ? 1ULL : 0ULL)) * 1099511628211ULL;
     {
         std::vector<Renderer::CcShapeDesc> ccShapes;
         ccShapes.reserve(m_qsCcShapes.size());
@@ -10949,8 +11047,12 @@ void DockApp::BeginShow() {
     m_animationToY = m_visibleY;
     m_animationStartedAt = QpcSeconds();
     StartCursorWatch();
-    QueueRenderFrame(false);
     PostMessageW(m_window, kBeginShowDeferredMessage, static_cast<WPARAM>(m_showSessionId), 0);
+    if (m_config.RevealDurationMs() <= 0) {
+        AdvanceAnimation();
+    } else {
+        QueueRenderFrame(false);
+    }
 }
 
 void DockApp::BeginHide() {
@@ -10985,20 +11087,25 @@ void DockApp::BeginHide() {
     m_animationFromY = m_currentY;
     m_animationToY = m_hiddenY;
     m_animationStartedAt = QpcSeconds();
+    if (m_config.RevealDurationMs() <= 0) {
+        AdvanceAnimation();
+    }
 }
 
 void DockApp::AdvanceAnimation() {
     ProfileScope scope("AdvanceAnimation");
-    const double duration = m_visibility == VisibilityState::Hiding
-        ? kHideDurationSeconds
-        : kShowDurationSeconds;
+    const double duration = m_config.RevealDurationSeconds();
     const double elapsed = SecondsSinceAnimationStarted();
-    const double linear = std::clamp(elapsed / duration, 0.0, 1.0);
+    const double linear = duration <= 0.0
+        ? 1.0
+        : std::clamp(elapsed / duration, 0.0, 1.0);
     const double eased = linear * linear * (3.0 - 2.0 * linear);
     m_currentY = std::lround(static_cast<double>(m_animationFromY) +
         static_cast<double>(m_animationToY - m_animationFromY) * eased);
-    PositionOverlayWindows();
-    RenderFrame();
+    if (!(m_visibility == VisibilityState::Hiding && linear >= 1.0)) {
+        PositionOverlayWindows();
+        RenderFrame();
+    }
 
     if (linear < 1.0) {
         return;

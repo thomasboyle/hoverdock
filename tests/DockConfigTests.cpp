@@ -141,6 +141,73 @@ void TestBomAndInvalidUtf8DoNotDropGroqApiKey() {
         invalidSections.at(L"dock").at(L"groqapikey") == L"dpapi:SurvivedBadByte==");
 }
 
+void TestRevealDurationSliderAndOverrideParsing() {
+    // 5 notch intervals from 0s (instant) to 1s in 0.2s (200ms) steps.
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(-0.2F) == 0);
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(0.0F) == 0);
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(0.09F) == 0);
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(0.11F) == 200);
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(0.2F) == 200);
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(0.4F) == 400);
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(0.6F) == 600);
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(0.8F) == 800);
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(1.0F) == 1000);
+    EXPECT(dockconfig::SnapRevealSliderFractionToMs(1.4F) == 1000);
+
+    // Manual override values > 1s clamp the slider thumb to 1.0 while keeping the ms value.
+    EXPECT(dockconfig::RevealDurationMsToSliderFraction(0) == 0.0F);
+    EXPECT(std::abs(dockconfig::RevealDurationMsToSliderFraction(50) - 0.05F) < 0.0001F);
+    EXPECT(std::abs(dockconfig::RevealDurationMsToSliderFraction(600) - 0.6F) < 0.0001F);
+    EXPECT(dockconfig::RevealDurationMsToSliderFraction(1000) == 1.0F);
+    EXPECT(dockconfig::RevealDurationMsToSliderFraction(1500) == 1.0F);
+    EXPECT(dockconfig::RevealDurationMsToSliderFraction(2000) == 1.0F);
+
+    // Manual override parsing: 0ms to 2s in ms, s, decimal s, or "instant".
+    EXPECT(dockconfig::ParseRevealDurationMs(L"0") == 0);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"0ms") == 0);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"0 ms") == 0);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"0s") == 0);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"instant") == 0);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"  INSTANT ") == 0);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"50") == 50);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"50ms") == 50);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"250 ms") == 250);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"0.2") == 200);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"0.2s") == 200);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"0.35 s") == 350);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"1s") == 1000);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"1.5") == 1500);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"1.5s") == 1500);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"2000") == 2000);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"2000ms") == 2000);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"2s") == 2000);
+    EXPECT(dockconfig::ParseRevealDurationMs(L"2.0") == 2000);
+
+    // Invalid / out-of-range manual override inputs are rejected.
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"   ").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"-10").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"-0.5s").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"2001ms").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"2.1s").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"3s").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"abc").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"100x").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"1.2.3s").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L".").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"ms").has_value());
+    EXPECT(!dockconfig::ParseRevealDurationMs(L"s").has_value());
+
+    // Formatting helpers.
+    EXPECT(dockconfig::FormatRevealDurationLabel(0) == L"Instant");
+    EXPECT(dockconfig::FormatRevealDurationLabel(50) == L"50 ms");
+    EXPECT(dockconfig::FormatRevealDurationLabel(200) == L"200 ms");
+    EXPECT(dockconfig::FormatRevealDurationLabel(1000) == L"1.0 s");
+    EXPECT(dockconfig::FormatRevealDurationLabel(1250) == L"1.25 s");
+    EXPECT(dockconfig::FormatRevealDurationLabel(1255) == L"1255 ms");
+    EXPECT(dockconfig::FormatRevealDurationLabel(2000) == L"2.0 s");
+}
+
 #ifdef _WIN32
 std::wstring EnvSnapshot(const wchar_t* name, bool& defined) {
     const DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
@@ -181,8 +248,12 @@ void TestWindowsDockConfigDpapiAndUpdatePersistence() {
         DockConfig cfg;
         EXPECT(cfg.LoadOrCreate());
         EXPECT(!cfg.MacosLiquidGlass());
+        EXPECT(!cfg.MacosControlCentreGlass());
+        EXPECT(cfg.RevealDurationMs() == 50);
         cfg.StopFollowingTaskbarPins();
         cfg.SetMacosLiquidGlass(true);
+        cfg.SetMacosControlCentreGlass(true);
+        cfg.SetRevealDurationMs(1750);
         cfg.SetGroqApiKey(L"gsk_unit_test_secret_key_987654");
         EXPECT(cfg.Save());
 
@@ -196,9 +267,13 @@ void TestWindowsDockConfigDpapiAndUpdatePersistence() {
         DockConfig restarted;
         EXPECT(restarted.LoadOrCreate());
         EXPECT(restarted.MacosLiquidGlass());
+        EXPECT(restarted.MacosControlCentreGlass());
+        EXPECT(restarted.RevealDurationMs() == 1750);
         EXPECT(restarted.GroqApiKey() == L"gsk_unit_test_secret_key_987654");
         EXPECT(restarted.LastInstalledVersion() == L"9.9.9");
         restarted.SetMacosLiquidGlass(false);
+        restarted.SetMacosControlCentreGlass(false);
+        restarted.SetRevealDurationMs(0);
         restarted.SetLastInstalledVersion(L"", 0);
         restarted.SetLastInstalledAttempts(0);
         EXPECT(restarted.Save());
@@ -209,6 +284,8 @@ void TestWindowsDockConfigDpapiAndUpdatePersistence() {
         DockConfig afterUpdate;
         EXPECT(afterUpdate.LoadOrCreate());
         EXPECT(!afterUpdate.MacosLiquidGlass());
+        EXPECT(!afterUpdate.MacosControlCentreGlass());
+        EXPECT(afterUpdate.RevealDurationMs() == 0);
         EXPECT(afterUpdate.GroqApiKey() == L"gsk_unit_test_secret_key_987654");
 
         // Write a legacy glued TypeSafeApiKey + GroqApiKey file and verify full recovery.
@@ -258,6 +335,7 @@ int main() {
     TestTypeSafeAndGroqKeysPersistAcrossUpdateCycle();
     TestRecoversLegacyEscapedNewlineCorruption();
     TestBomAndInvalidUtf8DoNotDropGroqApiKey();
+    TestRevealDurationSliderAndOverrideParsing();
 #ifdef _WIN32
     TestWindowsDockConfigDpapiAndUpdatePersistence();
 #endif

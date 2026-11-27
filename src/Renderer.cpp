@@ -4080,7 +4080,7 @@ bool Renderer::SampleBackdropLuma(const RECT& region, float& luma) const noexcep
 
 // Control Centre shapes -> panel instance buffer (two slots per shape) and the
 // per-shape adaptive face (macOS 26 Regular style tables, measured).
-void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
+void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale, bool liquidGlass) noexcept
 {
     static_cast<void>(width);
     static_cast<void>(height);
@@ -4100,24 +4100,20 @@ void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
         return;
     }
     const float dpi = (std::max)(dpiScale, 1.0F);
+    const float x = liquidGlass ? 0.25F : 0.5F;
+    const float W = liquidGlass ? 0.68F : 0.90F;
+    const float B = liquidGlass ? 0.13F : 0.90F;
+    const float fillA = liquidGlass ? 0.22F : 0.35F;
+    const float gain = liquidGlass ? 0.0F : 0.6F;
+    const bool black = liquidGlass;
+    const float faceLuma = (B + (W - B) * x) * (1.0F - fillA) + (black ? 0.0F : fillA);
     for (size_t i = 0; i < count; ++i) {
         const CcShapeDesc& sh = m_ccShapes[i];
         const float sPt = 2.0F * (std::min)(sh.hw, sh.hh) / dpi;
-        // One fixed frosted-light face for every shape, independent of the
-        // backdrop (no luma adaptation): W == B makes the face colour constant,
-        // then a white fill lifts it. Same on dark and bright backdrops.
-        const float x = 0.5F;
-        const float W = 0.90F;
-        const float B = 0.90F;
-        const float fillA = 0.35F;
-        // gain: fixed face + refraction signature (see CcGlass).
-        const float gain = 0.6F;
-        const bool black = false;
-        // Regular style scaling laws: A = -min(0.8 s, 60), h = min(0.25 s, 20),
-        // blur r = clamp(2 + (s-48)/56, 2, 4), sigma = 2 r (pt).
-        const float amountPt = (std::min)(0.8F * sPt, 60.0F);
-        const float heightPt = (std::min)(0.25F * sPt, 20.0F);
-        const float blurR = std::clamp(2.0F + (sPt - 48.0F) / 56.0F, 2.0F, 4.0F);
+        const float amountPt = liquidGlass ? (std::min)(0.68F * sPt, 46.0F) : (std::min)(0.8F * sPt, 60.0F);
+        const float heightPt = liquidGlass ? (std::min)(0.28F * sPt, 18.0F) : (std::min)(0.25F * sPt, 20.0F);
+        const float blurR = liquidGlass ? std::clamp(2.5F + (sPt - 48.0F) / 64.0F, 2.5F, 4.5F)
+                                        : std::clamp(2.0F + (sPt - 48.0F) / 56.0F, 2.0F, 4.0F);
         const float sigmaPx = 2.0F * blurR * dpi;
         IconInstanceConstants& a = slots[2 * i];
         IconInstanceConstants& b = slots[2 * i + 1];
@@ -4135,9 +4131,7 @@ void Renderer::UploadCcShapes(UINT width, UINT height, float dpiScale) noexcept
         b.iconRect[3] = black ? 1.0F : 0.0F;
         b.iconMeta[0] = gain;
         b.iconMeta[1] = b.iconMeta[2] = b.iconMeta[3] = 0.0F;
-        const float base = B + (W - B) * x;
-        const float fill = black ? 0.0F : 1.0F;
-        m_ccFaceLuma.push_back(base + (fill - base) * fillA);
+        m_ccFaceLuma.push_back(faceLuma);
     }
     m_panelIconInstances->Unmap(0, nullptr);
     m_panelMappedConstants->scene1[2] = 100.0F + static_cast<float>(count);
@@ -4222,7 +4216,7 @@ bool Renderer::BakeGlassPanel(const RECT& screenRect, UINT width, UINT height, U
         std::fill(std::begin(m_panelMappedConstants->scene3), std::end(m_panelMappedConstants->scene3), 0.0F);
         m_panelMappedConstants->scene3[1] = (std::max)(panelCornerRadius, 0.0F);
         if ((fxFlags & DOCK_FX_CC) != 0) {
-            UploadCcShapes(width, height, dpiScale);
+            UploadCcShapes(width, height, dpiScale, (fxFlags & DOCK_FX_CC_LIQUID) != 0);
         }
 
         D3D12_TEXTURE_COPY_LOCATION srcLoc{};
@@ -4607,7 +4601,7 @@ bool Renderer::BeginLiveGlassPanelBake(const RECT& screenRect, UINT width, UINT 
         std::fill(std::begin(m_panelMappedConstants->scene3), std::end(m_panelMappedConstants->scene3), 0.0F);
         m_panelMappedConstants->scene3[1] = (std::max)(panelCornerRadius, 0.0F);
         if ((fxFlags & DOCK_FX_CC) != 0) {
-            UploadCcShapes(width, height, dpiScale);
+            UploadCcShapes(width, height, dpiScale, (fxFlags & DOCK_FX_CC_LIQUID) != 0);
         }
 
         D3D12_TEXTURE_COPY_LOCATION srcLoc{};

@@ -2,14 +2,38 @@
 
 #include "GroqProtocol.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cwctype>
 #include <map>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
 
 namespace dockconfig {
+
+inline constexpr int kMinRevealDurationMs = 0;
+inline constexpr int kMaxRevealDurationMs = 2000;
+inline constexpr int kDefaultRevealDurationMs = 50;
+inline constexpr int kRevealSliderMaxMs = 1000;
+inline constexpr int kRevealSliderNotchCount = 5;
+inline constexpr int kRevealSliderStepMs = 200;
+
+inline int ClampRevealDurationMs(int ms) noexcept {
+    return std::clamp(ms, kMinRevealDurationMs, kMaxRevealDurationMs);
+}
+
+inline int SnapRevealSliderFractionToMs(float fraction) noexcept {
+    const int step = static_cast<int>(
+        std::lround(std::clamp(fraction, 0.0F, 1.0F) * static_cast<float>(kRevealSliderNotchCount)));
+    return std::clamp(step, 0, kRevealSliderNotchCount) * kRevealSliderStepMs;
+}
+
+inline float RevealDurationMsToSliderFraction(int ms) noexcept {
+    return std::clamp(static_cast<float>(ms) / static_cast<float>(kRevealSliderMaxMs), 0.0F, 1.0F);
+}
 
 using IniSections = std::map<std::wstring, std::map<std::wstring, std::wstring>>;
 
@@ -216,6 +240,74 @@ inline void AppendSecretAndAiLines(std::wostream& contents,
     if (!searchHotkey) {
         contents << L"SearchHotkey=0\n";
     }
+}
+
+// Parses a manual reveal/hide duration in [0ms, 2000ms]: "instant", "250ms", "0.4s",
+// decimal seconds ("0.35"), or integer ms ("50"). Rejects negative or > 2s inputs.
+inline std::optional<int> ParseRevealDurationMs(std::wstring_view raw) {
+    const std::wstring lower = ToLowerIni(TrimIniText(raw));
+    if (lower.empty()) {
+        return std::nullopt;
+    }
+    if (lower == L"instant") {
+        return 0;
+    }
+
+    std::wstring_view body(lower);
+    bool explicitMs = false;
+    bool explicitSec = false;
+    if (body.ends_with(L"ms")) {
+        explicitMs = true;
+        body.remove_suffix(2U);
+    } else if (body.ends_with(L's')) {
+        explicitSec = true;
+        body.remove_suffix(1U);
+    }
+
+    const std::wstring num = TrimIniText(body);
+    bool sawDigit = false;
+    bool sawDot = false;
+    for (const wchar_t ch : num) {
+        if (ch >= L'0' && ch <= L'9') {
+            sawDigit = true;
+        } else if (ch == L'.' && !sawDot) {
+            sawDot = true;
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (!sawDigit) {
+        return std::nullopt;
+    }
+
+    try {
+        size_t consumed = 0;
+        const double value = std::stod(num, &consumed);
+        if (consumed != num.size() || !std::isfinite(value) || value < 0.0) {
+            return std::nullopt;
+        }
+        const double msDouble = (explicitSec || (!explicitMs && sawDot)) ? value * 1000.0 : value;
+        if (msDouble > static_cast<double>(kMaxRevealDurationMs) + 0.5) {
+            return std::nullopt;
+        }
+        const int ms = static_cast<int>(std::lround(msDouble));
+        return ms <= kMaxRevealDurationMs ? std::optional<int>(ms) : std::nullopt;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+inline std::wstring FormatRevealDurationLabel(int ms) {
+    const int c = ClampRevealDurationMs(ms);
+    if (c == 0) {
+        return L"Instant";
+    }
+    if (c >= 1000 && c % 10 == 0) {
+        const int frac = (c % 1000) / (c % 100 == 0 ? 100 : 10);
+        const wchar_t* pad = (c % 100 != 0 && frac < 10) ? L"0" : L"";
+        return std::to_wstring(c / 1000) + L"." + pad + std::to_wstring(frac) + L" s";
+    }
+    return std::to_wstring(c) + L" ms";
 }
 
 }  // namespace dockconfig

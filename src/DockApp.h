@@ -124,8 +124,12 @@ private:
     };
 
     // What the Search panel is showing: results, an AI answer, or a one-line
-    // entry for a Dock Settings value (Groq API key / AI model).
-    enum class SearchMode : uint8_t { Search, Ai, KeyEntry, ModelEntry };
+    // entry for a Dock Settings value (Groq API key / AI model / reveal speed).
+    enum class SearchMode : uint8_t { Search, Ai, KeyEntry, ModelEntry, RevealSpeedEntry };
+    static constexpr bool IsSearchEntryMode(SearchMode mode) noexcept {
+        return mode == SearchMode::KeyEntry || mode == SearchMode::ModelEntry ||
+            mode == SearchMode::RevealSpeedEntry;
+    }
 
     struct SearchIconReply {
         UINT extent = 0;
@@ -333,7 +337,10 @@ private:
         None,
         Startup,
         Updates,
+        RevealSpeed,
+        RevealSpeedOverride,
         MacosLiquidGlass,
+        MacosControlCentreGlass,
         RimLight,
         Lensing,
         Dispersion,
@@ -513,6 +520,7 @@ private:
     void RebuildSettingsPopup();
     void HandleSettingsClick(const SettingsHit& hit, UINT message);
     void ApplyFrostSliderAt(LONG clientX);
+    void ApplyRevealSliderAt(LONG clientX);
     // Quick Settings icon colour picker (Dock Settings). Drag maps x on the
     // active hue / saturation / value track; Set applies live to Quick Settings.
     void ApplyQsColorDragAt(LONG clientX);
@@ -1277,6 +1285,7 @@ private:
     SIZE m_settingsPresentSize{};
     bool m_frostSliderDragging = false;
     ULONGLONG m_frostSliderLastRenderMs = 0;
+    RECT m_revealSliderTrack{};
     int m_livePopupGlassPending = -1;
     // Plate still owes a GPU bake after a dirty desktop frame (0 settings, 1 quick
     // settings, 2 context). Cleared when the bake is submitted or the pixels match.
