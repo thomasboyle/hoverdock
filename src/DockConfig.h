@@ -55,6 +55,9 @@ public:
     void SetDropShadow(bool enabled) noexcept;
     [[nodiscard]] bool DepthShade() const noexcept;
     void SetDepthShade(bool enabled) noexcept;
+    // Switch between the current dock glass and the macOS 26 Liquid Glass dock replica.
+    [[nodiscard]] bool MacosLiquidGlass() const noexcept;
+    void SetMacosLiquidGlass(bool enabled) noexcept;
     // Quick Settings and Dock Settings. Off is the dark plate.
     [[nodiscard]] bool LightPanels() const noexcept;
     void SetLightPanels(bool enabled) noexcept;
@@ -121,6 +124,7 @@ private:
     bool m_specular = true;
     bool m_dropShadow = true;
     bool m_depthShade = true;
+    bool m_macosLiquidGlass = false;
     bool m_lightPanels = false;
     bool m_handsFree = true;
     unsigned m_qsIconColor = kDefaultQsIconColor;

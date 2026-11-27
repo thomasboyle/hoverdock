@@ -64,6 +64,8 @@ struct DockRenderState {
     // Adaptive chrome ink, macOS menu bar style: 0 = white ink (dark backdrop),
     // 1 = black ink (light backdrop); in between while crossfading.
     float chromeDarkInk = 0.0F;
+    // True to render the dock with the macOS 26 (Tahoe) Liquid Glass material.
+    bool macosLiquidGlass = false;
     bool allowBlockingGpuWait = true;
     bool skipIfGpuBusy = false;
     std::span<const DockIconRenderData> icons;
@@ -189,6 +191,7 @@ private:
         UINT width = 0;
         UINT height = 0;
         UINT fxMask = ~0u;
+        bool macosLiquidGlass = false;
         bool operator==(const BlurCacheKey&) const noexcept = default;
     };
 

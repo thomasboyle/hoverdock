@@ -333,6 +333,7 @@ private:
         None,
         Startup,
         Updates,
+        MacosLiquidGlass,
         RimLight,
         Lensing,
         Dispersion,

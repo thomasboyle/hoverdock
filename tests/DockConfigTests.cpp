@@ -180,7 +180,9 @@ void TestWindowsDockConfigDpapiAndUpdatePersistence() {
     {
         DockConfig cfg;
         EXPECT(cfg.LoadOrCreate());
+        EXPECT(!cfg.MacosLiquidGlass());
         cfg.StopFollowingTaskbarPins();
+        cfg.SetMacosLiquidGlass(true);
         cfg.SetGroqApiKey(L"gsk_unit_test_secret_key_987654");
         EXPECT(cfg.Save());
 
@@ -193,8 +195,10 @@ void TestWindowsDockConfigDpapiAndUpdatePersistence() {
         // Simulate updated Dock.exe startup + ReconcileLastUpdate.
         DockConfig restarted;
         EXPECT(restarted.LoadOrCreate());
+        EXPECT(restarted.MacosLiquidGlass());
         EXPECT(restarted.GroqApiKey() == L"gsk_unit_test_secret_key_987654");
         EXPECT(restarted.LastInstalledVersion() == L"9.9.9");
+        restarted.SetMacosLiquidGlass(false);
         restarted.SetLastInstalledVersion(L"", 0);
         restarted.SetLastInstalledAttempts(0);
         EXPECT(restarted.Save());
@@ -204,6 +208,7 @@ void TestWindowsDockConfigDpapiAndUpdatePersistence() {
         // Verify key still persists on subsequent launches and can be intentionally cleared.
         DockConfig afterUpdate;
         EXPECT(afterUpdate.LoadOrCreate());
+        EXPECT(!afterUpdate.MacosLiquidGlass());
         EXPECT(afterUpdate.GroqApiKey() == L"gsk_unit_test_secret_key_987654");
 
         // Write a legacy glued TypeSafeApiKey + GroqApiKey file and verify full recovery.

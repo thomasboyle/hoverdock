@@ -7682,6 +7682,7 @@ void DockApp::ApplySettingsHoverHighlight(uint8_t* pixels, int width, int height
     }
     case SettingsHitKind::Startup:
     case SettingsHitKind::Updates:
+    case SettingsHitKind::MacosLiquidGlass:
     case SettingsHitKind::RimLight:
     case SettingsHitKind::Lensing:
     case SettingsHitKind::Dispersion:
@@ -8287,6 +8288,13 @@ void DockApp::HandleSettingsClick(const SettingsHit& hit, UINT message) {
         }
         break;
     }
+    case SettingsHitKind::MacosLiquidGlass: {
+        m_config.SetMacosLiquidGlass(!m_config.MacosLiquidGlass());
+        ScheduleConfigSave();
+        QueueSettingsPaint();
+        QueueRenderFrame();
+        break;
+    }
     case SettingsHitKind::RimLight: {
         const bool enabled = !m_config.RimLight();
         m_config.SetRimLight(enabled);
@@ -8523,6 +8531,8 @@ void DockApp::PaintSettingsPopup() {
             L"Restore Hands-Free after Bluetooth connect", false, m_config.HandsFree(), 0.0F},
     };
     const SettingsRow glassRows[] = {
+        {SettingsHitKind::MacosLiquidGlass, L"macOS Liquid Glass",
+            L"Exact macOS 26 Tahoe dock glass", false, m_config.MacosLiquidGlass(), 0.0F},
         {SettingsHitKind::RimLight, L"Rim light", L"Edge glow and caustic on the glass", false,
             m_config.RimLight(), 0.0F},
         {SettingsHitKind::Lensing, L"Lensing", L"Refraction warp through the bevel", false,
@@ -11067,7 +11077,11 @@ bool DockApp::RenderFrame(bool allowBlockingGpuWait) {
     // FrostAmount 1 = full mica (legacy toggle on): opaque frosted plate.
     // In between, alpha and blur strength track the slider continuously.
     const float frostAmount = m_config.FrostAmount();
-    state.glassAlpha = DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount;
+    const bool macosLiquidGlass = m_config.MacosLiquidGlass();
+    state.macosLiquidGlass = macosLiquidGlass;
+    state.glassAlpha = macosLiquidGlass
+        ? 1.0f
+        : (DOCK_GLASS_ALPHA + (1.0f - DOCK_GLASS_ALPHA) * frostAmount);
     UINT glassFx = 0;
     if (m_config.RimLight()) {
         glassFx |= DOCK_FX_RIM;

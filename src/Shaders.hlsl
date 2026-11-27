@@ -9,7 +9,7 @@ cbuffer FrameData : register(b0)
     float4 scene0; // output width, output height, glass alpha, dock scale
     float4 scene1; // fx bitmask | icon count, DPI scale, dev bounds, backdrop valid
     float4 scene2; // pointer glint x, y (output px), strength 0..1, unused
-    float4 scene3; // dock: chrome ink darkness 0 (white) .. 1 (black); panels: y = corner radius px (0 = default)
+    float4 scene3; // dock: x = chrome ink darkness 0 (white) .. 1 (black), z = 1 for macOS 26 Liquid Glass; panels: y = corner radius px (0 = default)
 };
 
 struct IconInstance
@@ -185,6 +185,12 @@ float FxEnabled(float packed, float bit)
 bool SpotlightPanel()
 {
     return FxEnabled(scene1.x, (float)DOCK_FX_PANEL) > 0.5 && FxEnabled(scene1.x, (float)DOCK_FX_SPOTLIGHT) > 0.5;
+}
+
+// Dock bar: macOS 26 (Tahoe) Liquid Glass dock replica (scene3.z > 0.5).
+bool MacosLiquidGlassDock()
+{
+    return FxEnabled(scene1.x, (float)DOCK_FX_PANEL) < 0.5 && scene3.z > 0.5;
 }
 
 // Bevel (lens band) width. Context panels refract as one full-face slab. The
@@ -534,7 +540,8 @@ float3 SampleGlassAxis(Texture2D tex, float2 uvR, float2 uvG, float2 uvB,
     const float2 lo = texel * 0.5;
     const float2 hi = 1.0 - texel * 0.5;
     const bool spotlight = SpotlightPanel();
-    const float step = spotlight ? blurPx * 0.0625 : min(blurPx * 0.0625, 1.0);
+    const bool macosLiquid = MacosLiquidGlassDock();
+    const float step = (spotlight || macosLiquid) ? blurPx * 0.0625 : min(blurPx * 0.0625, 1.0);
     if (all(uvR == uvG) && all(uvB == uvG))
     {
         return SampleBlurRgb(tex, uvG, texel, lo, hi, step, axis, !spotlight);
@@ -740,11 +747,137 @@ void ComputeBevelRefraction(float2 uv, float2 texel, float2 outward, float insid
     }
 }
 
+// ---------------------------------------------------------------------------
+// macOS 26 (Tahoe) Liquid Glass dock material, measured from
+// DesignLibrary.GlassMaterialProvider.Configuration.dock (NSGlassEffectView
+// variant 10 + CASDFKeyFillHighlightEffect) on macOS 26.7.3:
+//   * Undisplaced 2D Gaussian backdrop blur (sigma = 15.5 pt across 4 H/V pairs).
+//   * Pure neutral quarter-circle bevel refraction (H = 17.0 pt, A = 50.7 pt,
+//     zero chromatic dispersion) + 30% crisp refracted rim blend.
+//   * Adaptive light/dark glassBackground color matrix + fill driven by live
+//     backdrop luminance (scene3.x):
+//       Light: black=0.20, white=0.95, fill=(1,1,1,0.10) -> #474747..#f4f4f4
+//       Dark:  black=0.05, white=0.80, fill=(1,1,1,0.05) -> #191919..#cfcfcf
+//   * Diagonal Top-Left (-45 deg) + Bottom-Right (+135 deg) specular rim
+//     (CASDFKeyFillHighlightEffect) + 1 px outer dark hairline + soft drop shadow.
+// ---------------------------------------------------------------------------
+float4 MacosLiquidGlassDockPS(float2 pixel, float2 outputSize, float dpi)
+{
+    float2 halfSize;
+    float dockS;
+    float cornerRadius;
+    float distance;
+    float2 dockNrm;
+    Dock27Shape(pixel, outputSize, dpi, halfSize, dockS, cornerRadius, distance, dockNrm);
+
+    const float mask = saturate(0.5 - distance);
+    const float fxBits = scene1.x;
+    const float rimGain = FxEnabled(fxBits, 1.0);
+    const float lensOn = FxEnabled(fxBits, 2.0);
+    const float specOn = FxEnabled(fxBits, 32.0);
+    const float shadowOn = FxEnabled(fxBits, 64.0);
+    const float outerLine = saturate(1.0 - abs(distance - 0.85 * dpi) / max(0.85 * dpi, 0.5)) * 0.14 * rimGain;
+
+    if (mask <= 0.0)
+    {
+        float shadowAlpha = 0.0;
+        if (shadowOn > 0.5)
+        {
+            const float2 shadowCenter = outputSize * 0.5 + float2(0.0, DOCK_MACOS_GLASS_SHADOW_OFFSET_Y_PT) * dpi;
+            float2 shadowNrm;
+            const float shadowSdf = SdSquircleRectN(pixel - shadowCenter, halfSize,
+                cornerRadius, kDock27CornerN, shadowNrm);
+            const float penumbra = 10.0 * dpi;
+            const float s = 1.0 - saturate(max(shadowSdf, 0.0) / penumbra);
+            shadowAlpha = s * s * (3.0 - 2.0 * s) * DOCK_MACOS_GLASS_SHADOW_ALPHA;
+        }
+        return float4(0.0, 0.0, 0.0, 1.0 - (1.0 - shadowAlpha) * (1.0 - outerLine));
+    }
+
+    const float2 texel = 1.0 / outputSize;
+    const float2 lo = texel * 0.5;
+    const float2 hi = 1.0 - texel * 0.5;
+    const float insideDistance = max(-distance, 0.0);
+    const float k = dockS / kDock27RefS;
+
+    // Quarter-circle bevel refraction (pure neutral, zero chromatic dispersion).
+    const float bevelH = max(DOCK_MACOS_GLASS_REFRACT_H_PT * k, 1.0);
+    const float t = saturate(1.0 - insideDistance / bevelH);
+    const float disp = (lensOn > 0.5)
+        ? (DOCK_MACOS_GLASS_REFRACT_AMT_PT * k * (1.0 - sqrt(max(1.0 - t * t, 0.0))) *
+            smoothstep(0.0, 1.0 * dpi, insideDistance))
+        : 0.0;
+    const float2 uvDisp = clamp((pixel - dockNrm * disp) * texel, lo, hi);
+
+    const bool hasBackdrop = scene1.w > 0.5;
+    const float lightT = saturate(scene3.x);
+    const float lightMode = lightT * lightT * (3.0 - 2.0 * lightT);
+    const float cBlack = lerp(DOCK_MACOS_GLASS_DARK_BLACK, DOCK_MACOS_GLASS_LIGHT_BLACK, lightMode);
+    const float cWhite = lerp(DOCK_MACOS_GLASS_DARK_WHITE, DOCK_MACOS_GLASS_LIGHT_WHITE, lightMode);
+    const float fillA = lerp(DOCK_MACOS_GLASS_DARK_FILL_A, DOCK_MACOS_GLASS_LIGHT_FILL_A, lightMode);
+
+    float3 inside;
+    float insideAlpha;
+    if (hasBackdrop)
+    {
+        const float blurPx = DOCK_MACOS_GLASS_BLUR_SIGMA_PT * dpi;
+        float3 backdrop = SampleGlassAxis(blurTemp, uvDisp, uvDisp, uvDisp, texel, blurPx, float2(0.0, 1.0));
+        if (lensOn > 0.5 && t > 0.0)
+        {
+            const float3 crisp = backdropTexture.SampleLevel(linearClamp, uvDisp, 0).rgb;
+            backdrop = lerp(backdrop, crisp, DOCK_MACOS_GLASS_REFRACT_OPACITY * t * t);
+        }
+        const float3 mapped = saturate(cBlack + (cWhite - cBlack) * backdrop);
+        inside = lerp(mapped, float3(1.0, 1.0, 1.0), fillA);
+        insideAlpha = 1.0;
+    }
+    else
+    {
+        insideAlpha = lerp(0.55, 0.72, lightMode);
+        inside = lerp(float3(0.14, 0.14, 0.16), float3(0.92, 0.93, 0.95), lightMode);
+    }
+
+    // Diagonal Top-Left (-45 deg) + Bottom-Right (+135 deg) specular rim
+    // (CASDFKeyFillHighlightEffect).
+    const float ang = atan2(-dockNrm.y, dockNrm.x);
+    const float rimAng = 0.18 + 0.545 * pow(abs(cos(ang - 2.356194)), 1.08);
+    const float rimBand = saturate(1.0 - insideDistance / max(1.15 * dpi, 1.0));
+    const float rimGlow = 0.08 * exp(-insideDistance / max(2.5 * k, 1.0));
+    const float rimStrength = saturate(rimAng * (rimBand + rimGlow)) * rimGain;
+    inside = lerp(inside, float3(1.0, 1.0, 1.0), rimStrength);
+
+    // Subtle pointer-reactive rim glint.
+    const float glint = saturate(scene2.z) * specOn;
+    if (glint > 0.0)
+    {
+        const float2 toGlint = pixel - scene2.xy;
+        const float rimSigma = 48.0 * dpi;
+        const float nearRim = exp(-dot(toGlint, toGlint) / (2.0 * rimSigma * rimSigma));
+        inside = lerp(inside, float3(1.0, 1.0, 1.0),
+            saturate((rimBand + rimGlow * 2.0) * 0.45 * nearRim * glint * rimGain));
+    }
+
+    if (scene1.z > 0.5)
+    {
+        const float outline = 1.0 - smoothstep(0.0, 1.0, abs(distance));
+        inside = lerp(inside, float3(1.0, 0.18, 0.58), outline);
+    }
+
+    inside = saturate(inside);
+    const float cov = saturate(mask * scene0.z * (hasBackdrop ? scene1.w : 1.0)) * insideAlpha;
+    const float outA = cov + (1.0 - cov) * outerLine;
+    return float4(inside * cov, outA);
+}
+
 float4 GlassPS(VertexOutput input) : SV_Target
 {
     if (scene1.z > 50.0)
     {
         return CcGlass(input.position.xy, scene0.xy, max(scene1.y, 1.0));
+    }
+    if (MacosLiquidGlassDock())
+    {
+        return MacosLiquidGlassDockPS(input.position.xy, scene0.xy, max(scene1.y, 1.0));
     }
     const float2 outputSize = scene0.xy;
     const float2 pixel = input.position.xy;
@@ -1115,6 +1248,15 @@ void ComputeFrostUVs(float2 pixel, float2 outputSize, float dpi, bool allowDispe
         uvG = ccUv;
         uvB = ccUv;
         blurPx = CcBlurPxAt(pixel);
+        return;
+    }
+    if (MacosLiquidGlassDock())
+    {
+        const float2 macUv = clamp(pixel / outputSize, 0.5 / outputSize, 1.0 - 0.5 / outputSize);
+        uvR = macUv;
+        uvG = macUv;
+        uvB = macUv;
+        blurPx = DOCK_MACOS_GLASS_BLUR_SIGMA_PT * dpi;
         return;
     }
     const float panelOn = FxEnabled(scene1.x, (float)DOCK_FX_PANEL);

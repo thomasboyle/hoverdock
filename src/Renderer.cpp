@@ -2621,7 +2621,7 @@ bool Renderer::Render(const DockRenderState& state) {
     frame.mappedConstants->scene2[3] = 0.0F;
     frame.mappedConstants->scene3[0] = std::clamp(state.chromeDarkInk, 0.0F, 1.0F);
     frame.mappedConstants->scene3[1] = 0.0F;
-    frame.mappedConstants->scene3[2] = 0.0F;
+    frame.mappedConstants->scene3[2] = state.macosLiquidGlass ? 1.0F : 0.0F;
     frame.mappedConstants->scene3[3] = 0.0F;
 
     const bool uploadedBackdrop = m_backdropUploadDirty && m_backdropUpload != nullptr;
@@ -2683,19 +2683,24 @@ bool Renderer::Render(const DockRenderState& state) {
     const D3D12_GPU_DESCRIPTOR_HANDLE srvTable0 = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    const float frostAmt =
-        static_cast<float>((state.fxFlags >> 16) & 0xFFu) / 255.0F;
+    // macOS 26 Liquid Glass dock runs a fixed 4-pair Gaussian stack (extraFrostPairs = 3)
+    // to match the measured 15.5 pt blur sigma regardless of the custom Frost slider.
+    const float frostAmt = state.macosLiquidGlass
+        ? 0.875F
+        : static_cast<float>((state.fxFlags >> 16) & 0xFFu) / 255.0F;
     const int extraFrostPairs = static_cast<int>(std::lround(
         std::clamp((frostAmt - 0.5F) * 2.0F, 0.0F, 1.0F) * 4.0F));
-    if ((state.fxFlags & DOCK_FX_BLUR) != 0 && m_backdropValid && extraFrostPairs > 0 &&
+    const bool wantsBlur = state.macosLiquidGlass || (state.fxFlags & DOCK_FX_BLUR) != 0;
+    if (wantsBlur && m_backdropValid && extraFrostPairs > 0 &&
         m_blurTemp2 == nullptr) {
         EnsureDockBlurTemp2();
     }
-    const bool frostPass = (state.fxFlags & DOCK_FX_BLUR) != 0 && m_backdropValid &&
+    const bool frostPass = wantsBlur && m_backdropValid &&
         m_blurTemp != nullptr && (extraFrostPairs == 0 || m_blurTemp2 != nullptr);
     if (frostPass) {
         const BlurCacheKey blurKey{m_backdropGpuSerial, state.width, state.height,
-            state.fxFlags & ~(0x3Fu << 8)};
+            state.macosLiquidGlass ? 0u : (state.fxFlags & ~(0x3Fu << 8)),
+            state.macosLiquidGlass};
         if (m_blurTempIsShaderResource && blurKey == m_blurCache) {
             ProfileScope::Mark("Renderer::ReuseCachedBlur");
         } else {

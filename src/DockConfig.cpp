@@ -1158,6 +1158,7 @@ bool DockConfig::Load() {
     m_specular = true;
     m_dropShadow = true;
     m_depthShade = true;
+    m_macosLiquidGlass = false;
     m_lightPanels = false;
     m_handsFree = true;
     m_qsIconColor = kDefaultQsIconColor;
@@ -1237,6 +1238,10 @@ bool DockConfig::Load() {
         const auto depthShade = dockSection->second.find(L"depthshade");
         if (depthShade != dockSection->second.end()) {
             m_depthShade = ParseBoolean(depthShade->second);
+        }
+        const auto macosLiquidGlass = dockSection->second.find(L"macosliquidglass");
+        if (macosLiquidGlass != dockSection->second.end()) {
+            m_macosLiquidGlass = ParseBoolean(macosLiquidGlass->second);
         }
         const auto lightPanels = dockSection->second.find(L"lightpanels");
         if (lightPanels != dockSection->second.end()) {
@@ -1364,6 +1369,7 @@ bool DockConfig::Save() const {
     contents << L"Specular=" << (m_specular ? L"1" : L"0") << L"\n";
     contents << L"DropShadow=" << (m_dropShadow ? L"1" : L"0") << L"\n";
     contents << L"DepthShade=" << (m_depthShade ? L"1" : L"0") << L"\n";
+    contents << L"MacosLiquidGlass=" << (m_macosLiquidGlass ? L"1" : L"0") << L"\n";
     contents << L"LightPanels=" << (m_lightPanels ? L"1" : L"0") << L"\n";
     contents << L"HandsFree=" << (m_handsFree ? L"1" : L"0") << L"\n";
     {
@@ -1500,6 +1506,14 @@ void DockConfig::SetDepthShade(bool enabled) noexcept {
     m_depthShade = enabled;
 }
 
+bool DockConfig::MacosLiquidGlass() const noexcept {
+    return m_macosLiquidGlass;
+}
+
+void DockConfig::SetMacosLiquidGlass(bool enabled) noexcept {
+    m_macosLiquidGlass = enabled;
+}
+
 // Quick Settings / Dock Settings always use the dock's own glass tint with light ink;
 // the old light plate made them milky next to the dock. The ini key is still parsed
 // (and written back) for compatibility but no longer has any effect.
@@ -1610,6 +1624,7 @@ void DockConfig::SetDefaults() {
     m_specular = true;
     m_dropShadow = true;
     m_depthShade = true;
+    m_macosLiquidGlass = false;
     m_lightPanels = false;
     m_handsFree = true;
     m_qsIconColor = kDefaultQsIconColor;
